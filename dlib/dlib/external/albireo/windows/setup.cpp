@@ -160,10 +160,13 @@ namespace albireo
             bool rolled_back = false;    // the previous programs were put back after a failure
         };
 
-        // The text of a problem of a folder (setup::folder_problem()), in the language of the wizard.
+        /*
+            The text of a problem of a folder (setup::folder_problem()), in the language of the
+            wizard, with the folder, the drive or the file system it names.
+        */
         std::string folder_text(const std::string& problem, const std::string& dir)
         {
-            return narrow(tr(problem.c_str(), { { "d", dir } }));
+            return narrow(tr(problem, setup::folder_problem_marks(problem, dir)));
         }
 
         /*
@@ -198,6 +201,13 @@ namespace albireo
                 return false;
             }
             if (!setup::secure_parents(o.program_dir, error) || !secure_folder(o.program_dir, error)) return false;
+            // The path checked again once the folders exist: a folder another account made meanwhile shows.
+            const std::string late = setup::movable_folder_problem(o.program_dir);
+            if (!late.empty())
+            {
+                error = folder_text(late, o.program_dir);
+                return false;
+            }
             if (default_models)
             {
                 setup::record_models_dir(std::string(), false);
@@ -205,7 +215,8 @@ namespace albireo
             }
             // A models folder new or empty when chosen goes whole with Albireo.
             const bool owned = !dir_exists(o.models_dir) || list_dir(o.models_dir).empty();
-            if (!secure_folder(o.models_dir, error)) return false;
+            // The folders made on its path receive the permissions of the folder itself.
+            if (!setup::secure_parents(o.models_dir, error) || !secure_folder(o.models_dir, error)) return false;
             setup::record_models_dir(o.models_dir, owned);
             return true;
         }
@@ -346,6 +357,13 @@ namespace albireo
         {
             std::string& error = report.error;
             if (!record_data_folder(o, update, error) || !setup::prepare_data_dir(error)) return false;
+            // The path of a new data folder checked again once the folder exists.
+            const std::string late = update ? std::string() : setup::movable_folder_problem(data_dir());
+            if (!late.empty())
+            {
+                error = folder_text(late, data_dir());
+                return false;
+            }
             const std::string what = update ? "update" : "installation";
             setup::log(what + " of " + ALBIREO_VERSION + " in " + o.program_dir + ", data in " + data_dir() + ", port "
                 + std::to_string(o.port));
@@ -709,7 +727,7 @@ namespace albireo
                 problem = setup::folder_problem(models, false, programs);
             }
             if (problem.empty()) return true;
-            ui::message(wz.hwnd, tr(problem.c_str(), { { "d", dir } }), MB_OK | MB_ICONWARNING);
+            ui::message(wz.hwnd, widen(folder_text(problem, dir)), MB_OK | MB_ICONWARNING);
             return false;
         }
 
@@ -1365,7 +1383,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         {
             const std::string problem = setup::folder_problem(dir, false, setup::installed_dir());
             if (!problem.empty()) reason = folder_text(problem, dir);
-            else if (!secure_folder(dir, error)) reason = error;
+            else if (!setup::secure_parents(dir, error) || !secure_folder(dir, error)) reason = error;
         }
         if (!reason.empty())
         {

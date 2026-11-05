@@ -633,6 +633,33 @@ namespace albireo
 #endif
     }
 
+    bool drive_keeps_permissions(const std::string& p, std::string& file_system)
+    {
+        file_system.clear();
+#if defined(_WIN32)
+        // The drive of the deepest folder that exists on the path, through the volumes mounted in folders.
+        std::wstring existing = full_path(p);
+        while (existing.size() > 3 && !dir_exists(narrow(existing)))
+        {
+            const size_t cut = existing.find_last_of(L'\\');
+            existing = cut == std::wstring::npos || cut < 3 ? existing.substr(0, 3) : existing.substr(0, cut);
+        }
+        if (existing.size() < 3) return false;
+        std::wstring volume(MAX_PATH + 1, L'\0');
+        if (!GetVolumePathNameW(existing.c_str(), &volume[0], static_cast<DWORD>(volume.size()))) return false;
+        volume.resize(std::wcslen(volume.c_str()));
+        wchar_t name[MAX_PATH + 1] = {};
+        DWORD flags = 0;
+        if (!GetVolumeInformationW(volume.c_str(), nullptr, 0, nullptr, nullptr, &flags, name, MAX_PATH + 1))
+            return false;
+        file_system = narrow(name);
+        return (flags & FILE_PERSISTENT_ACLS) != 0;
+#else
+        (void)p;
+        return true;
+#endif
+    }
+
     bool secure_folder(const std::string& p, std::string& error, bool check_content)
     {
 #if defined(_WIN32)
@@ -640,6 +667,14 @@ namespace albireo
         if (full.size() < 4 || full[1] != L':' || full[2] != L'\\')
         {
             error = p + " is not a folder of a local drive";
+            return false;
+        }
+        // A drive without permissions, exFAT or FAT32, would leave the folder open to every account.
+        std::string file_system;
+        if (!drive_keeps_permissions(p, file_system))
+        {
+            error = file_system.empty() ? "the drive of " + narrow(full) + " does not answer"
+                : narrow(full) + " lies on a drive whose file system (" + file_system + ") keeps no permissions";
             return false;
         }
         // The links on the way, the folder included, must be those of SYSTEM or the administrators.

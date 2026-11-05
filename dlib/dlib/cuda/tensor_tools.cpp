@@ -1981,6 +1981,68 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void gguf_matvec (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_matvec(dest, src, weights, type, rows, cols, row_bytes);
+#else
+        cpu::gguf_matvec(dest, src, weights, type, rows, cols, row_bytes);
+#endif
+    }
+
+    void gguf_dequantize (
+        tensor& dest,
+        const tensor& weights,
+        int type,
+        long first,
+        long count,
+        long cols,
+        size_t row_bytes
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_dequantize(dest, weights, type, first, count, cols, row_bytes);
+#else
+        cpu::gguf_dequantize(dest, weights, type, first, count, cols, row_bytes);
+#endif
+    }
+
+    void rms_norm_rows (
+        tensor& dest,
+        const tensor& src,
+        const tensor& gamma,
+        float eps
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::rms_norm_rows(dest, src, gamma, eps);
+#else
+        cpu::rms_norm_rows(dest, src, gamma, eps);
+#endif
+    }
+
+    void silu_multiply (
+        tensor& gate,
+        const tensor& up
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::silu_multiply(gate, up);
+#else
+        cpu::silu_multiply(gate, up);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
 }}
 
 #endif // DLIB_TeNSOR_TOOLS_CPP_

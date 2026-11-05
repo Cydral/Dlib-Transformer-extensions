@@ -62,9 +62,10 @@ application, the description of the interface and the list of the programs of Wi
 - **Images** given to the models that read them: a question carries PNG or JPEG images (the
   browser converts the other formats it shows), attached, pasted or dropped, shown as thumbnails
   that open whole in a viewer, ten at most in the context of a discussion, the images of the
-  exchanges that a compression summarized leaving the context with them. A project holds ten
-  images, which the model that comes with Albireo describes in the background; their descriptions
-  are searched with its documents, and a question that finds one receives the image, four at most.
+  exchanges that a compression summarized leaving the context with them. The knowledge of a project
+  holds 100 items at most, documents and images together, of which ten images, which the model that
+  comes with Albireo describes in the background; their descriptions are searched with its
+  documents, and a question that finds one receives the image, four at most.
   A model that reads text only receives the names of the images.
 - **Reading aloud**: each answer has a button that reads it aloud, in English, French, German,
   Italian or Spanish as its words show, with the speech synthesis that comes with Albireo, which
@@ -75,7 +76,7 @@ application, the description of the interface and the list of the programs of Wi
 - **Three functions**, general, code and security, each served by a language model of the
   catalog, chosen in the Models window or by the service when a model arrives, and an embedding
   model for the search in documents, which the service installs in every case.
-- **Models that come with Albireo**: the complete installer carries Qwen3-VL-4B-Thinking-albireo,
+- **Models that come with Albireo**: the complete installer carries Qwen3-VL-2B-Thinking-albireo,
   which reads images and text, reasons when asked, and serves the three functions as soon as
   Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the search, both retrieved and
   checked by the build (see [Models that come with Albireo](#models-that-come-with-albireo)).
@@ -115,8 +116,9 @@ application, the description of the interface and the list of the programs of Wi
 
 ## Screenshots
 
-The web application served by the service, the windows of the icon and the installer, with the
-model that comes with Albireo (Qwen3-VL-4B-Thinking-albireo) on a processor of two cores.
+The web application served by the service, the windows of the icon and the installer, with
+Qwen3-VL-4B-Thinking-albireo, the model that came with Albireo up to version 1.0.8, on a processor
+of two cores.
 
 | | |
 |---|---|
@@ -210,25 +212,48 @@ with cuBLAS, whose libraries the installers carry.
 The engines of the devices add a `matmul_offload` ([`engine/offload.h`](engine/offload.h)) that
 receives each product with the way to compute it on the processor
 ([`engine/tensor_backend.cpp`](engine/tensor_backend.cpp)). The product goes to the device through
-the tensors of dlib, with a copy of the weight matrix in single precision kept while the copies of
-all the models fit in a budget:
+the tensors of dlib, with a copy of the weight matrix kept while the copies of all the models fit
+in a budget:
 
-- with OpenVINO, the routing of the NPU module of dlib times the processor kernels against the NPU
-  and the GPU, shape by shape, and keeps the faster;
-- with CUDA, the engine makes these measures itself, on two matrices of each shape, and checks its
-  choice at growing intervals. The copies are written on the card by blocks of 64 MB that a buffer
-  of the host holds in turn, without an image in the memory of the host, and stay within the memory
-  of the card that the extended device memory of dlib (V²RAM) manages, less 1 GiB (a quarter of it
-  on a smaller card) for the products, the matrices that cross the bus and cuBLAS. A matrix left
-  out of the copies is computed by the processor from its quantized weights for a product of fewer
-  than 128 tokens, a generated token among them, and crosses the bus for that product alone from
-  128 tokens on. A size given to the file of V²RAM (`v2ram_max_mb`) lets the copies go beyond the
-  card into it, the blocks that do not fit moving to the memory of the host or to that file and
-  coming back ahead of their use; once the copies exceed the memory of the card, the products of
-  fewer than eight tokens stay on the processor. Only the rows of a product cross the bus.
+- with OpenVINO, the copies hold floats in single precision, and the routing of the NPU module of
+  dlib times the processor kernels against the NPU and the GPU, shape by shape, and keeps the
+  faster;
+- with CUDA, a copy holds the blocks of the GGUF format of its matrix as the file holds them, for
+  F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q4_K, Q5_K and Q6_K, and floats in single
+  precision for the other formats. The kernels of dlib
+  ([`dlib/cuda/cuda_gguf.cu`](../../cuda/cuda_gguf.cu)) read the blocks in place for a product of
+  fewer than 64 tokens, a warp per row decoding each group of 32 weights once for up to eight
+  tokens, and expand them from 64 tokens on by tiles of 64 MB that cuBLAS multiplies. Before a new
+  copy serves, its first 64 rows multiply probe activations and are expanded on the card, against
+  the same work of the processor: a format whose results differ keeps its matrices in single
+  precision. The engine measures the
+  products of each shape on two matrices and on the processor, and checks its choice at growing
+  intervals. The blocks cross the bus from the mapping of the file, without an image in the memory
+  of the host, and the copies stay within the memory of the card that the extended device memory
+  of dlib (V²RAM) manages, less 1 GiB (a quarter of it on a smaller card) for the hidden states of
+  the passes, the tiles and cuBLAS. A matrix left out of the copies is computed by the processor
+  from its quantized weights for a product of fewer than 128 tokens, a generated token among them,
+  and crosses the bus in its format for that product alone from 128 tokens on. A size given to the
+  file of V²RAM (`v2ram_max_mb`) lets the copies go beyond the card into it, the blocks that do not
+  fit moving to the memory of the host or to that file and coming back ahead of their use; once
+  the copies exceed the memory of the card, the products of fewer than eight tokens stay on the
+  processor. Only the rows of a product cross the bus.
 
-The products of a single token often stay on the processor, which serves them from the compact
-weights; the products of the prompts go to the device. The image encoder of a model sends its
+With CUDA, the layers of a dense model run on the card as a whole (`layer_pass`): the hidden states
+of a pass stay on the card from the first layer to the last, the card computes the normalizations,
+the seven products, the SwiGLU gate and the residual sums of each layer, and the processor keeps
+the attention over the paged keys and values, the biases, the normalizations of queries and keys
+and the rotary positions. A layer crosses the bus once each way, the queries, keys and values of
+its tokens to the processor and the outputs of their attention back, through pinned memory and
+asynchronous copies, where the products alone crossed it twice per product. Before its first use,
+a pass of the card over 8 probe tokens must give the logits of the processor alone within 1 %,
+or the layers stay with the products; a check that the keys and values or the card put off is
+made again 64 passes later. A failure of the card brings the pass back to the processor, which
+computes it again. A model with a mixture of experts, and the passes that add the
+DeepStack slices of an image, keep the products.
+
+With OpenVINO, the products of a single token often stay on the processor, which serves them from
+the compact weights; the products of the prompts go to the device. The image encoder of a model sends its
 products to the device of the engine too, its copies leaving the device for the decoder between
 two images.
 
@@ -267,12 +292,12 @@ choice then gives the processor engine the place of an accelerator measured slow
 the service restarts when its choice changes. The Accelerator menu and the window of the computer
 give the measures in the language of the interface ("23.5 tokens/s", "23,5 jetons/s").
 
-The CUDA engine computes on the card, one product at a time, the products of the matrices whose
-copies in single precision it holds, and the attention on the processor: each product of a
-generated token sends its row to the card and reads its result back, and the products the card
-lacks room for run on the processor from their quantized weights. The prompts gain the most from
-the card; for the generated tokens, the gain over the processor engine depends on the share of the
-model the card holds.
+The CUDA engine keeps the weights on the card in their GGUF formats and computes there the layers
+of a dense model, the attention staying on the processor: a generated token crosses the bus once
+each way per layer and reads 1.1 GB of weights on the card for Qwen3-VL 2B in Q4_K_M, where it read
+them in single precision, six times as many bytes, and crossed the bus twice for each of the 197
+products of its pass. The products the card lacks room for run on the processor from their
+quantized weights.
 
 The conversation formats are written natively ([`engine/chat_format.cpp`](engine/chat_format.cpp)),
 the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
@@ -443,7 +468,12 @@ another model, a dialog says that its text cannot be read. A PDF where some page
 is added with a notice of the number of these pages, whose text is missing. The same rules apply
 to the files attached to a question and to the knowledge of a project. A document of more than
 100 MB and an image of more than 15 MB, attached to a question or added to a project, are refused
-before they are read, with a message that names the file and the limit.
+before they are read, with a message that names the file and the limit. The knowledge of a project
+takes 100 items at most, documents and images together: its card shows their count, its button
+turns off once they are there, and the files of a choice or of a drop beyond them are left out with
+a message that counts them and names the first ones. A project of an earlier version that holds
+more keeps them, and takes no other until it holds fewer than 100. The additions of a page apply
+one after the other, each to the project as the previous one left it.
 
 The images of a question ([`web/js/images.js`](web/js/images.js)) are reduced in the browser to
 1,536 pixels on their longest side at most and kept in its database; the message gives them before
@@ -630,7 +660,8 @@ missing and prints a table of what it found and installed:
 - The free space of each volume that receives the build trees and the caches, estimated at 7 GB
   for the tree of the programs and of the installers, 1 GB for the one of OpenVINO, 2 GB for the
   one of CUDA, 6.8 GB for the models that come with Albireo in their cache and 4.2 GB for the
-  archives of NVIDIA, less what these folders hold already; the script stops when a volume is short.
+  archives of NVIDIA (1.5 GB for cuDNN alone), less what these folders hold already; the script
+  stops when a volume is short.
 
 An installation that fails stops the build with the place of its log. `-NoInstall` installs
 nothing; the table then gives the command that installs each missing item, for a computer where an
@@ -685,11 +716,13 @@ without it, or with 12.9), `-Cudnn <folder>` one cuDNN installation for an insta
 (`C:\Program Files\NVIDIA\CUDNN\v9.11` for instance), and
 `-CudaArchitectures` replaces the list of architectures of the CUDA engine. Of several cuDNN
 versions in `C:\Program Files\NVIDIA\CUDNN`, the script takes the latest before 9.12 that serves
-the toolkit, else the latest; each configuration sets the architectures, the list given or the
-default one, never a list an earlier configuration kept, and the configuration and the end of the
-script warn when the CUDA engine leaves out the GTX 900 and 10 series. After a device tree is
-rebuilt by hand, delete `build-albireo/payload` so that the installer packs its engines again. The
-script amounts to:
+the toolkit, else the latest; when the cuDNN found is 9.12 or later, a CUDA 12 toolkit receives
+cuDNN 9.11.0 from the archives of NVIDIA instead, 0.6 GB downloaded once and 1.4 GB in the cache,
+unless `-Cudnn` or `-CudaArchitectures` is given. Each configuration sets the architectures, the
+list given or the default one, never a list an earlier configuration kept, and the configuration
+and the end of the script warn when the CUDA engine leaves out the GTX 900 and 10 series. After a
+device tree is rebuilt by hand, delete `build-albireo/payload` so that the installer packs its
+engines again. The script amounts to:
 
 ```
 cmake -S dlib/dlib/external/albireo -B build-albireo-ov -G "Visual Studio 17 2022" -A x64 -DALBIREO_PROGRAMS=OFF -DALBIREO_ENGINE_OPENVINO=ON
@@ -733,7 +766,9 @@ the cards that follow:
 cuDNN 9.12 and later run on Turing and later cards only (GTX 16 and RTX series). A build for the
 GTX 900 and 10 series therefore takes CUDA 12.8 or 12.9 with cuDNN 9.11 or earlier, the version
 copied beside the engine, which the archives of NVIDIA provide (CUDA 12.9.1, cuDNN 9.11.0). The
-configuration prints the toolkit, the cuDNN version and the oldest
+headers and the libraries of the cuDNN given to the configuration come before those of the
+toolkit, whose folder may carry another version of cuDNN. The configuration prints the toolkit,
+the cuDNN version and the oldest
 compute capability of the result, which the engine also checks at its start: a card below it is
 reported as unusable, with its compute capability, and the other engines serve the models.
 
@@ -789,7 +824,8 @@ cmake --build build-albireo-win -j
 | `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
-| `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
+| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing |
+| `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`) against the processor kernels, for every format, with activations on 16 bytes and off them, then the time of the products of a generated token on the matrices of a 2B model |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
@@ -798,7 +834,8 @@ cmake --build build-albireo-win -j
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
-plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same test on the host code of dlib.
+plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
+runs the layers of a dense model as the card does.
 
 Two scripts run these programs and the service, then print one line per step with its result:
 
@@ -861,16 +898,30 @@ bundle when it bears the signature of Albireo and the models this catalog lists,
 against its hash. The option "This computer has no Internet access" of the wizard, or `/offline`,
 sets the service offline from the start.
 
-The folder of the data must lie on a local fixed drive, those of the programs and of the models on
-a local drive; the installer refuses a drive root, the folders of Windows and of the users, a
-folder that holds them, a link made by another account, a program or data folder on whose path
-another account could rename a folder (`folder_parent_unsafe`), a program or data folder that is
-neither empty nor an installation of Albireo, or that lies inside Windows or the profiles of the
-users, and a models folder inside the folder of the programs, or that holds it (`folder_overlap`),
-in the wizard as with `/silent /models` and `/models-dir`. It gives the
-folders it creates or takes over, and the parent folders it creates, the rights of the data
-folder (writing for the administrators and the service only), and records the files it installs
-in `albireo-files.json`.
+The folder of the data must lie on a local fixed drive, which most external hard drives and SSDs
+are and most USB keys are not (`folder_not_fixed`), those of the programs and of the models on a
+local drive, each on a drive that answers (`folder_drive_unavailable` for a drive locked by
+BitLocker, empty or not ready) and whose file system keeps permissions, NTFS or ReFS; the installer
+refuses a folder of an exFAT or FAT32 drive (`folder_no_permissions`, which names the file system),
+a drive root, the folders of Windows and of the users, a folder that holds them, a link made by
+another account, a program or data folder on whose path another account could rename a folder
+(`folder_parent_unsafe`, which names that folder), or whose drive root belongs to another account
+or lets other accounts delete or rename what it holds, as a root open to everyone does
+(`folder_root_unsafe`), a program or data folder that is neither empty nor an installation of
+Albireo, or that lies inside Windows or the profiles of the users, and a models folder inside the
+folder of the programs, or that holds it (`folder_overlap`), in the wizard as with
+`/silent /models` and `/models-dir`. On an external NTFS drive whose root keeps the permissions Windows
+gives a drive it formats, the folders of the programs, of the data and of the models can lie below
+a new folder at the root, `E:\Albireo` for instance, which the installer creates with them. It
+gives the folders it creates or takes over, and the parent folders it creates for the programs,
+the data and the models, the rights of the data folder (writing for the administrators and the
+service only), checks the path of the programs and of the data again once their folders exist, so
+that a folder another account made on it meanwhile stops the installation, and records the files
+it installs in `albireo-files.json`. The service refuses the same drives without permissions for
+its data folder and its models folder, a models folder there leaving the models to the data
+folder, and loads a model only from a folder that SYSTEM and the administrators alone may change,
+its projector included: a model left in a folder that another account may write in, or in a
+folder put in the place of the models folder, stays unloaded with that reason.
 
 The uninstallation stops the tray of every session, the service and the programs of the
 installation folder, removes the trust of the local authority and the certificates, then
@@ -941,9 +992,9 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; a size lets the copies of the weights go beyond the card into it; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
 | `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
 | `threads`       | 0       | threads of the engine, 0 for the physical cores                           |
-| `context`       | 0       | context of the models, 0 for the trained one up to 32768, within `kv_mb`  |
+| `context`       | 0       | context of the models, 0 for the trained one, within `kv_mb`              |
 | `max_sequences` | 4       | requests computed together per model                                      |
-| `kv_mb`         | 0       | memory of the keys and values, 0 for automatic                            |
+| `kv_mb`         | 0       | memory of the keys and values, 0 for two contexts within a third of the available memory |
 | `check_updates` | true    | checks the feed at each start and every six hours                          |
 | `default_model` | true    | downloads the default language model of the catalog at the first start    |
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |
@@ -1195,8 +1246,9 @@ and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------|---------|
-| Qwen3-VL 4B Thinking (default) | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
+| Qwen3-VL 2B Thinking (default) | Alibaba            | general, code, security | text, image   | 1.55 GB  | Apache-2.0 |
 | Qwen3 Embedding 0.6B (default) | Alibaba            | embedding               | text          | 0.64 GB  | Apache-2.0 |
+| Qwen3-VL 4B Thinking           | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
 | Qwen3-VL 2B Instruct           | Alibaba            | general                 | text, image   | 1.55 GB  | Apache-2.0 |
 | Qwen3-VL 4B Instruct           | Alibaba            | general, code           | text, image   | 2.95 GB  | Apache-2.0 |
 | Qwen3-VL 8B Instruct           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
@@ -1223,8 +1275,8 @@ programming agent for those of 32 GB:
 | Function | Text and images | Text |
 |----------|-----------------|------|
 | General  | Qwen3-VL 2B, 4B and 8B, Ministral 3 3B and 8B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B, Qwen3 8B, Qwen3 30B A3B |
-| Code     | Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B, Qwen3 8B, Qwen3 30B A3B |
-| Security | Qwen3-VL 4B Thinking, Qwen3-VL 8B (Instruct and Thinking) | Foundation-Sec 1.1 8B and 8B Reasoning, Qwen3 8B, Qwen3 30B A3B |
+| Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B, Qwen3 8B, Qwen3 30B A3B |
+| Security | Qwen3-VL 2B and 4B Thinking, Qwen3-VL 8B (Instruct and Thinking) | Foundation-Sec 1.1 8B and 8B Reasoning, Qwen3 8B, Qwen3 30B A3B |
 
 The choices follow the published measures: Qwen3-VL gives the best scores of the models that read
 images and that the engine runs (MMMU 67.4 for the 4B Instruct, 74.1 for the 8B Thinking, OCRBench
@@ -1290,7 +1342,7 @@ and the quantization Albireo ships:
 
 | Model                        | From                                                     | Shipped         | Functions               |
 |------------------------------|----------------------------------------------------------|-----------------|-------------------------|
-| Qwen3-VL-4B-Thinking-albireo | Qwen3VL-4B-Thinking-Q4_K_M.gguf of Qwen, 2.50 GB, and its projector mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 2.95 GB | general, code, security |
+| Qwen3-VL-2B-Thinking-albireo | Qwen3VL-2B-Thinking-Q4_K_M.gguf of Qwen, 1.11 GB, and its projector mmproj-Qwen3VL-2B-Thinking-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 1.55 GB | general, code, security |
 | Qwen3-Embedding-0.6B-albireo | Qwen3-Embedding-0.6B-Q8_0.gguf, 0.64 GB                  | Q8_0, 0.64 GB   | document search         |
 
 The build retrieves and converts them as the import example of dlib reads a GGUF file
@@ -1313,7 +1365,7 @@ of the engine:
    down projections of the first and last eighths of the layers and of one layer in three between
    them), with the search and the mix of the reference quantizer of the format, whose output it
    matches byte for byte, and the first and last rows of each matrix are checked against their
-   source; a model published in Q4_K_M, as Qwen3-VL-4B-Thinking is, keeps its weights. The
+   source; a model published in Q4_K_M, as Qwen3-VL-2B-Thinking is, keeps its weights. The
    metadata receive the identity of the model in Albireo. The projector of a model that reads
    images is checked against its SHA-256, read by the image encoder of the engine and installed
    beside its model (`<id>.mmproj.gguf`);
@@ -1324,8 +1376,8 @@ of the engine:
    `albireo-setup.models` beside it when both would reach the 4 GiB Windows runs; the overlay is
    read back before it takes its name.
 
-The conversion takes a few minutes and the cache holds about 6.8 GB, the downloaded files and the
-converted ones; the models of the complete installer weigh about 3.6 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
+The conversion takes a few minutes and the cache holds about 4.0 GB, the downloaded files and the
+converted ones; the models of the complete installer weigh about 2.2 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
 `-NoBuiltinModels` of `build_windows.ps1`, builds without them; a cross build gives
 `ALBIREO_BUILTIN_TOOL`, the `albireo-builtin` of the build machine.
 

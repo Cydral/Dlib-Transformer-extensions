@@ -188,6 +188,12 @@ const texts = {
       '{left}. The images of the oldest exchanges leave the context once the discussion summarizes them, which ' +
       'frees their places.',
     projectImagesNotAdded: '{notAdded} A project holds at most {max} images; places left in this one: {left}.',
+    notAddedItems_one: 'Not added: {names}.', notAddedItems_other: '{n} not added: {names}.',
+    notAddedItemsAmong: '{n} not added, among them {names}.',
+    projectItemsNotAdded: '{notAdded} The knowledge of a project holds at most {max} items, documents and images; ' +
+      'places left in this one: {left}.',
+    projectItemsCount: 'Items of the knowledge: {n} of {max} at most',
+    projectItemsFull: 'The knowledge of this project has reached its limit of {max} items: delete some to add others.',
     replayImagesFull: 'Images of this question: {n}; places left in the context of this discussion: {left} of {max}. ' +
       'The images of the oldest exchanges leave the context once the discussion summarizes them.',
     imagePlaces: 'image places left in the context: {left} of {max}',
@@ -464,6 +470,13 @@ const texts = {
       'les résume, ce qui libère leurs places.',
     projectImagesNotAdded: '{notAdded} Un projet contient au plus {max} images ; places restantes dans celui-ci : ' +
       '{left}.',
+    notAddedItems_one: 'Non ajouté : {names}.', notAddedItems_other: '{n} non ajoutés : {names}.',
+    notAddedItemsAmong: '{n} non ajoutés, dont {names}.',
+    projectItemsNotAdded: '{notAdded} Les connaissances d\'un projet contiennent au plus {max} éléments, ' +
+      'documents et images ; places restantes dans celui-ci : {left}.',
+    projectItemsCount: 'Éléments des connaissances : {n} sur {max} au plus',
+    projectItemsFull: 'Les connaissances de ce projet ont atteint leur limite de {max} éléments : supprimez-en ' +
+      'pour en ajouter d\'autres.',
     replayImagesFull: 'Images de cette question : {n} ; places restantes dans le contexte de cette discussion : ' +
       '{left} sur {max}. Les images des échanges les plus anciens quittent le contexte une fois que la discussion ' +
       'les résume.',
@@ -741,6 +754,13 @@ const texts = {
       'dieser: {left}. Die Bilder der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie ' +
       'zusammenfasst, und geben ihre Plätze frei.',
     projectImagesNotAdded: '{notAdded} Ein Projekt enthält höchstens {max} Bilder; freie Plätze in diesem: {left}.',
+    notAddedItems_one: 'Nicht hinzugefügt: {names}.', notAddedItems_other: '{n} nicht hinzugefügt: {names}.',
+    notAddedItemsAmong: '{n} nicht hinzugefügt, darunter {names}.',
+    projectItemsNotAdded: '{notAdded} Das Wissen eines Projekts enthält höchstens {max} Elemente, Dokumente und ' +
+      'Bilder; freie Plätze in diesem: {left}.',
+    projectItemsCount: 'Elemente des Wissens: {n} von höchstens {max}',
+    projectItemsFull: 'Das Wissen dieses Projekts hat seine Grenze von {max} Elementen erreicht: Löschen Sie welche, ' +
+      'um andere hinzuzufügen.',
     replayImagesFull: 'Bilder dieser Frage: {n}; freie Plätze im Kontext dieser Unterhaltung: {left} von {max}. Die ' +
       'Bilder der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie zusammenfasst.',
     imagePlaces: 'freie Bildplätze im Kontext: {left} von {max}',
@@ -1015,6 +1035,13 @@ const texts = {
       'questa: {left}. Le immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume, ' +
       'liberando i loro posti.',
     projectImagesNotAdded: '{notAdded} Un progetto contiene al massimo {max} immagini; posti liberi in questo: {left}.',
+    notAddedItems_one: 'Non aggiunto: {names}.', notAddedItems_other: '{n} non aggiunti: {names}.',
+    notAddedItemsAmong: '{n} non aggiunti, tra cui {names}.',
+    projectItemsNotAdded: '{notAdded} Le conoscenze di un progetto contengono al massimo {max} elementi, documenti e ' +
+      'immagini; posti liberi in questo: {left}.',
+    projectItemsCount: 'Elementi delle conoscenze: {n} su {max} al massimo',
+    projectItemsFull: 'Le conoscenze di questo progetto hanno raggiunto il limite di {max} elementi: eliminatene ' +
+      'alcuni per aggiungerne altri.',
     replayImagesFull: 'Immagini di questa domanda: {n}; posti liberi nel contesto di questa conversazione: {left} ' +
       'su {max}. Le immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume.',
     imagePlaces: 'posti liberi per immagini nel contesto: {left} su {max}',
@@ -1292,6 +1319,13 @@ const texts = {
       'esta: {left}. Las imágenes de los intercambios más antiguos salen del contexto cuando la conversación los ' +
       'resume, lo que libera sus plazas.',
     projectImagesNotAdded: '{notAdded} Un proyecto contiene como máximo {max} imágenes; plazas libres en este: {left}.',
+    notAddedItems_one: 'No añadido: {names}.', notAddedItems_other: '{n} no añadidos: {names}.',
+    notAddedItemsAmong: '{n} no añadidos, entre ellos {names}.',
+    projectItemsNotAdded: '{notAdded} Los conocimientos de un proyecto contienen como máximo {max} elementos, ' +
+      'documentos e imágenes; plazas libres en este: {left}.',
+    projectItemsCount: 'Elementos de los conocimientos: {n} de {max} como máximo',
+    projectItemsFull: 'Los conocimientos de este proyecto han alcanzado su límite de {max} elementos: elimine ' +
+      'algunos para añadir otros.',
     replayImagesFull: 'Imágenes de esta pregunta: {n}; plazas libres en el contexto de esta conversación: {left} de ' +
       '{max}. Las imágenes de los intercambios más antiguos salen del contexto cuando la conversación los resume.',
     imagePlaces: 'plazas libres para imágenes en el contexto: {left} de {max}',

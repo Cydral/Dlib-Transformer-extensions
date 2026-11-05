@@ -982,7 +982,13 @@ namespace albireo
         };
         long ctx = embedding && !options.contains("context") ? 0
             : static_cast<long>(setting("context", 0, 0, 1 << 26));
-        if (ctx <= 0) ctx = std::min<long>(m->cfg.ctx_train, embedding ? 8192 : 32768);
+        /*
+            By default, the context the model was trained for, which the memory given to its keys
+            and values may reduce below; an embedding model reads inputs of 8192 tokens at most.
+        */
+        if (ctx <= 0 && m->cfg.ctx_train > 0)
+            ctx = embedding ? std::min<long>(m->cfg.ctx_train, 8192) : m->cfg.ctx_train;
+        if (ctx <= 0) ctx = 4096;
         const long limit = m->cfg.ctx_train > 0 ? std::max<long>(m->cfg.ctx_train, 256) : ctx;
         m->context = std::max<long>(256, std::min<long>(ctx, limit));
         m->max_sequences = embedding && !options.contains("max_sequences") ? 8
@@ -1001,9 +1007,11 @@ namespace albireo
         else if (kv == 0)
         {
             /*
-                Two full contexts, within a quarter of the memory available once the other
+                Two full contexts, within a third of the memory available once the other
                 models have grown to their own budgets: the blocks are allocated as the
-                sequences grow, so the memory free now still has to hold that growth.
+                sequences grow, so the memory free now still has to hold that growth.  The
+                context of a model trained on a long one then comes down to what this
+                memory holds.
             */
             const memory_info mem = read_memory_info();
             size_t growth = 0;
@@ -1021,7 +1029,7 @@ namespace albireo
             if (mem.available > 0)
             {
                 const size_t available = static_cast<size_t>(mem.available);
-                kv = std::min<size_t>(kv, (available > growth ? available - growth : 0) / 4);
+                kv = std::min<size_t>(kv, (available > growth ? available - growth : 0) / 3);
             }
             kv = std::max<size_t>(kv, per_token * static_cast<size_t>(std::min<long>(m->context, 4096)));
         }

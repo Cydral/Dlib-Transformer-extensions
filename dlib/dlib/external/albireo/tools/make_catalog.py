@@ -35,11 +35,11 @@ INPUTS = ("text", "image")
 
 MODELS = [
     {
-        "id": "qwen3-vl-4b-thinking",
-        "name": "Qwen3-VL 4B Thinking",
+        "id": "qwen3-vl-2b-thinking",
+        "name": "Qwen3-VL 2B Thinking",
         "publisher": "Alibaba",
-        "hub": ("Qwen/Qwen3-VL-4B-Thinking-GGUF", "Qwen3VL-4B-Thinking-Q4_K_M.gguf"),
-        "projector": ("Qwen/Qwen3-VL-4B-Thinking-GGUF", "mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf", "Q8_0"),
+        "hub": ("Qwen/Qwen3-VL-2B-Thinking-GGUF", "Qwen3VL-2B-Thinking-Q4_K_M.gguf"),
+        "projector": ("Qwen/Qwen3-VL-2B-Thinking-GGUF", "mmproj-Qwen3VL-2B-Thinking-Q8_0.gguf", "Q8_0"),
         "quantization": "Q4_K_M",
         "roles": ["general", "code", "security"],
         "inputs": ["text", "image"],
@@ -50,19 +50,57 @@ MODELS = [
         "description": {
             "en": "Multimodal assistant that reads images and text and reasons step by step before answering: "
                   "conversation, documents, screenshots, diagrams, code and security. Albireo installs it by "
-                  "default, for computers with 8 GB of memory.",
+                  "default: half the size of the 4B version, it answers faster, from 8 GB of memory on.",
             "fr": "Assistant multimodal qui lit les images et le texte et raisonne étape par étape avant de "
                   "répondre : discussion, documents, captures d'écran, schémas, code et sécurité. Albireo "
-                  "l'installe par défaut, pour les ordinateurs dotés de 8 Go de mémoire.",
+                  "l'installe par défaut : deux fois plus petit que la version 4B, il répond plus vite, dès 8 Go "
+                  "de mémoire.",
             "de": "Multimodaler Assistent, der Bilder und Text liest und vor der Antwort Schritt für Schritt "
                   "nachdenkt: Gespräche, Dokumente, Bildschirmfotos, Diagramme, Code und Sicherheit. Albireo "
-                  "installiert ihn standardmäßig, für Computer mit 8 GB Arbeitsspeicher.",
+                  "installiert ihn standardmäßig: halb so groß wie die 4B-Fassung, antwortet er schneller, ab 8 GB "
+                  "Arbeitsspeicher.",
             "it": "Assistente multimodale che legge immagini e testo e ragiona passo dopo passo prima di "
                   "rispondere: conversazione, documenti, schermate, schemi, codice e sicurezza. Albireo lo installa "
-                  "per impostazione predefinita, per computer con 8 GB di memoria.",
+                  "per impostazione predefinita: grande la metà della versione 4B, risponde più rapidamente, a "
+                  "partire da 8 GB di memoria.",
             "es": "Asistente multimodal que lee imágenes y texto y razona paso a paso antes de responder: "
                   "conversación, documentos, capturas de pantalla, diagramas, código y seguridad. Albireo lo "
-                  "instala por defecto, para ordenadores con 8 GB de memoria.",
+                  "instala por defecto: con la mitad del tamaño de la versión 4B, responde más rápido, a partir de "
+                  "8 GB de memoria.",
+        },
+    },
+    {
+        "id": "qwen3-vl-4b-thinking",
+        "name": "Qwen3-VL 4B Thinking",
+        "publisher": "Alibaba",
+        "hub": ("Qwen/Qwen3-VL-4B-Thinking-GGUF", "Qwen3VL-4B-Thinking-Q4_K_M.gguf"),
+        "projector": ("Qwen/Qwen3-VL-4B-Thinking-GGUF", "mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf", "Q8_0"),
+        "quantization": "Q4_K_M",
+        "roles": ["general", "code", "security"],
+        "inputs": ["text", "image"],
+        "tools": True,
+        "reasoning": True,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "Multimodal assistant that reads images and text and reasons step by step before answering: "
+                  "conversation, documents, screenshots, diagrams, code and security. Twice the size of the 2B "
+                  "version installed by default, it reasons in more depth; for computers with 8 GB of memory.",
+            "fr": "Assistant multimodal qui lit les images et le texte et raisonne étape par étape avant de "
+                  "répondre : discussion, documents, captures d'écran, schémas, code et sécurité. Deux fois plus "
+                  "grand que la version 2B installée par défaut, il raisonne avec plus de profondeur ; pour les "
+                  "ordinateurs dotés de 8 Go de mémoire.",
+            "de": "Multimodaler Assistent, der Bilder und Text liest und vor der Antwort Schritt für Schritt "
+                  "nachdenkt: Gespräche, Dokumente, Bildschirmfotos, Diagramme, Code und Sicherheit. Doppelt so "
+                  "groß wie die standardmäßig installierte 2B-Fassung, denkt er gründlicher nach; für Computer mit "
+                  "8 GB Arbeitsspeicher.",
+            "it": "Assistente multimodale che legge immagini e testo e ragiona passo dopo passo prima di "
+                  "rispondere: conversazione, documenti, schermate, schemi, codice e sicurezza. Grande il doppio "
+                  "della versione 2B installata per impostazione predefinita, ragiona con maggiore profondità; per "
+                  "computer con 8 GB di memoria.",
+            "es": "Asistente multimodal que lee imágenes y texto y razona paso a paso antes de responder: "
+                  "conversación, documentos, capturas de pantalla, diagramas, código y seguridad. Con el doble del "
+                  "tamaño de la versión 2B instalada por defecto, razona con más profundidad; para ordenadores con "
+                  "8 GB de memoria.",
         },
     },
     {

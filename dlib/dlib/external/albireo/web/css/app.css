@@ -632,7 +632,7 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 .knowledge-images { margin-top: 14px; }
 .images-head { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; margin-bottom: 2px; }
 .images-head svg { width: 16px; height: 16px; flex: 0 0 16px; color: var(--text-soft); }
-.images-head .count {
+.images-head .count, .card h3 .count {
   margin-left: auto; font-size: 12.5px; font-weight: 500; color: var(--text-faint); font-variant-numeric: tabular-nums;
 }
 .list .row.image-row { align-items: flex-start; }

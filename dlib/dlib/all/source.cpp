@@ -82,6 +82,7 @@
 #endif // DLIB_NO_GUI_SUPPORT
 
 #include "../cuda/cpu_dlib.cpp"
+#include "../cuda/cpu_gguf.cpp"
 #include "../cuda/tensor_tools.cpp"
 #include "../cuda/extended_memory.cpp"
 // A build that defines DLIB_USE_NPU also compiles ../cuda/npu_dlib.cpp, as a separate C++17

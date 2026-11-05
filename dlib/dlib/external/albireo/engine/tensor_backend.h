@@ -26,10 +26,16 @@ namespace albireo
                     - the processor itself otherwise, through the host code of dlib, a
                       configuration that serves to validate this code on any machine.
 
-                A product runs on the device with a copy of its weight matrix in single
-                precision, the element type of the tensors of dlib.  The copies are made
-                the first time the device takes a matrix and kept while they fit in a
-                budget shared by the models.  A model that lacks room takes it from the
+                A product runs on the device with a copy of its weight matrix: the blocks of
+                its GGUF format for the formats of dlib/cuda/gguf_blocks.h, which the kernels
+                of dlib read in place (tt::gguf_matvec()) or expand by tiles that cuBLAS
+                multiplies (tt::gguf_dequantize()), and single precision floats for the other
+                formats and with OpenVINO.  A new copy in a GGUF format serves once its first
+                rows give, on probe activations, the products of the processor, and their
+                expansion its rows: a format the device would decode wrongly keeps its
+                matrices in single precision.  The
+                copies are made the first time the device takes a matrix and kept while they
+                fit in a budget shared by the models.  A model that lacks room takes it from the
                 models without requests, the least recently used first, each giving the
                 room asked and keeping its other copies; the copies that leave come back
                 when their model needs them again.  The copies of a model with requests in
@@ -46,9 +52,16 @@ namespace albireo
                 OpenVINO, the routing of dlib makes these measures itself, against the
                 processor kernels of the engine.
 
-                On a CUDA device, the copies are written on the card from a buffer of the
-                host of bounded size, without an image in the memory of the host, and their
-                budget is the memory of the card that the extended memory of dlib (V²RAM)
+                With CUDA and with the host code of dlib, the runtime of a dense model also
+                hands its layers to the device (matmul_offload::make_layer_pass()): the
+                hidden states of a pass stay on the device, which exchanges the inputs and
+                outputs of the attention with the processor once per layer, so that a token
+                waits for the bus once per layer instead of once per product.
+
+                On a CUDA device, the blocks of a copy cross the bus from the mapping of the
+                file, and a copy in single precision from a buffer of the host of bounded
+                size, neither with an image in the memory of the host; their budget is the
+                memory of the card that the extended memory of dlib (V²RAM)
                 manages, less a reserve for the products, the matrices that cross the bus
                 and cuBLAS: a model whose copies exceed it computes the products of the
                 matrices left out on the processor, from its quantized weights.  A size

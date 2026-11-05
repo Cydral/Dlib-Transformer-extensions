@@ -35,8 +35,9 @@
 #include <sys/stat.h>
 #endif
 
-#include <dlib/cuda/tensor_tools.h>
 #include <dlib/cuda/extended_memory.h>
+#include <dlib/cuda/gguf_blocks.h>
+#include <dlib/cuda/tensor_tools.h>
 #ifdef DLIB_USE_CUDA
 #include <cuda_runtime_api.h>
 #endif
@@ -174,6 +175,47 @@ namespace albireo
             }
             return cards;
         }
+
+        /*
+            Host memory that the driver of CUDA keeps in place: the copies between the device and
+            this memory run asynchronously, in the order of their stream, at the full rate of the
+            bus.
+        */
+        class pinned_floats
+        {
+        public:
+            pinned_floats() {}
+            ~pinned_floats()
+            {
+                if (!p_) return;
+                // A copy of the default stream may still read or write the buffer.
+                cudaStreamSynchronize(0);
+                cudaFreeHost(p_);
+            }
+            pinned_floats(const pinned_floats&) = delete;
+            pinned_floats& operator=(const pinned_floats&) = delete;
+
+            // Room for n floats, by half of the size held more at least.
+            float* reserve(size_t n)
+            {
+                if (n <= size_) return p_;
+                // The copies of the default stream that use the buffer end before it is freed.
+                cuda_check(cudaStreamSynchronize(0), "synchronization with the device");
+                if (p_) cudaFreeHost(p_);
+                p_ = nullptr;
+                const size_t grown = std::max(n, size_ + size_ / 2);
+                size_ = 0;
+                void* p = nullptr;
+                cuda_check(cudaMallocHost(&p, sizeof(float) * grown), "allocation of pinned host memory");
+                p_ = static_cast<float*>(p);
+                size_ = grown;
+                return p_;
+            }
+
+        private:
+            float* p_ = nullptr;
+            size_t size_ = 0;
+        };
 #endif
 #endif
 
@@ -201,19 +243,36 @@ namespace albireo
             average += (value - average) / count;
         }
 
-        // A matrix larger than this is never expanded at each product: its copy is kept, or
+        // A matrix larger than this never crosses the bus at each product: its copy is kept, or
         // the processor computes it.
         const size_t max_staged_bytes = size_t(512) << 20;
 
         /*
             The tokens of a product from which a matrix without a copy on the device crosses the
             bus for that product alone: below, the processor computes it from the quantized weights
-            faster than the matrix in single precision crosses the bus.
+            faster than the matrix crosses the bus.
         */
         const long staged_min_tokens = 128;
 
         // The bytes of a matrix in single precision that cross the bus at a time when its copy is made.
         const size_t upload_block_bytes = size_t(64) << 20;
+
+        /*
+            The tokens of a product from which the device expands a matrix kept in its GGUF format,
+            a tile of rows at a time, and multiplies the tiles with cuBLAS: below, it reads the
+            blocks in place, the weights of a row decoded once for up to eight tokens.
+        */
+        const long expanded_product_tokens = 64;
+
+        // The bytes of a tile of a matrix expanded to single precision for a product.
+        const size_t expanded_tile_bytes = size_t(64) << 20;
+
+        /*
+            The rows of a new copy in a GGUF format that the device multiplies with probe
+            activations, against the same products of the processor, before the copy serves: a
+            format the device would decode wrongly then keeps its matrices in single precision.
+        */
+        const long verified_rows = 64;
 
         // The memory of the card the copies leave to the products, the staged matrices and cuBLAS.
         const size_t card_reserve_bytes = size_t(1) << 30;
@@ -273,6 +332,28 @@ namespace albireo
         }
 #endif
 
+        // The name of a weight format of gguf_blocks.h, for the messages.
+        std::string format_name(int type)
+        {
+            namespace gb = dlib::gguf_blocks;
+            switch (type)
+            {
+            case gb::f32: return "F32";
+            case gb::f16: return "F16";
+            case gb::bf16: return "BF16";
+            case gb::q4_0: return "Q4_0";
+            case gb::q4_1: return "Q4_1";
+            case gb::q5_0: return "Q5_0";
+            case gb::q5_1: return "Q5_1";
+            case gb::q8_0: return "Q8_0";
+            case gb::iq4_nl: return "IQ4_NL";
+            case gb::q4_K: return "Q4_K";
+            case gb::q5_K: return "Q5_K";
+            case gb::q6_K: return "Q6_K";
+            default: return "the format " + std::to_string(type);
+            }
+        }
+
         long long now_ns()
         {
             return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -316,7 +397,13 @@ namespace albireo
         std::atomic<unsigned long long> device_us{0};
         std::atomic<unsigned long long> host_us{0};
         std::atomic<unsigned long long> failures{0};
+        std::atomic<unsigned long long> layer_passes{0};
+        std::atomic<unsigned long long> layer_pass_tokens{0};
         std::atomic<bool> disabled{false};
+        // The GGUF formats, as bits 1 << type, whose products on the device differed from those of
+        // the processor, whose matrices are copied in single precision, and those that agreed.
+        std::atomic<unsigned> faulty_formats{0};
+        std::atomic<unsigned> verified_formats{0};
         // The card of the engine (CUDA), -1 for the other backends.
         int cuda_device = -1;
         // The bytes of copies the memory of the card holds; beyond, the extended memory moves them over the bus.
@@ -478,11 +565,18 @@ namespace albireo
             return d_.name;
         }
 
+        std::unique_ptr<layer_pass> make_layer_pass(const dense_model& model) override;
+
     private:
+        friend class tensor_layer_pass;
+
         struct copy
         {
             std::unique_ptr<dlib::resizable_tensor> t;
             size_t bytes = 0;
+            // The blocks of the GGUF format of the matrix, which the kernels of dlib read in
+            // place, or false for a copy in single precision.
+            bool quantized = false;
         };
 
         struct route
@@ -588,13 +682,112 @@ namespace albireo
         }
 #endif
 
+        /*
+            Whether the device keeps W in its GGUF format: a format of gguf_blocks.h, in rows of
+            whole blocks, that the device was not found to decode wrongly.  The routing of dlib
+            (OpenVINO) multiplies matrices of floats only.
+        */
+        bool quantizable(const weight_matrix& W) const
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            (void)W;
+            return false;
+#else
+            const int type = static_cast<int>(W.type);
+            return dlib::gguf_blocks::known_format(type) && type < 32
+                && dlib::gguf_blocks::row_bytes(type, W.cols) == W.row_bytes
+                && (d_.faulty_formats.load() & (1u << type)) == 0;
+#endif
+        }
+
+        // Keeps the matrices of a GGUF format that the device decodes wrongly in single precision.
+        void faulty_format(int type)
+        {
+            if ((d_.faulty_formats.fetch_or(1u << type) & (1u << type)) == 0)
+                d_.message(ALBIREO_LOG_WARNING, "device: the products of the weights in " + format_name(type)
+                    + " on the device differ from those of the processor; the device keeps the matrices of this "
+                    "format in single precision");
+        }
+
+        // The bytes the device holds W in: its blocks, a whole number of floats, or single precision.
+        static size_t copy_size(const weight_matrix& W, bool quantized)
+        {
+            if (quantized) return (static_cast<size_t>(W.rows) * W.row_bytes + sizeof(float) - 1) / sizeof(float)
+                * sizeof(float);
+            return static_cast<size_t>(W.rows) * static_cast<size_t>(W.cols) * sizeof(float);
+        }
+
+        // Writes the blocks of W, as the file holds them, at the start of t.
+        static void upload_blocks(const weight_matrix& W, dlib::tensor& t)
+        {
+            const size_t total = static_cast<size_t>(W.rows) * W.row_bytes;
+#if defined(DLIB_USE_CUDA)
+            cuda_check(cudaMemcpy(t.device_write_only(), W.data, total, cudaMemcpyHostToDevice),
+                "copy of a matrix to the device");
+#else
+            std::memcpy(t.host_write_only(), W.data, total);
+#endif
+        }
+
+        /*
+            Multiplies the first rows of a copy of W in its GGUF format with probe activations on
+            the device and on the processor, and tells whether they agree: a format the device
+            decodes wrongly shows in every row.
+        */
+        static bool verify_copy(const weight_matrix& W, const dlib::tensor& t)
+        {
+            const long rows = std::min(W.rows, verified_rows);
+            const long n = 3;
+            dlib::resizable_tensor x(n, W.cols), y(n, rows);
+            float* xp = x.host_write_only();
+            uint32_t s = 2463534242u;
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                xp[i] = static_cast<float>(s >> 8) * (2.0f / 16777216.0f) - 1.0f;
+            }
+            dlib::tt::gguf_matvec(y, x, t, static_cast<int>(W.type), rows, W.cols, W.row_bytes);
+            // The expansion of the same rows, which the products of 64 tokens and more read.
+            dlib::resizable_tensor expanded(rows, W.cols);
+            dlib::tt::gguf_dequantize(expanded, t, static_cast<int>(W.type), 0, rows, W.cols, W.row_bytes);
+            const float* got = y.host();
+            const float* values = expanded.host();
+            const float* probe = x.host();
+            std::vector<float> row(static_cast<size_t>(W.cols));
+            for (long r = 0; r < rows; ++r)
+            {
+                qk_dequantize_row(W.type, W.data + static_cast<size_t>(r) * W.row_bytes, row.data(), W.cols);
+                for (long i = 0; i < W.cols; ++i)
+                {
+                    const float a = row[static_cast<size_t>(i)];
+                    const float b = values[r * W.cols + i];
+                    if (!(std::fabs(b - a) <= 1e-5f * std::max(1.0f, std::fabs(a)))) return false;
+                }
+                for (long j = 0; j < n; ++j)
+                {
+                    double sum = 0, magnitude = 0;
+                    for (long i = 0; i < W.cols; ++i)
+                    {
+                        const double term = static_cast<double>(row[static_cast<size_t>(i)]) * probe[j * W.cols + i];
+                        sum += term;
+                        magnitude += std::fabs(term);
+                    }
+                    // Written so that a value that is not a number fails.
+                    if (!(std::fabs(got[j * rows + r] - sum) <= 1e-3 * magnitude + 1e-6)) return false;
+                }
+            }
+            return true;
+        }
+
         // The copy of W, made when it fits in the budget; null otherwise.  created tells
         // whether this call made it.
-        const dlib::tensor* resident_copy(const weight_matrix& W, bool& created)
+        const copy* resident_copy(const weight_matrix& W, bool& created)
         {
             created = false;
             auto it = weights_.find(W.data);
-            if (it != weights_.end()) return it->second.t.get();
+            if (it != weights_.end()) return &it->second;
             const unsigned long long generation = d_.generation.load();
             auto refused = refused_.find(W.data);
             if (refused != refused_.end())
@@ -602,22 +795,35 @@ namespace albireo
                 if (refused->second == generation) return nullptr;
                 refused_.erase(refused);
             }
-            const size_t bytes = static_cast<size_t>(W.rows) * static_cast<size_t>(W.cols) * sizeof(float);
+            const bool quantized = quantizable(W);
+            const size_t bytes = copy_size(W, quantized);
             if (!d_.reserve(bytes) && !(d_.make_room(bytes, this) && d_.reserve(bytes)))
             {
                 refused_[W.data] = d_.generation.load();
                 return nullptr;
             }
             copy c;
+            c.bytes = bytes;
+            c.quantized = quantized;
+            bool same = true;
             try
             {
                 c.t.reset(new dlib::resizable_tensor());
-                c.t->set_size(W.rows, W.cols);
+                if (quantized)
+                {
+                    c.t->set_size(static_cast<long long>(bytes / sizeof(float)));
+                    upload_blocks(W, *c.t);
+                    same = verify_copy(W, *c.t);
+                }
+                else
+                {
+                    c.t->set_size(W.rows, W.cols);
 #if defined(DLIB_USE_CUDA)
-                upload_expanded(W, c.t->device_write_only());
+                    upload_expanded(W, c.t->device_write_only());
 #else
-                expand(W, c.t->host_write_only());
+                    expand(W, c.t->host_write_only());
 #endif
+                }
             }
             catch (...)
             {
@@ -625,11 +831,19 @@ namespace albireo
                 refused_[W.data] = d_.generation.load();
                 throw;
             }
-            c.bytes = bytes;
-            const dlib::tensor* t = c.t.get();
-            weights_[W.data] = std::move(c);
+            if (!same)
+            {
+                // The matrices of this format, this one included, are copied in single precision.
+                faulty_format(static_cast<int>(W.type));
+                c.t.reset();
+                d_.release(bytes);
+                return resident_copy(W, created);
+            }
+            if (quantized) d_.verified_formats |= 1u << static_cast<int>(W.type);
+            copy& stored = weights_[W.data];
+            stored = std::move(c);
             created = true;
-            return t;
+            return &stored;
         }
 
         /*
@@ -642,54 +856,138 @@ namespace albireo
             if (b.size() >= values) return;
             const size_t limit = std::max(values, max_staged_bytes / sizeof(float));
             const size_t grown = std::min(limit, std::max(values, b.size() + b.size() / 2));
-            b.set_size(static_cast<long long>(grown));
+            try
+            {
+                b.set_size(static_cast<long long>(grown));
+            }
+            catch (...)
+            {
+                // A tensor whose memory was refused keeps the size asked: it is emptied, so that
+                // the next product asks again instead of writing through no memory.
+                b.clear();
+                throw;
+            }
         }
 
-        // Y = X W^T with the device, the weights given as a tensor.
-        void device_gemm(const dlib::tensor& w, long rows, long cols, const float* X, long n, long x_stride,
-            float* Y, long y_stride)
+        /*
+            y[t][first + i] = part[t][i] on the device, for t < n and i < count, the rows of y
+            holding width floats.
+        */
+        static void place_columns(const dlib::tensor& part, dlib::tensor& y, long n, long width, long first,
+            long count)
         {
-            reserve_buffer(x_, static_cast<size_t>(n) * cols);
-            reserve_buffer(y_, static_cast<size_t>(n) * rows);
-            dlib::alias_tensor xa(n, cols), ya(n, rows);
 #if defined(DLIB_USE_CUDA)
-            /*
-                The staging tensors keep the size of the largest product, and dlib moves whole
-                blocks: through the views of a product, each one would cross the bus twice, in
-                both directions, as the host or the device writes it.  The rows of the product
-                are written and read here through the device pointers of the tensors instead, and
-                nothing else crosses the bus.  The copies and the product share the default
-                stream of CUDA, which orders them.
-            */
-            float* xd = x_.device_write_only();
-            cuda_check(cudaMemcpy2D(xd, sizeof(float) * cols, X, sizeof(float) * x_stride, sizeof(float) * cols,
-                static_cast<size_t>(n), cudaMemcpyHostToDevice), "copy of the activations to the device");
-            const float* yd = y_.device_write_only();
-            dlib::alias_tensor_instance x = xa(x_);
-            dlib::alias_tensor_instance y = ya(y_);
-            dlib::tt::gemm(0, y, 1, x, false, w, true);
-            cuda_check(cudaMemcpy2D(Y, sizeof(float) * y_stride, yd, sizeof(float) * rows, sizeof(float) * rows,
-                static_cast<size_t>(n), cudaMemcpyDeviceToHost), "copy of the products from the device");
+            cuda_check(cudaMemcpy2DAsync(y.device() + first, sizeof(float) * width, part.device(),
+                sizeof(float) * count, sizeof(float) * count, static_cast<size_t>(n), cudaMemcpyDeviceToDevice, 0),
+                "copy of products on the device");
 #else
-            dlib::alias_tensor_instance x = xa(x_);
-            dlib::alias_tensor_instance y = ya(y_);
-            float* xp = x.host_write_only();
+            const float* src = part.host();
+            float* dst = y.host();
+            for (long t = 0; t < n; ++t) std::memcpy(dst + t * width + first, src + t * count, sizeof(float) * count);
+#endif
+        }
+
+        /*
+            y = x W^T on the device, x holding n rows of W.cols floats and y n rows of W.rows
+            floats, w being the weights of W in their GGUF format (quantized) or in single
+            precision.  A product of fewer than expanded_product_tokens tokens reads the blocks
+            in place; a larger one expands them by tiles of rows that cuBLAS multiplies, as it
+            does the weights in single precision.
+        */
+        void product_on_device(const weight_matrix& W, const dlib::tensor& w, bool quantized, const dlib::tensor& x,
+            dlib::tensor& y)
+        {
+            if (!quantized)
+            {
+                dlib::tt::gemm(0, y, 1, x, false, w, true);
+                return;
+            }
+            const int type = static_cast<int>(W.type);
+            const long n = x.num_samples();
+            if (n < expanded_product_tokens)
+            {
+                dlib::tt::gguf_matvec(y, x, w, type, W.rows, W.cols, W.row_bytes);
+                return;
+            }
+            const long tile = tile_rows(W);
+            reserve_buffer(tile_, static_cast<size_t>(tile) * static_cast<size_t>(W.cols));
+            if (tile < W.rows) reserve_buffer(tile_out_, static_cast<size_t>(n) * static_cast<size_t>(tile));
+            for (long first = 0; first < W.rows; first += tile)
+            {
+                const long count = std::min(tile, W.rows - first);
+                dlib::alias_tensor wa(count, W.cols);
+                dlib::alias_tensor_instance expanded = wa(tile_);
+                dlib::tt::gguf_dequantize(expanded, w, type, first, count, W.cols, W.row_bytes);
+                if (count == W.rows)
+                {
+                    dlib::tt::gemm(0, y, 1, x, false, expanded, true);
+                    return;
+                }
+                dlib::alias_tensor pa(n, count);
+                dlib::alias_tensor_instance part = pa(tile_out_);
+                dlib::tt::gemm(0, part, 1, x, false, expanded, true);
+                place_columns(part, y, n, W.rows, first, count);
+            }
+        }
+
+        // The rows of W that a tile of its expansion to single precision holds.
+        static long tile_rows(const weight_matrix& W)
+        {
+            const size_t row = sizeof(float) * static_cast<size_t>(std::max<long>(1, W.cols));
+            return std::max<long>(1, std::min<long>(W.rows, static_cast<long>(expanded_tile_bytes / row)));
+        }
+
+        // Copies n rows of cols floats of the host, x_stride floats apart, to the view x of the device.
+        static void rows_to_device(const float* X, long n, long cols, long x_stride, dlib::tensor& x)
+        {
+#if defined(DLIB_USE_CUDA)
+            cuda_check(cudaMemcpy2D(x.device(), sizeof(float) * cols, X, sizeof(float) * x_stride, sizeof(float) * cols,
+                static_cast<size_t>(n), cudaMemcpyHostToDevice), "copy of the activations to the device");
+#else
+            float* xp = x.host();
             if (x_stride == cols)
                 std::memcpy(xp, X, sizeof(float) * static_cast<size_t>(n) * cols);
             else
                 for (long t = 0; t < n; ++t) std::memcpy(xp + t * cols, X + t * x_stride, sizeof(float) * cols);
-            dlib::tt::gemm(0, y, 1, x, false, w, true);
-            copy_out(y, rows, n, Y, y_stride);
 #endif
         }
 
-        static void copy_out(const dlib::tensor& y, long rows, long n, float* Y, long y_stride)
+        // Copies the n rows of rows floats of the view y of the device to the host, y_stride floats apart.
+        static void rows_to_host(const dlib::tensor& y, long n, long rows, float* Y, long y_stride)
         {
+#if defined(DLIB_USE_CUDA)
+            cuda_check(cudaMemcpy2D(Y, sizeof(float) * y_stride, y.device(), sizeof(float) * rows, sizeof(float) * rows,
+                static_cast<size_t>(n), cudaMemcpyDeviceToHost), "copy of the products from the device");
+#else
             const float* yp = y.host();
             if (y_stride == rows)
                 std::memcpy(Y, yp, sizeof(float) * static_cast<size_t>(n) * rows);
             else
                 for (long t = 0; t < n; ++t) std::memcpy(Y + t * y_stride, yp + t * rows, sizeof(float) * rows);
+#endif
+        }
+
+        /*
+            Y = X W^T with the device, w being the weights of W in their GGUF format (quantized) or
+            in single precision.
+
+            The staging tensors keep the size of the largest product, and dlib moves whole blocks:
+            through the views of a product, each one would cross the bus twice, in both directions,
+            as the host or the device writes it.  The rows of the product are written and read here
+            through the device pointers of the views instead, and nothing else crosses the bus.  The
+            copies and the product share the default stream of CUDA, which orders them.
+        */
+        void device_gemm(const weight_matrix& W, const dlib::tensor& w, bool quantized, const float* X, long n,
+            long x_stride, float* Y, long y_stride)
+        {
+            reserve_buffer(x_, static_cast<size_t>(n) * W.cols);
+            reserve_buffer(y_, static_cast<size_t>(n) * W.rows);
+            dlib::alias_tensor xa(n, W.cols), ya(n, W.rows);
+            dlib::alias_tensor_instance x = xa(x_);
+            dlib::alias_tensor_instance y = ya(y_);
+            rows_to_device(X, n, W.cols, x_stride, x);
+            product_on_device(W, w, quantized, x, y);
+            rows_to_host(y, n, W.rows, Y, y_stride);
         }
 
         // The outcome of device_product().
@@ -709,28 +1007,54 @@ namespace albireo
             long y_stride)
         {
             bool created = false;
-            const dlib::tensor* w = resident_copy(W, created);
-            if (w)
+            const copy* c = resident_copy(W, created);
+            if (c)
             {
-                device_gemm(*w, W.rows, W.cols, X, n, x_stride, Y, y_stride);
+                device_gemm(W, *c->t, c->quantized, X, n, x_stride, Y, y_stride);
                 return created ? placed::created : placed::steady;
             }
             if (n < staged_min_tokens) return placed::declined;
+            // The matrix alone crosses the bus, in its GGUF format when the device reads it, as the
+            // rows of the products do (device_gemm()).
+            bool quantized = quantizable(W);
+            if (copy_size(W, quantized) > max_staged_bytes) throw beyond_budget();
+            if (quantized)
+            {
+                reserve_buffer(w_, copy_size(W, true) / sizeof(float));
+                upload_blocks(W, w_);
+                const int type = static_cast<int>(W.type);
+                if ((d_.verified_formats.load() & (1u << type)) == 0)
+                {
+                    if (verify_copy(W, w_))
+                        d_.verified_formats |= 1u << type;
+                    else
+                    {
+                        faulty_format(type);
+                        quantized = false;
+                    }
+                }
+                if (quantized)
+                {
+                    device_gemm(W, w_, true, X, n, x_stride, Y, y_stride);
+                    return placed::steady;
+                }
+            }
             const size_t values = static_cast<size_t>(W.rows) * static_cast<size_t>(W.cols);
             if (values * sizeof(float) > max_staged_bytes) throw beyond_budget();
             reserve_buffer(w_, values);
             dlib::alias_tensor wa(W.rows, W.cols);
             dlib::alias_tensor_instance staged = wa(w_);
 #if defined(DLIB_USE_CUDA)
-            // The matrix alone crosses the bus, as the rows of the products do (device_gemm()).
             if (expanded_.size() < values) expanded_.resize(values);
             expand(W, expanded_.data());
             cuda_check(cudaMemcpy(w_.device_write_only(), expanded_.data(), sizeof(float) * values,
                 cudaMemcpyHostToDevice), "copy of a matrix to the device");
+            // The buffer of a large matrix goes back to the system, as after a copy.
+            if (expanded_.size() * sizeof(float) > upload_block_bytes) std::vector<float>().swap(expanded_);
 #else
-            expand(W, staged.host_write_only());
+            expand(W, staged.host());
 #endif
-            device_gemm(staged, W.rows, W.cols, X, n, x_stride, Y, y_stride);
+            device_gemm(W, staged, false, X, n, x_stride, Y, y_stride);
             return placed::steady;
         }
 
@@ -902,17 +1226,17 @@ namespace albireo
         void routed_by_dlib(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
             const std::function<void()>& host)
         {
-            const dlib::tensor* w = nullptr;
+            const copy* c = nullptr;
             try
             {
                 bool created = false;
-                w = resident_copy(W, created);
+                c = resident_copy(W, created);
             }
             catch (const std::exception& e)
             {
                 d_.message(ALBIREO_LOG_WARNING, std::string("device: no copy of a matrix (") + e.what() + ")");
             }
-            if (!w)
+            if (!c)
             {
                 host_product(host);
                 return;
@@ -928,9 +1252,9 @@ namespace albireo
                 std::memcpy(xp, X, sizeof(float) * static_cast<size_t>(n) * W.cols);
             else
                 for (long t = 0; t < n; ++t) std::memcpy(xp + t * W.cols, X + t * x_stride, sizeof(float) * W.cols);
-            if (dlib::npu::gemm(0, y, 1, x, false, *w, true, dlib::operation_mode::CHANNEL_WISE))
+            if (dlib::npu::gemm(0, y, 1, x, false, *c->t, true, dlib::operation_mode::CHANNEL_WISE))
             {
-                copy_out(y, W.rows, n, Y, y_stride);
+                rows_to_host(y, n, W.rows, Y, y_stride);
                 count_device(seconds_since(t0));
                 return;
             }
@@ -949,9 +1273,301 @@ namespace albireo
         std::unordered_map<const uint8_t*, unsigned long long> refused_;
         std::map<std::tuple<long, long, int>, route> routes_;
         dlib::resizable_tensor x_, y_, w_;
+        // A tile of a matrix expanded to single precision on the device, and its products.
+        dlib::resizable_tensor tile_, tile_out_;
         // The matrix expanded on the host before it goes to w_ (CUDA).
         std::vector<float> expanded_;
     };
+
+    /*
+        The layers of a dense decoder on the device of a tensor_offload (layer_pass).  The hidden
+        states of the tokens of a pass stay in a tensor of the device from the first layer to the
+        last, and each layer exchanges with the processor the queries, keys and values of the
+        tokens and the outputs of their attention, through pinned host memory that the copies
+        read and write asynchronously, in the order of the default stream of CUDA: a layer waits
+        for the device once, when its queries, keys and values arrive.  The matrices are the
+        copies of the offload, which the first pass makes and which stay while the model has
+        requests; the norms are copied to the device at the first pass.
+    */
+    class tensor_layer_pass : public layer_pass
+    {
+    public:
+        tensor_layer_pass(tensor_offload& o, const dense_model& m) : o_(o), m_(m) {}
+
+        bool begin(const float* x, long n) override
+        {
+            auto& d = o_.d_;
+            o_.last_use_ = now_ns();
+            if (n <= 0 || n < d.min_tokens || d.disabled.load() || !d.bind_thread()) return false;
+            // Once the copies exceed the card, a generated token waits for the extended memory.
+            if (n < qk_float_product_tokens && d.resident.load(std::memory_order_relaxed) > d.card_bytes) return false;
+            try
+            {
+                if (!gather_copies()) return false;
+                if (norms_.empty()) copy_norms();
+                const long d_model = m_.d_model;
+                const size_t rows = static_cast<size_t>(n);
+                tensor_offload::reserve_buffer(x_, rows * d_model);
+                tensor_offload::reserve_buffer(xn_, rows * d_model);
+                tensor_offload::reserve_buffer(tmp_, rows * d_model);
+                tensor_offload::reserve_buffer(qkv_, rows * (m_.q_dim + 2 * m_.kv_dim));
+                tensor_offload::reserve_buffer(ctx_, rows * m_.q_dim);
+                tensor_offload::reserve_buffer(gate_, rows * m_.d_ffn);
+                tensor_offload::reserve_buffer(up_, rows * m_.d_ffn);
+                // The tiles of the expansions of the larger passes, so that no layer allocates.
+                if (n >= expanded_product_tokens)
+                {
+                    long tile = 1;
+                    size_t tile_values = 0;
+                    for (const dense_layer& L : m_.layers)
+                        for (const weight_matrix* W : { &L.wq, &L.wk, &L.wv, &L.wo, &L.w_gate, &L.w_up, &L.w_down })
+                        {
+                            const long t = tensor_offload::tile_rows(*W);
+                            if (t < W->rows) tile = std::max(tile, t);
+                            tile_values = std::max(tile_values, static_cast<size_t>(t) * W->cols);
+                        }
+                    tensor_offload::reserve_buffer(o_.tile_, tile_values);
+                    if (tile > 1) tensor_offload::reserve_buffer(o_.tile_out_, rows * tile);
+                }
+                n_ = n;
+                dlib::device_scope pin({ &x_ });
+                dlib::alias_tensor_instance states = view(x_, n_, d_model);
+                upload(states, x, rows * d_model);
+            }
+            catch (const std::exception& e)
+            {
+                settle();
+                // No room on the device for now: the processor computes the pass.
+                if (lack_of_memory(e)) return false;
+                throw device_failure(e.what(), false);
+            }
+            ++d.layer_passes;
+            d.layer_pass_tokens += static_cast<unsigned long long>(n);
+            return true;
+        }
+
+        void attention_inputs(long layer, float* q, float* k, float* v) override
+        {
+            guarded([&]() {
+                const long d = m_.d_model, qd = m_.q_dim, kvd = m_.kv_dim;
+                const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
+                const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+                dlib::device_scope pin({ &x_, &xn_, &qkv_, &o_.tile_, &o_.tile_out_ });
+                dlib::alias_tensor_instance x = view(x_, n_, d);
+                dlib::alias_tensor_instance xn = view(xn_, n_, d);
+                dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer)], m_.rms_eps);
+                dlib::alias_tensor_instance qv = view(qkv_, n_, qd);
+                dlib::alias_tensor_instance kv = view(qkv_, n_, kvd, n_ * qd);
+                dlib::alias_tensor_instance vv = view(qkv_, n_, kvd, n_ * (qd + kvd));
+                o_.product_on_device(L.wq, *c[0]->t, c[0]->quantized, xn, qv);
+                o_.product_on_device(L.wk, *c[1]->t, c[1]->quantized, xn, kv);
+                o_.product_on_device(L.wv, *c[2]->t, c[2]->quantized, xn, vv);
+                const size_t qn = static_cast<size_t>(n_ * qd), kn = static_cast<size_t>(n_ * kvd);
+                const float* all = download(view(qkv_, n_, qd + 2 * kvd), qn + 2 * kn);
+                std::memcpy(q, all, sizeof(float) * qn);
+                std::memcpy(k, all + qn, sizeof(float) * kn);
+                std::memcpy(v, all + qn + kn, sizeof(float) * kn);
+            });
+        }
+
+        void attention_output(long layer, const float* ctx) override
+        {
+            guarded([&]() {
+                const long d = m_.d_model, qd = m_.q_dim, df = m_.d_ffn;
+                const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
+                const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+                dlib::device_scope pin({ &x_, &xn_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.tile_out_ });
+                dlib::alias_tensor_instance x = view(x_, n_, d);
+                dlib::alias_tensor_instance xn = view(xn_, n_, d);
+                dlib::alias_tensor_instance tmp = view(tmp_, n_, d);
+                dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
+                upload(attended, ctx, static_cast<size_t>(n_ * qd));
+                o_.product_on_device(L.wo, *c[3]->t, c[3]->quantized, attended, tmp);
+                dlib::tt::add(1, x, m_.residual_scale, tmp);
+                dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer) + 1], m_.rms_eps);
+                dlib::alias_tensor_instance gate = view(gate_, n_, df);
+                dlib::alias_tensor_instance up = view(up_, n_, df);
+                o_.product_on_device(L.w_gate, *c[4]->t, c[4]->quantized, xn, gate);
+                o_.product_on_device(L.w_up, *c[5]->t, c[5]->quantized, xn, up);
+                dlib::tt::silu_multiply(gate, up);
+                o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp);
+                dlib::tt::add(1, x, m_.residual_scale, tmp);
+            });
+        }
+
+        void end(const std::vector<long>& rows, float* x) override
+        {
+            guarded([&]() {
+                const long d = m_.d_model;
+                dlib::device_scope pin({ &x_ });
+                if (rows.size() == 1)
+                {
+                    // The row of the next token of a single sequence, the usual case.
+                    const long r = rows[0];
+                    const float* row = download(view(x_, 1, d, r * d), static_cast<size_t>(d));
+                    std::memcpy(x + r * d, row, sizeof(float) * static_cast<size_t>(d));
+                }
+                else if (!rows.empty())
+                {
+                    const float* all = download(view(x_, n_, d), static_cast<size_t>(n_ * d));
+                    for (long r : rows) std::memcpy(x + r * d, all + r * d, sizeof(float) * static_cast<size_t>(d));
+                }
+#if defined(DLIB_USE_CUDA)
+                else
+                {
+                    // A pass without logits, a part of a prompt, ends once the device has computed it,
+                    // so that a failure of the device belongs to the pass that met it.
+                    cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
+                }
+#endif
+            });
+            n_ = 0;
+        }
+
+        long min_tokens() const override
+        {
+            return std::max<long>(1, o_.d_.min_tokens);
+        }
+
+        void report(bool ok, const std::string& detail) override
+        {
+            if (ok)
+                o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + o_.model() + "' run on the device, which "
+                    "exchanges the inputs and outputs of the attention with the processor once per layer (" + detail
+                    + ")");
+            else
+                o_.d_.message(ALBIREO_LOG_WARNING, "device: the layers of '" + o_.model() + "' return to the "
+                    "processor, which hands their products to the device one by one (" + detail + ")");
+        }
+
+    private:
+        /*
+            The copies of the seven matrices of every layer, made when they are missing; false when
+            one of them lacks room.  The copies of a model leave the device only for another model,
+            between two passes, and never for the copies of their own model: the pointers stay
+            valid for the pass.
+        */
+        bool gather_copies()
+        {
+            copies_.clear();
+            for (const dense_layer& L : m_.layers)
+                for (const weight_matrix* W : { &L.wq, &L.wk, &L.wv, &L.wo, &L.w_gate, &L.w_up, &L.w_down })
+                {
+                    bool created = false;
+                    const tensor_offload::copy* c = o_.resident_copy(*W, created);
+                    if (!c) return false;
+                    copies_.push_back(c);
+                }
+            return true;
+        }
+
+        void copy_norms()
+        {
+            const long d = m_.d_model;
+            std::vector<dlib::resizable_tensor> norms(2 * m_.layers.size());
+            for (size_t i = 0; i < m_.layers.size(); ++i)
+                for (size_t j = 0; j < 2; ++j)
+                {
+                    dlib::resizable_tensor& t = norms[2 * i + j];
+                    t.set_size(d);
+                    std::memcpy(t.host_write_only(), j == 0 ? m_.layers[i].attn_norm : m_.layers[i].ffn_norm,
+                        sizeof(float) * static_cast<size_t>(d));
+                }
+            norms_.swap(norms);
+        }
+
+        // The n rows of cols floats of a buffer that start first floats in, as a tensor.
+        static dlib::alias_tensor_instance view(dlib::resizable_tensor& buffer, long n, long cols, long first = 0)
+        {
+            dlib::alias_tensor a(n, cols);
+            return a(buffer, static_cast<size_t>(first));
+        }
+
+        // Copies count floats of the host to the start of the view dst of the device.
+        void upload(dlib::tensor& dst, const float* src, size_t count)
+        {
+#if defined(DLIB_USE_CUDA)
+            // A copy of the buffer is still running only before the wait of the layer that follows.
+            float* staging = to_device_.reserve(count);
+            std::memcpy(staging, src, sizeof(float) * count);
+            cuda_check(cudaMemcpyAsync(dst.device(), staging, sizeof(float) * count, cudaMemcpyHostToDevice, 0),
+                "copy of the activations to the device");
+#else
+            std::memcpy(dst.host(), src, sizeof(float) * count);
+#endif
+        }
+
+        // The first count floats of the view src of the device, once the device has computed them.
+        const float* download(const dlib::tensor& src, size_t count)
+        {
+#if defined(DLIB_USE_CUDA)
+            float* staging = from_device_.reserve(count);
+            cuda_check(cudaMemcpyAsync(staging, src.device(), sizeof(float) * count, cudaMemcpyDeviceToHost, 0),
+                "copy of the activations from the device");
+            cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
+            return staging;
+#else
+            (void)count;
+            return src.host();
+#endif
+        }
+
+        // Runs f, a failure of the device becoming a device_failure.
+        template <typename F>
+        void guarded(F&& f)
+        {
+            try
+            {
+                f();
+            }
+            catch (const device_failure&)
+            {
+                settle();
+                throw;
+            }
+            catch (const std::exception& e)
+            {
+                settle();
+                throw device_failure(e.what(), lack_of_memory(e));
+            }
+        }
+
+        /*
+            Waits for the copies and the kernels a failed pass left queued, so that the pinned
+            buffers are free for the next pass; the error of a failed device stays with the call
+            that met it.
+        */
+        static void settle()
+        {
+#if defined(DLIB_USE_CUDA)
+            cudaStreamSynchronize(0);
+#endif
+        }
+
+        tensor_offload& o_;
+        const dense_model m_;
+        long n_ = 0;
+        std::vector<const tensor_offload::copy*> copies_;
+        // The norms of the attention and of the feed-forward block of each layer, in turn.
+        std::vector<dlib::resizable_tensor> norms_;
+        dlib::resizable_tensor x_, xn_, tmp_, qkv_, ctx_, gate_, up_;
+#if defined(DLIB_USE_CUDA)
+        // The rows that cross the bus, each way.
+        pinned_floats to_device_, from_device_;
+#endif
+    };
+
+    std::unique_ptr<layer_pass> tensor_offload::make_layer_pass(const dense_model& model)
+    {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+        // The routing of dlib takes products only.
+        (void)model;
+        return std::unique_ptr<layer_pass>();
+#else
+        if (d_.forced < 0 || model.layers.empty()) return std::unique_ptr<layer_pass>();
+        return std::unique_ptr<layer_pass>(new tensor_layer_pass(*this, model));
+#endif
+    }
 
     bool tensor_device::impl::make_room(size_t bytes, const tensor_offload* requester)
     {
@@ -1090,7 +1706,7 @@ namespace albireo
         }
         if (d.v2ram) d.card_bytes = dlib::get_extended_memory_stats().vram_budget;
         d.message(ALBIREO_LOG_INFO, "device: " + d.name + " through CUDA, " + (d.v2ram ? "extended memory on, " : "")
-            + "weights in single precision up to " + megabytes(d.budget));
+            + "weights in their GGUF formats up to " + megabytes(d.budget));
         d.name += d.v2ram ? " (CUDA, V\xC2\xB2" "RAM)" : " (CUDA)";
 #elif defined(DLIB_USE_NPU)
         d.backend = "openvino";
@@ -1117,7 +1733,7 @@ namespace albireo
         d.backend = "dlib";
         d.budget = requested > 0 ? requested : available / 4;
         d.name = "the host code of dlib";
-        d.message(ALBIREO_LOG_INFO, "device: host code of dlib, weights in single precision up to "
+        d.message(ALBIREO_LOG_INFO, "device: host code of dlib, weights in their GGUF formats up to "
             + megabytes(d.budget));
 #endif
     }
@@ -1152,6 +1768,9 @@ namespace albireo
         s["device_seconds"] = d.device_us.load() / 1e6;
         s["host_seconds"] = d.host_us.load() / 1e6;
         s["failures"] = d.failures.load();
+        // The passes whose layers ran on the device (layer_pass), and their tokens.
+        s["layer_passes"] = d.layer_passes.load();
+        s["layer_pass_tokens"] = d.layer_pass_tokens.load();
         s["disabled"] = d.disabled.load();
         s["evictions"] = d.evictions.load();
         s["evicted_bytes"] = d.evicted_bytes.load();

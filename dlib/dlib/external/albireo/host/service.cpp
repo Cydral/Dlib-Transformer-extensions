@@ -1378,6 +1378,21 @@ namespace albireo
             std::lock_guard<std::mutex> lock(m_);
             load_state_[m.id] = "loading";
         }
+        /*
+            The engine parses the files of the model with the rights of the service: their folders must be
+            those that only SYSTEM and the administrators change (folder_admin_only()).  A folder another
+            account may write in, a drive without permissions, or a folder put in the place of the models
+            folder by an account that renamed one of its parents, leaves the model unloaded.
+        */
+        for (const std::string& file : { m.file, m.projector })
+        {
+            if (file.empty() || folder_admin_only(parent_path(file))) continue;
+            error = "the folder of " + file + " lets accounts other than the administrators change its files";
+            std::lock_guard<std::mutex> lock(m_);
+            load_state_[m.id] = error;
+            log_error("models: " + m.id + " not loaded: " + error);
+            return false;
+        }
         const host_settings st = settings_->get();
         json options = json::object();
         // The settings of the conversations apply to the language models; an embedding

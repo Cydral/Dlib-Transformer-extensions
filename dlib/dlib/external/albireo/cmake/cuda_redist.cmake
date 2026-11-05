@@ -5,7 +5,8 @@
 # from the redistributable archives that NVIDIA publishes for windows-x86_64, for a computer
 # that has neither of them installed (cmake -P, CMake 3.19 or later):
 #
-#   cmake -DCACHE=<folder> [-DCUDA_VERSION=12.9.1] [-DCUDNN_VERSION=9.11.0] -P cuda_redist.cmake
+#   cmake -DCACHE=<folder> [-DCUDA_VERSION=12.9.1] [-DCUDNN_VERSION=9.11.0] [-DCUDNN_ONLY=ON]
+#         -P cuda_redist.cmake
 #
 # The manifests of the two releases give each archive with its size and its SHA-256.  The
 # archives are downloaded once into <CACHE>/archives, checked against their hash, and downloaded
@@ -19,6 +20,10 @@
 #   -- CUDA_REDIST_TOOLKIT=<folder>
 #   -- CUDA_REDIST_CUDNN=<folder>
 #   -- CUDA_REDIST_DOWNLOADED=<bytes>
+#
+# CUDNN_ONLY lays out cuDNN alone, in its build for the major version of CUDA_VERSION, for an
+# installed toolkit whose own cuDNN leaves out cards the engine serves; CUDA_REDIST_TOOLKIT is
+# then not printed.
 #
 # The toolkit holds what the engine is built with: the compiler (cuda_nvcc), the runtime
 # (cuda_cudart), the headers of CCCL that those of the runtime include (cuda_cccl), cuBLAS,
@@ -188,21 +193,27 @@ function(albireo_redist_folder dest label archives license_component license_nam
    set(downloaded ${downloaded} PARENT_SCOPE)
 endfunction()
 
-albireo_redist_manifest(cuda ${CUDA_VERSION} cuda_manifest)
+if (NOT CUDNN_ONLY)
+   albireo_redist_manifest(cuda ${CUDA_VERSION} cuda_manifest)
+   set(toolkit_archives)
+   foreach (component cuda_nvcc cuda_cudart cuda_cccl libcublas libcurand libcusolver visual_studio_integration)
+      albireo_redist_entry("${cuda_manifest}" cuda ${component} toolkit_archives windows-x86_64)
+   endforeach()
+endif()
 albireo_redist_manifest(cudnn ${CUDNN_VERSION} cudnn_manifest)
-set(toolkit_archives)
-foreach (component cuda_nvcc cuda_cudart cuda_cccl libcublas libcurand libcusolver visual_studio_integration)
-   albireo_redist_entry("${cuda_manifest}" cuda ${component} toolkit_archives windows-x86_64)
-endforeach()
 set(cudnn_archives)
 albireo_redist_entry("${cudnn_manifest}" cudnn cudnn cudnn_archives windows-x86_64 cuda${cuda_major})
 
 # The EULA of the toolkit is the LICENSE of each of its archives, in revisions of several dates:
 # the one of cuBLAS, whose libraries make most of what the installer carries, becomes EULA.txt,
 # where an installed toolkit has it.
-albireo_redist_folder("${toolkit}" "CUDA ${CUDA_VERSION}" "${toolkit_archives}" libcublas EULA.txt)
+if (NOT CUDNN_ONLY)
+   albireo_redist_folder("${toolkit}" "CUDA ${CUDA_VERSION}" "${toolkit_archives}" libcublas EULA.txt)
+endif()
 albireo_redist_folder("${cudnn}" "cuDNN ${CUDNN_VERSION}" "${cudnn_archives}" cudnn LICENSE)
 
-message(STATUS "CUDA_REDIST_TOOLKIT=${toolkit}")
+if (NOT CUDNN_ONLY)
+   message(STATUS "CUDA_REDIST_TOOLKIT=${toolkit}")
+endif()
 message(STATUS "CUDA_REDIST_CUDNN=${cudnn}")
 message(STATUS "CUDA_REDIST_DOWNLOADED=${downloaded}")

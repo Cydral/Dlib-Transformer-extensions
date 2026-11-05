@@ -9,15 +9,18 @@
     "CPU" with OpenVINO (the CPU plugin of OpenVINO runs the device code on a machine
     without NPU), ignored with the host code of dlib.
 
-    The program runs the same token sequence through the runtime alone and through the
-    runtime with the device:
+    The program runs the same token sequence, a prompt of 130 tokens then 16 single steps,
+    through the runtime alone and through the runtime with the device:
         1. every product on the device, against the processor kernels computing in
            single precision (qk_set_exact_products), so that the logits agree to the
-           rounding of the device;
+           rounding of the device; with CUDA and the host code of dlib, the layers of a
+           dense model run on the device (layer_pass), the prompt through tiles of the
+           weights expanded for cuBLAS and the steps through the blocks read in place;
         2. the same with a budget of 16 MB for the copies of the weights, so that most
-           matrices are expanded at each product, or left to the processor;
-        3. the measured routing with the usual kernels, on a prompt followed by single
-           steps, compared as distributions, and the routes it chose.
+           matrices cross the bus at each product of the prompt, or are left to the
+           processor;
+        3. the measured routing with the usual kernels, compared as distributions, and the
+           routes it chose.
 */
 
 #include <algorithm>
@@ -25,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
@@ -147,7 +151,7 @@ namespace
     }
 }
 
-int main(int argc, char** argv)
+static int run_checks(int argc, char** argv)
 {
     if (argc < 2)
     {
@@ -180,13 +184,13 @@ int main(int argc, char** argv)
     // A deterministic sequence of ordinary tokens.
     std::vector<int> tokens;
     unsigned s = 12345;
-    for (int i = 0; i < 48; ++i)
+    for (int i = 0; i < 146; ++i)
     {
         s = s * 1103515245u + 12345u;
         tokens.push_back(static_cast<int>(100 + (s >> 8) % static_cast<unsigned>(std::min<long>(V - 100, 20000))));
     }
     const long T = static_cast<long>(tokens.size());
-    const long k = 32;
+    const long k = 130;
 
     thread_pool pool(threads);
     const size_t kv = size_t(256) << 20;
@@ -223,11 +227,13 @@ int main(int argc, char** argv)
             expect(d.mean_kl < 0.01 && d.top1 >= 0.95, "device products");
         else
             expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97, "device products");
-        expect(st["device_products"].as_int() > 0, "the device computed products");
+        expect(st["device_products"].as_int() > 0 || st["layer_passes"].as_int() > 0, "the device computed products");
+        if ((backend == "cuda" || backend == "dlib") && !budget && !cfg.is_moe())
+            expect(st["layer_passes"].as_int() > 0, "the layers ran on the device");
         if (backend != "openvino" && !budget && !cfg.is_moe())
         {
             // Every product stays on the device when the automatic budget, a share of the free
-            // memory, holds every matrix in single precision.
+            // memory, holds every matrix, even in single precision.
             const double matrices = 4.0 * cfg.d_model * (cfg.vocab + cfg.n_layers * (2.0 * cfg.q_dim()
                 + 2.0 * cfg.kv_dim() + 3.0 * cfg.d_ffn));
             if (st["weights_budget"].as_double(0) >= matrices)
@@ -275,4 +281,19 @@ int main(int argc, char** argv)
     }
     std::printf("all checks passed\n");
     return 0;
+}
+
+int main(int argc, char** argv)
+{
+    // An error, such as a file that cannot be opened or a device that fails, ends the program
+    // with its message.
+    try
+    {
+        return run_checks(argc, argv);
+    }
+    catch (const std::exception& e)
+    {
+        std::printf("error: %s\n", e.what());
+        return 2;
+    }
 }

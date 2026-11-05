@@ -46,7 +46,10 @@
     toolkit installer goes to the Build Tools when Visual Studio is absent.  cuDNN is found in
     C:\Program Files\NVIDIA\CUDNN, where its installer puts it, or in the folder -Cudnn names
     (an extracted archive).  Of several versions there, the latest before 9.12 that serves the
-    toolkit is taken, else the latest.
+    toolkit is taken, else the latest.  When the cuDNN found is 9.12 or later, which leaves out
+    the GeForce GTX 900 and 10 series, a CUDA 12 toolkit receives cuDNN 9.11.0 from the
+    redistributable archives of NVIDIA instead, downloaded once into the same cache (0.6 GB,
+    1.4 GB on disk with its extracted files), unless -Cudnn or -CudaArchitectures is given.
 
     -CudaVersion picks one of several installed toolkits; the archives serve when it is absent
     or names their version, 12.9.  -Cudnn names the folder of one cuDNN installation for an
@@ -296,6 +299,38 @@ function Get-CudaRedist([string]$cache) {
     # which Windows PowerShell reads in the code page of the console.
     return [pscustomobject]@{
         Toolkit = Join-Path $cache (Split-Path -Leaf $printed["TOOLKIT"])
+        Cudnn = Join-Path $cache (Split-Path -Leaf $printed["CUDNN"])
+        Downloaded = [long]$printed["DOWNLOADED"]
+    }
+}
+
+# The version of cuDNN in a folder, from its cudnn_version.h, or $null when the header does not give it.
+function Get-CudnnVersion([string]$folder, [string]$major) {
+    try {
+        $header = Find-CudnnFile $folder "cudnn_version.h" $major
+    }
+    catch {
+        return $null
+    }
+    $text = Get-Content -Raw -LiteralPath $header
+    if ($text -match '#define\s+CUDNN_MAJOR\s+([0-9]+)') { $first = $Matches[1] } else { return $null }
+    if ($text -match '#define\s+CUDNN_MINOR\s+([0-9]+)') { return [version]"$first.$($Matches[1])" }
+    return $null
+}
+
+# cuDNN of the redistributable archives of NVIDIA alone, for the major version of the toolkit of
+# the archives, laid out by cmake/cuda_redist.cmake beside an installed toolkit: its folder and the
+# bytes downloaded by this run, or $null when a download, a hash or an extraction fails.
+function Get-CudnnRedist([string]$cache) {
+    Write-Host "== cuDNN $redistCudnn from the redistributable archives of NVIDIA, in $cache"
+    $printed = @{}
+    & $cmake "-DCACHE=$($cache.Replace('\', '/'))" "-DCUDA_VERSION=$redistCuda" "-DCUDNN_VERSION=$redistCudnn" `
+        "-DCUDNN_ONLY=ON" -P (Join-Path $source "cmake\cuda_redist.cmake") | ForEach-Object {
+        Write-Host $_
+        if ($_ -match '^-- CUDA_REDIST_([A-Z]+)=(.+)$') { $printed[$Matches[1]] = $Matches[2].Trim() }
+    }
+    if ($LASTEXITCODE -ne 0 -or -not $printed["CUDNN"]) { return $null }
+    return [pscustomobject]@{
         Cudnn = Join-Path $cache (Split-Path -Leaf $printed["CUDNN"])
         Downloaded = [long]$printed["DOWNLOADED"]
     }
@@ -629,7 +664,10 @@ else {
     $shown = if ($interpreter) { $interpreter } else { "python" }
     $command = "`"$shown`" $($pipArguments -join ' ') `"$openvinoRange`""
     if ($version -eq "archive") {
-        Add-Prerequisite "OpenVINO runtime" "found" "the archive of INTEL_OPENVINO_DIR or OpenVINO_DIR"
+        # The folder the variable names, which may also be the package of an interpreter.
+        $named = "OpenVINO_DIR $env:OpenVINO_DIR"
+        if ($env:INTEL_OPENVINO_DIR) { $named = "INTEL_OPENVINO_DIR $env:INTEL_OPENVINO_DIR" }
+        Add-Prerequisite "OpenVINO runtime" "found" $named
     }
     elseif (Test-OpenVINOVersion $version) {
         Add-Prerequisite "OpenVINO runtime" "found" "$version, package of $interpreter"
@@ -675,6 +713,7 @@ if ($CudaCache) {
 }
 $redist = $null
 $useRedist = $false
+$useRedistCudnn = $false
 $toolkit = $null
 $cudnnFolder = $null
 $major = ""
@@ -703,6 +742,13 @@ else {
     if ($cudaMissing.Count -eq 0) {
         $buildCuda = $true
         Add-Prerequisite "CUDA and cuDNN" "found" "toolkit $toolkit, cuDNN $cudnnFolder"
+        # cuDNN 9.12 and later leave out the GeForce GTX 900 and 10 series, which CUDA 12 still
+        # compiles for: the archives of NVIDIA give cuDNN 9.11 to the installed toolkit.
+        $installedCudnn = Get-CudnnVersion $cudnnFolder $major
+        if (-not $Cudnn -and -not $CudaArchitectures -and $major -eq "12" -and $installedCudnn -and
+            $installedCudnn -ge [version]"9.12") {
+            $useRedistCudnn = $true
+        }
     }
     elseif (-not $CudaVersion -or "$redistCuda.".StartsWith("$CudaVersion.")) {
         $useRedist = $true
@@ -722,7 +768,7 @@ else {
 # each folder holds already: the tree of the programs and of the installers (3.5, and 3.5 more for
 # the models in the complete installer, 3.5 more again for their copies in the tree when their
 # cache lies on another volume), the trees of OpenVINO (1) and of CUDA (2), the models that come
-# with Albireo in their cache (6.8) and the archives of NVIDIA laid out (4.2).
+# with Albireo in their cache (6.8) and the archives of NVIDIA laid out (4.2), or cuDNN alone (1.5).
 $main = Join-Path $root "build-albireo"
 $modelCacheFolder = if ($ModelCache) { $ModelCache } else { Join-Path $env:LOCALAPPDATA "Albireo\build-cache" }
 $programs = 3.5
@@ -741,6 +787,7 @@ if ($buildCuda -or $useRedist) {
     Add-Space $tree 2 (Get-FolderBytes $tree -Recurse)
 }
 if ($useRedist) { Add-Space $cudaCacheFolder 4.2 (Get-FolderBytes $cudaCacheFolder -Recurse) }
+if ($useRedistCudnn) { Add-Space $cudaCacheFolder 1.5 (Get-FolderBytes $cudaCacheFolder -Recurse) }
 $short = @()
 foreach ($volume in @($needs.Keys | Sort-Object)) {
     try {
@@ -799,6 +846,37 @@ if ($useRedist) {
                 ", and the redistributable archives of NVIDIA could not be laid out in $cudaCacheFolder (see the " +
                 "messages above); -NoCuda leaves the engine out without this message.")
             Add-Prerequisite "CUDA and cuDNN" "missing" "the archives of NVIDIA, not laid out (see the messages above)"
+        }
+    }
+}
+
+# cuDNN 9.11 for the installed toolkit, laid out when the free space allows it; otherwise the
+# engine keeps the cuDNN installed, and the warning of the end names the cards it leaves out.
+if ($useRedistCudnn) {
+    $item = "cuDNN for GTX 900 and 10"
+    $cudnnStamp = "cudnn-$redistCudnn-cuda$major\albireo-redist.stamp"
+    $laidOut = Test-Path -LiteralPath (Join-Path $cudaCacheFolder $cudnnStamp)
+    $command = ("`"$(if ($cmake) { $cmake } else { 'cmake' })`" `"-DCACHE=$cudaCacheFolder`" " +
+        "-DCUDA_VERSION=$redistCuda -DCUDNN_VERSION=$redistCudnn -DCUDNN_ONLY=ON " +
+        "-P `"$(Join-Path $source 'cmake\cuda_redist.cmake')`"")
+    if (($NoInstall -and -not $laidOut) -or -not $cmake) {
+        Add-Prerequisite $item "skipped" "cuDNN $installedCudnn kept; the archive of cuDNN $redistCudnn: $command"
+    }
+    elseif ($short.Count -gt 0) {
+        Add-Prerequisite $item "skipped" "cuDNN $installedCudnn kept, the free space lacks for cuDNN $redistCudnn"
+    }
+    else {
+        $cudnnRedist = Get-CudnnRedist $cudaCacheFolder
+        if ($cudnnRedist) {
+            $cudnnFolder = $cudnnRedist.Cudnn
+            $state = if ($cudnnRedist.Downloaded -gt 0) { "installed" } else { "found" }
+            Add-Prerequisite $item $state ("cuDNN $redistCudnn of the archives of NVIDIA in $cudaCacheFolder, " +
+                "in place of cuDNN $installedCudnn")
+        }
+        else {
+            Write-Warning ("cuDNN $redistCudnn could not be laid out in $cudaCacheFolder (see the messages above): " +
+                "the CUDA engine keeps cuDNN $installedCudnn")
+            Add-Prerequisite $item "skipped" "cuDNN $installedCudnn kept (see the messages above)"
         }
     }
 }

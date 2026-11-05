@@ -366,6 +366,7 @@ if (NOT TARGET dlib)
          timer/timer.cpp
          stack_trace.cpp
          cuda/cpu_dlib.cpp
+         cuda/cpu_gguf.cpp
          cuda/tensor_tools.cpp
          cuda/extended_memory.cpp
          data_io/image_dataset_metadata.cpp
@@ -733,6 +734,7 @@ if (NOT TARGET dlib)
             if(CUDNN_FOUND)
                set(source_files ${source_files} 
                   cuda/cuda_dlib.cu 
+                  cuda/cuda_gguf.cu
                   cuda/cudnn_dlibapi.cpp
                   cuda/cublas_dlibapi.cpp
                   cuda/cusolver_dlibapi.cu
@@ -750,7 +752,8 @@ if (NOT TARGET dlib)
                   list (APPEND dlib_needed_private_libraries ${openmp_libraries})
                endif()
 
-               include_directories(${CUDAToolkit_INCLUDE_DIRS} ${CUDNN_INCLUDE_PATH})
+               # The cuDNN found comes before the toolkit, which may carry another version of it.
+               include_directories(${CUDNN_INCLUDE_PATH} ${CUDAToolkit_INCLUDE_DIRS})
                message(STATUS "Enabling CUDA support for dlib.  DLIB WILL USE CUDA using cuda arch ${CMAKE_CUDA_ARCHITECTURES}.  If you don't want to use that arch set the CUDAARCHS env var or CMAKE_CUDA_ARCHITECTURES cmake variable.")
             else()
                 set(DLIB_USE_CUDA OFF CACHE STRING ${DLIB_USE_BLAS_STR} FORCE )

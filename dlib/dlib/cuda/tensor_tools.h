@@ -10,6 +10,9 @@
 #include "curand_dlibapi.h"
 #include "cpu_dlib.h"
 #include "cuda_dlib.h"
+#include "cpu_gguf.h"
+#include "cuda_gguf.h"
+#include "gguf_blocks.h"
 #include "npu_dlib.h"
 #include "../rand.h"
 #include <memory>
@@ -3118,6 +3121,87 @@ namespace dlib { namespace tt
             - dst.nc() == src.k() * src.nc()
             - dst.num_samples() == src.num_samples()
             - dst.nr() == src.nr()
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    void gguf_matvec (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes
+    );
+    /*!
+        requires
+            - gguf_blocks::known_format(type) == true (gguf_blocks.h)
+            - row_bytes == gguf_blocks::row_bytes(type, cols) and row_bytes != 0
+            - weights holds, from its first byte, the rows*row_bytes bytes of a weight matrix
+              of rows rows and cols columns in the GGUF format type, as they lie in a GGUF
+              file.  Its floats only store these bytes.
+            - src.size() == n*cols for some n, the number of rows of src
+            - dest.size() == n*rows
+            - is_same_object(dest, src) == false
+        ensures
+            - performs: dest[t*rows + r] = sum over i of W[r][i]*src[t*cols + i], for t < n and
+              r < rows, W being the matrix the bytes of weights encode.
+            - The weights are read once for every 8 rows of src, in their compact form: this is
+              the product of the generation of a few tokens, which the reading of the weights
+              bounds.  For many rows, gguf_dequantize() followed by gemm() reads them once.
+    !*/
+
+    void gguf_dequantize (
+        tensor& dest,
+        const tensor& weights,
+        int type,
+        long first,
+        long count,
+        long cols,
+        size_t row_bytes
+    );
+    /*!
+        requires
+            - type, cols, row_bytes and weights as for gguf_matvec(), the matrix holding at
+              least first+count rows
+            - first >= 0 and count >= 0
+            - dest.size() == count*cols
+        ensures
+            - dest holds the rows [first, first+count) of the matrix as floats, one row of cols
+              values after the other.
+    !*/
+
+    void rms_norm_rows (
+        tensor& dest,
+        const tensor& src,
+        const tensor& gamma,
+        float eps
+    );
+    /*!
+        requires
+            - gamma.size() > 0
+            - src.size() is a multiple of gamma.size()
+            - dest.size() == src.size()
+            - eps >= 0
+        ensures
+            - Normalizes each row of w == gamma.size() values of src by its root mean square and
+              scales it by gamma, the RMS normalization of the decoders:
+                dest[r*w + i] == src[r*w + i]/sqrt(mean over j of src[r*w + j]^2 + eps)*gamma[i]
+            - dest may be the same object as src.
+    !*/
+
+    void silu_multiply (
+        tensor& gate,
+        const tensor& up
+    );
+    /*!
+        requires
+            - gate.size() == up.size()
+            - is_same_object(gate, up) == false
+        ensures
+            - #gate[i] == gate[i]*sigmoid(gate[i])*up[i] for all i, the gate of a SwiGLU
+              feed-forward block.
     !*/
 
 // ----------------------------------------------------------------------------------------

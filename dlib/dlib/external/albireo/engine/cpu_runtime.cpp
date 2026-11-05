@@ -150,6 +150,38 @@ namespace albireo
         }
     }
 
+    void cpu_runtime::set_offload(std::unique_ptr<matmul_offload> offload)
+    {
+        layer_pass_.reset();
+        offload_ = std::move(offload);
+        layer_pass_checked_ = false;
+        layer_pass_memory_failures_ = 0;
+        layer_pass_wait_ = 0;
+        if (!offload_ || cfg_.is_moe()) return;
+        dense_model m;
+        m.d_model = cfg_.d_model;
+        m.q_dim = cfg_.q_dim();
+        m.kv_dim = cfg_.kv_dim();
+        m.d_ffn = cfg_.d_ffn;
+        m.rms_eps = static_cast<float>(cfg_.rms_eps);
+        m.residual_scale = static_cast<float>(cfg_.residual_scale);
+        for (const layer& L : layers_)
+        {
+            dense_layer l;
+            l.attn_norm = L.attn_norm.data();
+            l.ffn_norm = L.ffn_norm.data();
+            l.wq = L.wq;
+            l.wk = L.wk;
+            l.wv = L.wv;
+            l.wo = L.wo;
+            l.w_gate = L.w_gate;
+            l.w_up = L.w_up;
+            l.w_down = L.w_down;
+            m.layers.push_back(l);
+        }
+        layer_pass_ = offload_->make_layer_pass(m);
+    }
+
     std::string cpu_runtime::description() const
     {
         std::ostringstream o;
@@ -387,7 +419,7 @@ namespace albireo
     void cpu_runtime::product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
         qk_path path)
     {
-        if (!offload_)
+        if (!offload_ || host_only_)
         {
             qk_matmul(W, X, n, x_stride, Y, y_stride, pool_, scratch_[0], false, path);
             return;
@@ -584,10 +616,128 @@ namespace albireo
 
     // Forward pass
 
+    bool cpu_runtime::takes_layer_pass(const forward_batch& batch) const
+    {
+        // The DeepStack slices of the images are added to the hidden states between the first layers.
+        return !(cfg_.n_deepstack > 0 && !batch.embedding_rows.empty());
+    }
+
+    void cpu_runtime::drop_layer_pass(const std::string& why)
+    {
+        layer_pass_->report(false, why);
+        layer_pass_.reset();
+    }
+
+    /*
+        Runs probe_tokens tokens in a sequence of their own through the layers of the device,
+        then through the processor alone, and keeps the layer pass when their logits agree: a
+        defect of the device or of its kernels would otherwise reach every answer.  The state
+        stays unchecked when the keys and values or the device lack room for the probe, so that
+        a later pass checks again.
+    */
+    void cpu_runtime::check_layer_pass()
+    {
+        long n = probe_tokens;
+        n = std::max(n, layer_pass_->min_tokens());
+        if (cfg_.ctx_train > 0) n = std::min(n, cfg_.ctx_train);
+        const long V = cfg_.vocab;
+        const int seq = create_sequence();
+        struct release
+        {
+            cpu_runtime& rt;
+            int seq;
+            ~release() { rt.release_sequence(seq); }
+        } guard{ *this, seq };
+        if (!reserve_sequence(seq, n)) return;
+        forward_batch b;
+        for (long i = 0; i < n; ++i) b.tokens.push_back(static_cast<int>((1009 + 7919 * i) % V));
+        b.segments.push_back({ seq, 0, n });
+        for (long i = 0; i < n; ++i) b.logit_rows.push_back(i);
+        std::vector<float> reference, device;
+        if (!run(b, device, true)) return;
+        // The truncation gives the blocks back.
+        truncate_sequence(seq, 0);
+        if (!reserve_sequence(seq, n)) return;
+        {
+            struct processor_only
+            {
+                bool& flag;
+                ~processor_only() { flag = false; }
+            } scope{ host_only_ };
+            host_only_ = true;
+            run(b, reference, false);
+        }
+        double worst = 0;
+        long same = 0;
+        bool apart = false;
+        for (long r = 0; r < n; ++r)
+        {
+            const float* a = reference.data() + r * V;
+            const float* d = device.data() + r * V;
+            double diff = 0, norm = 0;
+            long ia = 0, id = 0;
+            for (long v = 0; v < V; ++v)
+            {
+                diff += (static_cast<double>(a[v]) - d[v]) * (static_cast<double>(a[v]) - d[v]);
+                norm += static_cast<double>(a[v]) * a[v];
+                if (a[v] > a[ia]) ia = v;
+                if (d[v] > d[id]) id = v;
+            }
+            const double relative = std::sqrt(diff / std::max(norm, 1e-30));
+            // Written so that a value that is not a number sets the row apart.
+            if (!(relative <= 0.01)) apart = true;
+            if (relative > worst) worst = relative;
+            if (ia == id) ++same;
+        }
+        std::ostringstream detail;
+        detail << "logits of " << n << " probe tokens within " << worst * 100 << "% of those of the processor"
+            << (apart && worst <= 0.01 ? ", some not numbers" : "") << ", " << same << " of " << n
+            << " most likely tokens the same";
+        if (!apart && same >= n - 1)
+        {
+            layer_pass_checked_ = true;
+            layer_pass_->report(true, detail.str());
+        }
+        else
+            drop_layer_pass(detail.str());
+    }
+
     void cpu_runtime::forward(const forward_batch& batch, std::vector<float>& logits)
     {
+        if (layer_pass_ && !batch.tokens.empty() && takes_layer_pass(batch))
+        {
+            try
+            {
+                // A check that the keys and values or the device put off waits for a few passes.
+                if (!layer_pass_checked_ && layer_pass_wait_ > 0)
+                    --layer_pass_wait_;
+                else if (!layer_pass_checked_)
+                {
+                    check_layer_pass();
+                    if (!layer_pass_checked_) layer_pass_wait_ = layer_pass_check_interval;
+                }
+                if (layer_pass_ && layer_pass_checked_ && run(batch, logits, true))
+                {
+                    layer_pass_memory_failures_ = 0;
+                    return;
+                }
+            }
+            catch (const device_failure& e)
+            {
+                // The pass is computed again below; its keys and values are written again.
+                if (!e.memory)
+                    drop_layer_pass(std::string("the device failed: ") + e.what());
+                else if (++layer_pass_memory_failures_ >= max_layer_pass_memory_failures)
+                    drop_layer_pass(std::string("the device lacked memory several times in a row: ") + e.what());
+            }
+        }
+        run(batch, logits, false);
+    }
+
+    bool cpu_runtime::run(const forward_batch& batch, std::vector<float>& logits, bool on_device)
+    {
         const long T = static_cast<long>(batch.tokens.size());
-        if (T == 0) { logits.clear(); return; }
+        if (T == 0) { logits.clear(); return true; }
         const long d = cfg_.d_model;
         const long qd = cfg_.q_dim();
         const long kvd = cfg_.kv_dim();
@@ -638,16 +788,22 @@ namespace albireo
         k_.resize(static_cast<size_t>(T * kvd));
         v_.resize(static_cast<size_t>(T * kvd));
         tmp_.resize(static_cast<size_t>(T * d));
+        if (on_device && !layer_pass_->begin(x_.data(), T)) return false;
 
         for (long li = 0; li < cfg_.n_layers; ++li)
         {
             const layer& L = layers_[static_cast<size_t>(li)];
 
             // Attention block.
-            rms_norm_rows(x_.data(), L.attn_norm.data(), xn_.data(), T, d, eps);
-            product(L.wq, xn_.data(), T, d, q_.data(), qd);
-            product(L.wk, xn_.data(), T, d, k_.data(), kvd);
-            product(L.wv, xn_.data(), T, d, v_.data(), kvd);
+            if (on_device)
+                layer_pass_->attention_inputs(li, q_.data(), k_.data(), v_.data());
+            else
+            {
+                rms_norm_rows(x_.data(), L.attn_norm.data(), xn_.data(), T, d, eps);
+                product(L.wq, xn_.data(), T, d, q_.data(), qd);
+                product(L.wk, xn_.data(), T, d, k_.data(), kvd);
+                product(L.wv, xn_.data(), T, d, v_.data(), kvd);
+            }
             if (!L.bq.empty())
                 for (long t = 0; t < T; ++t)
                 {
@@ -699,6 +855,12 @@ namespace albireo
             }
 
             attention(li, batch, positions_);
+            if (on_device)
+            {
+                // The projection, the feed-forward block and both residual sums.
+                layer_pass_->attention_output(li, ctx_.data());
+                continue;
+            }
             product(L.wo, ctx_.data(), T, qd, tmp_.data(), d);
             for (size_t i = 0; i < x_.size(); ++i) x_[i] += rs * tmp_[i];
 
@@ -729,6 +891,7 @@ namespace albireo
             if (li < cfg_.n_deepstack && !batch.embedding_rows.empty()) add_given_embeddings(batch, li + 1);
         }
 
+        if (on_device) layer_pass_->end(batch.logit_rows, x_.data());
         for (const auto& s : batch.segments)
             sequences_[static_cast<size_t>(s.sequence)]->length += s.count;
 
@@ -743,7 +906,7 @@ namespace albireo
         if (batch.hidden_only)
         {
             logits.clear();
-            return;
+            return true;
         }
         logits.resize(static_cast<size_t>(R * cfg_.vocab));
         if (R > 0)
@@ -752,6 +915,7 @@ namespace albireo
             if (cfg_.logit_scale != 1.0)
                 qk_scale(logits.data(), static_cast<float>(1.0 / cfg_.logit_scale), R * cfg_.vocab);
         }
+        return true;
     }
 
 }

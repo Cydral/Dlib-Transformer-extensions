@@ -75,6 +75,8 @@ const summaryShare = 0.15;
 const maxContextImages = 10;
 const maxQuestionProjectImages = 4;
 const maxProjectImages = 10;
+// The items of the knowledge of a project, its documents and its images together.
+const maxProjectItems = 100;
 
 // Tokens of a text, estimated from its characters.
 function estimateTokens(text) {
@@ -1958,6 +1960,21 @@ async function newProject(silent) {
   return p;
 }
 
+/*
+    The edits of the projects in this tab, one after the other for each project: task, an async function, starts
+    once the previous edit of the project ended, whether it succeeded or not.  Returns the promise of task.
+*/
+const projectEdits = new Map();
+function queueProjectEdit(id, task) {
+  const run = (projectEdits.get(id) || Promise.resolve()).then(task);
+  const tail = run.catch(() => {});
+  projectEdits.set(id, tail);
+  tail.then(() => {
+    if (projectEdits.get(id) === tail) projectEdits.delete(id);
+  });
+  return run;
+}
+
 function renderProject(p) {
   const main = ui.content;
   const convs = state.conversations.filter((c) => c.projectId === p.id);
@@ -1970,10 +1987,11 @@ function renderProject(p) {
   /*
       Saves an edit of the project, edit(project) changing the fields it concerns.  The edit applies to the
       project as stored, read again, so that what another tab or the descriptions of the images wrote meanwhile
-      stays; a project deleted meanwhile is not written again.  The name, the description and the color show at
-      once in the page, the top bar, the side panel and the other tabs.
+      stays; the edits of this tab run one after the other (queueProjectEdit()), so that each one reads what the
+      previous one wrote, and a project deleted meanwhile is not written again.  The name, the description and the
+      color show at once in the page, the top bar, the side panel and the other tabs.
   */
-  const save = async (edit) => {
+  const save = (edit) => queueProjectEdit(p.id, async () => {
     let stored = p;
     try {
       stored = await store.getProject(p.id);
@@ -2001,7 +2019,7 @@ function renderProject(p) {
     broadcast({ type: 'projects' });
     renderSidebar();
     renderTopbar();
-  };
+  });
   name.addEventListener('change', () => save((x) => { x.name = name.value.trim() || x.name; }));
   description.addEventListener('change', () => save((x) => { x.description = description.value; }));
   instructions.addEventListener('change', () => save((x) => { x.instructions = instructions.value; }));
@@ -2015,21 +2033,55 @@ function renderProject(p) {
       }
     }));
   }
-  // The documents and the images, maxProjectImages of them at most: the documents are indexed, the images described.
+  /*
+    The documents and the images, maxProjectItems of them at most, of which maxProjectImages images: the documents
+    are indexed, the images described.  A project of an earlier version that holds more keeps them, and takes no
+    other until some are deleted.
+  */
+  const items = () => (p.files || []).length + (p.images || []).length;
+  const room = () => Math.max(0, maxProjectItems - items());
   const places = () => Math.max(0, maxProjectImages - (p.images || []).length);
   const fileInput = h('input', {
     type: 'file', multiple: true, class: 'hidden', accept: documentAccept() + (places() ? ',image/*' : '')
   });
   // Adds the files chosen with the button or dropped on the card of the knowledge to the project.
   const addFiles = async (files) => {
-    const added = await readFiles(files, null, places());
-    const docs = added.filter((a) => a.kind !== 'image');
-    const pictures = added.filter((a) => a.kind === 'image')
-      .map((a) => Object.assign(imageRecord(a), { state: 'pending', description: '' }));
+    if (!room()) {
+      toast(t('projectItemsFull', { max: maxProjectItems }), true, 9000);
+      return;
+    }
+    const added = await readFiles(files, null, places(), room());
+    // The limits apply again to the project as stored, which an earlier addition may have filled meanwhile.
+    const docs = [];
+    const pictures = [];
+    const late = [];
+    const lateImages = [];
     await save((x) => {
+      let free = Math.max(0, maxProjectItems - (x.files || []).length - (x.images || []).length);
+      let imageFree = Math.max(0, maxProjectImages - (x.images || []).length);
+      for (const a of added) {
+        const image = a.kind === 'image';
+        if (free <= 0) {
+          late.push(a.name);
+          continue;
+        }
+        if (image && imageFree <= 0) {
+          lateImages.push(a.name);
+          continue;
+        }
+        --free;
+        if (!image) {
+          docs.push(a);
+          continue;
+        }
+        --imageFree;
+        pictures.push(Object.assign(imageRecord(a), { state: 'pending', description: '' }));
+      }
       x.files = (x.files || []).concat(docs);
       if (pictures.length) x.images = (x.images || []).concat(pictures);
     });
+    if (lateImages.length) toast(imageLimitText(lateImages, places(), true), true, 10000);
+    if (late.length) toast(itemLimitText(late, room()), true, 10000);
     // The images are stored once the project that holds them is (pruneImages).
     try {
       await images.keep(p.id, pictures, true);
@@ -2098,12 +2150,17 @@ function renderProject(p) {
       h('span', { class: 'faint' }, new Date(c.updated).toLocaleDateString(language()))));
   }
   if (!convs.length) convList.append(h('div', { class: 'empty-note' }, t('noDiscussions')));
-  // The card of the knowledge, which also takes the files dropped on it.
-  const knowledge = h('div', { class: 'card' }, h('h3', { html: icon('book') + escapeHtml(t('knowledge')) }),
+  // The card of the knowledge, which also takes the files dropped on it, with the count of its items.
+  const full = !room();
+  const knowledge = h('div', { class: 'card' },
+    h('h3', { html: icon('book') + escapeHtml(t('knowledge')) },
+      h('span', { class: 'count', title: t('projectItemsCount', { n: items(), max: maxProjectItems }) },
+        items() + ' / ' + maxProjectItems)),
     h('p', { class: 'help' }, t('knowledgeHelp')), capacity, fileList, imagesBlock,
     h('div', { class: 'buttons', style: { marginTop: '10px' } },
       h('button', {
-        class: 'button', type: 'button', onclick: () => fileInput.click(),
+        class: 'button', type: 'button', disabled: full, onclick: () => fileInput.click(),
+        title: full ? t('projectItemsFull', { max: maxProjectItems }) : null,
         html: icon('upload') + '<span>' + escapeHtml(t('addFiles')) + '</span>'
       }),
       fileInput));
@@ -2153,13 +2210,19 @@ function renderProject(p) {
     maxFileBytes and an image of more than images.maxImageBytes are refused before they are read, with a message
     that names the file and the limit.
 */
-async function readFiles(files, role, room) {
+async function readFiles(files, role, room, most) {
   const out = [];
   const scans = [];
   const refused = [];
+  const overflow = [];
   const inputs = role ? roleInputs(role) : ['text', 'image'];
   let left = room || 0;
   for (const f of files) {
+    // The knowledge of a project, which takes most items more at most.
+    if (most !== undefined && out.length >= most) {
+      overflow.push(f.name);
+      continue;
+    }
     const kind = fileKind(f);
     if (kind !== 'document' && !inputs.includes(kind)) {
       const model = role ? modelName(roleModel(role)) : '';
@@ -2207,6 +2270,7 @@ async function readFiles(files, role, room) {
     }
   }
   if (refused.length) toast(imageLimitText(refused, left, !role), true, 10000);
+  if (overflow.length) toast(itemLimitText(overflow, most - out.length), true, 10000);
   for (const scan of scans) {
     if (role && inputs.includes('image')) {
       const pages = await scanPages(scan, left);
@@ -2299,6 +2363,14 @@ function imageLimitText(names, left, project) {
     max: project ? maxProjectImages : maxContextImages, left: Math.max(0, left),
     notAdded: tn('notAddedImages', names.length, { names: names.join(', ') })
   });
+}
+
+// The message of the files left out of the knowledge of a project, whose items reach maxProjectItems.
+function itemLimitText(names, left) {
+  const n = formatNumber(names.length);
+  const notAdded = names.length > 8 ? t('notAddedItemsAmong', { n, names: names.slice(0, 8).join(', ') })
+    : tn('notAddedItems', names.length, { n, names: names.join(', ') });
+  return t('projectItemsNotAdded', { max: maxProjectItems, left: Math.max(0, left), notAdded });
 }
 
 // The description of an image as a question or a project keeps it.

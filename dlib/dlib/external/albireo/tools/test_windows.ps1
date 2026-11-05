@@ -13,14 +13,15 @@
     Steps: the quantized kernels; the loading of damaged model files and of a file of more
     than 2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on
     the device of -Device (CPU by default, which every machine has) and a question to the
-    OpenVINO engine; with the CUDA tree, a question to the CUDA engine when the machine has
-    a card it supports; the embedding model; the models that come with Albireo, prepared by
-    the build, and a question to their language model, these engine steps with the PATH of
-    the service, System32 and the Windows folder only; a sentence read aloud by the program
-    of the speech synthesis; then the installed service, unless -NoService, once it has
-    started: its state, its models, its engines, each described within its time limit, with
-    the devices they found, the models that came with it, a question and the vectors of two
-    texts through the OpenAI interface, and a sentence read aloud through its speech route.
+    OpenVINO engine; with the CUDA tree, when the machine has a card it supports, a question to
+    the CUDA engine, then test_device_ops and test_offload on the card; the embedding model;
+    the models that come with Albireo, prepared by the build, and a question to their language
+    model, these engine steps with the PATH of the service, System32 and the Windows folder
+    only; a sentence read aloud by the program of the speech synthesis; then the installed
+    service, unless -NoService, once it has started: its state, its models, its engines, each
+    described within its time limit, with the devices they found, the models that came with
+    it, a question and the vectors of two texts through the OpenAI interface, and a sentence
+    read aloud through its speech route.
     The exit code is the number of failed steps.
 #>
 param(
@@ -153,6 +154,12 @@ try {
         else {
             Invoke-Check "engine cuda" "Paris" $chat @($cudaEngine, $Model, "--reasoning", "off", "--max", "40",
                 $question) | Out-Null
+            # The operations of dlib on the weights in their GGUF formats, then the products and the
+            # layers of the card against the processor.
+            Invoke-Check "cuda operations" "all checks passed" (Join-Path $cuda "tests\test_device_ops.exe") @() |
+                Out-Null
+            Invoke-Check "offload cuda" "all checks passed" (Join-Path $cuda "tests\test_offload.exe") @($Model) |
+                Out-Null
         }
     }
     else {

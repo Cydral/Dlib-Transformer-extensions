@@ -90,12 +90,22 @@ namespace albireo
     bool owned_by_system(const std::string& p);
 
     /*
+        Whether the drive that holds p, or would hold it when p does not exist yet, keeps the
+        permissions of its files, as NTFS and ReFS do and exFAT and FAT32 do not.
+        file_system receives the name of its file system ("NTFS", "exFAT"...), empty when the
+        drive does not answer, which keeps no permission either.  Always true elsewhere than
+        on Windows, file_system then empty.
+    */
+    bool drive_keeps_permissions(const std::string& p, std::string& file_system);
+
+    /*
         Makes p a folder that only SYSTEM and the administrators change, and that the
         users read: the folders where the service and the installer write with their
         rights.  On Windows:
             - a missing folder is created so;
             - the links on its path must belong to SYSTEM or the administrators, and the
-              folder they lead to must be on a local drive;
+              folder they lead to must be on a local drive that keeps permissions
+              (drive_keeps_permissions());
             - the folder must belong to them too, or be empty: it is then taken over;
             - unless it has these permissions already, it receives them, and what other
               accounts placed in it, links included, is renamed with the suffix

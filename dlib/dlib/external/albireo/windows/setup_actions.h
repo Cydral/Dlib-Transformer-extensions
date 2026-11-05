@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../common/json.h"
@@ -40,31 +41,49 @@ namespace setup
     std::string default_models_dir();
 
     /*
-        Why a folder cannot receive the programs (program true) or the models: the key of
-        the text that says it (strings.cpp, with {d} for the folder), or an empty string
-        when it can.  The folder must be on a local drive, below its root, and neither a
-        folder of Windows or of the users nor one that holds them; the models folder may
-        lie inside them, the folder of the programs may not.  The links on its path must
-        belong to SYSTEM or the administrators, and no other account may rename a folder
-        on the path of the programs (folder_parent_unsafe).  An existing folder of the
-        programs must be empty or hold an installation of Albireo; an existing models
-        folder must belong to SYSTEM or the administrators, or be empty, and hold nothing
-        of another account.  The models folder lies apart from the folder of the programs
-        program_dir, when given (folder_overlap): an update replaces what that folder holds.
+        Why a folder cannot receive the programs (program true) or the models: the key of the text that
+        says it (strings.cpp, with {d} for the folder), or an empty string when it can.  The folder must
+        be on a local drive that answers (folder_drive_unavailable) and keeps permissions, NTFS or ReFS
+        (folder_no_permissions), below its root, and neither a folder of Windows or of the users nor one
+        that holds them; the models folder may lie inside them, the folder of the programs may not.  The
+        links on its path must belong to SYSTEM or the administrators, and no other account may rename a
+        folder on the path of the programs (folder_parent_unsafe), the root of its drive included, which
+        then lets other accounts delete or rename what it holds (folder_root_unsafe).  An existing
+        folder of the programs must be empty or hold an installation of Albireo; an existing models
+        folder must belong to SYSTEM or the administrators, or be empty, and hold nothing of another
+        account.  The models folder lies apart from the folder of the programs program_dir, when given
+        (folder_overlap): an update replaces what that folder holds.
     */
     std::string folder_problem(const std::string& dir, bool program, const std::string& program_dir = std::string());
 
     /*
         Why a folder cannot hold the data (the settings, the database, the logs, the
         certificates and, by default, the models): the key of the text that says it, or an
-        empty string when it can.  The folder must be on a local fixed drive, below its
-        root, outside the folder of Windows and the folders of the users, holding none of
-        them, and apart from the folder of the programs program_dir; no other account may
-        rename a folder on its path.  An existing folder must be empty, or hold the data of
-        an earlier installation (settings.json, albireo.db) and belong to SYSTEM or the
-        administrators.
+        empty string when it can.  The folder must be on a local fixed drive that answers and
+        keeps permissions, below its root, outside the folder of Windows and the folders of
+        the users, holding none of them, and apart from the folder of the programs
+        program_dir; no other account may rename a folder on its path, the root of its drive
+        included.  An existing folder must be empty, or hold the data of an earlier
+        installation (settings.json, albireo.db) and belong to SYSTEM or the administrators.
     */
     std::string data_folder_problem(const std::string& dir, const std::string& program_dir);
+
+    /*
+        The problem of a folder of the programs or of the data whose path another account may
+        change, checked again once the installer made the folders: folder_root_unsafe,
+        folder_parent_unsafe, or an empty string.  A folder made on the path by another account
+        between the choice of the folders and their creation shows there.
+    */
+    std::string movable_folder_problem(const std::string& dir);
+
+    /*
+        The marks of the text of a problem of folder_problem() or data_folder_problem() for
+        dir: {d}, the folder, and as the problem needs them {p}, the folder on its path that
+        other accounts may rename (folder_parent_unsafe), {r}, the root of its drive
+        (folder_root_unsafe), and {fs}, the file system of its drive (folder_no_permissions).
+    */
+    std::vector<std::pair<std::string, std::string>> folder_problem_marks(const std::string& problem,
+        const std::string& dir);
 
     /*
         Makes the missing folders on the path of dir, below the folder that exists, with

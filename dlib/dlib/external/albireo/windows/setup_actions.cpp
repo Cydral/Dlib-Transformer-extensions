@@ -241,7 +241,7 @@ namespace setup
             Whether another account than those of trusted_account() may rename folder (a full
             path), or what it holds, and put a folder of its own in its place: as its owner,
             or through a right over its permissions, its deletion or the deletion of what it
-            holds.  For a drive root, only the deletion of what it holds counts.
+            holds.  For a drive root, its owner and the deletion of what it holds count.
         */
         bool movable_by_others(const std::wstring& folder)
         {
@@ -252,8 +252,11 @@ namespace setup
             if (GetNamedSecurityInfoW(folder.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION
                     | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl, nullptr, &sd) != ERROR_SUCCESS)
                 return true;
-            // A missing list of permissions gives every right to every account.
-            bool others = !dacl || (!root && !trusted_account(owner));
+            /*
+                A missing list of permissions gives every right to every account, and the owner of a folder, a
+                drive root included, may give itself any right.
+            */
+            bool others = !dacl || !trusted_account(owner);
             const ACCESS_MASK moves = root ? FILE_DELETE_CHILD | GENERIC_ALL
                 : DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
             for (WORD i = 0; !others && i < dacl->AceCount; ++i)
@@ -274,20 +277,31 @@ namespace setup
             return others;
         }
 
-        // Whether a folder that exists on the path of folder (a full path), its drive root
-        // included, lets another account put a folder of its own in the place of the next one.
-        bool movable_parents(const std::wstring& folder)
+        /*
+            The first folder that exists on the path of folder (a full path), its drive root
+            included, that lets another account put a folder of its own in the place of the
+            next one, or an empty string.
+        */
+        std::wstring movable_parent(const std::wstring& folder)
         {
-            if (movable_by_others(folder.substr(0, 3))) return true;
+            if (movable_by_others(folder.substr(0, 3))) return folder.substr(0, 3);
             for (size_t at = 3; at < folder.size(); ++at)
             {
                 if (folder[at] != L'\\') continue;
                 const std::wstring parent = folder.substr(0, at);
                 // The folders to come are made as secure_parents() makes them.
                 if (!dir_exists(narrow(parent))) break;
-                if (movable_by_others(parent)) return true;
+                if (movable_by_others(parent)) return parent;
             }
-            return false;
+            return std::wstring();
+        }
+
+        // The problem of a folder whose path another account may change: at the root of its drive, or below.
+        std::string movable_problem(const std::wstring& folder)
+        {
+            const std::wstring movable = movable_parent(folder);
+            if (movable.empty()) return std::string();
+            return movable.size() <= 3 ? "folder_root_unsafe" : "folder_parent_unsafe";
         }
 
         // The restarts after a failure: twice, then the service stays stopped; the count resets daily.
@@ -329,6 +343,10 @@ namespace setup
         full.resize(n);
         while (full.size() > 3 && full.back() == L'\\') full.pop_back();
         if (full.size() <= 3) return "folder_system";
+        // The rights of the folders of Albireo need a drive that keeps permissions: neither exFAT nor FAT32.
+        std::string file_system;
+        if (!drive_keeps_permissions(narrow(full), file_system))
+            return file_system.empty() ? "folder_drive_unavailable" : "folder_no_permissions";
         // The folders of Windows and of the users, the data folder, and those that hold them.
         std::vector<std::string> folders = system_folders();
         folders.push_back(data_dir());
@@ -350,7 +368,11 @@ namespace setup
             if (is_link(prefix) && !owned_by_system(prefix)) return "folder_foreign";
         }
         // Another account that may rename a folder on its path could put programs of its own in their place.
-        if (program && movable_parents(full)) return "folder_parent_unsafe";
+        if (program)
+        {
+            const std::string movable = movable_problem(full);
+            if (!movable.empty()) return movable;
+        }
         const std::string path = narrow(full);
         if (!dir_exists(path)) return file_exists(path) ? "folder_not_empty" : std::string();
         const bool empty = list_dir(path).empty();
@@ -373,6 +395,9 @@ namespace setup
         if (drive != DRIVE_FIXED) return drive == DRIVE_NO_ROOT_DIR ? "folder_not_local" : "folder_not_fixed";
         const std::wstring full = full_folder(dir);
         if (system_or_root(full) || inside_windows_or_users(full)) return "folder_system";
+        std::string file_system;
+        if (!drive_keeps_permissions(narrow(full), file_system))
+            return file_system.empty() ? "folder_drive_unavailable" : "folder_no_permissions";
         if (!program_dir.empty())
         {
             const std::wstring programs = full_folder(program_dir);
@@ -386,7 +411,8 @@ namespace setup
             if (is_link(prefix) && !owned_by_system(prefix)) return "folder_foreign";
         }
         // Another account that may rename a folder on its path could put its own data in its place.
-        if (movable_parents(full)) return "folder_parent_unsafe";
+        const std::string movable = movable_problem(full);
+        if (!movable.empty()) return movable;
         const std::string path = narrow(full);
         if (!dir_exists(path)) return file_exists(path) ? "folder_not_empty" : std::string();
         if (list_dir(path).empty()) return std::string();
@@ -396,6 +422,31 @@ namespace setup
         if (!albireo) return "folder_not_empty";
         if (!owned_by_system(final_path(path))) return "folder_foreign";
         return std::string();
+    }
+
+    std::string movable_folder_problem(const std::string& dir)
+    {
+        return movable_problem(full_folder(dir));
+    }
+
+    std::vector<std::pair<std::string, std::string>> folder_problem_marks(const std::string& problem,
+        const std::string& dir)
+    {
+        std::vector<std::pair<std::string, std::string>> marks = { { "d", dir } };
+        const std::wstring full = full_folder(dir);
+        if (problem == "folder_parent_unsafe" || problem == "folder_root_unsafe")
+        {
+            const std::wstring movable = movable_parent(full);
+            marks.push_back({ "p", narrow(movable.empty() ? full : movable) });
+            marks.push_back({ "r", narrow(full.substr(0, std::min<size_t>(full.size(), 3))) });
+        }
+        else if (problem == "folder_no_permissions")
+        {
+            std::string file_system;
+            drive_keeps_permissions(narrow(full), file_system);
+            marks.push_back({ "fs", file_system.empty() ? std::string("?") : file_system });
+        }
+        return marks;
     }
 
     bool secure_parents(const std::string& dir, std::string& error)
