@@ -860,7 +860,7 @@ if ($useRedistCudnn) {
         "-DCUDA_VERSION=$redistCuda -DCUDNN_VERSION=$redistCudnn -DCUDNN_ONLY=ON " +
         "-P `"$(Join-Path $source 'cmake\cuda_redist.cmake')`"")
     if (($NoInstall -and -not $laidOut) -or -not $cmake) {
-        Add-Prerequisite $item "skipped" "cuDNN $installedCudnn kept; the archive of cuDNN $redistCudnn: $command"
+        Add-Prerequisite $item "skipped" "cuDNN $installedCudnn kept; the archive of cuDNN ${redistCudnn}: $command"
     }
     elseif ($short.Count -gt 0) {
         Add-Prerequisite $item "skipped" "cuDNN $installedCudnn kept, the free space lacks for cuDNN $redistCudnn"
