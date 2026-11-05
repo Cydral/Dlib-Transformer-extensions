@@ -111,13 +111,40 @@
             <option value="es">Español</option>
           </select></label>
         <label><span data-t="set_drive"></span><input type="text" id="set-drive" maxlength="1" class="letter"></label>
-        <label><span data-t="set_max"></span><input type="number" id="set-max" min="1" max="2048"></label>
-        <label><span data-t="set_removed"></span><input type="number" id="set-removed" min="1" max="3650"></label>
+        <label><span data-t="set_dates"></span>
+          <select id="set-dates">
+            <option value="dmy" data-t="set_dates_dmy"></option>
+            <option value="mdy" data-t="set_dates_mdy"></option>
+          </select></label>
+        <label><span data-t="set_max"></span><input type="number" id="set-max" min="1" max="2048" step="1"></label>
+        <label><span data-t="set_removed"></span>
+          <input type="number" id="set-removed" min="0" max="3650" step="1"></label>
+        <label><span data-t="set_history"></span>
+          <input type="number" id="set-history" min="1" max="1048576" step="1"></label>
       </div>
+      <p class="hint" data-t="set_removed_hint"></p>
       <label class="option"><input type="checkbox" id="set-albireo"> <span data-t="set_albireo"></span></label>
       <label class="option"><input type="checkbox" id="set-updates"> <span data-t="set_updates"></span></label>
       <div class="buttons"><button id="settings-save" data-t="btn_save"></button></div>
       <p class="message" id="settings-message" hidden></p>
+    </section>
+
+    <section class="card" id="terms-card" hidden>
+      <h2 data-t="terms_title"></h2>
+      <p class="hint" data-t="terms_hint"></p>
+      <table class="records terms">
+        <thead>
+          <tr><th data-t="col_term"></th><th data-t="col_case"></th><th data-t="col_tag"></th><th></th></tr>
+        </thead>
+        <tbody id="terms"></tbody>
+      </table>
+      <p class="hint" id="terms-none" data-t="terms_none" hidden></p>
+      <div class="buttons">
+        <button class="secondary" id="terms-add" data-t="terms_add"></button>
+        <button id="terms-save" data-t="terms_save"></button>
+        <span class="count" id="terms-count"></span>
+      </div>
+      <p class="message" id="terms-message" hidden></p>
     </section>
   </main>
 

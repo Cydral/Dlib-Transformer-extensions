@@ -1371,19 +1371,28 @@ namespace pseudalis
 
     uint64_t free_disk_space(const std::string& p)
     {
+        uint64_t available = 0;
+        return free_disk_space(p, available) ? available : 0;
+    }
+
+    bool free_disk_space(const std::string& p, uint64_t& available)
+    {
+        available = 0;
 #if defined(_WIN32)
         ULARGE_INTEGER avail;
         std::string dir = p;
         while (!dir.empty() && !dir_exists(dir)) dir = parent_path(dir);
-        if (GetDiskFreeSpaceExW(widen(dir.empty() ? std::string("C:\\") : dir).c_str(), &avail, nullptr, nullptr))
-            return avail.QuadPart;
-        return 0;
+        if (!GetDiskFreeSpaceExW(widen(dir.empty() ? std::string("C:\\") : dir).c_str(), &avail, nullptr, nullptr))
+            return false;
+        available = avail.QuadPart;
+        return true;
 #else
         std::string dir = p;
         while (!dir.empty() && !dir_exists(dir)) dir = parent_path(dir);
         struct statvfs s;
-        if (statvfs(dir.empty() ? "/" : dir.c_str(), &s) != 0) return 0;
-        return static_cast<uint64_t>(s.f_bavail) * s.f_frsize;
+        if (statvfs(dir.empty() ? "/" : dir.c_str(), &s) != 0) return false;
+        available = static_cast<uint64_t>(s.f_bavail) * s.f_frsize;
+        return true;
 #endif
     }
 

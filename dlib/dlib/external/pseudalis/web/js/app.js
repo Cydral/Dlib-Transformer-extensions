@@ -42,7 +42,10 @@
     document.documentElement.lang = language;
     document.querySelectorAll('[data-t]').forEach(function (e) { e.textContent = t(e.getAttribute('data-t')); });
     refreshStatus();
-    if (admin) renderRecords();
+    if (admin) {
+      renderRecords();
+      renderTerms();
+    }
   }
 
   /* The administration token, which the icon gives in the fragment of the address it opens: the
@@ -96,6 +99,8 @@
       const a = info.albireo || {};
       box.appendChild(pill(t('s_albireo'), a.found ? a.model : t('s_albireo_off'), !!a.found));
       box.appendChild(pill(t('s_records'), String(info.records || 0)));
+      const h = info.history || {};
+      if (h.limit) box.appendChild(pill(t('s_history'), size(h.bytes || 0) + ' / ' + size(h.limit)));
     } catch (e) {
       box.textContent = '';
       box.appendChild(pill('', t('s_offline'), false));
@@ -456,9 +461,12 @@
       tr.appendChild(el('td', 'name', r.original_name));
       tr.appendChild(el('td', '', new Date(r.created).toLocaleString(language)));
       const source = el('td', '', t('source_' + r.source));
+      // A file that left the drive: its original stays until a day, or without limit of time.
       if (r.forgotten) {
         const until = new Date(r.forgotten).toLocaleDateString(language);
         source.appendChild(el('div', 'note', t('records_removed', { d: until })));
+      } else if (r.removed) {
+        source.appendChild(el('div', 'note', t('records_removed_always')));
       }
       tr.appendChild(source);
       tr.appendChild(el('td', 'number', size(r.original_size)));
@@ -477,9 +485,15 @@
   }
 
   async function loadRecords(more) {
-    const r = await adminFetch('v1/records?limit=50&offset=' + (more ? records.length : 0));
+    let r;
+    try {
+      r = await adminFetch('v1/records?limit=50&offset=' + (more ? records.length : 0));
+    } catch (e) {
+      return false;
+    }
     if (!r.ok) return false;
-    const body = await r.json();
+    const body = await r.json().catch(function () { return null; });
+    if (!body || !Array.isArray(body.records)) return false;
     if (!more) records.length = 0;
     body.records.forEach(function (x) { records.push(x); });
     recordsTotal = body.total;
@@ -488,7 +502,13 @@
   }
 
   async function original(r) {
-    const answer = await adminFetch('v1/records/' + r.id + '/original');
+    let answer;
+    try {
+      answer = await adminFetch('v1/records/' + r.id + '/original');
+    } catch (e) {
+      window.alert(t('s_offline'));
+      return;
+    }
     if (!answer.ok) {
       const body = await answer.json().catch(function () { return null; });
       window.alert(errorText(body, answer.status));
@@ -499,7 +519,13 @@
 
   async function forgetRecord(r) {
     if (!window.confirm(t('confirm_forget', { f: r.original_name }))) return;
-    const answer = await adminFetch('v1/records/' + r.id, { method: 'DELETE' });
+    let answer;
+    try {
+      answer = await adminFetch('v1/records/' + r.id, { method: 'DELETE' });
+    } catch (e) {
+      window.alert(t('s_offline'));
+      return;
+    }
     if (!answer.ok) {
       const body = await answer.json().catch(function () { return null; });
       window.alert(errorText(body, answer.status));
@@ -508,21 +534,31 @@
     refreshStatus();
   }
 
-  async function postJson(route, value) {
-    const r = await adminFetch(route, {
-      method: route === 'v1/settings' ? 'PUT' : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(value)
-    });
+  // A request of the administration with a JSON body: its answer, or status 0 when the service did not answer.
+  async function sendJson(route, value, method) {
+    let r;
+    try {
+      r = await adminFetch(route, {
+        method: method || 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(value)
+      });
+    } catch (e) {
+      return { ok: false, status: 0, body: null };
+    }
     const body = await r.json().catch(function () { return null; });
     return { ok: r.ok && !!body, status: r.status, body: body };
+  }
+
+  function failure(r) {
+    return r.status === 0 ? t('s_offline') : errorText(r.body, r.status);
   }
 
   async function exportKey() {
     const p1 = document.getElementById('pass1').value, p2 = document.getElementById('pass2').value;
     if (p1 !== p2) return message('key-message', t('passphrase_mismatch'), true);
-    const r = await postJson('v1/key/export', { passphrase: p1 });
-    if (!r.ok) return message('key-message', errorText(r.body, r.status), true);
+    const r = await sendJson('v1/key/export', { passphrase: p1 });
+    if (!r.ok) return message('key-message', failure(r), true);
     save(new Blob([r.body.key], { type: 'application/json' }), 'pseudalis-key-' + (fingerprint || 'export') + '.json');
     document.getElementById('pass1').value = document.getElementById('pass2').value = '';
     message('key-message', t('key_exported'));
@@ -530,41 +566,191 @@
 
   async function importKey(file) {
     const passphrase = document.getElementById('pass1').value;
-    const r = await postJson('v1/key/import', { key: await file.text(), passphrase: passphrase });
-    if (!r.ok) return message('key-message', errorText(r.body, r.status), true);
+    const r = await sendJson('v1/key/import', { key: await file.text(), passphrase: passphrase });
+    if (!r.ok) return message('key-message', failure(r), true);
     document.getElementById('pass1').value = document.getElementById('pass2').value = '';
     message('key-message', t('key_imported'));
   }
 
   async function loadSettings() {
-    const r = await adminFetch('v1/settings');
+    let r;
+    try {
+      r = await adminFetch('v1/settings');
+    } catch (e) {
+      return;
+    }
     if (!r.ok) return;
-    const s = await r.json();
+    const s = await r.json().catch(function () { return null; });
+    if (!s) return;
     document.getElementById('set-language').value = s.language || 'auto';
     document.getElementById('set-drive').value = s.drive_letter || '';
+    document.getElementById('set-dates').value = s.date_order === 'mdy' ? 'mdy' : 'dmy';
     document.getElementById('set-max').value = s.max_file_mb;
     document.getElementById('set-removed').value = s.removed_days;
+    document.getElementById('set-history').value = s.history_mb;
     document.getElementById('set-albireo').checked = s.albireo !== 'off';
     document.getElementById('set-updates').checked = !!s.check_updates;
   }
 
+  // The settings that the card shows, by their name in the interface, with the key of their label.
+  const settingLabels = {
+    language: 'set_language', drive_letter: 'set_drive', date_order: 'set_dates', max_file_mb: 'set_max',
+    removed_days: 'set_removed', history_mb: 'set_history', albireo: 'set_albireo', check_updates: 'set_updates'
+  };
+
+  // A whole number of a field, or null when it holds none: the service refuses it with its range.
+  function wholeNumber(id) {
+    const text = document.getElementById(id).value.trim();
+    return /^\d+$/.test(text) ? parseInt(text, 10) : null;
+  }
+
   async function saveSettings() {
-    const r = await postJson('v1/settings', {
+    const r = await sendJson('v1/settings', {
       language: document.getElementById('set-language').value,
       drive_letter: document.getElementById('set-drive').value.trim().toUpperCase(),
-      max_file_mb: parseInt(document.getElementById('set-max').value, 10) || 150,
-      removed_days: parseInt(document.getElementById('set-removed').value, 10) || 30,
+      date_order: document.getElementById('set-dates').value,
+      max_file_mb: wholeNumber('set-max'),
+      removed_days: wholeNumber('set-removed'),
+      history_mb: wholeNumber('set-history'),
       albireo: document.getElementById('set-albireo').checked ? 'auto' : 'off',
       check_updates: document.getElementById('set-updates').checked
-    });
-    if (!r.ok) return message('settings-message', errorText(r.body, r.status), true);
+    }, 'PUT');
+    if (!r.ok) {
+      const b = r.body || {};
+      if (b.code === 'settings_value' && b.args && settingLabels[b.args.field]) {
+        const range = b.args.min !== undefined ? t('range', { min: b.args.min, max: b.args.max }) : '';
+        return message('settings-message', t('err_settings_value', { field: t(settingLabels[b.args.field]) }) +
+          range, true);
+      }
+      return message('settings-message', failure(r), true);
+    }
     message('settings-message', t(r.body.restart ? 'saved_restart' : 'saved'));
     loadSettings();
+    refreshStatus();
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // The imposed terms: replaced with the tag of their type before anything else of a text.
+
+  let terms = [];
+  let termTypes = ['ORG', 'PERSON', 'LOCATION', 'ADDRESS', 'ID', 'EMAIL', 'PHONE', 'URL'];
+  let termsMax = 100, termLength = 200;
+
+  function renderTerms() {
+    const body = document.getElementById('terms');
+    if (!body) return;
+    body.textContent = '';
+    terms.forEach(function (term, i) {
+      const tr = el('tr');
+      if (term.bad) tr.className = 'bad';
+      const cell = el('td');
+      const input = el('input');
+      input.type = 'text';
+      input.maxLength = termLength;
+      input.value = term.term;
+      input.setAttribute('aria-label', t('col_term'));
+      input.addEventListener('input', function () {
+        term.term = input.value;
+        term.bad = false;
+        tr.className = '';
+      });
+      cell.appendChild(input);
+      tr.appendChild(cell);
+      const check = el('td', 'check');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = !!term.case_sensitive;
+      box.setAttribute('aria-label', t('col_case'));
+      box.addEventListener('change', function () { term.case_sensitive = box.checked; });
+      check.appendChild(box);
+      tr.appendChild(check);
+      const tag = el('td');
+      const select = el('select');
+      select.setAttribute('aria-label', t('col_tag'));
+      termTypes.forEach(function (k) {
+        const o = el('option', '', t('tag_' + k));
+        o.value = k;
+        select.appendChild(o);
+      });
+      select.value = termTypes.indexOf(term.type) >= 0 ? term.type : termTypes[0];
+      term.type = select.value;
+      select.addEventListener('change', function () { term.type = select.value; });
+      tag.appendChild(select);
+      tr.appendChild(tag);
+      const actions = el('td', 'actions');
+      const remove = el('button', 'secondary', t('btn_remove'));
+      remove.addEventListener('click', function () {
+        terms.splice(i, 1);
+        renderTerms();
+      });
+      actions.appendChild(remove);
+      tr.appendChild(actions);
+      body.appendChild(tr);
+    });
+    document.getElementById('terms-none').hidden = terms.length > 0;
+    document.getElementById('terms-add').disabled = terms.length >= termsMax;
+    document.getElementById('terms-count').textContent = t('terms_count', { n: terms.length, max: termsMax });
+  }
+
+  async function loadTerms() {
+    let r;
+    try {
+      r = await adminFetch('v1/terms');
+    } catch (e) {
+      return;
+    }
+    if (!r.ok) return;
+    const body = await r.json().catch(function () { return null; });
+    if (!body) return;
+    if (Array.isArray(body.types) && body.types.length) termTypes = body.types;
+    termsMax = body.max || termsMax;
+    termLength = body.max_length || termLength;
+    terms = (body.terms || []).map(function (x) {
+      return { term: x.term, type: x.type, case_sensitive: !!x.case_sensitive };
+    });
+    renderTerms();
+  }
+
+  function addTerm() {
+    if (terms.length >= termsMax) return;
+    terms.push({ term: '', type: termTypes[0], case_sensitive: false });
+    renderTerms();
+    const inputs = document.querySelectorAll('#terms input[type=text]');
+    if (inputs.length) inputs[inputs.length - 1].focus();
+  }
+
+  async function saveTerms() {
+    // The rows left empty are no terms; the others keep their place for the errors.
+    const rows = [];
+    const list = [];
+    terms.forEach(function (x, i) {
+      x.bad = false;
+      const text = (x.term || '').trim();
+      if (!text) return;
+      rows.push(i);
+      list.push({ term: text, type: x.type, case_sensitive: !!x.case_sensitive });
+    });
+    const r = await sendJson('v1/terms', { terms: list }, 'PUT');
+    if (!r.ok) {
+      const b = r.body || {};
+      const at = b.args && b.args.index !== undefined ? Number(b.args.index) : -1;
+      const row = at >= 0 && at < rows.length ? rows[at] : -1;
+      if (row >= 0) terms[row].bad = true;
+      renderTerms();
+      const known = ['terms_invalid', 'terms_too_many', 'terms_type', 'terms_duplicate'].indexOf(b.code) >= 0;
+      return message('terms-message', known ? t('err_' + b.code, { n: row + 1, max: termsMax, length: termLength })
+        : failure(r), true);
+    }
+    terms = (r.body.terms || []).map(function (x) {
+      return { term: x.term, type: x.type, case_sensitive: !!x.case_sensitive };
+    });
+    renderTerms();
+    message('terms-message', t('terms_saved', { n: terms.length }));
   }
 
   async function startAdmin() {
     if (!admin || !(await loadRecords(false))) return;
-    ['records-card', 'key-card', 'settings-card'].forEach(function (id) {
+    ['records-card', 'key-card', 'settings-card', 'terms-card'].forEach(function (id) {
       document.getElementById(id).hidden = false;
     });
     const info = await fetch('v1/info', { cache: 'no-store' }).then(function (r) { return r.json(); })
@@ -572,6 +758,7 @@
     fingerprint = info.key_fingerprint || '';
     document.getElementById('fingerprint').textContent = fingerprint;
     loadSettings();
+    loadTerms();
   }
 
   document.getElementById('records-more').addEventListener('click', function () { loadRecords(true); });
@@ -582,6 +769,8 @@
     if (f) importKey(f);
   });
   document.getElementById('settings-save').addEventListener('click', saveSettings);
+  document.getElementById('terms-add').addEventListener('click', addTerm);
+  document.getElementById('terms-save').addEventListener('click', saveTerms);
 
   const select = document.getElementById('language');
   language = pick();

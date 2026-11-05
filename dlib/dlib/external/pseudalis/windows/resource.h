@@ -17,10 +17,14 @@
 #define IDR_LICENSE 301
 #define IDR_PAYLOAD 401
 
-// The texts of the commands of the Explorer, in each language of pseudalis.exe.
-#define IDS_VERB_PROTECT 501
-#define IDS_VERB_PROTECT_COPY 502
-#define IDS_VERB_RESTORE 503
-#define IDS_VERB_RESTORE_COPY 504
+/*
+    The texts of the commands of the Explorer, in each language of pseudalis.exe.  The Explorer
+    keeps the text it read for an indirect string ("@pseudalis.exe,-511"): new identifiers make it
+    read these tables again.
+*/
+#define IDS_VERB_PROTECT 511
+#define IDS_VERB_PROTECT_COPY 512
+#define IDS_VERB_RESTORE 513
+#define IDS_VERB_RESTORE_COPY 514
 
 #endif // PSEUDALIS_WINDOWS_RESOURCE_H_

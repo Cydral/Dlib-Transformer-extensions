@@ -113,7 +113,12 @@ namespace pseudalis
         bool output_size_known(long long size);
         std::vector<file_record> list_files(long long limit, long long offset,
             const std::string& source = std::string());
-        long long count_files();
+        // The records, those of one source when source is not empty ("web", "shell", "api", "drive").
+        long long count_files(const std::string& source = std::string());
+        // The bytes of the originals the records keep.
+        long long originals_bytes();
+        // The records first created, the oldest first: their identifiers and the sizes of their originals.
+        std::vector<std::pair<long long, long long>> oldest_files(long long limit);
         // The blobs the records and the pictures name.
         std::set<std::string> referenced_blobs();
         void set_file_location(long long id, const std::string& object_id, const std::string& path);

@@ -14,6 +14,25 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct pii_imposed_term
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A term that a detector always reports, with its type, before any other
+                reading of the text: the name of a project, of a contract, of a client or of
+                an organisation that the other channels do not know.
+
+                text           - the term; its words and numbers are what a text must hold
+                type           - the type reported for each of its occurrences
+                case_sensitive - when true, the case and the accents of each word must match;
+                                 when false, both are ignored ("Societe Generale" matches
+                                 "Société Générale" and "SOCIÉTÉ GÉNÉRALE")
+        !*/
+        std::string text;
+        pii_type type = pii_type::organization;
+        bool case_sensitive = false;
+    };
+
     struct pii_detector_options
     {
         /*!
@@ -49,11 +68,16 @@ namespace dlib
                                     councils of an organisation ("la Direction financière",
                                     "the Steering Group") and the label of a number
                                     ("numéro de Sécurité sociale") stay readable.
+                imposed_terms     - the terms always reported (pii_imposed_term), above
+                                    every other channel; a term of a type left out of
+                                    types is ignored, and so is a term without a letter
+                                    or a digit.
         !*/
         std::vector<pii_type> types = all_pii_types();
         numeric_date_order date_order = numeric_date_order::day_month_year;
         bool profile_urls_only = true;
         bool public_bodies = true;
+        std::vector<pii_imposed_term> imposed_terms;
     };
 
     struct detection_context
@@ -197,9 +221,10 @@ namespace dlib
                    above the place they hold), sector words after a name ("Zorvane Finance",
                    "Ulmeo Seguros"), partners ("Martin et Fils"), public body names, and
                    about two thousand organisations of all countries known by their own name
-                   ("Airbus", "Johnson & Johnson", "La Banque postale"), with a legal form, a
-                   trade, a country or the division of a group after them ("AXA France",
-                   "Veolia Water", "Enel Green Power"); such a name followed by
+                   ("Airbus", "Johnson & Johnson", "La Banque postale"), their ampersand
+                   written as a conjunction too ("Marks and Spencer", "Ernst und Young"), with
+                   a legal form, a trade, a country or the division of a group after them
+                   ("AXA France", "Veolia Water", "Enel Green Power"); such a name followed by
                    another capitalized word is a product or a longer name and is left to the
                    other channels ("Microsoft Teams", "Airbus A320"). Products, applications
                    and the intergovernmental organisations of the United Nations system are
@@ -227,7 +252,25 @@ namespace dlib
                    (29200)"), from "né à", "domicilié à", "originaire de", and from the place
                    before the date of a letter ("Rennes, le 12 mars 2024"). User names come
                    from logs and chats ("user=jdupont", "[10:42] jdupont:", "opened by
-                   jdupont").
+                   jdupont"). A capitalized word that a conjunction or an ampersand joins to
+                   a person or an organisation found with a confidence of 0.8 at least,
+                   without a value of its own, is another person beside a person ("Martin
+                   and Dupont", "Dupont et Martin") and completes the name of an
+                   organisation ("Clifford & Chance", "Oficina de Asilo y Refugio", "Porcu e
+                   Lo Cascio S.a.s."), or is an organisation of its own after a name that
+                   ends with a legal form ("Acme Ltd and Zorvane"), unless it is a function
+                   word, a civility, a title or a role, a legal form, a partner word
+                   ("Martin and Partners") or the head noun of an organisation, a country, a
+                   region, an acronym, a greeting, a month, a day or a holiday ("Navidad"),
+                   the start of a longer name, capitalized or joined by a connector
+                   ("Conseil de prud'hommes"), an acronym beside an organisation or beside
+                   one written as an acronym ("STD et DTCO"), a part of a compound
+                   ("Nord-Ovest"), a word in capitals beside a name that is not, or a common
+                   word written in capitals, opening a sentence or in a line whose words
+                   take capitals, and unless the pair ends a list after a comma ("Rose,
+                   Violette et Capucine", "Natale, Santo Stefano e Capodanno") or names a
+                   region or a country ("Castilla y León"); German, which capitalizes its
+                   nouns, joins no word after "und" this way.
 
                    A civility before a name is reported as title, since it tells the sex
                    of the person: "M. Dupont", "M. et Mme Martin", "Titulaire : Mme
@@ -317,6 +360,8 @@ namespace dlib
                   most two characters ("EMP-4521", "Dupont Conseil"). A number is matched
                   as a whole: the term "12345" is not found in "A12345".
                 - Does nothing if type is pii_type::none or term holds no word or number.
+                - The term ranks with the rules of its type; the imposed terms of the
+                  options (pii_imposed_term) outrank every channel.
         !*/
 
         void add_allowed_term(const std::string& term);
@@ -434,7 +479,14 @@ namespace dlib
                   close the name, and common words in lower case or in a line of capitals
                   are left out. A legal form keeps its own period
                   ("S.A.", "Pte. Ltd.") and leaves out the period of the sentence
-                  ("Goelia SNC.").
+                  ("Goelia SNC."). Two organisations, or two persons, that the rules read
+                  on both sides of a conjunction, an ampersand or a comma stay two values
+                  when a recognizer reads them as one ("Siemens Energy and Veolia Water",
+                  "Enel Green Power e Veolia Water"); a name that the rules read whole,
+                  its conjunction included, stays whole ("Martin et Fils"), and so does a
+                  name closed by partners after the conjunction ("Gestoría Navarro y
+                  Asociados S.L.") or by a legal form that ends the second name alone
+                  ("Hermanos Martinez y Merino SL").
                 - The calls are serialized and their results cached, keyed by the
                   SHA-256 digest of the text, until the next begin_document(): learn() and
                   detect() see the same texts and models are seldom reentrant, so
@@ -478,8 +530,25 @@ namespace dlib
                   keyword and a check of three Crockford characters) are never reported,
                   nor anything inside them; brackets that only look like a tag are read
                   like any text.
+                - Each occurrence of an imposed term of the options is reported with its
+                  type: its words and numbers in the same order, each a whole run of
+                  letters and digits of the text ("Alpha" is not found in "Alphabet"),
+                  separated by at most two characters of one line ("Projet Alpha",
+                  "PROJET-ALPHA"), read over the whole text. Of two occurrences that
+                  overlap, the earlier is reported, and the longer at one position. An
+                  occurrence inside an e-mail address, a web address, a date or a number
+                  found by the other channels is protected with that value, which stays
+                  whole; any other value that overlaps an occurrence keeps its parts
+                  outside it, with their type and their confidence.
             throws
                 - error if a pattern fails while matching.
+        !*/
+
+        std::size_t imposed_term_count() const;
+        /*!
+            ensures
+                - Returns the number of imposed terms of the options that the detector
+                  reads: those with a letter or a digit, of a type it reports.
         !*/
 
         pii_type label_type(const std::string& text) const;

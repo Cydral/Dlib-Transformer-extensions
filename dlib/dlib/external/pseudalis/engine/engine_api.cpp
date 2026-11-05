@@ -308,6 +308,44 @@ PSD_API int PSD_CALL psd_key_fingerprint(psd_engine* engine, psd_buffer* fingerp
     }
 }
 
+PSD_API int PSD_CALL psd_set_terms(psd_engine* engine, const char* terms, size_t size, psd_buffer* error)
+{
+    clear(error);
+    if (!engine || !engine->e)
+    {
+        put(error, "no engine");
+        return 0;
+    }
+    try
+    {
+        pseudalis::json list;
+        if (!pseudalis::json::parse(std::string(terms ? terms : "", terms ? size : 0), list))
+        {
+            put(error, "the terms are not JSON");
+            return 0;
+        }
+        std::vector<pseudalis::imposed_term> parsed;
+        std::string message, code;
+        long long index = -1;
+        if (!pseudalis::parse_imposed_terms(list, parsed, message, code, index))
+        {
+            put(error, message);
+            return 0;
+        }
+        engine->e->set_terms(parsed);
+        return 1;
+    }
+    catch (const std::exception& x)
+    {
+        put(error, x.what());
+    }
+    catch (...)
+    {
+        put(error, "unexpected error");
+    }
+    return 0;
+}
+
 PSD_API char* PSD_CALL psd_alloc(size_t size)
 {
     return static_cast<char*>(std::malloc(size + 1));

@@ -156,6 +156,27 @@ namespace pseudalis
         wipe(key);
         if (!engine_->ok()) return false;
         key_fingerprint_ = engine_->key_fingerprint();
+        // The imposed terms that the database keeps: a list it no longer takes is left aside.
+        {
+            std::vector<imposed_term> kept;
+            std::string message, code;
+            long long index = -1;
+            const json list = json::parse_or_null(db_->value("imposed_terms"));
+            if (!list.is_null() && !parse_imposed_terms(list, kept, message, code, index))
+            {
+                log_warning("terms: the imposed terms of the database are left aside: " + message);
+                kept.clear();
+            }
+            std::string te;
+            if (!engine_->set_terms(imposed_terms_json(kept), te))
+            {
+                error = "the engine refuses the imposed terms: " + te;
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(terms_m_);
+            terms_ = kept;
+            if (!kept.empty()) log_info("terms: " + std::to_string(kept.size()) + " imposed term(s)");
+        }
         log_info("engine: " + library_->path() + " (" + engine_->variant() + ", " + engine_->build() + "), key " +
                  key_fingerprint_);
         return true;
@@ -386,12 +407,14 @@ namespace pseudalis
         {
             {
                 std::unique_lock<std::mutex> lock(wake_m_);
-                wake_.wait_for(lock, std::chrono::seconds(60), [this]() { return stopping_.load(); });
+                wake_.wait_for(lock, std::chrono::seconds(60),
+                               [this]() { return stopping_.load() || cleanup_.load(); });
             }
             if (stopping_) break;
-            if (now_unix() >= next_purge)
+            if (cleanup_.exchange(false) || now_unix() >= next_purge)
             {
                 purge_removed();
+                make_room(0);
                 next_purge = now_unix() + 3600;
             }
             if (settings_->get().check_updates && now_unix() >= next_check)
@@ -400,6 +423,12 @@ namespace pseudalis
                 next_check = now_unix() + 24 * 3600;
             }
         }
+    }
+
+    void service::counts_changed()
+    {
+        std::lock_guard<std::mutex> lock(counts_m_);
+        counts_at_ = std::chrono::steady_clock::time_point();
     }
 
     json service::status()
@@ -427,10 +456,18 @@ namespace pseudalis
             {
                 records_count_ = db_ ? db_->count_files() : 0;
                 drive_status_ = drive_ ? drive_->status() : json::object();
+                unsigned long long used = 0, limit = 0;
+                if (db_) history_space(used, limit);
+                history_bytes_ = used;
+                history_limit_ = limit;
                 counts_at_ = now;
             }
             j["records"] = records_count_;
             j["drive"] = drive_status_;
+            json history = json::object();
+            history["bytes"] = history_bytes_;
+            history["limit"] = history_limit_;
+            j["history"] = history;
         }
         j["albireo"] = albireo_.status();
         j["updates"] = updater_ ? updater_->status() : json::object();
@@ -515,6 +552,8 @@ namespace pseudalis
         out.record = 0;
         // The substitutes of the names and the properties come back through their tags, kept here.
         if (!record_substitutes(result, error)) return false;
+        // An original larger than the space of the originals is not kept: the file is protected without record.
+        if (record && !make_room(bytes.size())) record = false;
         if (record)
         {
             const std::string blob = vault_->put(bytes);
@@ -549,6 +588,7 @@ namespace pseudalis
                 out.record = db_->add_file(r);
                 for (const json& id : result["pictures"].elements()) db_->link_picture(out.record, id.str());
                 db_->add_entries(out.record, entries);
+                counts_changed();
             }
             catch (const std::exception& x)
             {
@@ -655,6 +695,12 @@ namespace pseudalis
                                              " cannot be extracted from its original: " + error.text);
             return extracted == -1 ? -1 : 0;
         }
+        // An entry larger than the space of the originals: the file stays as it is, protected, without record.
+        if (!make_room(bytes.size()))
+        {
+            wipe(bytes);
+            return 1;
+        }
         const std::string blob = vault_->put(bytes);
         if (blob.empty())
         {
@@ -678,6 +724,7 @@ namespace pseudalis
             record = db_->add_file(r);
             // An archive extracted from the archive keeps the entries inside it, for the files extracted from it.
             db_->add_entries(record, db_->entries_inside(e));
+            counts_changed();
         }
         catch (const std::exception& x)
         {
@@ -709,6 +756,9 @@ namespace pseudalis
             if (reason == "expired")
                 error.set("the original of this file was kept until " + day +
                           " after its file left the drive, and can no longer be restored", "original_expired");
+            else if (reason == "space")
+                error.set("the original of this file was forgotten on " + day + " to make room for newer "
+                          "originals, and can no longer be restored", "original_space");
             else
                 error.set("the original of this file was forgotten on " + day + " and can no longer be restored",
                           "original_forgotten");
@@ -893,6 +943,7 @@ namespace pseudalis
             log_error("records: " + std::string(x.what()));
             return false;
         }
+        counts_changed();
         // A blob that cannot be deleted now goes at the next start, nothing naming it any more.
         for (const std::string& b : blobs)
             if (!vault_->remove(b) && vault_->exists(b)) log_warning("vault: a blob of record " +
@@ -915,6 +966,8 @@ namespace pseudalis
     void service::purge_removed()
     {
         const int days = settings_->get().removed_days;
+        // 0: the originals of the files removed from the drive stay, within the space of the history.
+        if (days <= 0) return;
         std::vector<long long> records;
         try
         {
@@ -931,6 +984,138 @@ namespace pseudalis
         if (forgotten)
             log_info("records: " + std::to_string(forgotten) + " original(s) of files removed from the drive " +
                      std::to_string(days) + " days ago or more forgotten");
+    }
+
+    void service::history_space(unsigned long long& used, unsigned long long& limit)
+    {
+        used = 0;
+        try
+        {
+            const long long bytes = db_->originals_bytes();
+            used = bytes > 0 ? static_cast<unsigned long long>(bytes) : 0;
+        }
+        catch (const std::exception& x)
+        {
+            log_error("records: " + std::string(x.what()));
+        }
+        limit = static_cast<unsigned long long>(settings_->get().history_mb) << 20;
+    }
+
+    bool service::make_room(unsigned long long needed)
+    {
+        std::lock_guard<std::mutex> lock(room_m_);
+        const host_settings st = settings_->get();
+        const unsigned long long limit = static_cast<unsigned long long>(st.history_mb) << 20;
+        // The free space the disk of the data folder keeps beyond a new original.
+        const unsigned long long reserve = 256ull << 20;
+        unsigned long long used = 0, ignored = 0;
+        history_space(used, ignored);
+        // An original larger than the space of all of them: forgetting the others would not make it fit.
+        if (needed > limit)
+        {
+            log_warning("records: an original of " + std::to_string(needed >> 20) + " MB is larger than the space " +
+                        "of the originals (" + std::to_string(limit >> 20) + " MB), it is not kept");
+            return false;
+        }
+        /*
+            For a new original, the disk keeps 256 MB free once it is written: the originals make room
+            for it when forgetting them would reach that, and stay when other files fill the disk or
+            when its free space cannot be known (the vault then reports the lack of space).  The
+            free space counts what each original forgotten gives back, its blob deleted at once.
+        */
+        uint64_t free_at_start = 0;
+        bool disk = false;
+        if (needed > 0 && free_disk_space(data_dir_, free_at_start) && free_at_start < reserve + needed)
+        {
+            disk = free_at_start + used >= reserve + needed;
+            if (!disk)
+                log_warning("records: the disk of the data folder has " + std::to_string(free_at_start >> 20) +
+                            " MB free, the originals kept would not give the room an original needs");
+        }
+        unsigned long long freed = 0;
+        auto full = [&]() {
+            return used + needed > limit || (disk && free_at_start + freed < reserve + needed);
+        };
+        size_t forgotten = 0;
+        while (full())
+        {
+            std::vector<std::pair<long long, long long>> oldest;
+            try
+            {
+                oldest = db_->oldest_files(64);
+            }
+            catch (const std::exception& x)
+            {
+                log_error("records: " + std::string(x.what()));
+                break;
+            }
+            if (oldest.empty()) break;
+            bool any = false;
+            for (const auto& r : oldest)
+            {
+                if (!full()) break;
+                if (!forget(r.first, "space")) continue;
+                any = true;
+                ++forgotten;
+                const unsigned long long size = r.second > 0 ? static_cast<unsigned long long>(r.second) : 0;
+                used = used > size ? used - size : 0;
+                freed += size;
+            }
+            if (!any) break;
+        }
+        if (forgotten)
+            log_info("records: " + std::to_string(forgotten) + " original(s) first kept forgotten to make room, " +
+                     std::to_string(used >> 20) + " MB kept of " + std::to_string(limit >> 20) + " MB");
+        return true;
+    }
+
+    void service::request_cleanup()
+    {
+        cleanup_ = true;
+        std::lock_guard<std::mutex> lock(wake_m_);
+        wake_.notify_all();
+    }
+
+    json service::terms()
+    {
+        std::lock_guard<std::mutex> lock(terms_m_);
+        return imposed_terms_json(terms_);
+    }
+
+    bool service::set_terms(const json& list, user_error& error)
+    {
+        std::vector<imposed_term> parsed;
+        std::string message, code;
+        long long index = -1;
+        if (!parse_imposed_terms(list, parsed, message, code, index))
+        {
+            error.set(message, code);
+            if (index >= 0) error.arg("index", std::to_string(index));
+            return false;
+        }
+        const json canonical = imposed_terms_json(parsed);
+        std::lock_guard<std::mutex> lock(terms_m_);
+        std::string e;
+        if (!engine_ || !engine_->set_terms(canonical, e))
+        {
+            error.set(e.empty() ? "the engine is not ready" : e, "engine");
+            return false;
+        }
+        try
+        {
+            db_->set_value("imposed_terms", canonical.dump());
+        }
+        catch (const std::exception& x)
+        {
+            // The engine keeps the terms it had: those of the database, which the next start reads.
+            std::string ignored;
+            engine_->set_terms(imposed_terms_json(terms_), ignored);
+            error.set(x.what(), "database");
+            return false;
+        }
+        terms_ = parsed;
+        log_info("terms: " + std::to_string(parsed.size()) + " imposed term(s) set");
+        return true;
     }
 
     bool service::export_key(const std::string& passphrase, std::string& exported, user_error& error)

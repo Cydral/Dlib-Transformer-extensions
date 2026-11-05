@@ -9,6 +9,7 @@
 
 #include <sqlite3.h>
 
+#include "../common/imposed_terms.h"
 #include "../common/platform.h"
 #include "../host/keys.h"
 #include "../host/settings.h"
@@ -83,14 +84,37 @@ int main()
     }
     CHECK(v.remove(empty_id));
 
-    // The settings: a value out of its range takes its default.
+    /*
+        The settings: a value out of its range loses no original (days without limit, the largest
+        space), the space holds the largest file, and a file of a version before 1.0.2, without
+        space, keeps every original, its 30 days of default becoming 45.
+    */
     {
+        CHECK(host_settings().removed_days == 45 && host_settings().history_mb == 10240);
         json j = json::object();
-        j["removed_days"] = 0;
+        j["removed_days"] = -1;
+        j["history_mb"] = 0;
         j["max_file_mb"] = 64;
         j["drive_letter"] = "c";
         host_settings s = host_settings::from_json(j);
-        CHECK(s.removed_days == 30 && s.max_file_mb == 64 && s.drive_letter == "A");
+        CHECK(s.removed_days == 0 && s.history_mb == host_settings::max_history_mb && s.max_file_mb == 64 &&
+              s.drive_letter == "A");
+        j["removed_days"] = 0;
+        j["history_mb"] = 100;
+        s = host_settings::from_json(j);
+        CHECK(s.removed_days == 0 && s.history_mb == 100);
+        CHECK(host_settings::from_json(s.to_json()).removed_days == 0 &&
+              host_settings::from_json(s.to_json()).history_mb == 100);
+        j["history_mb"] = 2;
+        CHECK(host_settings::from_json(j).history_mb == 64);
+        json earlier = json::object();
+        earlier["removed_days"] = 30;
+        earlier["max_file_mb"] = 150;
+        CHECK(host_settings::from_json(earlier).removed_days == 45 &&
+              host_settings::from_json(earlier).history_mb == host_settings::max_history_mb);
+        earlier["removed_days"] = 60;
+        CHECK(host_settings::from_json(earlier).removed_days == 60);
+        j["history_mb"] = 100;
         j["removed_days"] = 90;
         j["drive_letter"] = "p";
         s = host_settings::from_json(j);
@@ -101,16 +125,58 @@ int main()
         s.feed_url = "https://example.org/feed.json";
         CHECK(host_settings::from_json(s.to_json()).feed_url == "https://example.org/feed.json");
     }
-    // A damaged settings.json keeps the originals of the files removed from the drive the longest.
+    // A damaged settings.json keeps the originals without limit of time, in the largest space.
     {
         const std::string path = join_path(dir, "settings.json");
         CHECK(write_file_atomic(path, "{ not json"));
         settings_store damaged(path);
-        CHECK(damaged.get().removed_days == host_settings::max_removed_days && file_exists(path + ".invalid"));
+        CHECK(damaged.get().removed_days == 0 && damaged.get().history_mb == host_settings::max_history_mb &&
+              file_exists(path + ".invalid"));
         host_settings changed;
         CHECK(damaged.update([](host_settings& s) { s.removed_days = 45; }, changed) && changed.removed_days == 45);
         settings_store again(path);
         CHECK(again.get().removed_days == 45);
+    }
+
+    // The imposed terms: a list the service takes, or the reason and the place of its refusal.
+    {
+        std::vector<imposed_term> terms;
+        std::string message, code;
+        long long index = -1;
+        json list = json::parse_or_null("[{\"term\": \"  Projet Alpha \", \"type\": \"ORG\"}, "
+                                        "{\"term\": \"ACME\", \"type\": \"ORG\", \"case_sensitive\": true}, "
+                                        "{\"term\": \"acme\", \"type\": \"PERSON\"}]");
+        CHECK(parse_imposed_terms(list, terms, message, code, index) && terms.size() == 3 &&
+              terms[0].term == "Projet Alpha" && !terms[0].case_sensitive && terms[1].case_sensitive &&
+              terms[2].type == "PERSON" && index == -1);
+        const json canonical = imposed_terms_json(terms);
+        std::vector<imposed_term> back;
+        CHECK(parse_imposed_terms(canonical, back, message, code, index) && back.size() == 3 &&
+              back[1].term == "ACME");
+        CHECK(parse_imposed_terms(json::parse_or_null("[]"), terms, message, code, index) && terms.empty());
+        auto refused = [&](const char* text, const char* expected, long long at) {
+            std::vector<imposed_term> t;
+            std::string m, c;
+            long long i = -2;
+            return !parse_imposed_terms(json::parse_or_null(text), t, m, c, i) && c == expected && i == at &&
+                   !m.empty();
+        };
+        CHECK(refused("{}", "terms_invalid", -1));
+        CHECK(refused("[{\"term\": \"   \"}]", "terms_invalid", 0));
+        CHECK(refused("[{\"term\": \"Alpha\"}, {\"term\": \"---\"}]", "terms_invalid", 1));
+        CHECK(refused("[{\"term\": \"Alpha\\nBeta\"}]", "terms_invalid", 0));
+        CHECK(refused("[{\"term\": \"Alpha\", \"type\": \"DATE\"}]", "terms_type", 0));
+        CHECK(refused("[{\"term\": \"Société\"}, {\"term\": \"SOCIETE\"}]", "terms_duplicate", 1));
+        CHECK(parse_imposed_terms(json::parse_or_null("[{\"term\": \"Société\"}, {\"term\": \"SOCIETE\", "
+                                                      "\"case_sensitive\": true}]"), terms, message, code, index));
+        std::string many = "[";
+        for (int k = 0; k <= static_cast<int>(max_imposed_terms); ++k)
+            many += std::string(k ? "," : "") + "{\"term\": \"term " + std::to_string(k) + "\"}";
+        CHECK(refused((many + "]").c_str(), "terms_too_many", -1));
+        CHECK(refused(("[{\"term\": \"" + std::string(max_imposed_term_length + 1, 'a') + "\"}]").c_str(),
+                      "terms_invalid", 0));
+        CHECK(parse_imposed_terms(json::parse_or_null("[{\"term\": \"" + std::string(max_imposed_term_length, 'a') +
+                                                      "\"}]"), terms, message, code, index));
     }
 
     // The database: records, pictures and the tree of the drive.
@@ -124,8 +190,10 @@ int main()
         r.output_sha256 = std::string(64, 'b');
         r.original_blob = v.put("original");
         r.kind = "docx";
+        r.original_size = 1000;
         const long long rec = db.add_file(r);
-        CHECK(rec > 0 && db.count_files() == 1);
+        CHECK(rec > 0 && db.count_files() == 1 && db.count_files("shell") == 1 && db.count_files("web") == 0);
+        CHECK(db.originals_bytes() == 1000 && db.oldest_files(10).size() == 1 && db.oldest_files(10)[0].first == rec);
         file_record found;
         CHECK(db.find_by_output(std::string(64, 'b'), found) && found.id == rec
             && found.original_name == r.original_name);
@@ -161,7 +229,12 @@ int main()
         archive.original_name = "Dossier Jean Dupont.zip";
         archive.output_sha256 = std::string(64, '9');
         archive.original_blob = v.put("archive");
+        archive.original_size = 2500;
         const long long zip = db.add_file(archive);
+        // The space of the originals, and the oldest first.
+        CHECK(db.originals_bytes() == 3500 && db.oldest_files(1).size() == 1 && db.oldest_files(1)[0].first == rec &&
+              db.oldest_files(5).size() == 2 && db.oldest_files(5)[1].first == zip &&
+              db.oldest_files(5)[1].second == 2500);
         std::vector<entry_record> entries(3);
         entries[0].name = "Dossier X/lettre.txt";
         entries[0].original = "Dossier Jean Dupont/lettre.txt";

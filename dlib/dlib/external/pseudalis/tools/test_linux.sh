@@ -12,7 +12,8 @@
 # 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a CSV file,
 # a name and the archive of a folder as the web application sends it, then files and a folder
 # through its drive, whose originals come back through the interface, an archive extracted on the
-# drive, an archive whose original was forgotten coming back and the copies of a file, and stops.
+# drive, an archive whose original was forgotten coming back and the copies of a file, saves the
+# settings as the web application does, imposes terms, makes room for newer originals, and stops.
 # The exit code is the number of failed steps.
 
 set -u
@@ -324,6 +325,52 @@ PY
   then
     record "copies on the drive" PASS "one record, kept with a copy, removed with the last"
   else record "copies on the drive" FAIL "record '$COPIES_ID', with the copy '$KEPT', after it '$GONE'"
+  fi
+  # The settings as the web application saves them, without feed nor proxy; a value out of its range refused.
+  admin_json() { # method route body
+    api -X "$1" -H "X-Pseudalis-Admin: $TOKEN" -H "Content-Type: application/json" --data "$3" "$URL$2"
+  }
+  SAVED=$(admin_json PUT /v1/settings '{"language": "auto", "drive_letter": "A", "date_order": "dmy",
+    "max_file_mb": 150, "removed_days": 0, "history_mb": 10240, "albireo": "off", "check_updates": false}')
+  REFUSED=$(admin_json PUT /v1/settings '{"removed_days": -1}')
+  if printf '%s' "$SAVED" | grep -q '"removed_days":0' && printf '%s' "$SAVED" | grep -q '"restart":false' &&
+     printf '%s' "$REFUSED" | grep -q '"code":"settings_value"'; then
+    record "settings saved" PASS "the body of the web application, 0 days, a value out of range refused"
+  else record "settings saved" FAIL "$SAVED / $REFUSED"
+  fi
+  # The imposed terms: kept, replaced before anything else, and refused with their reason.
+  SET=$(admin_json PUT /v1/terms '{"terms": [{"term": "Projet Alpha", "type": "ORG"},
+    {"term": "KX-77", "type": "ID", "case_sensitive": true}]}')
+  BAD=$(admin_json PUT /v1/terms '{"terms": [{"term": "Alpha", "type": "DATE"}]}')
+  TERMS_TEXT=$(api -X POST -H "Content-Type: application/json" \
+    --data '{"text": "Le PROJET-ALPHA suit la reference KX-77, pas kx-77."}' "$URL/v1/text/anonymize")
+  LISTED=$(api -H "X-Pseudalis-Admin: $TOKEN" "$URL/v1/terms")
+  if printf '%s' "$SET" | grep -q 'Projet Alpha' && printf '%s' "$BAD" | grep -q '"code":"terms_type"' &&
+     printf '%s' "$TERMS_TEXT" | grep -q '\[\[ORG:' && printf '%s' "$TERMS_TEXT" | grep -q '\[\[ID:' &&
+     ! printf '%s' "$TERMS_TEXT" | grep -q -e ALPHA -e KX-77 && printf '%s' "$TERMS_TEXT" | grep -q 'kx-77' &&
+     printf '%s' "$LISTED" | grep -q '"max":100'; then
+    record "imposed terms" PASS "replaced first, case kept for KX-77, a type refused"
+  else record "imposed terms" FAIL "$SET / $BAD / $TERMS_TEXT"
+  fi
+  admin_json PUT /v1/terms '{"terms": []}' > /dev/null
+  # The space of the originals: with 1 MB, the oldest originals make room for the newer ones; a space
+  # smaller than the largest file is refused.
+  SMALL=$(admin_json PUT /v1/settings '{"history_mb": 1}')
+  admin_json PUT /v1/settings '{"max_file_mb": 1, "history_mb": 1}' > /dev/null
+  for k in 1 2 3; do
+    python3 -c 'import sys
+sys.stdout.write(("Note %s de Jean Dupont, jean.dupont@exemple.fr\n" % sys.argv[1]) * 9000)' "$k" > "$WORK/gros$k.txt"
+    api -X POST --data-binary @"$WORK/gros$k.txt" -o "$WORK/gros$k.anon.txt" "$URL/v1/anonymize?name=gros$k.txt"
+  done
+  api -X POST --data-binary @"$WORK/gros1.anon.txt" -o "$WORK/gros1.back.txt" "$URL/v1/restore?name=gros1.txt"
+  api -X POST --data-binary @"$WORK/gros3.anon.txt" -o "$WORK/gros3.back.txt" "$URL/v1/restore?name=gros3.txt"
+  SPACE=$(api "$URL/v1/info" | python3 -c 'import json, sys; h = json.load(sys.stdin)["history"]
+print(h["bytes"] <= h["limit"])')
+  admin_json PUT /v1/settings '{"history_mb": 10240, "max_file_mb": 150}' > /dev/null
+  if grep -q '"code":"original_space"' "$WORK/gros1.back.txt" && cmp -s "$WORK/gros3.txt" "$WORK/gros3.back.txt" &&
+     [ "$SPACE" = True ] && printf '%s' "$SMALL" | grep -q '"field":"history_mb"'; then
+    record "room for originals" PASS "the oldest forgotten (original_space), the newest restored, 1 MB refused"
+  else record "room for originals" FAIL "$(head -c 200 "$WORK/gros1.back.txt"), within the limit: $SPACE / $SMALL"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

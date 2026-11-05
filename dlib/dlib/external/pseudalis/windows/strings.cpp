@@ -40,6 +40,23 @@ namespace pseudalis
                 "Riavvia Pseudalis", "Reiniciar Pseudalis" } },
             { "tray_start_service", { "Start the service", "Démarrer le service", "Dienst starten",
                 "Avvia il servizio", "Iniciar el servicio" } },
+            { "tray_service", { "Service management", "Gestion du service", "Dienstverwaltung",
+                "Gestione del servizio", "Gestión del servicio" } },
+            { "tray_stop_service", { "Stop the service", "Arrêter le service", "Dienst beenden",
+                "Arresta il servizio", "Detener el servicio" } },
+            { "notify_service_stopping", { "The Pseudalis service stops. It stays stopped until the computer starts "
+                "again, unless you start it from the menu of this icon.",
+                "Le service Pseudalis s'arrête. Il reste arrêté jusqu'au prochain démarrage de l'ordinateur, sauf "
+                "si vous le démarrez depuis le menu de cette icône.",
+                "Der Pseudalis-Dienst wird beendet. Er bleibt bis zum nächsten Start des Computers beendet, sofern "
+                "Sie ihn nicht über das Menü dieses Symbols starten.",
+                "Il servizio Pseudalis si arresta. Resta arrestato fino al prossimo avvio del computer, a meno che "
+                "non lo avviate dal menu di questa icona.",
+                "El servicio Pseudalis se detiene. Permanece detenido hasta el próximo inicio del equipo, salvo que "
+                "lo inicie desde el menú de este icono." } },
+            { "notify_service_starting", { "The Pseudalis service starts.", "Le service Pseudalis démarre.",
+                "Der Pseudalis-Dienst startet.", "Il servizio Pseudalis si avvia.",
+                "El servicio Pseudalis se inicia." } },
             { "tray_docs", { "Interface documentation", "Documentation de l'interface",
                 "Dokumentation der Schnittstelle", "Documentazione dell'interfaccia",
                 "Documentación de la interfaz" } },
@@ -671,6 +688,16 @@ namespace pseudalis
                 "Das Original dieser Datei wurde am {date} vergessen: Es kann nicht mehr wiederhergestellt werden.",
                 "L'originale di questo file è stato dimenticato il {date}: non può più essere ripristinato.",
                 "El original de este archivo se olvidó el {date}: ya no se puede restaurar." } },
+            { "err_original_space", { "The original of this file was forgotten on {date} to make room for newer "
+                "originals: it can no longer be restored.",
+                "L'original de ce fichier a été oublié le {date} pour faire place à des originaux plus récents : il "
+                "ne peut plus être restauré.",
+                "Das Original dieser Datei wurde am {date} vergessen, um Platz für neuere Originale zu schaffen: Es "
+                "kann nicht mehr wiederhergestellt werden.",
+                "L'originale di questo file è stato dimenticato il {date} per fare spazio a originali più recenti: "
+                "non può più essere ripristinato.",
+                "El original de este archivo se olvidó el {date} para dejar sitio a originales más recientes: ya no "
+                "se puede restaurar." } },
             { "err_original_expired", { "The original of this file was kept until {date} after the file left the "
                 "drive: it can no longer be restored.",
                 "L'original de ce fichier a été conservé jusqu'au {date} après la sortie du fichier du lecteur : il "

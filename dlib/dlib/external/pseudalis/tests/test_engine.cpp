@@ -616,6 +616,40 @@ int main()
     CHECK(process(e, "detect", "prompt", "Écrire à Jean Dupont", res, out));
     CHECK(res["spans"].size() >= 1 && res["spans"].elements()[0]["type"].str() == "PERSON");
 
+    // The imposed terms: replaced before anything else, in the texts, the files and the names.
+    {
+        const std::string terms = "[{\"term\": \"Projet Alpha\", \"type\": \"ORG\"}, "
+                                  "{\"term\": \"KX-77\", \"type\": \"ID\", \"case_sensitive\": true}]";
+        CHECK(psd_set_terms(e, terms.data(), terms.size(), &err) == 1);
+        psd_free(&err);
+        const std::string text = "Le PROJET ALPHA de Jean Dupont suit la référence KX-77, pas kx-77.";
+        CHECK(process(e, "detect", "prompt", text, res, out));
+        bool project = false, reference = false, lower = false;
+        for (const json& s : res["spans"].elements())
+        {
+            project = project || (s["text"].str() == "PROJET ALPHA" && s["type"].str() == "ORG");
+            reference = reference || (s["text"].str() == "KX-77" && s["type"].str() == "ID");
+            lower = lower || s["text"].str() == "kx-77";
+        }
+        CHECK(project && reference && !lower);
+        CHECK(process(e, "anonymize", "note.txt", text, res, out));
+        CHECK(out.find("ALPHA") == std::string::npos && out.find("KX-77") == std::string::npos &&
+              out.find("kx-77") != std::string::npos && out.find("[[ORG:") != std::string::npos);
+        std::string restored;
+        CHECK(process(e, "restore", "note.txt", out, res, restored) && restored == text);
+        CHECK(process(e, "anonymize_name", "", "Rapport Projet Alpha.docx", res, out));
+        CHECK(out.find("Alpha") == std::string::npos);
+        // A list the engine does not take changes nothing; an empty one removes the terms.
+        const std::string wrong = "[{\"term\": \"Alpha\", \"type\": \"DATE\"}]";
+        CHECK(psd_set_terms(e, wrong.data(), wrong.size(), &err) == 0 && err.data);
+        psd_free(&err);
+        const std::string plain = "la note KX-77 est close";
+        CHECK(process(e, "anonymize_text", "prompt", plain, res, out) && out.find("KX-77") == std::string::npos);
+        CHECK(psd_set_terms(e, "[]", 2, &err) == 1);
+        psd_free(&err);
+        CHECK(process(e, "anonymize_text", "prompt", plain, res, out) && out == plain);
+    }
+
     psd_buffer fp = { nullptr, 0 };
     CHECK(psd_key_fingerprint(e, &fp) == 1 && fp.size > 0);
     psd_free(&fp);

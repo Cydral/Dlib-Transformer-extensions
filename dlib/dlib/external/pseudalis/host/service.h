@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../common/engine_loader.h"
+#include "../common/imposed_terms.h"
 #include "../common/json.h"
 #include "albireo_client.h"
 #include "settings.h"
@@ -136,6 +137,7 @@ namespace pseudalis
         // The language of the descriptions and of the messages: the setting, else the one of the system.
         std::string language() const;
 
+        // Protects a file; with record, keeps its original (out.record), unless it is larger than history_mb.
         bool protect(const std::string& bytes, const std::string& name, const std::string& source, bool record,
             protect_result& out, user_error& error);
         /*!
@@ -151,9 +153,9 @@ namespace pseudalis
             A file of the drive whose content is an entry of a protected archive that the
             database records, extracted from it, is recorded with the original of that entry,
             which the vault keeps apart from the original of the archive: each one is restored
-            and forgotten alone.  Returns 1 with its new record, 0 when the content is no such
-            entry or its original cannot be read, -1 when the engine or the vault cannot do it
-            now.
+            and forgotten alone.  Returns 1 with its new record (0 for an entry larger than
+            history_mb, kept as it is without record), 0 when the content is no such entry or its
+            original cannot be read, -1 when the engine or the vault cannot do it now.
         !*/
         int adopt(const std::string& sha256, const std::string& name, long long size, long long& record);
         // A name alone, a folder of the drive for instance: its values become substitutes, recorded.
@@ -164,16 +166,40 @@ namespace pseudalis
         bool text(const std::string& operation, const std::string& text, json& out, user_error& error);
         /*!
             Deletes a record, its original and the pictures no other record shows.  With a
-            reason, "forgotten" when a user asked for it or "expired" when its time is over, the
-            protected file of the record is remembered, and its restoration refused from then on.
+            reason, "forgotten" when a user asked for it, "expired" when its time is over or
+            "space" when the oldest originals make room (make_room()), the protected file of
+            the record is remembered, and its restoration refused from then on.
         !*/
         bool forget(long long record, const std::string& reason = std::string());
         // Marks a record whose file left the drive, deleted or replaced.  A move out of the drive
         // is a copy followed by a deletion: the original stays restorable from the copies of the
-        // file for removed_days days (settings), then purge_removed() forgets it.
+        // file for removed_days days (settings, 0 for always), then purge_removed() forgets it.
         void mark_removed(long long record);
-        // Forgets the records whose file left the drive more than removed_days days ago.
+        // Forgets the records whose file left the drive more than removed_days days ago, none for 0.
         void purge_removed();
+        /*!
+            Makes room for an original of needed bytes: the originals first kept are forgotten,
+            the oldest first, while those kept with it would take more than history_mb
+            (settings), and, for a new original, while the disk of the data folder would keep
+            less than 256 MB free once it is written.  Forgetting starts only when it reaches its
+            end: the originals stay when other files fill the disk, or when its free space cannot
+            be known.  Returns false, forgetting none, for an original larger than history_mb,
+            which is not kept.
+        !*/
+        bool make_room(unsigned long long needed);
+        // Runs purge_removed() and make_room(0) in the background, at once: the settings changed.
+        void request_cleanup();
+        // The space the originals kept take, in bytes, and the one they may take.
+        void history_space(unsigned long long& used, unsigned long long& limit);
+
+        /*!
+            The imposed terms (common/imposed_terms.h), kept in the database and given to the
+            engine: set_terms() takes a list [{"term", "type", "case_sensitive"}] whole, or
+            refuses it with its reason (codes terms_invalid, terms_too_many, terms_type,
+            terms_duplicate, with the position of the term at fault in "index").
+        !*/
+        json terms();
+        bool set_terms(const json& list, user_error& error);
 
         bool export_key(const std::string& passphrase, std::string& exported, user_error& error);
         // Allowed while the database records no file: the key of an earlier installation.
@@ -210,6 +236,11 @@ namespace pseudalis
         std::thread background_;
         std::mutex wake_m_;
         std::condition_variable wake_;
+        std::atomic<bool> cleanup_{false};
+        // make_room() runs for one caller at a time.
+        std::mutex room_m_;
+        std::mutex terms_m_;
+        std::vector<imposed_term> terms_;
         std::atomic<bool> stopping_{false};
         std::atomic<bool> restart_{false};
         std::atomic<bool> update_started_{false};
@@ -224,10 +255,13 @@ namespace pseudalis
         */
         std::shared_timed_mutex work_m_;
         std::atomic<bool> key_replaced_{false};
-        // The counts of status(), which every icon asks every few seconds, kept two seconds.
+        // The counts of status(), which every icon asks every few seconds, kept two seconds, or until
+        // a record is added or forgotten (counts_changed()).
+        void counts_changed();
         std::mutex counts_m_;
         std::chrono::steady_clock::time_point counts_at_;
         long long records_count_ = 0;
+        unsigned long long history_bytes_ = 0, history_limit_ = 0;
         json drive_status_ = json::object();
 
         friend class drive_host;

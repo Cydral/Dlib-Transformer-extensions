@@ -113,10 +113,18 @@ written is deleted.
   other program opens it (sharing violation), a few seconds for most documents. The lock and temporary
   files of the editors, whose names start with `~` or end with `.tmp`, are left as they are.
 - Deleting a file, a folder or the whole tree removes them from the drive. The original of a file
-  deleted or replaced by a new version stays restorable from the copies of the file for 30 days (the
-  setting `removed_days`) once the last copy of the drive left it, then leaves the vault with the
-  pictures no other file shows. A file moved, renamed or copied within the drive keeps its original,
-  which all its copies share.
+  deleted or replaced by a new version stays restorable from the copies of the file for 45 days (the
+  setting `removed_days`, 0 for no limit of time) once the last copy of the drive left it, then leaves
+  the vault with the pictures no other file shows. A file moved, renamed or copied within the drive keeps
+  its original, which all its copies share.
+- Whatever their time, the originals kept, those of the drive and of every other source, stay within
+  10 GB (the setting `history_mb`, 10240 MB, never below `max_file_mb`): the originals first kept are
+  forgotten to make room, the oldest first, before a new one is written, every hour and at once when the
+  settings lower the days or the space. A new original also leaves 256 MB free on the disk of the data
+  folder: the oldest make room for it when forgetting them gives that room, and stay when other files
+  fill the disk. An installation updated from version 1.0.1 keeps every original: its settings, without
+  `history_mb`, take the largest space (1048576 MB) and the 30 days of its default become 45, until an
+  administrator sets them; a damaged `settings.json` keeps them the same way.
 - A file extracted on the drive from an anonymized archive that the service recorded stays as it is, and
   the list of the originals kept shows it under its original name, its original being the entry of the
   original archive, which the vault keeps apart: the archive and each file extracted from it are
@@ -155,8 +163,9 @@ the first failure. The original of an anonymized file is found by the SHA-256 of
 NTFS object identifier of the file, which the command records with its place; a file edited since its
 anonymization gets its values back from its tags, and its name and its properties from the substitutes
 the database recorded. A file whose original was forgotten, from the web application or at the end of
-its time once its file left the drive, is no longer restored at all, from its tags either: Restore says
-so, with the date (HTTP 410, codes `original_forgotten` and `original_expired`). A file saved by another
+its time once its file left the drive, or to make room for newer originals, is no longer restored at
+all, from its tags either: Restore says so, with the date (HTTP 410, codes `original_forgotten`,
+`original_expired` and `original_space`). A file saved by another
 program while a command processes it stays as it is, and the command says so. A file of the drive is
 anonymized already: Restore asks where to save its original, outside the drive, which would anonymize it
 again, and the folder where the originals of a folder of the drive go. The same program runs from a
@@ -169,7 +178,8 @@ waits for them).
 The icon opens the web application of the service, `https://localhost:8444`: files dropped there are
 anonymized or restored and downloaded back, a folder dropped or chosen there as the ZIP archive of its
 tree, texts are anonymized, restored or analyzed, and, opened from the icon, it lists the originals kept
-(download, forget), exports and imports the key, and changes the settings. The interface it uses is
+(download, forget), exports and imports the key, and changes the settings and the imposed terms. The
+interface it uses is
 described with Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu of the
 icon), without account: the operations of administration take the token of the data folder in the header
 `X-Pseudalis-Admin`, which the pages opened by the icon receive in the fragment of their address and use
@@ -188,6 +198,7 @@ by themselves.
 | `GET /v1/albireo` | whether Albireo describes the pictures |
 | `GET /v1/records`, `GET /v1/records/{id}/original`, `DELETE /v1/records/{id}` | the originals kept (token) |
 | `GET /v1/settings`, `PUT /v1/settings`, `POST /v1/restart` | the settings and the restart (token) |
+| `GET /v1/terms`, `PUT /v1/terms` | the imposed terms (token) |
 | `GET /v1/updates`, `POST /v1/updates/check`, `POST /v1/updates/apply` | the updates |
 | `POST /v1/key/export`, `POST /v1/key/import` | the key, protected by a passphrase (token) |
 | `GET /v1/logs` | the last lines of the log (token) |
@@ -198,8 +209,25 @@ The icon in the notification area follows the service: its tooltip gives the ver
 the number of originals kept, and it notifies the files the drive anonymized or did not process, the
 results of the commands of the Explorer, the updates and a service that stops answering. It tells the
 Explorer of the drive that comes and goes. Its menu opens Pseudalis (the web application), the drive
-and the folder of the files not processed of its user, checks for updates and installs them, restarts
-the service, opens the documentation of the interface and the About window.
+and the folder of the files not processed of its user, checks for updates and installs them, manages the
+service, opens the documentation of the interface and the About window. Service management restarts
+the service, and stops it while it runs or starts it while it is stopped: a service stopped there stays
+stopped, without the warning of the icon, until the computer starts again, its start with the system
+unchanged, or until a user starts it.
+
+### Imposed terms
+
+The administrators give up to 100 terms that Pseudalis replaces in every file, text and name before
+anything else is read: the name of a client, of a project, of a contract or of an organisation that the
+detector does not know, each with the tag of its type (ORG, PERSON, LOCATION, ADDRESS, ID, EMAIL, PHONE
+or URL) and, when asked, its case. A term is found as whole words, its words and numbers in the same
+order, separated by at most two characters of one line ("Projet Alpha", "PROJET-ALPHA"); without case
+sensitivity, its case and its accents are ignored. Its occurrences outrank every other value found: a
+name or an organisation read over a term keeps its parts outside it, while a term inside an e-mail
+address, a web address, a date or a number stays protected with that value. The web application edits
+the list in its Imposed terms card, the interface through `GET` and `PUT /v1/terms`; the service keeps it
+in its database, which only SYSTEM and the administrators read, and the engine applies a new list at
+once, to the files processed afterwards.
 
 ### Pictures and Albireo
 
@@ -322,11 +350,13 @@ processed, `refused\`.
   reach any program that reads it; the originals come back through Restore, the web application or the
   interface, from any copy of the anonymized file, and no second drive restores them, since it would
   give them to any program as well. For the same reason, the original of a file that leaves the drive
-  stays in the vault for `removed_days` days, which the records of the web application show, then goes,
-  or at once when it is forgotten there: gone with its file, it would leave the copy restorable from its
-  tags alone, without its pictures and the parts the protection removed. Once an original is forgotten,
-  its protected file is refused by Restore: the database keeps its SHA-256 and its object identifier,
-  never its content.
+  stays in the vault for `removed_days` days, 45 by default, which the records of the web application
+  show, then goes, or at once when it is forgotten there; with 0 days it stays without limit of time.
+  Gone with its file, it would leave the copy restorable from its tags alone, without its pictures and
+  the parts the protection removed. The space of the originals is bounded all the same, `history_mb`
+  and the free space of the disk: when it is full, the oldest originals go first, whatever their time.
+  Once an original is forgotten, its protected file is refused by Restore: the database keeps its
+  SHA-256 and its object identifier, never its content.
 - The names and the properties take substitutes rather than tags, which a name cannot hold and a window
   of properties would show as they are; the database keeps their tags. A substitute is found again in a
   name or a property edited since as long as it keeps its form, a run of up to twelve words; one of four
@@ -370,7 +400,9 @@ account replaces it meanwhile.
 ### Windows
 
 With Visual Studio 2022 or its Build Tools (C++ workload, CMake 3.21 or later), from the root of the
-repository:
+copy of the repository of the production chain, `%USERPROFILE%\work\Dlib-Transformer-extensions`, the
+only one the script builds and the publication reads (`-AnyFolder` builds another copy, which is not
+published):
 
 ```
 powershell -ExecutionPolicy Bypass -File dlib\dlib\external\pseudalis\tools\build_windows.ps1
@@ -433,11 +465,12 @@ first failure:
    sources are committed and pushed. `PSEUDALIS_VERSION` of [`common/version.h`](common/version.h)
    increases for each version that the installed copies are to receive: a feed that announces the
    version a copy holds installs nothing.
-2. Windows: the installer is built from the sources pushed, tested and installed in place
+2. Windows, in the copy of the production chain, `%USERPROFILE%\work\Dlib-Transformer-extensions`:
+   the installer is built from the sources pushed, tested and installed in place
    (`tools/build_windows.ps1 -Tests -Install`), which prints its size, its SHA-256 and its path under WSL.
-3. Linux, where the private key lies: the installer, which Linux reads under `/mnt/c`, goes into
-   `dist/pseudalis` with the feed written and signed for it, then both are committed and pushed, and the
-   publication ends once GitHub serves them.
+3. Linux, where the private key lies: the installer of that copy, which Linux reads under
+   `/mnt/c/Users/<user>/work`, goes into `dist/pseudalis` with the feed written and signed for it, then
+   both are committed and pushed, and the publication ends once GitHub serves them.
 
 ```
 bash dlib/dlib/external/pseudalis/tools/test_linux.sh &&
@@ -446,13 +479,17 @@ git add dlib/dlib/external/pseudalis && git commit -m "<message>" -- dlib/dlib/e
 ```
 
 ```
-git pull --ff-only; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\dlib\dlib\external\pseudalis\tools\build_windows.ps1 -Tests -Install }
+Set-Location $env:USERPROFILE\work\Dlib-Transformer-extensions; git pull --ff-only; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\dlib\dlib\external\pseudalis\tools\build_windows.ps1 -Tests -Install }
 ```
 
 ```
 git pull --ff-only &&
-python3 dlib/dlib/external/pseudalis/tools/publish_release.py /mnt/c/<repository on Windows>/build-pseudalis/bin/pseudalis-setup.exe --key ~/keys/pseudalis-feed-signing.key --notes notes.json --push
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py --key ~/keys/pseudalis-feed-signing.key --notes notes.json --push
 ```
+
+Without an installer named, `publish_release.py` takes the one of the copy of the production chain,
+`build-pseudalis\bin\pseudalis-setup.exe` under `%USERPROFILE%\work\Dlib-Transformer-extensions`, and it
+refuses an installer of another folder unless `--any-folder` is given.
 
 `publish_release.py` checks that the installer carries the version of
 [`common/version.h`](common/version.h), that the feed announces no later one, that the installer stays

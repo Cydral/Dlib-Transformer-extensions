@@ -48,7 +48,9 @@
     other countries in their own layout and lexicons (given names of every region of the
     world, nicknames and stage names, organisations of all countries known by their own
     name), and the civility, sex and nationality of a person from their labels and cues.
-    Regular expressions given with --patterns add what is specific to an organisation.
+    Regular expressions given with --patterns add what is specific to an organisation, and
+    the terms given with --terms, the name of a project or of a contract for instance, are
+    replaced with their type before any other reading of the text.
     And two learned recognizers, trained here on synthetic data, find the names, places,
     addresses and organisations that the rules miss:
 
@@ -1030,23 +1032,42 @@ namespace
         if (parser.option("names"))
             for (const string& name : read_list(parser.option("names").argument()))
                 detector.add_person_name(name);
-        if (parser.option("terms"))
-        {
-            const string filename = parser.option("terms").argument();
-            for (const string& line : read_list(filename))
-            {
-                const size_t tab = line.find('\t');
-                const pii_type t = tab == string::npos ? pii_type::none : pii_type_from_keyword(line.substr(0, tab));
-                if (t == pii_type::none)
-                    throw error(filename + ": expected \"TYPE<tab>term\": " + line);
-                detector.add_term(t, line.substr(tab + 1));
-            }
-        }
         if (parser.option("keep"))
             for (const string& term : read_list(parser.option("keep").argument()))
                 detector.add_allowed_term(term);
         if (parser.option("patterns"))
             read_patterns(parser.option("patterns").argument(), detector);
+    }
+
+    /*
+        The terms always replaced, before any other reading of the text: one "TYPE<tab>term"
+        per line, which matches whatever the case and the accents, or "TYPE<tab>term<tab>case",
+        which matches them.
+    */
+    std::vector<pii_imposed_term> read_imposed_terms(const string& filename)
+    {
+        std::vector<pii_imposed_term> terms;
+        for (const string& line : read_list(filename))
+        {
+            const size_t tab = line.find('\t');
+            pii_imposed_term term;
+            term.type = tab == string::npos ? pii_type::none : pii_type_from_keyword(line.substr(0, tab));
+            string rest = tab == string::npos ? string() : line.substr(tab + 1);
+            const size_t second = rest.find('\t');
+            if (second != string::npos)
+            {
+                const string flag = rest.substr(second + 1);
+                if (flag != "case")
+                    throw error(filename + ": expected \"TYPE<tab>term\" or \"TYPE<tab>term<tab>case\": " + line);
+                term.case_sensitive = true;
+                rest = rest.substr(0, second);
+            }
+            term.text = rest;
+            if (term.type == pii_type::none || term.text.empty())
+                throw error(filename + ": expected \"TYPE<tab>term\" or \"TYPE<tab>term<tab>case\": " + line);
+            terms.push_back(term);
+        }
+        return terms;
     }
 
     /* Reads a comma separated list of type keywords; spaces around them are ignored. */
@@ -1199,7 +1220,8 @@ int main(int argc, char** argv)
                           "Leave administrations, courts and public agencies readable; they are replaced as ORG "
                           "by default.");
         parser.add_option("names", "File of person names always replaced, one per line.", 1);
-        parser.add_option("terms", "File of terms always replaced, one \"TYPE<tab>term\" per line.", 1);
+        parser.add_option("terms", "File of terms always replaced before any other reading, one \"TYPE<tab>term\" "
+                          "per line, \"TYPE<tab>term<tab>case\" to match their case and accents.", 1);
         parser.add_option(
             "keep", "File of terms never replaced (the organisation's own name, public figures), one per line.", 1);
         parser.add_option("patterns", "File of regular expressions, one \"TYPE<tab>regex[<tab>options]\" per line; "
@@ -1354,6 +1376,7 @@ int main(int argc, char** argv)
             if (parser.option("except"))
                 for (pii_type t : read_types(parser.option("except").argument(), "except"))
                     dopt.types.erase(std::remove(dopt.types.begin(), dopt.types.end(), t), dopt.types.end());
+            if (parser.option("terms")) dopt.imposed_terms = read_imposed_terms(parser.option("terms").argument());
         }
         catch (error& e)
         {

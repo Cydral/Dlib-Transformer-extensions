@@ -43,51 +43,144 @@ BEGIN
 END
 
 /*
-    The texts of the commands of the Explorer, which the Explorer loads in the language of
-    each user (the indirect strings of MUIVerb), and in English, the neutral language, for a
-    language that Pseudalis does not speak.  0x0c French, 0x07 German, 0x10 Italian, 0x0a
-    Spanish, each with its neutral sublanguage (0).
+    The texts of the commands of the Explorer, which the Explorer loads in the language of each
+    user (the indirect strings of MUIVerb).  No table is neutral: the resource loader would take
+    a neutral table before the one of the language of the user.  Each language is given under
+    its neutral sublanguage and under those of its countries, English, first, under its own:
+    the loader falls back on it for a language that Pseudalis does not speak.  shell_verbs.rc2
+    writes the table of the texts VERB_*.
 */
-STRINGTABLE
-BEGIN
-    IDS_VERB_PROTECT "Anonymize"
-    IDS_VERB_PROTECT_COPY "Anonymize as a copy"
-    IDS_VERB_RESTORE "Restore the original"
-    IDS_VERB_RESTORE_COPY "Restore as a copy"
-END
 
-LANGUAGE 0x0c, 0
-STRINGTABLE
-BEGIN
-    IDS_VERB_PROTECT "Anonymiser"
-    IDS_VERB_PROTECT_COPY "Anonymiser dans une copie"
-    IDS_VERB_RESTORE "Restaurer l'original"
-    IDS_VERB_RESTORE_COPY "Restaurer dans une copie"
-END
+// English.
+#define VERB_PROTECT "Anonymize"
+#define VERB_PROTECT_COPY "Anonymize as a copy"
+#define VERB_RESTORE "Restore the original"
+#define VERB_RESTORE_COPY "Restore as a copy"
+LANGUAGE 0x09, 0x01
+#include "shell_verbs.rc2"
+LANGUAGE 0x09, 0x02
+#include "shell_verbs.rc2"
+LANGUAGE 0x09, 0x00
+#include "shell_verbs.rc2"
+#undef VERB_PROTECT
+#undef VERB_PROTECT_COPY
+#undef VERB_RESTORE
+#undef VERB_RESTORE_COPY
 
-LANGUAGE 0x07, 0
-STRINGTABLE
-BEGIN
-    IDS_VERB_PROTECT "Anonymisieren"
-    IDS_VERB_PROTECT_COPY "Als Kopie anonymisieren"
-    IDS_VERB_RESTORE "Original wiederherstellen"
-    IDS_VERB_RESTORE_COPY "Als Kopie wiederherstellen"
-END
+// French.
+#define VERB_PROTECT "Anonymiser"
+#define VERB_PROTECT_COPY "Anonymiser dans une copie"
+#define VERB_RESTORE "Restaurer l'original"
+#define VERB_RESTORE_COPY "Restaurer dans une copie"
+LANGUAGE 0x0c, 0x00
+#include "shell_verbs.rc2"
+LANGUAGE 0x0c, 0x01
+#include "shell_verbs.rc2"
+LANGUAGE 0x0c, 0x02
+#include "shell_verbs.rc2"
+LANGUAGE 0x0c, 0x03
+#include "shell_verbs.rc2"
+LANGUAGE 0x0c, 0x04
+#include "shell_verbs.rc2"
+LANGUAGE 0x0c, 0x05
+#include "shell_verbs.rc2"
+LANGUAGE 0x0c, 0x06
+#include "shell_verbs.rc2"
+#undef VERB_PROTECT
+#undef VERB_PROTECT_COPY
+#undef VERB_RESTORE
+#undef VERB_RESTORE_COPY
 
-LANGUAGE 0x10, 0
-STRINGTABLE
-BEGIN
-    IDS_VERB_PROTECT "Anonimizza"
-    IDS_VERB_PROTECT_COPY "Anonimizza in una copia"
-    IDS_VERB_RESTORE "Ripristina l'originale"
-    IDS_VERB_RESTORE_COPY "Ripristina in una copia"
-END
+// German.
+#define VERB_PROTECT "Anonymisieren"
+#define VERB_PROTECT_COPY "Als Kopie anonymisieren"
+#define VERB_RESTORE "Original wiederherstellen"
+#define VERB_RESTORE_COPY "Als Kopie wiederherstellen"
+LANGUAGE 0x07, 0x00
+#include "shell_verbs.rc2"
+LANGUAGE 0x07, 0x01
+#include "shell_verbs.rc2"
+LANGUAGE 0x07, 0x02
+#include "shell_verbs.rc2"
+LANGUAGE 0x07, 0x03
+#include "shell_verbs.rc2"
+LANGUAGE 0x07, 0x04
+#include "shell_verbs.rc2"
+LANGUAGE 0x07, 0x05
+#include "shell_verbs.rc2"
+#undef VERB_PROTECT
+#undef VERB_PROTECT_COPY
+#undef VERB_RESTORE
+#undef VERB_RESTORE_COPY
 
-LANGUAGE 0x0a, 0
-STRINGTABLE
-BEGIN
-    IDS_VERB_PROTECT "Anonimizar"
-    IDS_VERB_PROTECT_COPY "Anonimizar en una copia"
-    IDS_VERB_RESTORE "Restaurar el original"
-    IDS_VERB_RESTORE_COPY "Restaurar en una copia"
-END
+// Italian.
+#define VERB_PROTECT "Anonimizza"
+#define VERB_PROTECT_COPY "Anonimizza in una copia"
+#define VERB_RESTORE "Ripristina l'originale"
+#define VERB_RESTORE_COPY "Ripristina in una copia"
+LANGUAGE 0x10, 0x00
+#include "shell_verbs.rc2"
+LANGUAGE 0x10, 0x01
+#include "shell_verbs.rc2"
+LANGUAGE 0x10, 0x02
+#include "shell_verbs.rc2"
+#undef VERB_PROTECT
+#undef VERB_PROTECT_COPY
+#undef VERB_RESTORE
+#undef VERB_RESTORE_COPY
+
+// Spanish.
+#define VERB_PROTECT "Anonimizar"
+#define VERB_PROTECT_COPY "Anonimizar en una copia"
+#define VERB_RESTORE "Restaurar el original"
+#define VERB_RESTORE_COPY "Restaurar en una copia"
+LANGUAGE 0x0a, 0x00
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x01
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x02
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x03
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x04
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x05
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x06
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x07
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x08
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x09
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x0a
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x0b
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x0c
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x0d
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x0e
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x0f
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x10
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x11
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x12
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x13
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x14
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x15
+#include "shell_verbs.rc2"
+LANGUAGE 0x0a, 0x16
+#include "shell_verbs.rc2"
+#undef VERB_PROTECT
+#undef VERB_PROTECT_COPY
+#undef VERB_RESTORE
+#undef VERB_RESTORE_COPY

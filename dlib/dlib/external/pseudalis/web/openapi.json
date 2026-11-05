@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -69,7 +69,7 @@
      "Service"
     ],
     "summary": "The state of the service",
-    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drive, Albireo and the number of originals kept.",
+    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drive, Albireo, the number of originals kept (records) and the space they take: {\"bytes\", \"limit\"} in history, limit being history_mb of the settings.",
     "responses": {
      "200": {
       "description": "The state",
@@ -90,7 +90,7 @@
      "Files"
     ],
     "summary": "Protect a file",
-    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have. A file of any other extension, or without extension, is protected as a text when its content is text through and through: no binary signature, the measures of a text, every character decoded with no control character but the tabulation, the ends of lines and the form feed, and no encoded part: a block of base64, base64url or hexadecimal digits (1024 characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or of a program too), data or JSON in base64, bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or marks among them), a message with parts in base64, quoted-printable or uuencode or with encoded words, an RTF document, a vCard or an iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a string too, uuencode or ASCII85, and, by its first line, a PostScript program or an export of the registry; without extension, a picture, an Office document, an archive or a PDF is also taken by its signature. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch), and so is a text of another extension that holds an encoded part (code encoded_content). Their content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed, its values replaced by tags as those of the text of its document; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have. A file of any other extension, or without extension, is protected as a text when its content is text through and through: no binary signature, the measures of a text, every character decoded with no control character but the tabulation, the ends of lines and the form feed, and no encoded part: a block of base64, base64url or hexadecimal digits (1024 characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or of a program too), data or JSON in base64, bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or marks among them), a message with parts in base64, quoted-printable or uuencode or with encoded words, an RTF document, a vCard or an iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a string too, uuencode or ASCII85, and, by its first line, a PostScript program or an export of the registry; without extension, a picture, an Office document, an archive or a PDF is also taken by its signature. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch), and so is a text of another extension that holds an encoded part (code encoded_content). Their content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed, its values replaced by tags as those of the text of its document; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file; the originals first kept are forgotten when the originals would take more than history_mb of the settings, or leave less than 256 MB free on the disk when forgetting them gives that room; a file larger than history_mb is protected without keeping its original (record 0). The imposed terms (/v1/terms) are replaced before any other value is read. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -184,6 +184,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "413": {
       "$ref": "#/components/responses/Error"
      },
@@ -202,7 +205,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten) or kept for its time after the file left the drive (code original_expired), its date in args.date: such a file is not restored from its tags either. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten), kept for its time after the file left the drive (code original_expired) or forgotten to make room for newer originals (code original_space), its date in args.date: such a file is not restored from its tags either. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -280,6 +283,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "404": {
       "$ref": "#/components/responses/Error"
      },
@@ -326,7 +332,7 @@
     ],
     "responses": {
      "200": {
-      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}; for a file not known whose original was forgotten, \"forgotten\": {\"time\", \"reason\"}, the reason \"forgotten\" or \"expired\"",
+      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}; for a file not known whose original was forgotten, \"forgotten\": {\"time\", \"reason\"}, the reason \"forgotten\" (a user asked for it), \"expired\" (its time after the file left the drive was over) or \"space\" (it made room for newer originals)",
       "content": {
        "application/json": {
         "schema": {
@@ -388,6 +394,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "401": {
       "$ref": "#/components/responses/Error"
      },
@@ -435,6 +444,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "413": {
       "$ref": "#/components/responses/Error"
      },
@@ -445,7 +457,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
+    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The imposed terms (/v1/terms) are replaced before any other value is read."
    }
   },
   "/v1/text/restore": {
@@ -483,6 +495,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "413": {
       "$ref": "#/components/responses/Error"
      },
@@ -493,7 +508,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
+    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
    }
   },
   "/v1/text/detect": {
@@ -534,6 +549,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "413": {
       "$ref": "#/components/responses/Error"
      },
@@ -544,7 +562,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
+    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The imposed terms (/v1/terms) come first, with a confidence of 1."
    }
   },
   "/v1/names/anonymize": {
@@ -796,7 +814,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "Each record gives its file (original_name, output_name, sizes, kind, output_sha256, object_id, path) and, when its file left the drive, the time it left (removed) and the time its original is forgotten (forgotten), removed_days later."
+    "description": "Each record gives its file (original_name, output_name, sizes, kind, output_sha256, object_id, path) and, when its file left the drive, the time it left (removed) and the time its original is forgotten (forgotten), removed_days later, empty when removed_days is 0 and the original stays without limit of time. total counts the records of the source asked, or all of them. The originals first kept are forgotten whatever their time when they take more than history_mb, or when a new original would leave less than 256 MB free on the disk and forgetting them gives that room."
    }
   },
   "/v1/records/{id}/original": {
@@ -936,7 +954,7 @@
      "Administration"
     ],
     "summary": "Change settings",
-    "description": "The members given replace those of settings.json; the service restarts when the port, the letter of the drive, the date order, the proxy or the address of the feed change (\"restart\": true). The feed must be an https address, the proxy empty, \"none\" or http://host:port (400, code settings_publication otherwise). The changes apply in one step against concurrent ones.",
+    "description": "The members given replace those of settings.json, the others keep their values; the service restarts when the port, the letter of the drive, the date order, the proxy or the address of the feed change (\"restart\": true). The feed must be an https address, the proxy empty, \"none\" or http://host:port (400, code settings_publication otherwise), the letter A, B or D to Z (code settings_drive); a number out of its range, a choice out of its list or a flag that is not true or false is refused (400, code settings_value, with field, and min and max for a number), and so is a history_mb smaller than max_file_mb (field history_mb, min being max_file_mb). Fewer days or less space forget at once, in the background, the originals beyond them. The changes apply in one step against concurrent ones; 500 (code settings) when settings.json cannot be written.",
     "security": [
      {
       "admin": []
@@ -967,6 +985,102 @@
       "$ref": "#/components/responses/Error"
      },
      "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/terms": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "The imposed terms",
+    "description": "Each occurrence of an imposed term is replaced with the tag of its type before any other value is read, in the files, the texts and the names: its words and numbers in the same order, as whole words, separated by at most two characters of one line (\"Projet Alpha\", \"PROJET-ALPHA\"). An occurrence inside an e-mail address, a web address, a date or a number stays protected with that value; any other value that overlaps it keeps its parts outside it. The terms are kept in the database of the service, which only SYSTEM and the administrators read.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The terms, with the limits and the types the service takes",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Terms"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Replace the imposed terms",
+    "description": "The list given replaces the imposed terms, whole, at once for the files and texts processed afterwards; an empty list removes them. A list the service does not take changes nothing (400): terms_invalid (a term empty, longer than 200 characters, on several lines, with a control character or without a letter or a digit), terms_too_many (more than 100), terms_type (a type out of the list) or terms_duplicate (a term given twice with the same case sensitivity), the position of the term at fault in args.index; 500 (codes engine, database) when the engine or the database cannot take them.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "terms"
+        ],
+        "properties": {
+         "terms": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+           "$ref": "#/components/schemas/ImposedTerm"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"terms\"}: the terms kept, trimmed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "terms": {
+           "type": "array",
+           "maxItems": 100,
+           "items": {
+            "$ref": "#/components/schemas/ImposedTerm"
+           }
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
       "$ref": "#/components/responses/Error"
      }
     }
@@ -1121,6 +1235,9 @@
        }
       }
      },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
      "401": {
       "$ref": "#/components/responses/Error"
      },
@@ -1174,6 +1291,9 @@
         }
        }
       }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
      },
      "401": {
       "$ref": "#/components/responses/Error"
@@ -1283,6 +1403,8 @@
     "properties": {
      "port": {
       "type": "integer",
+      "minimum": 1024,
+      "maximum": 65535,
       "default": 8444
      },
      "language": {
@@ -1317,11 +1439,24 @@
      },
      "max_file_mb": {
       "type": "integer",
-      "description": "The largest file processed, in MB, 1 to 2048: 150 by default"
+      "minimum": 1,
+      "maximum": 2048,
+      "default": 150,
+      "description": "The largest file processed, in MB"
      },
      "removed_days": {
       "type": "integer",
-      "description": "The days the original of a file removed from the drive stays kept, 1 to 3650"
+      "minimum": 0,
+      "maximum": 3650,
+      "default": 45,
+      "description": "The days the original of a file removed from the drive stays kept; 0 keeps it without limit of time, within history_mb"
+     },
+     "history_mb": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1048576,
+      "default": 10240,
+      "description": "The space the originals kept may take, in MB, max_file_mb at least: beyond it, the originals first kept are forgotten, the oldest first (reason space), and so they are when a new original would leave less than 256 MB free on the disk of the data folder and forgetting them would give that room; an original larger than the space is not kept. A settings.json of a version before 1.0.2, without this member, takes the maximum, and its 30 days of removed_days become 45"
      },
      "check_updates": {
       "type": "boolean"
@@ -1334,6 +1469,68 @@
      },
      "proxy": {
       "type": "string"
+     }
+    }
+   },
+   "ImposedTerm": {
+    "type": "object",
+    "required": [
+     "term"
+    ],
+    "properties": {
+     "term": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "example": "Projet Alpha",
+      "description": "The term, trimmed of its spaces: one line of 1 to 200 characters with a letter or a digit"
+     },
+     "type": {
+      "type": "string",
+      "enum": [
+       "ORG",
+       "PERSON",
+       "LOCATION",
+       "ADDRESS",
+       "ID",
+       "EMAIL",
+       "PHONE",
+       "URL"
+      ],
+      "default": "ORG",
+      "description": "The type of the tag of each occurrence"
+     },
+     "case_sensitive": {
+      "type": "boolean",
+      "default": false,
+      "description": "true: the case and the accents of each word must match; false: both are ignored"
+     }
+    }
+   },
+   "Terms": {
+    "type": "object",
+    "properties": {
+     "terms": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+       "$ref": "#/components/schemas/ImposedTerm"
+      }
+     },
+     "max": {
+      "type": "integer",
+      "description": "The most terms that may be imposed: 100"
+     },
+     "max_length": {
+      "type": "integer",
+      "description": "The longest term, in characters: 200"
+     },
+     "types": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "The types a term may take"
      }
     }
    }

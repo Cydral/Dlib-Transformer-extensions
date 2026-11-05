@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -885,6 +886,18 @@ namespace pseudalis
         model_set m;
         // The key of the identifiers of the pictures, derived from the key of the engine.
         std::string picture_key;
+        // The imposed terms, which set_terms() replaces while files are processed.
+        mutable std::mutex terms_m;
+        std::vector<pii_imposed_term> terms;
+
+        // The options of a detector: those of the engine, with the imposed terms of the moment.
+        pii_detector_options options() const
+        {
+            pii_detector_options o = dopt;
+            std::lock_guard<std::mutex> lock(terms_m);
+            o.imposed_terms = terms;
+            return o;
+        }
 
         ~impl()
         {
@@ -931,7 +944,7 @@ namespace pseudalis
             }
             while (!line.empty() && line.back() == ' ') line.pop_back();
             if (line.empty()) return line;
-            pii_detector d(dopt);
+            pii_detector d(options());
             attach(d);
             d.begin_document();
             d.learn(line);
@@ -1049,7 +1062,7 @@ namespace pseudalis
         std::string protect_alone(const std::string& base, const substitute_lookup& lookup,
                                   std::vector<substitution>& made, document_report& r) const
         {
-            pii_detector d(dopt);
+            pii_detector d(options());
             attach(d);
             document_anonymizer a(*p, d);
             a.set_substitute_resolver(resolver_of(lookup));
@@ -1058,7 +1071,7 @@ namespace pseudalis
 
         std::string restore_alone(const std::string& base, const substitute_lookup& lookup, document_report& r) const
         {
-            pii_detector d(dopt);
+            pii_detector d(options());
             document_anonymizer a(*p, d);
             a.set_substitute_resolver(resolver_of(lookup));
             return restore_base(a, r, base);
@@ -1082,7 +1095,7 @@ namespace pseudalis
                                const picture_handler& handler, bool restoring, const substitute_lookup& lookup,
                                uint64_t& budget) const
         {
-            pii_detector first(dopt);
+            pii_detector first(options());
             if (!handler || restoring) return read_document(bytes, name, f, handler, restoring, lookup, budget, first);
             std::map<std::string, std::string> given;
             const picture_handler once = [&](const picture_found& found) {
@@ -1107,7 +1120,7 @@ namespace pseudalis
             }
             if (!again) return out;
             out = engine_result();
-            pii_detector second(dopt);
+            pii_detector second(options());
             return read_document(bytes, name, f, once, false, lookup, budget, second, &first);
         }
 
@@ -1235,14 +1248,14 @@ namespace pseudalis
                         std::string changed;
                         if (restoring)
                         {
-                            pii_detector d(dopt);
+                            pii_detector d(options());
                             document_anonymizer a(*p, d);
                             a.set_substitute_resolver(resolver_of(lookup));
                             changed = a.restore_name(part, r);
                         }
                         else
                         {
-                            pii_detector d(dopt);
+                            pii_detector d(options());
                             attach(d);
                             document_anonymizer a(*p, d);
                             a.set_substitute_resolver(resolver_of(lookup));
@@ -1511,7 +1524,7 @@ namespace pseudalis
 
     std::string engine::anonymize_text(const std::string& text, json& report) const
     {
-        pii_detector d(p_->dopt);
+        pii_detector d(p_->options());
         p_->attach(d);
         document_anonymizer a(*p_->p, d);
         document_report r;
@@ -1522,7 +1535,7 @@ namespace pseudalis
 
     std::string engine::restore_text(const std::string& text, json& report) const
     {
-        pii_detector d(p_->dopt);
+        pii_detector d(p_->options());
         document_anonymizer a(*p_->p, d);
         document_report r;
         const std::string out = a.restore(text, document_format::text, r);
@@ -1530,9 +1543,30 @@ namespace pseudalis
         return out;
     }
 
+    void engine::set_terms(const std::vector<imposed_term>& terms)
+    {
+        std::vector<pii_imposed_term> converted;
+        for (const imposed_term& t : terms)
+        {
+            pii_imposed_term c;
+            c.text = t.term;
+            c.type = pii_type_from_keyword(t.type);
+            c.case_sensitive = t.case_sensitive;
+            if (c.type != pii_type::none && !c.text.empty()) converted.push_back(c);
+        }
+        std::lock_guard<std::mutex> lock(p_->terms_m);
+        p_->terms.swap(converted);
+    }
+
+    std::size_t engine::term_count() const
+    {
+        std::lock_guard<std::mutex> lock(p_->terms_m);
+        return p_->terms.size();
+    }
+
     json engine::detect(const std::string& text) const
     {
-        pii_detector d(p_->dopt);
+        pii_detector d(p_->options());
         p_->attach(d);
         d.begin_document();
         d.learn(text);

@@ -73,7 +73,7 @@
 #define PSD_CALL
 #endif
 
-#define PSEUDALIS_ENGINE_API_VERSION 3
+#define PSEUDALIS_ENGINE_API_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -122,6 +122,13 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
     psd_buffer* error);
 // The fingerprint of the key, as the reports give it.
 PSD_API int PSD_CALL psd_key_fingerprint(psd_engine* engine, psd_buffer* fingerprint);
+/*
+    Replaces the imposed terms of the engine (common/imposed_terms.h): terms is a JSON list
+    [{"term", "type", "case_sensitive"}] of size bytes, which the calls that start afterwards
+    read before anything else of their texts.  0, with the reason in error, for a list the
+    service does not take, the terms of the engine then unchanged.
+*/
+PSD_API int PSD_CALL psd_set_terms(psd_engine* engine, const char* terms, size_t size, psd_buffer* error);
 
 PSD_API char* PSD_CALL psd_alloc(size_t size);
 PSD_API void PSD_CALL psd_free(psd_buffer* buffer);

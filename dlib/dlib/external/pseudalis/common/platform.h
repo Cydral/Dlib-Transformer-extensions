@@ -228,8 +228,10 @@ namespace pseudalis
     */
     bool write_file_restricted(const std::string& p, const std::string& data, bool interactive_readers = false);
 
-    // Bytes available to the user on the volume of a path.
+    // Bytes available to the user on the volume of a path, 0 when they cannot be known.
     uint64_t free_disk_space(const std::string& p);
+    // The same, false when they cannot be known: a full disk gives true and 0.
+    bool free_disk_space(const std::string& p, uint64_t& available);
 
     // Seconds since 1970, and the ISO 8601 form of a time in UTC.
     int64_t now_unix();

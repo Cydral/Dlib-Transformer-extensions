@@ -171,6 +171,7 @@ namespace pseudalis
         destroy = psd_destroy;
         process = psd_process;
         key_fingerprint = psd_key_fingerprint;
+        set_terms = psd_set_terms;
         alloc = psd_alloc;
         free_buffer = psd_free;
         path_ = "(built in)";
@@ -223,11 +224,12 @@ namespace pseudalis
         PSD_RESOLVE(destroy, "psd_destroy");
         PSD_RESOLVE(process, "psd_process");
         PSD_RESOLVE(key_fingerprint, "psd_key_fingerprint");
+        PSD_RESOLVE(set_terms, "psd_set_terms");
         PSD_RESOLVE(alloc, "psd_alloc");
         PSD_RESOLVE(free_buffer, "psd_free");
 #undef PSD_RESOLVE
         if (!api_version || !variant || !build || !models || !create || !destroy || !process || !key_fingerprint ||
-            !alloc || !free_buffer || api_version() != PSEUDALIS_ENGINE_API_VERSION)
+            !set_terms || !alloc || !free_buffer || api_version() != PSEUDALIS_ENGINE_API_VERSION)
         {
             error = path_ + " is not an engine of this version of Pseudalis";
             create = nullptr;
@@ -304,6 +306,21 @@ namespace pseudalis
         if (lib_->key_fingerprint(e_, &b) == 1 && b.data) out.assign(b.data, b.size);
         lib_->free_buffer(&b);
         return out;
+    }
+
+    bool engine_client::set_terms(const json& terms, std::string& error) const
+    {
+        if (!e_ || !lib_->set_terms)
+        {
+            error = "no engine";
+            return false;
+        }
+        const std::string text = terms.dump();
+        psd_buffer err = { nullptr, 0 };
+        const int ok = lib_->set_terms(e_, text.data(), text.size(), &err);
+        if (ok != 1) error = err.data ? std::string(err.data, err.size) : std::string("the terms were refused");
+        lib_->free_buffer(&err);
+        return ok == 1;
     }
 
     std::string engine_client::variant() const

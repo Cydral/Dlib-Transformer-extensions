@@ -24,7 +24,8 @@ set_target_properties(pseudalis-shell PROPERTIES OUTPUT_NAME pseudalis)
 target_include_directories(pseudalis-shell PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(pseudalis-shell PRIVATE pseudalis_common dlib::httplib ${ui_libraries} crypt32)
 target_compile_options(pseudalis-shell PRIVATE ${PSEUDALIS_WARNINGS})
-set_source_files_properties(shell.rc PROPERTIES OBJECT_DEPENDS ${PSEUDALIS_SOURCE_DIR}/resources/pseudalis.ico)
+set_source_files_properties(shell.rc PROPERTIES OBJECT_DEPENDS
+   "${PSEUDALIS_SOURCE_DIR}/resources/pseudalis.ico;${CMAKE_CURRENT_SOURCE_DIR}/shell_verbs.rc2")
 
 # The libraries the programs and the engines import: those of Windows alone, the runtime of the
 # compiler linked statically, so that the installer carries no library of a third party

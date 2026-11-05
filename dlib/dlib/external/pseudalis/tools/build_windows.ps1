@@ -6,7 +6,7 @@
     of the Explorer and the installer, which carries them with the web application and the
     licenses.
 
-        powershell -ExecutionPolicy Bypass -File build_windows.ps1 [-Tests] [-Install] [-Jobs <n>]
+        powershell -ExecutionPolicy Bypass -File build_windows.ps1 [-Tests] [-Install] [-Jobs <n>] [-AnyFolder]
 
     Requirements: Visual Studio 2022, or the Build Tools for Visual Studio 2022, with the
     C++ workload, and CMake 3.21 or later (the C++ CMake tools of the workload, found
@@ -27,17 +27,28 @@
     run at once, for a machine with little memory.  The build tree is build-pseudalis at the
     root of the repository; the installer is build-pseudalis\bin\pseudalis-setup.exe, whose
     path under WSL the script prints for the publication (tools/publish_release.py).
+
+    The production chain works in one copy of the repository on Windows,
+    %USERPROFILE%\work\Dlib-Transformer-extensions, whose installer the publication reads: the
+    script stops when it runs from another copy, unless -AnyFolder is given for a build that is
+    not to be published.
 #>
 param(
     [switch]$Tests,
     [switch]$Install,
-    [int]$Jobs = 0
+    [int]$Jobs = 0,
+    [switch]$AnyFolder
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $source = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $root = (Resolve-Path (Join-Path $source "..\..\..\..")).Path
+$chain = Join-Path $env:USERPROFILE "work\Dlib-Transformer-extensions"
+if (-not $AnyFolder -and
+    [System.IO.Path]::GetFullPath($root).TrimEnd('\') -ne [System.IO.Path]::GetFullPath($chain).TrimEnd('\')) {
+    throw "the production chain builds in $chain, not in $root`: run the script of that copy, or give -AnyFolder"
+}
 $tree = Join-Path $root "build-pseudalis"
 $testing = if ($Tests) { "ON" } else { "OFF" }
 $parallel = if ($Jobs -gt 0) { @("--parallel", "$Jobs") } else { @("--parallel") }

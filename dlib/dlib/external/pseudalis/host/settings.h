@@ -30,8 +30,15 @@ namespace pseudalis
         std::string date_order = "dmy";         // dmy or mdy: the numeric dates the detector reads
         std::string albireo = "auto";           // auto: the pictures are described when Albireo answers; off
         int max_file_mb = 150;                  // the largest file processed, in MB
-        int removed_days = 30;                  // the days an original stays kept once its file left the drive
+        /*
+            The days an original stays kept once its file left the drive, 0 for always; whatever
+            the days, the originals kept never take more than history_mb, nor leave the disk of
+            the data folder with less than 256 MB free: the oldest go first (service::make_room()).
+        */
+        int removed_days = 45;
         static const int max_removed_days = 3650;
+        int history_mb = 10240;                 // the space the originals kept may take, in MB, max_file_mb at least
+        static const int max_history_mb = 1048576;
         bool check_updates = true;              // a check every day
         bool trust_authority = true;            // the local authority in the trusted roots (the installer)
         std::string feed_url = default_feed_url;
@@ -52,8 +59,8 @@ namespace pseudalis
                 the lock that get() takes.  A file that is no longer valid JSON is replaced by
                 the defaults, kept aside as settings.json.invalid; a file that cannot be read
                 stays as it is.  In both cases the originals of the files removed from the
-                drive are kept the longest time (max_removed_days) until the settings are set
-                again.
+                drive are kept without limit of time (removed_days 0) until the settings are
+                set again, within the space of history_mb.
         !*/
     public:
         explicit settings_store(const std::string& path);

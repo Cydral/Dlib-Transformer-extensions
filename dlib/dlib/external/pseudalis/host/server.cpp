@@ -173,9 +173,10 @@ namespace pseudalis
             j["output_sha256"] = r.output_sha256;
             j["object_id"] = r.object_id;
             j["path"] = r.path;
-            // When its file left the drive, and the day its original goes.
+            // When its file left the drive, and the day its original goes: none when the originals stay (0).
             j["removed"] = r.removed ? iso_time(r.removed) : std::string();
-            j["forgotten"] = r.removed ? iso_time(r.removed + static_cast<int64_t>(days) * 86400) : std::string();
+            j["forgotten"] = r.removed && days > 0 ? iso_time(r.removed + static_cast<int64_t>(days) * 86400)
+                                                   : std::string();
             return j;
         }
 
@@ -363,7 +364,8 @@ namespace pseudalis
             if (!s->restore(body, name, lower(req.get_param_value("object_id")), r, e))
             {
                 // A file whose original was forgotten is gone for good: 410, not 404.
-                const bool gone = e.code == "original_forgotten" || e.code == "original_expired";
+                const bool gone = e.code == "original_forgotten" || e.code == "original_expired" ||
+                                  e.code == "original_space";
                 send_error(res, e.code == "not_protected" ? 404 : gone ? 410 : 422, e);
                 return;
             }
@@ -505,7 +507,7 @@ namespace pseudalis
                 list.push_back(record_json(r, days));
             json j = json::object();
             j["records"] = list;
-            j["total"] = s->db().count_files();
+            j["total"] = s->db().count_files(req.get_param_value("source"));
             send_json(res, 200, j);
         });
         srv.Get(R"(/v1/records/(\d+)/original)", [s, admin](const httplib::Request& req, httplib::Response& res) {
@@ -538,8 +540,10 @@ namespace pseudalis
         });
         srv.Put("/v1/settings", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
-            json body;
-            if (!parse_body(req, res, body)) return;
+            json parsed;
+            if (!parse_body(req, res, parsed)) return;
+            // Read without adding a member: a setting the request leaves out keeps its value.
+            const json& body = parsed;
             const std::string letter = body["drive_letter"].str();
             if (body.contains("drive_letter") && !letter.empty() && !valid_drive_letter(letter))
             {
@@ -548,12 +552,79 @@ namespace pseudalis
             }
             // The place of the publication and the proxy, in the forms the service reads only.
             const std::string feed = body["feed_url"].str();
-            if ((body.contains("feed_url") && (feed.compare(0, 8, "https://") != 0 || feed.size() > 1024 ||
-                 feed.find_first_of(" \t\r\n\"<>") != std::string::npos)) ||
-                (body.contains("proxy") && !valid_proxy_setting(body["proxy"].str())))
+            if ((body.contains("feed_url") && (!body["feed_url"].is_string() || feed.compare(0, 8, "https://") != 0 ||
+                 feed.size() > 1024 || feed.find_first_of(" \t\r\n\"<>") != std::string::npos)) ||
+                (body.contains("proxy") && (!body["proxy"].is_string() || !valid_proxy_setting(body["proxy"].str()))))
             {
-                send_error(res, 400, "the feed or the proxy is not in a form the service reads", "settings_publication");
+                send_error(res, 400, "the feed or the proxy is not in a form the service reads",
+                           "settings_publication");
                 return;
+            }
+            // The other settings, each in its range: a value out of it is refused, not replaced.
+            struct range
+            {
+                const char* name;
+                long long low, high;
+            };
+            const range ranges[] = { { "port", 1024, 65535 }, { "max_file_mb", 1, 2048 },
+                                     { "removed_days", 0, host_settings::max_removed_days },
+                                     { "history_mb", 1, host_settings::max_history_mb } };
+            for (const range& r : ranges)
+            {
+                if (!body.contains(r.name)) continue;
+                const json& v = body[r.name];
+                const long long n = v.as_int(r.low - 1);
+                if (!v.is_number() || static_cast<double>(n) != v.as_double() || n < r.low || n > r.high)
+                {
+                    user_error e;
+                    e.set(std::string("the setting ") + r.name + " must be a whole number from " +
+                          std::to_string(r.low) + " to " + std::to_string(r.high), "settings_value")
+                        .arg("field", r.name).arg("min", std::to_string(r.low)).arg("max", std::to_string(r.high));
+                    send_error(res, 400, e);
+                    return;
+                }
+            }
+            const char* const choices[][2] = { { "language", " auto en fr de it es " }, { "date_order", " dmy mdy " },
+                                               { "albireo", " auto off " } };
+            for (const auto& c : choices)
+            {
+                if (!body.contains(c[0])) continue;
+                const std::string v = body[c[0]].str();
+                if (!body[c[0]].is_string() || v.empty() || std::string(c[1]).find(" " + v + " ") == std::string::npos)
+                {
+                    user_error e;
+                    e.set(std::string("the setting ") + c[0] + " has a value the service does not take",
+                          "settings_value").arg("field", c[0]);
+                    send_error(res, 400, e);
+                    return;
+                }
+            }
+            for (const char* flag : { "check_updates", "trust_authority" })
+                if (body.contains(flag) && !body[flag].is_bool())
+                {
+                    user_error e;
+                    e.set(std::string("the setting ") + flag + " must be true or false", "settings_value")
+                        .arg("field", flag);
+                    send_error(res, 400, e);
+                    return;
+                }
+            // The space of the originals holds the largest file.
+            {
+                const host_settings current = s->settings().get();
+                const long long space = body.contains("history_mb") ? body["history_mb"].as_int(0) : current.history_mb;
+                const long long largest =
+                    body.contains("max_file_mb") ? body["max_file_mb"].as_int(0) : current.max_file_mb;
+                if (space < largest)
+                {
+                    user_error e;
+                    e.set("the setting history_mb must be a whole number from " + std::to_string(largest) + " to " +
+                          std::to_string(host_settings::max_history_mb) + ", the largest file at least",
+                          "settings_value")
+                        .arg("field", "history_mb").arg("min", std::to_string(largest))
+                        .arg("max", std::to_string(host_settings::max_history_mb));
+                    send_error(res, 400, e);
+                    return;
+                }
             }
             host_settings before, after;
             if (!s->settings().update([&](host_settings& st) {
@@ -570,6 +641,9 @@ namespace pseudalis
                                  after.date_order != before.date_order || after.proxy != before.proxy ||
                                  after.feed_url != before.feed_url;
             s->albireo().set_enabled(after.albireo != "off");
+            // Fewer days or less space: the originals beyond them go now, in the background.
+            if (after.removed_days != before.removed_days || after.history_mb != before.history_mb)
+                s->request_cleanup();
             json j = after.to_json();
             j["restart"] = restart;
             send_json(res, 200, j);
@@ -579,6 +653,33 @@ namespace pseudalis
                 log_info("settings: changed, the service restarts");
                 s->request_restart();
             }
+        });
+        // The imposed terms, which the engine reads before anything else of a text.
+        srv.Get("/v1/terms", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
+            json j = json::object();
+            j["terms"] = s->terms();
+            j["max"] = static_cast<unsigned long long>(max_imposed_terms);
+            j["max_length"] = static_cast<unsigned long long>(max_imposed_term_length);
+            json types = json::array();
+            for (const std::string& t : imposed_term_types()) types.push_back(t);
+            j["types"] = types;
+            send_json(res, 200, j);
+        });
+        srv.Put("/v1/terms", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
+            json parsed;
+            if (!parse_body(req, res, parsed)) return;
+            const json& body = parsed;
+            user_error e;
+            if (!s->set_terms(body["terms"], e))
+            {
+                send_error(res, e.code == "engine" || e.code == "database" ? 500 : 400, e);
+                return;
+            }
+            json j = json::object();
+            j["terms"] = s->terms();
+            send_json(res, 200, j);
         });
         srv.Post("/v1/restart", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;

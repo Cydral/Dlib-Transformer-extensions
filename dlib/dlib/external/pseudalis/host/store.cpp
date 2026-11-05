@@ -262,11 +262,29 @@ namespace pseudalis
         return out;
     }
 
-    long long store::count_files()
+    long long store::count_files(const std::string& source)
     {
         std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, "SELECT COUNT(*) FROM files");
+        statement s(db_, "SELECT COUNT(*) FROM files WHERE ?1 = '' OR source = ?1");
+        s.bind(1, source);
         return s.step() ? s.integer(0) : 0;
+    }
+
+    long long store::originals_bytes()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT COALESCE(SUM(original_size), 0) FROM files");
+        return s.step() ? s.integer(0) : 0;
+    }
+
+    std::vector<std::pair<long long, long long>> store::oldest_files(long long limit)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT id, original_size FROM files ORDER BY created, id LIMIT ?1");
+        s.bind(1, limit);
+        std::vector<std::pair<long long, long long>> out;
+        while (s.step()) out.push_back(std::make_pair(s.integer(0), s.integer(1)));
+        return out;
     }
 
     std::set<std::string> store::referenced_blobs()

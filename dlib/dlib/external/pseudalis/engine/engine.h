@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "../common/imposed_terms.h"
 #include "../common/json.h"
 
 namespace pseudalis
@@ -167,6 +168,14 @@ namespace pseudalis
         std::string restore_text(const std::string& text, json& report) const;
         // [{"begin", "end", "type", "confidence", "text"}] of the values of a text.
         json detect(const std::string& text) const;
+
+        /*
+            Replaces the imposed terms (common/imposed_terms.h), which every file, text and name
+            processed afterwards reads before anything else; a call in progress keeps the terms
+            it started with for the detectors it already made.
+        */
+        void set_terms(const std::vector<imposed_term>& terms);
+        std::size_t term_count() const;
 
         std::string key_fingerprint() const;
         // {"tagger", "span_model", "size"}

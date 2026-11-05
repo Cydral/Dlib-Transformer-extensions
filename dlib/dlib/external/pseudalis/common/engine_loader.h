@@ -54,6 +54,7 @@ namespace pseudalis
         int (PSD_CALL* process)(psd_engine*, const char*, const char*, size_t, psd_picture_fn, psd_lookup_fn, void*,
             psd_buffer*, psd_buffer*, psd_buffer*) = nullptr;
         int (PSD_CALL* key_fingerprint)(psd_engine*, psd_buffer*) = nullptr;
+        int (PSD_CALL* set_terms)(psd_engine*, const char*, size_t, psd_buffer*) = nullptr;
         char* (PSD_CALL* alloc)(size_t) = nullptr;
         void (PSD_CALL* free_buffer)(psd_buffer*) = nullptr;
 
@@ -96,6 +97,8 @@ namespace pseudalis
             const std::function<std::vector<std::string>(const std::string&)>& lookup =
                 std::function<std::vector<std::string>(const std::string&)>()) const;
         std::string key_fingerprint() const;
+        // Replaces the imposed terms of the engine ([{"term", "type", "case_sensitive"}]).
+        bool set_terms(const json& terms, std::string& error) const;
         std::string variant() const;
         // The version and the build of the engine (psd_build()).
         std::string build() const;

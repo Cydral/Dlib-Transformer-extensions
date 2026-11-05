@@ -1,15 +1,20 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
-"""
+r"""
 Publishes a version of Pseudalis on GitHub: puts its installer in dist/pseudalis of the
 repository, beside the update feed that announces it, written and signed.
 
-    python3 publish_release.py <pseudalis-setup.exe> --key <private key>
+    python3 publish_release.py [<pseudalis-setup.exe>] --key <private key>
                                [--notes <notes.json>] [--sign <pseudalis-sign>]
                                [--dist <folder>] [--dry-run] [--push [--wait <seconds>]]
     python3 publish_release.py --check-key --key <private key> [--sign <pseudalis-sign>]
     python3 publish_release.py --create-key --key <private key> [--sign <pseudalis-sign>]
     python3 publish_release.py --check [--dist <folder>] [--wait <seconds>]
+
+The installer is by default the one that tools/build_windows.ps1 makes in the copy of the
+repository of the production chain on Windows, %USERPROFILE%\work\Dlib-Transformer-extensions,
+read under WSL (/mnt/c/Users/<user>/work/Dlib-Transformer-extensions/build-pseudalis/bin); an
+installer named elsewhere is refused unless --any-folder is given.
 
 The version is that of common/version.h, which must also be the version the installer carries
 in its resources.  The installer is copied into <dist> (dist/pseudalis of the repository by
@@ -71,6 +76,29 @@ SETTINGS = os.path.join(HERE, "..", "host", "settings.cpp")
 # The limits of GitHub for a file of a repository, with a margin under the refusal.
 REFUSED_BYTES = 95 << 20
 WARNED_BYTES = 50 << 20
+
+
+# The copy of the repository of the production chain on Windows, under its profile folder.
+CHAIN_FOLDER = ("work", "Dlib-Transformer-extensions")
+CHAIN_INSTALLER = ("build-pseudalis", "bin", "pseudalis-setup.exe")
+
+
+def windows_profile():
+    """The profile folder of the Windows user, as WSL reads it: /mnt/c/Users/<user>."""
+    try:
+        out = subprocess.run(["cmd.exe", "/c", "echo %USERPROFILE%"], capture_output=True, text=True,
+                             cwd="/mnt/c", timeout=30).stdout.strip()
+        if out and "%" not in out:
+            return subprocess.run(["wslpath", "-u", out], capture_output=True, text=True,
+                                  timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    raise RuntimeError("the profile folder of Windows cannot be read from here (cmd.exe and wslpath of WSL): "
+                       "name the installer, with --any-folder")
+
+
+def chain_installer():
+    return os.path.join(windows_profile(), *(CHAIN_FOLDER + CHAIN_INSTALLER))
 
 
 def verify_command(signer, path):
@@ -299,6 +327,8 @@ def main():
     p.add_argument("--check-key", action="store_true")
     p.add_argument("--create-key", action="store_true")
     p.add_argument("--wait", type=int, default=900)
+    p.add_argument("--any-folder", action="store_true", help="take an installer of another copy than the one of "
+                   "the production chain")
     a = p.parse_args()
     # The steps print in their order, before the messages of pseudalis-sign and of git.
     sys.stdout.reconfigure(line_buffering=True)
@@ -323,9 +353,16 @@ def main():
             print("error: %s" % e, file=sys.stderr)
             return 1
         return 0
-    if not a.installer:
-        p.error("the installer to publish is missing")
     try:
+        if not a.installer:
+            a.installer = chain_installer()
+        elif not a.any_folder:
+            chain = os.path.realpath(os.path.join(windows_profile(), *CHAIN_FOLDER))
+            if not os.path.realpath(a.installer).startswith(chain + os.sep):
+                raise RuntimeError("%s is not in the copy of the production chain, %s: publish the installer of "
+                                   "that copy, or give --any-folder" % (a.installer, chain))
+        if not os.path.isfile(a.installer):
+            raise RuntimeError("no installer at %s: build it on Windows first (tools/build_windows.ps1)" % a.installer)
         version = source_version()
         feed_path = os.path.join(a.dist, "feed.json")
         notes = make_feed.read_notes(a.notes, feed_path, version)

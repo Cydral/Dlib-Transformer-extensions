@@ -97,3 +97,10 @@ footer { max-width: 980px; margin: 8px auto 30px; padding: 0 16px; display: grid
 .message { margin: 10px 0 0; font-size: 14px; color: var(--navy); }
 .message.bad { color: var(--bad); }
 section .option { display: flex; }
+.terms td input[type=text] { width: 100%; min-width: 180px; border: 1px solid var(--line); border-radius: 7px;
+  padding: 5px 8px; font: inherit; color: var(--text); }
+.terms td select { border: 1px solid var(--line); border-radius: 7px; padding: 5px 6px; font: inherit;
+  background: #fff; }
+.terms td.check { text-align: center; }
+.terms tr.bad td input[type=text] { border-color: var(--bad); }
+.count { align-self: center; color: var(--faint); font-size: 13px; }

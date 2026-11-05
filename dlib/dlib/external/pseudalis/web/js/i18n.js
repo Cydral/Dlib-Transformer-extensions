@@ -112,7 +112,45 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'A key can only be imported while this installation keeps no original and no file ' +
       'on its drive.',
     err_settings: 'The settings cannot be written.',
-    err_settings_drive: 'The letter of the drive must be A, B or D to Z.'
+    err_settings_drive: 'The letter of the drive must be A, B or D to Z.',
+    err_settings_value: 'The setting "{field}" has a value the service does not take',
+    range: ' ({min} to {max}).',
+    err_original_space: 'The original of this file was forgotten on {date} to make room for newer originals: it ' +
+      'can no longer be restored.',
+    s_history: 'Space of the originals',
+    records_removed_always: 'left the drive, kept without limit of time',
+    set_dates: 'Order of the numeric dates',
+    set_dates_dmy: 'day/month/year (31/12/2026)',
+    set_dates_mdy: 'month/day/year (12/31/2026)',
+    set_history: 'Space of the originals kept (MB)',
+    set_removed_hint: 'With 0 days, the originals of the files removed from the drive are kept without limit of ' +
+      'time. Whatever the days, the originals kept stay within their space: when it is full, or the disk short of ' +
+      'free space, the oldest are forgotten first.',
+    terms_title: 'Imposed terms',
+    terms_hint: 'Each term is replaced with its tag before any other detection, in the files, the texts and the ' +
+      'names: the name of a client, of a project, of a contract or of an organisation that Pseudalis does not know. ' +
+      'Without case sensitivity, the case and the accents are ignored. At most 100 terms.',
+    col_term: 'Term',
+    col_case: 'Case sensitive',
+    col_tag: 'Tag',
+    terms_none: 'No imposed term.',
+    terms_add: 'Add a term',
+    terms_save: 'Save the terms',
+    terms_count: '{n} of {max} terms',
+    terms_saved: 'Saved: {n} imposed terms.',
+    btn_remove: 'Remove',
+    tag_ORG: 'Organisation (ORG)',
+    tag_PERSON: 'Person (PERSON)',
+    tag_LOCATION: 'Place (LOCATION)',
+    tag_ADDRESS: 'Address (ADDRESS)',
+    tag_ID: 'Identifier (ID)',
+    tag_EMAIL: 'E-mail address (EMAIL)',
+    tag_PHONE: 'Telephone number (PHONE)',
+    tag_URL: 'Web address (URL)',
+    err_terms_invalid: 'Term {n}: a term is a text of one line, of 1 to {length} characters, with a letter or a digit.',
+    err_terms_too_many: 'At most {max} terms may be imposed.',
+    err_terms_type: 'Term {n}: its tag is not one the service takes.',
+    err_terms_duplicate: 'Term {n} is given twice.'
   },
   fr: {
     tagline: 'Protection des données personnelles de vos documents',
@@ -224,7 +262,46 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: "Une clé ne s'importe que tant que cette installation ne conserve aucun original " +
       'ni aucun fichier sur son lecteur.',
     err_settings: 'Les réglages ne peuvent pas être écrits.',
-    err_settings_drive: 'La lettre du lecteur doit être A, B ou de D à Z.'
+    err_settings_drive: 'La lettre du lecteur doit être A, B ou de D à Z.',
+    err_settings_value: 'Le réglage « {field} » a une valeur que le service n’accepte pas',
+    range: ' (de {min} à {max}).',
+    err_original_space: 'L’original de ce fichier a été oublié le {date} pour faire place à des originaux plus ' +
+      'récents : il ne peut plus être restauré.',
+    s_history: 'Espace des originaux',
+    records_removed_always: 'retiré du lecteur, conservé sans limite de durée',
+    set_dates: 'Ordre des dates numériques',
+    set_dates_dmy: 'jour/mois/année (31/12/2026)',
+    set_dates_mdy: 'mois/jour/année (12/31/2026)',
+    set_history: 'Espace des originaux conservés (Mo)',
+    set_removed_hint: 'Avec 0 jour, les originaux des fichiers retirés du lecteur sont conservés sans limite de ' +
+      'durée. Quelle que soit la durée, les originaux conservés restent dans leur espace : quand il est plein, ou ' +
+      'que le disque manque d’espace libre, les plus anciens sont oubliés en premier.',
+    terms_title: 'Termes imposés',
+    terms_hint: 'Chaque terme est remplacé par son étiquette avant toute autre détection, dans les fichiers, les ' +
+      'textes et les noms : le nom d’un client, d’un projet, d’un contrat ou d’une organisation que Pseudalis ne ' +
+      'connaît pas. Sans respect de la casse, la casse et les accents sont ignorés. 100 termes au plus.',
+    col_term: 'Terme',
+    col_case: 'Respect de la casse',
+    col_tag: 'Étiquette',
+    terms_none: 'Aucun terme imposé.',
+    terms_add: 'Ajouter un terme',
+    terms_save: 'Enregistrer les termes',
+    terms_count: '{n} terme(s) sur {max}',
+    terms_saved: 'Enregistré : {n} terme(s) imposé(s).',
+    btn_remove: 'Retirer',
+    tag_ORG: 'Organisation (ORG)',
+    tag_PERSON: 'Personne (PERSON)',
+    tag_LOCATION: 'Lieu (LOCATION)',
+    tag_ADDRESS: 'Adresse (ADDRESS)',
+    tag_ID: 'Identifiant (ID)',
+    tag_EMAIL: 'Adresse e-mail (EMAIL)',
+    tag_PHONE: 'Numéro de téléphone (PHONE)',
+    tag_URL: 'Adresse web (URL)',
+    err_terms_invalid: 'Terme {n} : un terme est un texte d’une ligne, de 1 à {length} caractères, avec une lettre ' +
+      'ou un chiffre.',
+    err_terms_too_many: '{max} termes au plus peuvent être imposés.',
+    err_terms_type: 'Terme {n} : son étiquette n’est pas une de celles que le service accepte.',
+    err_terms_duplicate: 'Le terme {n} figure deux fois.'
   },
   de: {
     tagline: 'Schutz personenbezogener Daten in Ihren Dokumenten',
@@ -339,7 +416,47 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'Ein Schlüssel kann nur importiert werden, solange diese Installation kein Original ' +
       'und keine Datei auf ihrem Laufwerk aufbewahrt.',
     err_settings: 'Die Einstellungen können nicht geschrieben werden.',
-    err_settings_drive: 'Der Buchstabe des Laufwerks muss A, B oder D bis Z sein.'
+    err_settings_drive: 'Der Buchstabe des Laufwerks muss A, B oder D bis Z sein.',
+    err_settings_value: 'Die Einstellung „{field}“ hat einen Wert, den der Dienst nicht annimmt',
+    range: ' ({min} bis {max}).',
+    err_original_space: 'Das Original dieser Datei wurde am {date} vergessen, um Platz für neuere Originale zu ' +
+      'schaffen: Es kann nicht mehr wiederhergestellt werden.',
+    s_history: 'Platz der Originale',
+    records_removed_always: 'vom Laufwerk entfernt, ohne zeitliche Grenze aufbewahrt',
+    set_dates: 'Reihenfolge der numerischen Datumsangaben',
+    set_dates_dmy: 'Tag/Monat/Jahr (31/12/2026)',
+    set_dates_mdy: 'Monat/Tag/Jahr (12/31/2026)',
+    set_history: 'Platz der aufbewahrten Originale (MB)',
+    set_removed_hint: 'Mit 0 Tagen werden die Originale der vom Laufwerk entfernten Dateien ohne zeitliche Grenze ' +
+      'aufbewahrt. Unabhängig von den Tagen bleiben die aufbewahrten Originale in ihrem Platz: Ist er voll oder ' +
+      'fehlt dem Datenträger freier Platz, werden die ältesten zuerst vergessen.',
+    terms_title: 'Vorgegebene Begriffe',
+    terms_hint: 'Jeder Begriff wird vor jeder anderen Erkennung durch seine Kennzeichnung ersetzt, in den Dateien, ' +
+      'den Texten und den Namen: der Name eines Kunden, eines Projekts, eines Vertrags oder einer Organisation, den ' +
+      'Pseudalis nicht kennt. Ohne Beachtung der Groß- und Kleinschreibung werden Schreibweise und Akzente ' +
+      'ignoriert. Höchstens 100 Begriffe.',
+    col_term: 'Begriff',
+    col_case: 'Groß-/Kleinschreibung',
+    col_tag: 'Kennzeichnung',
+    terms_none: 'Kein vorgegebener Begriff.',
+    terms_add: 'Begriff hinzufügen',
+    terms_save: 'Begriffe speichern',
+    terms_count: '{n} von {max} Begriffen',
+    terms_saved: 'Gespeichert: {n} vorgegebene Begriffe.',
+    btn_remove: 'Entfernen',
+    tag_ORG: 'Organisation (ORG)',
+    tag_PERSON: 'Person (PERSON)',
+    tag_LOCATION: 'Ort (LOCATION)',
+    tag_ADDRESS: 'Adresse (ADDRESS)',
+    tag_ID: 'Kennung (ID)',
+    tag_EMAIL: 'E-Mail-Adresse (EMAIL)',
+    tag_PHONE: 'Telefonnummer (PHONE)',
+    tag_URL: 'Webadresse (URL)',
+    err_terms_invalid: 'Begriff {n}: Ein Begriff ist ein Text einer Zeile mit 1 bis {length} Zeichen, darunter ein ' +
+      'Buchstabe oder eine Ziffer.',
+    err_terms_too_many: 'Höchstens {max} Begriffe können vorgegeben werden.',
+    err_terms_type: 'Begriff {n}: Seine Kennzeichnung nimmt der Dienst nicht an.',
+    err_terms_duplicate: 'Der Begriff {n} steht doppelt in der Liste.'
   },
   it: {
     tagline: 'Protezione dei dati personali dei tuoi documenti',
@@ -454,7 +571,46 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'Una chiave può essere importata solo finché questa installazione non conserva ' +
       "alcun originale né alcun file sulla sua unità.",
     err_settings: 'Le impostazioni non possono essere scritte.',
-    err_settings_drive: "La lettera dell'unità deve essere A, B o da D a Z."
+    err_settings_drive: "La lettera dell'unità deve essere A, B o da D a Z.",
+    err_settings_value: 'L’impostazione «{field}» ha un valore che il servizio non accetta',
+    range: ' (da {min} a {max}).',
+    err_original_space: 'L’originale di questo file è stato dimenticato il {date} per fare spazio a originali più ' +
+      'recenti: non può più essere ripristinato.',
+    s_history: 'Spazio degli originali',
+    records_removed_always: 'rimosso dall’unità, conservato senza limite di tempo',
+    set_dates: 'Ordine delle date numeriche',
+    set_dates_dmy: 'giorno/mese/anno (31/12/2026)',
+    set_dates_mdy: 'mese/giorno/anno (12/31/2026)',
+    set_history: 'Spazio degli originali conservati (MB)',
+    set_removed_hint: 'Con 0 giorni, gli originali dei file rimossi dall’unità sono conservati senza limite di ' +
+      'tempo. Qualunque sia la durata, gli originali conservati restano nel loro spazio: quando è pieno, o il disco ' +
+      'è a corto di spazio libero, i più vecchi vengono dimenticati per primi.',
+    terms_title: 'Termini imposti',
+    terms_hint: 'Ogni termine è sostituito dalla sua etichetta prima di ogni altro rilevamento, nei file, nei testi ' +
+      'e nei nomi: il nome di un cliente, di un progetto, di un contratto o di un’organizzazione che Pseudalis non ' +
+      'conosce. Senza distinzione tra maiuscole e minuscole, si ignorano anche gli accenti. Al massimo 100 termini.',
+    col_term: 'Termine',
+    col_case: 'Maiuscole/minuscole',
+    col_tag: 'Etichetta',
+    terms_none: 'Nessun termine imposto.',
+    terms_add: 'Aggiungi un termine',
+    terms_save: 'Salva i termini',
+    terms_count: '{n} termini su {max}',
+    terms_saved: 'Salvato: {n} termini imposti.',
+    btn_remove: 'Rimuovi',
+    tag_ORG: 'Organizzazione (ORG)',
+    tag_PERSON: 'Persona (PERSON)',
+    tag_LOCATION: 'Luogo (LOCATION)',
+    tag_ADDRESS: 'Indirizzo (ADDRESS)',
+    tag_ID: 'Identificativo (ID)',
+    tag_EMAIL: 'Indirizzo e-mail (EMAIL)',
+    tag_PHONE: 'Numero di telefono (PHONE)',
+    tag_URL: 'Indirizzo web (URL)',
+    err_terms_invalid: 'Termine {n}: un termine è un testo di una riga, da 1 a {length} caratteri, con una lettera o ' +
+      'una cifra.',
+    err_terms_too_many: 'Si possono imporre al massimo {max} termini.',
+    err_terms_type: 'Termine {n}: la sua etichetta non è tra quelle che il servizio accetta.',
+    err_terms_duplicate: 'Il termine {n} compare due volte.'
   },
   es: {
     tagline: 'Protección de los datos personales de sus documentos',
@@ -568,6 +724,46 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'Una clave solo se puede importar mientras esta instalación no conserve ningún ' +
       'original ni ningún archivo en su unidad.',
     err_settings: 'La configuración no se puede escribir.',
-    err_settings_drive: 'La letra de la unidad debe ser A, B o de D a Z.'
+    err_settings_drive: 'La letra de la unidad debe ser A, B o de D a Z.',
+    err_settings_value: 'El ajuste «{field}» tiene un valor que el servicio no acepta',
+    range: ' (de {min} a {max}).',
+    err_original_space: 'El original de este archivo se olvidó el {date} para dejar sitio a originales más ' +
+      'recientes: ya no se puede restaurar.',
+    s_history: 'Espacio de los originales',
+    records_removed_always: 'retirado de la unidad, guardado sin límite de tiempo',
+    set_dates: 'Orden de las fechas numéricas',
+    set_dates_dmy: 'día/mes/año (31/12/2026)',
+    set_dates_mdy: 'mes/día/año (12/31/2026)',
+    set_history: 'Espacio de los originales conservados (MB)',
+    set_removed_hint: 'Con 0 días, los originales de los archivos retirados de la unidad se guardan sin límite de ' +
+      'tiempo. Sea cual sea la duración, los originales conservados permanecen en su espacio: cuando está lleno, o ' +
+      'al disco le falta espacio libre, se olvidan primero los más antiguos.',
+    terms_title: 'Términos impuestos',
+    terms_hint: 'Cada término se sustituye por su etiqueta antes de cualquier otra detección, en los archivos, los ' +
+      'textos y los nombres: el nombre de un cliente, de un proyecto, de un contrato o de una organización que ' +
+      'Pseudalis no conoce. Sin distinguir mayúsculas y minúsculas, también se ignoran los acentos. Como máximo 100 ' +
+      'términos.',
+    col_term: 'Término',
+    col_case: 'Mayúsculas/minúsculas',
+    col_tag: 'Etiqueta',
+    terms_none: 'Ningún término impuesto.',
+    terms_add: 'Añadir un término',
+    terms_save: 'Guardar los términos',
+    terms_count: '{n} de {max} términos',
+    terms_saved: 'Guardado: {n} términos impuestos.',
+    btn_remove: 'Quitar',
+    tag_ORG: 'Organización (ORG)',
+    tag_PERSON: 'Persona (PERSON)',
+    tag_LOCATION: 'Lugar (LOCATION)',
+    tag_ADDRESS: 'Dirección (ADDRESS)',
+    tag_ID: 'Identificador (ID)',
+    tag_EMAIL: 'Correo electrónico (EMAIL)',
+    tag_PHONE: 'Número de teléfono (PHONE)',
+    tag_URL: 'Dirección web (URL)',
+    err_terms_invalid: 'Término {n}: un término es un texto de una línea, de 1 a {length} caracteres, con una ' +
+      'letra o una cifra.',
+    err_terms_too_many: 'Se pueden imponer como máximo {max} términos.',
+    err_terms_type: 'Término {n}: su etiqueta no es una de las que acepta el servicio.',
+    err_terms_duplicate: 'El término {n} aparece dos veces.'
   }
 };

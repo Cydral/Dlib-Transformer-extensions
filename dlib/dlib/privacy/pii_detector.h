@@ -35,12 +35,20 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct pii_imposed_term
+    {
+        std::string text;
+        pii_type type = pii_type::organization;
+        bool case_sensitive = false;
+    };
+
     struct pii_detector_options
     {
         std::vector<pii_type> types = all_pii_types();
         numeric_date_order date_order = numeric_date_order::day_month_year;
         bool profile_urls_only = true;
         bool public_bodies = true;
+        std::vector<pii_imposed_term> imposed_terms;
     };
 
     struct detection_context
@@ -73,6 +81,7 @@ namespace dlib
             double confidence;
             bool strong = false;    // usable to teach the document lexicon
             bool exact = false;     // boundaries of a known name or of a postal layout, matched whole
+            bool learned = false;   // read by a recognizer
         };
 
         struct word_token
@@ -297,6 +306,7 @@ namespace dlib
         {
             for (pii_type t : options_.types)
                 if (static_cast<std::size_t>(t) < enabled_.size()) enabled_[static_cast<std::size_t>(t)] = true;
+            compile_imposed_terms();
         }
 
         void add_person_name(const std::string& name)
@@ -478,25 +488,34 @@ namespace dlib
                 comes from the piece where it begins away from the edges.  A value of a column
                 keeps its cell whole.
             */
-            if (text.size() <= piece_size + piece_overlap || context.forced != pii_type::none)
-                return detect_piece(text, context);
             std::vector<pii_entity> out;
-            for_each_piece(text, [&](std::size_t start, std::size_t end, std::size_t own_b, std::size_t own_e) {
-                std::vector<pii_entity> found = detect_piece(text.substr(start, end - start), context);
-                std::sort(found.begin(), found.end(),
-                          [](const pii_entity& a, const pii_entity& b) { return a.begin < b.begin; });
-                for (pii_entity e : found)
-                {
-                    e.begin += start;
-                    e.end += start;
-                    // A value that begins in the part of this piece, and overlaps none kept.
-                    if (e.begin < own_b || e.begin >= own_e) continue;
-                    if (!out.empty() && e.begin < out.back().end) continue;
-                    out.push_back(e);
-                }
-            });
+            if (text.size() <= piece_size + piece_overlap || context.forced != pii_type::none)
+            {
+                out = detect_piece(text, context);
+            }
+            else
+            {
+                for_each_piece(text, [&](std::size_t start, std::size_t end, std::size_t own_b, std::size_t own_e) {
+                    std::vector<pii_entity> found = detect_piece(text.substr(start, end - start), context);
+                    std::sort(found.begin(), found.end(),
+                              [](const pii_entity& a, const pii_entity& b) { return a.begin < b.begin; });
+                    for (pii_entity e : found)
+                    {
+                        e.begin += start;
+                        e.end += start;
+                        // A value that begins in the part of this piece, and overlaps none kept.
+                        if (e.begin < own_b || e.begin >= own_e) continue;
+                        if (!out.empty() && e.begin < out.back().end) continue;
+                        out.push_back(e);
+                    }
+                });
+            }
+            // The imposed terms, read over the whole text, outrank every value found.
+            if (!imposed_.empty()) impose_terms(text, out);
             return out;
         }
+
+        std::size_t imposed_term_count() const { return imposed_.size(); }
 
         pii_type label_type(const std::string& text) const
         {
@@ -774,6 +793,7 @@ namespace dlib
             }
             join_given_and_family_names(text, t, taken, accepted);
             attach_name_edges(t, words, taken, accepted);
+            attach_coordinated_names(text, t, words, taken, accepted);
             attach_department_codes(t, taken, accepted);
             attach_titles(t, words, taken, accepted);
             attach_attributes(text, t, taken, accepted);
@@ -1076,6 +1096,204 @@ namespace dlib
            before a person, in the case of the name, opens it: "LE FLOC'H Yann", "DE LA FONTAINE
            Jean", "avec Le Bihan"; "de", "du" and "des", which may be prepositions, only before
            another particle. */
+        // The name ends with a legal form, its periods left out: "Lo Cascio S.a.s.", "Merino SL", "Acme Ltd".
+        static bool ends_with_legal_form(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e)
+        {
+            using namespace privacy_impl;
+            while (e > b && t.cps[e - 1] == '.') --e;
+            std::size_t q = e;
+            while (q > b && (is_word_char(t.cps[q - 1]) || t.cps[q - 1] == '.')) --q;
+            std::string key = fold_key(cp_substr(t, text, q, e));
+            key.erase(std::remove(key.begin(), key.end(), '.'), key.end());
+            return organization_forms().count(key) != 0 || organization_short_forms().count(key) != 0;
+        }
+
+        /* A capitalized word that a conjunction or an ampersand joins to a person or an
+           organisation found with a confidence of 0.8 at least, without a value of its own, names
+           the same kind of thing. Beside a person, it is another person: "Martin and Dupont",
+           "Dupont et Martin". Beside an organisation, it completes its name: "Clifford & Chance",
+           "Oficina de Asilo y Refugio", "Porcu e Lo Cascio S.a.s.", unless it follows a name that
+           ends with a legal form, where it is an organisation of its own ("Acme Ltd and Zorvane").
+           The word stays readable when it is a function word, a civility, a title or a role, a
+           legal form, a partner word ("Martin and Partners") or the head noun of an organisation, a
+           country, a region, an acronym, a greeting, a month, a day or a holiday ("Inmaculada y
+           Navidad"), when a capitalized word or a connector follows it ("Conseil de prud'hommes"),
+           where the rules read longer names, when it is an acronym beside an organisation or joins
+           an organisation written as one acronym ("STD et DTCO"), when it is a part of a compound
+           ("Nord-Ovest"), when it is written in capitals beside a name that is not ("Oliveira Roca
+           y CONDENA"), and when it is a common word written in capitals, at the start of a
+           sentence or in a line whose words take capitals ("Conseil et Stratégie"). The pair joins
+           nothing when it ends a list after a comma ("Rose, Violette et Capucine", "Natale, Santo
+           Stefano e Capodanno") or when it is the name of a region or a country ("Castilla y
+           León"). German, which capitalizes its nouns, joins no word after "und" this way. */
+        void attach_coordinated_names(const std::string& text, const utf8_text& t,
+                                      const std::vector<word_token>& words,
+                                      std::map<std::size_t, std::size_t>& taken,
+                                      std::vector<candidate>& accepted) const
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> conjunctions = make_word_set("and et y e ed");
+            static const std::unordered_set<std::string> calendar = make_word_set(
+                "january february march april may june july august september october november december monday "
+                "tuesday wednesday thursday friday saturday sunday janvier fevrier mars avril mai juin juillet "
+                "aout septembre octobre novembre decembre lundi mardi mercredi jeudi vendredi samedi dimanche "
+                "gennaio febbraio marzo aprile maggio giugno luglio agosto settembre ottobre dicembre lunedi "
+                "martedi mercoledi giovedi venerdi sabato domenica enero febrero abril mayo junio julio "
+                "septiembre octubre noviembre diciembre lunes martes miercoles jueves viernes domingo "
+                "christmas easter halloween thanksgiving noel paques toussaint pentecote natale pasqua pasquetta "
+                "capodanno ferragosto epifania befana navidad nochebuena nochevieja pascua weihnachten ostern "
+                "pfingsten silvester neujahr carnaval carnevale karneval ramadan");
+            // Words that join a head noun to the rest of a longer name: "Communauté de communes de Bruz".
+            static const std::unordered_set<std::string> connectors = make_word_set(
+                "de du des d of di del della dei da von van fur");
+            const std::size_t n = words.size();
+            if (n < 3 || accepted.empty()) return;
+            auto spaced = [&](std::size_t a, std::size_t b) {
+                return b == a + 1 && (t.cps[a] == ' ' || t.cps[a] == 0xA0);
+            };
+            auto capital = [&](std::size_t k) { return words[k].shape == 1 || words[k].shape == 2; };
+            auto word_starting = [&](std::size_t pos) {
+                auto it = std::lower_bound(words.begin(), words.end(), pos,
+                                           [](const word_token& w, std::size_t p) { return w.b < p; });
+                return it != words.end() && it->b == pos ? static_cast<std::size_t>(it - words.begin()) : n;
+            };
+            auto word_ending = [&](std::size_t pos) {
+                auto it = std::lower_bound(words.begin(), words.end(), pos,
+                                           [](const word_token& w, std::size_t p) { return w.e < p; });
+                return it != words.end() && it->e == pos ? static_cast<std::size_t>(it - words.begin()) : n;
+            };
+            // Most words of four letters or more take a capital in the line of word k, within 40 words.
+            auto capitalized_line = [&](std::size_t k) {
+                std::size_t total = 0, capitals = 0;
+                for (std::size_t q = k; q > 0 && k - q < 40 && same_line(t, words[q - 1].e, words[q].b); --q)
+                    if (words[q - 1].e - words[q - 1].b >= 4)
+                    {
+                        ++total;
+                        if (capital(q - 1)) ++capitals;
+                    }
+                for (std::size_t q = k + 1; q < n && q - k < 40 && same_line(t, words[q - 1].e, words[q].b); ++q)
+                    if (words[q].e - words[q].b >= 4)
+                    {
+                        ++total;
+                        if (capital(q)) ++capitals;
+                    }
+                return total >= 2 && capitals * 10 >= total * 6;
+            };
+            // Word k may join the name whose nearest word is beside.
+            auto eligible = [&](std::size_t k, std::size_t beside, bool sentence_start) {
+                const word_token& w = words[k];
+                if (!capital(k) || w.e - w.b < 2 || overlaps(taken, w.b, w.e)) return false;
+                if (w.shape == 2 && words[beside].shape != 2) return false;
+                // A part of a compound: "Nord-Ovest", "Dupont-Moretti", "d'Ovest".
+                if ((w.b > 0 && (is_hyphen(t.cps[w.b - 1]) || is_apostrophe(t.cps[w.b - 1]))) ||
+                    ((is_hyphen(t.at(w.e)) || is_apostrophe(t.at(w.e))) && is_word_char(t.at(w.e + 1))))
+                    return false;
+                const std::string& key = w.key;
+                if (function_words().count(key) || civility_words().count(key) || person_titles().count(key) ||
+                    role_words().count(key) || organization_forms().count(key) ||
+                    organization_partner_words().count(key) || organization_heads().count(key) ||
+                    public_body_heads().count(key) || country_names().count(key) || region_names().count(key) ||
+                    acronym_words().count(key) || greeting_words().count(key) || calendar.count(key))
+                    return false;
+                return !(common_words().count(key) && (w.shape == 2 || sentence_start || capitalized_line(k)));
+            };
+            /* A list "A, B et C": a comma or a semicolon before the first word of the pair, or before
+               the capitalized words that open its name ("Natale, Santo Stefano e Capodanno"). */
+            auto in_list = [&](std::size_t b) {
+                std::size_t k = word_starting(b);
+                for (int steps = 0;; ++steps)
+                {
+                    std::size_t q = k < n ? words[k].b : b;
+                    while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0)) --q;
+                    if (q > 0 && (t.cps[q - 1] == ',' || t.cps[q - 1] == ';')) return true;
+                    if (k >= n || k == 0 || steps == 3 || words[k - 1].e != q || !capital(k - 1)) return false;
+                    --k;
+                }
+            };
+            // Word k opens a longer name: a connector in lower case follows it ("Conseil de prud'hommes").
+            auto opens_name = [&](std::size_t k) {
+                return k + 1 < n && words[k + 1].shape == 0 && connectors.count(words[k + 1].key) &&
+                       words[k + 1].b <= words[k].e + 2 && same_line(t, words[k].e, words[k + 1].b);
+            };
+            // A word in capitals of five letters at most, an acronym: "STD", "DTCO".
+            auto acronym = [&](std::size_t k) { return words[k].shape == 2 && words[k].e - words[k].b <= 5; };
+            // "Castilla y León", "Trinidad and Tobago": the pair names a region or a country.
+            auto named_place = [&](std::size_t b, std::size_t e) {
+                const std::string key = fold_key(cp_substr(t, text, b, e));
+                return region_names().count(key) != 0 || country_names().count(key) != 0;
+            };
+            std::vector<candidate> added;
+            auto take = [&](std::size_t k, pii_type type) {
+                const std::size_t before = added.size();
+                add(added, words[k].b, words[k].e, type, 0.6);
+                if (added.size() > before) taken[words[k].b] = words[k].e;
+            };
+            for (candidate& x : accepted)
+            {
+                if ((x.type != pii_type::person && x.type != pii_type::organization) || x.confidence < 0.8)
+                    continue;
+                const bool organization = x.type == pii_type::organization;
+                const std::size_t last = word_ending(x.e), first = word_starting(x.b);
+                // Two acronyms joined by a conjunction name two organisations that the rules read alone:
+                // "STD et DTCO".
+                if (organization && first < n && first == last && words[first].shape == 2) continue;
+                // After the value: " and Dupont", " & Chance", the word ending no longer name.
+                if (last < n && last + 1 < n)
+                {
+                    std::size_t k = n;
+                    const std::size_t c = last + 1;
+                    if (c + 1 < n && words[c].shape == 0 && conjunctions.count(words[c].key) &&
+                        spaced(x.e, words[c].b) && spaced(words[c].e, words[c + 1].b))
+                        k = c + 1;
+                    else if (words[c].b == x.e + 3 && t.cps[x.e] == ' ' && t.cps[x.e + 1] == '&' &&
+                             t.cps[x.e + 2] == ' ')
+                        k = c;
+                    if (k < n && !(k + 1 < n && spaced(words[k].e, words[k + 1].b) && capital(k + 1)) &&
+                        !opens_name(k) && !(organization && acronym(k)) && !in_list(x.b) &&
+                        !named_place(x.b, words[k].e) && eligible(k, last, false))
+                    {
+                        if (organization && !ends_with_legal_form(text, t, x.b, x.e))
+                        {
+                            taken[x.b] = words[k].e;
+                            x.e = words[k].e;
+                        }
+                        else
+                        {
+                            take(k, x.type);
+                        }
+                    }
+                }
+                // Before the value: "Dupont and ", "Clifford & ", the word ending no longer name.
+                if (first < n && first >= 1)
+                {
+                    std::size_t k = n;
+                    const std::size_t c = first - 1;
+                    if (c >= 1 && words[c].shape == 0 && conjunctions.count(words[c].key) &&
+                        spaced(words[c].e, x.b) && spaced(words[c - 1].e, words[c].b))
+                        k = c - 1;
+                    else if (x.b >= 3 && words[c].e == x.b - 3 && t.cps[x.b - 3] == ' ' && t.cps[x.b - 2] == '&' &&
+                             t.cps[x.b - 1] == ' ')
+                        k = c;
+                    if (k < n && !(k >= 1 && spaced(words[k - 1].e, words[k].b) && capital(k - 1)) &&
+                        !(organization && acronym(k)) && !in_list(words[k].b) && !named_place(words[k].b, x.e) &&
+                        eligible(k, first, at_sentence_start(t, words[k].b)))
+                    {
+                        if (organization)
+                        {
+                            taken.erase(x.b);
+                            taken[words[k].b] = x.e;
+                            x.b = words[k].b;
+                        }
+                        else
+                        {
+                            take(k, x.type);
+                        }
+                    }
+                }
+            }
+            accepted.insert(accepted.end(), added.begin(), added.end());
+        }
+
         static void attach_name_edges(const utf8_text& t, const std::vector<word_token>& words,
                                       std::map<std::size_t, std::size_t>& taken,
                                       std::vector<candidate>& accepted)
@@ -2081,6 +2299,23 @@ namespace dlib
             auto spaced = [&](std::size_t a, std::size_t b) {
                 return b == a + 1 && (t.cps[a] == ' ' || t.cps[a] == 0xA0);
             };
+            // "Marks and Spencer", "Ernst und Young": a conjunction written for the ampersand of the name.
+            auto known = [&](const std::string& key) {
+                if (names.count(key)) return true;
+                static const char* const conjunctions[] = { " and ", " et ", " und ", " y ", " e " };
+                std::string k = key;
+                bool changed = false;
+                for (const char* c : conjunctions)
+                {
+                    const std::string s(c);
+                    for (std::size_t at = k.find(s); at != std::string::npos; at = k.find(s, at + 3))
+                    {
+                        k.replace(at, s.size(), " & ");
+                        changed = true;
+                    }
+                }
+                return changed && names.count(k) != 0;
+            };
             for (std::size_t k = 0; k < n; ++k)
             {
                 const word_token& w = words[k];
@@ -2092,12 +2327,12 @@ namespace dlib
                     const std::size_t j = k + len - 1;
                     if (len > 1 && !name_gap(words[j - 1].e, words[j].b)) break;
                     const std::size_t e = words[j].e, d = number_after(e);
-                    if (d > e && names.count(fold_key(cp_substr(t, text, w.b, d))))
+                    if (d > e && known(fold_key(cp_substr(t, text, w.b, d))))
                     {
                         best = len;
                         best_end = d;
                     }
-                    else if (names.count(fold_key(cp_substr(t, text, w.b, e))))
+                    else if (known(fold_key(cp_substr(t, text, w.b, e))))
                     {
                         best = len;
                         best_end = e;
@@ -5185,6 +5420,85 @@ namespace dlib
             int parts;
         };
 
+        /* Two organisations, or two persons, that the rules read on both sides of a conjunction,
+           an ampersand or a comma stay two values when a recognizer reads them as one: the piece
+           is cut there ("Siemens Energy and Veolia Water", "Enel Green Power e Veolia Water"). A
+           name whose rules read it whole, a conjunction included, keeps it ("Martin et Fils",
+           "Merrow Oil and Gas Plc"), and so does a name closed by partners after the conjunction
+           ("Gestoría Navarro y Asociados S.L.") or by a legal form that ends the second name alone
+           ("Hermanos Martinez y Merino SL"). */
+        void split_coordinated_pieces(const std::string& text, const privacy_impl::utf8_text& t,
+                                      const std::vector<candidate>& rules, std::vector<learned_piece>& pieces) const
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> conjunctions = make_word_set(
+                "and et und y e ed or ou o oder & ,");
+            std::vector<learned_piece> out;
+            out.reserve(pieces.size());
+            for (const learned_piece& p : pieces)
+            {
+                if (p.type != pii_type::organization && p.type != pii_type::person)
+                {
+                    out.push_back(p);
+                    continue;
+                }
+                // The values of the rules of the same type inside the piece, joined where they overlap.
+                std::vector<std::pair<std::size_t, std::size_t>> inside;
+                for (const candidate& r : rules)
+                    if (!r.learned && r.type == p.type && p.b <= r.b && r.e <= p.e && r.b < r.e &&
+                        (r.exact || r.confidence >= 0.8))
+                        inside.push_back(std::make_pair(r.b, r.e));
+                if (inside.size() < 2)
+                {
+                    out.push_back(p);
+                    continue;
+                }
+                std::sort(inside.begin(), inside.end());
+                std::vector<std::pair<std::size_t, std::size_t>> groups;
+                for (const auto& r : inside)
+                {
+                    if (!groups.empty() && r.first < groups.back().second)
+                        groups.back().second = std::max(groups.back().second, r.second);
+                    else
+                        groups.push_back(r);
+                }
+                std::vector<std::pair<std::size_t, std::size_t>> cuts;
+                for (std::size_t k = 0; k + 1 < groups.size(); ++k)
+                {
+                    const std::size_t a = groups[k].second, b = groups[k + 1].first;
+                    if (b <= a || b - a > 8 || !same_line(t, a, b)) continue;
+                    std::string g;
+                    for (std::size_t q = a; q < b; ++q)
+                        if (!(t.cps[q] == ' ' || t.cps[q] == 0xA0)) utf8_append(g, t.cps[q]);
+                    if (!conjunctions.count(fold_key(g))) continue;
+                    // Partners or a legal form after the conjunction close the name: "Navarro y Asociados S.L.".
+                    std::size_t q = b;
+                    while (q < p.e && (is_word_char(t.cps[q]) || t.cps[q] == '.')) ++q;
+                    std::string next = fold_key(cp_substr(t, text, b, q));
+                    next.erase(std::remove(next.begin(), next.end(), '.'), next.end());
+                    if (organization_partner_words().count(next) || organization_forms().count(next)) continue;
+                    // A legal form that ends the second name alone closes both: "Hermanos Martinez y Merino SL".
+                    if (ends_with_legal_form(text, t, b, groups[k + 1].second) &&
+                        !ends_with_legal_form(text, t, groups[k].first, a))
+                        continue;
+                    cuts.push_back(std::make_pair(a, b));
+                }
+                std::size_t start = p.b;
+                for (const auto& c : cuts)
+                {
+                    learned_piece q = p;
+                    q.b = start;
+                    q.e = c.first;
+                    if (q.e > q.b) out.push_back(q);
+                    start = c.second;
+                }
+                learned_piece q = p;
+                q.b = start;
+                if (q.e > q.b) out.push_back(q);
+            }
+            pieces.swap(out);
+        }
+
         /* The boundaries of the organisations a recognizer reads, made consistent with those of
            the annotation. The pieces of one name are joined: pieces of an organisation that meet
            or are one space apart ("Club" and "Dexiq"), that a comma, a bracket or a hyphen
@@ -6093,6 +6407,7 @@ namespace dlib
                     --p.b;
                 if (!spurious_learned_span(text, t, p.b, p.e, p.type, capitals >= 2)) merged.push_back(p);
             }
+            split_coordinated_pieces(text, t, out, merged);
             /* A confident recognizer outranks the heuristics of the rules for the same
                categories, whose boundaries follow no annotation guideline, and stays below
                the validated scanners. What the rules established about the same value is
@@ -6168,9 +6483,13 @@ namespace dlib
                 }
             }
             for (std::size_t p = 0; p < merged.size(); ++p)
-                if (!inside_exact[p])
-                    add(out, merged[p].b, merged[p].e, merged[p].type, confidence[p],
-                        merged[p].confidence >= 0.7 ? 10 : 0, strong[p]);
+            {
+                if (inside_exact[p]) continue;
+                const std::size_t before = out.size();
+                add(out, merged[p].b, merged[p].e, merged[p].type, confidence[p],
+                    merged[p].confidence >= 0.7 ? 10 : 0, strong[p]);
+                if (out.size() > before) out.back().learned = true;
+            }
         }
 
     // ------------------------------------------------------------------------------------
@@ -8203,8 +8522,245 @@ namespace dlib
             }
         }
 
+    // ------------------------------------------------------------------------------------
+    // Imposed terms.
+
+        /* A word or a number read for the imposed terms: its bytes without the invisible marks,
+           its folded form, and whether at most two characters of the same line separate it from
+           the token before it. */
+        struct imposed_token
+        {
+            std::size_t b = 0, e = 0;
+            std::string raw, folded;
+            bool joined = false;
+        };
+
+        struct imposed_entry
+        {
+            std::vector<std::string> keys;      // the raw words when case_sensitive, folded otherwise
+            pii_type type = pii_type::none;
+            bool case_sensitive = false;
+        };
+
+        struct imposed_match
+        {
+            std::size_t b, e;
+            pii_type type;
+        };
+
+        /* The tokens of a text, runs of letters and digits given to each in their order; a line
+           break, or a gap of three characters or more, separates two tokens that no term joins.
+           The tags of the pseudonymizer are skipped whole: no term is read inside them. */
+        template <typename F>
+        static void imposed_tokens(const std::string& text, F&& each)
+        {
+            using namespace privacy_impl;
+            imposed_token cur;
+            bool in_token = false, broken = true;
+            std::size_t gap = 0, i = 0;
+            /* The first "]]" from a place, kept from one opening to the next: the searches cover the
+               text once, whatever the number of openings without their end ("[[ORG:a [[ORG:a"). */
+            std::size_t next_close = 0;
+            bool close_known = false;
+            auto close_after = [&](std::size_t k) {
+                if (!close_known || (next_close != std::string::npos && next_close < k))
+                {
+                    next_close = text.find("]]", k);
+                    close_known = true;
+                }
+                return next_close;
+            };
+            auto finish = [&]() {
+                if (!in_token) return;
+                cur.folded = fold_key(cur.raw);
+                each(cur);
+                in_token = false;
+                broken = false;
+                gap = 0;
+            };
+            while (i < text.size())
+            {
+                if (text[i] == '[' && i + 1 < text.size() && text[i + 1] == '[')
+                {
+                    // A keyword of 32 characters at most.
+                    std::size_t k = i + 2;
+                    const std::size_t keyword_end = std::min(text.size(), i + 34);
+                    while (k < keyword_end && ((text[k] >= 'A' && text[k] <= 'Z') || text[k] == '_' ||
+                                               (text[k] >= '0' && text[k] <= '9')))
+                        ++k;
+                    const std::size_t close = k < text.size() && text[k] == ':' ? close_after(k) : std::string::npos;
+                    if (k > i + 2 && close != std::string::npos && close - k <= 20000 &&
+                        pii_type_from_keyword(text.substr(i + 2, k - i - 2)) != pii_type::none)
+                    {
+                        finish();
+                        i = close + 2;
+                        broken = true;
+                        continue;
+                    }
+                }
+                const std::size_t at = i;
+                const char32_t c = utf8_next(text, i);
+                if (is_invisible_mark(c))
+                {
+                    if (in_token) cur.e = i;
+                    continue;
+                }
+                if (is_word_char(c))
+                {
+                    if (!in_token)
+                    {
+                        cur = imposed_token();
+                        cur.b = at;
+                        cur.joined = !broken && gap <= 2;
+                        in_token = true;
+                    }
+                    cur.raw.append(text, at, i - at);
+                    cur.e = i;
+                    continue;
+                }
+                finish();
+                if (is_line_break(c)) broken = true;
+                ++gap;
+            }
+            finish();
+        }
+
+        void compile_imposed_terms()
+        {
+            for (const pii_imposed_term& term : options_.imposed_terms)
+            {
+                if (term.type == pii_type::none || !enabled(term.type)) continue;
+                imposed_entry entry;
+                entry.type = term.type;
+                entry.case_sensitive = term.case_sensitive;
+                std::string last;
+                imposed_tokens(term.text, [&](const imposed_token& w) {
+                    entry.keys.push_back(term.case_sensitive ? w.raw : w.folded);
+                    last = w.folded;
+                });
+                if (entry.keys.empty()) continue;
+                imposed_index_[last].push_back(imposed_.size());
+                imposed_max_words_ = std::max(imposed_max_words_, entry.keys.size());
+                imposed_.push_back(entry);
+            }
+        }
+
+        // The occurrences of the imposed terms, without overlap: the earliest first, the longest at one place.
+        std::vector<imposed_match> find_imposed(const std::string& text) const
+        {
+            std::vector<imposed_match> found;
+            std::vector<imposed_token> window;
+            imposed_tokens(text, [&](const imposed_token& w) {
+                if (!w.joined) window.clear();
+                window.push_back(w);
+                if (window.size() > imposed_max_words_) window.erase(window.begin());
+                const auto it = imposed_index_.find(w.folded);
+                if (it == imposed_index_.end()) return;
+                for (std::size_t index : it->second)
+                {
+                    const imposed_entry& entry = imposed_[index];
+                    const std::size_t n = entry.keys.size();
+                    if (n > window.size()) continue;
+                    const std::size_t first = window.size() - n;
+                    bool same = true;
+                    for (std::size_t k = 0; k < n && same; ++k)
+                    {
+                        const imposed_token& x = window[first + k];
+                        same = (entry.case_sensitive ? x.raw : x.folded) == entry.keys[k];
+                    }
+                    if (same) found.push_back(imposed_match{ window[first].b, w.e, entry.type });
+                }
+            });
+            std::sort(found.begin(), found.end(), [](const imposed_match& a, const imposed_match& b) {
+                return a.b < b.b || (a.b == b.b && a.e > b.e);
+            });
+            std::vector<imposed_match> kept;
+            for (const imposed_match& m : found)
+                if (kept.empty() || m.b >= kept.back().e) kept.push_back(m);
+            return kept;
+        }
+
+        /* The imposed terms over the values found. A term read inside an e-mail address, a web
+           address, a date or a number is protected with that value, which stays whole; any other
+           value that overlaps a term keeps its parts outside it, under its own type. */
+        void impose_terms(const std::string& text, std::vector<pii_entity>& out) const
+        {
+            using namespace privacy_impl;
+            const std::vector<imposed_match> found = find_imposed(text);
+            if (found.empty()) return;
+            std::sort(out.begin(), out.end(),
+                      [](const pii_entity& a, const pii_entity& b) { return a.begin < b.begin; });
+            auto named = [](pii_type t) {
+                return t == pii_type::person || t == pii_type::organization || t == pii_type::location ||
+                       t == pii_type::address || t == pii_type::title || t == pii_type::gender ||
+                       t == pii_type::nationality;
+            };
+            std::vector<imposed_match> terms;
+            for (const imposed_match& m : found)
+            {
+                auto it = std::upper_bound(out.begin(), out.end(), m.b,
+                                           [](std::size_t pos, const pii_entity& e) { return pos < e.begin; });
+                const bool inside = it != out.begin() && !named((it - 1)->type) && (it - 1)->end >= m.e;
+                if (!inside) terms.push_back(m);
+            }
+            if (terms.empty()) return;
+            // The part [b, e) of a value, without the spaces and the punctuation at its edges.
+            auto word_at = [&](std::size_t b) {
+                std::size_t i = b;
+                return is_word_char(utf8_next(text, i));
+            };
+            std::vector<pii_entity> result;
+            auto keep_part = [&](const pii_entity& e, std::size_t b, std::size_t end) {
+                while (b < end && !word_at(b))
+                {
+                    std::size_t i = b;
+                    utf8_next(text, i);
+                    b = i;
+                }
+                while (end > b)
+                {
+                    std::size_t k = end - 1;
+                    while (k > b && (static_cast<unsigned char>(text[k]) & 0xC0) == 0x80) --k;
+                    if (word_at(k)) break;
+                    end = k;
+                }
+                if (end <= b) return;
+                pii_entity part = e;
+                part.begin = b;
+                part.end = end;
+                result.push_back(part);
+            };
+            for (const pii_entity& e : out)
+            {
+                auto it = std::upper_bound(terms.begin(), terms.end(), e.begin,
+                                           [](std::size_t pos, const imposed_match& m) { return pos < m.e; });
+                std::size_t b = e.begin;
+                for (; it != terms.end() && it->b < e.end; ++it)
+                {
+                    if (it->b > b) keep_part(e, b, it->b);
+                    b = std::max(b, it->e);
+                }
+                if (b < e.end) keep_part(e, b, e.end);
+            }
+            for (const imposed_match& m : terms)
+            {
+                pii_entity e;
+                e.begin = m.b;
+                e.end = m.e;
+                e.type = m.type;
+                e.confidence = 1.0;
+                result.push_back(e);
+            }
+            std::sort(result.begin(), result.end(),
+                      [](const pii_entity& a, const pii_entity& b) { return a.begin < b.begin; });
+            out.swap(result);
+        }
+
         pii_detector_options options_;
         std::vector<bool> enabled_;
+        std::vector<imposed_entry> imposed_;
+        std::unordered_map<std::string, std::vector<std::size_t>> imposed_index_;   // last folded word to imposed_
+        std::size_t imposed_max_words_ = 0;
         std::unordered_set<std::string> user_names_full_;
         std::unordered_set<std::string> user_name_words_;
         std::unordered_set<std::string> doc_names_full_;

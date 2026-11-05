@@ -15,8 +15,9 @@
     the commands of the Explorer (pseudalis.exe sends them here, WM_COPYDATA), and the
     updates.  It tells the Explorer of the drive that comes and goes.  Its menu opens the web
     application, the drive and the folder of the files the drive did not process, checks for
-    updates, restarts the service, opens the documentation of the interface and the About
-    window.
+    updates, manages the service (restart, and stop or start as it runs or not: a service
+    stopped here stays so until the computer starts again, its start type unchanged), opens
+    the documentation of the interface and the About window.
 
     While the service does not answer, the icon asks the service manager of Windows what
     the service does, and warns only when the service stays stopped, or stays silent while
@@ -64,10 +65,10 @@ namespace pseudalis
         enum command_id
         {
             CMD_OPEN = 100, CMD_DRIVE, CMD_CHECK_UPDATES, CMD_INSTALL_UPDATE, CMD_RESTART, CMD_START_SERVICE, CMD_DOCS,
-            CMD_ABOUT, CMD_QUIT, CMD_REFUSED
+            CMD_ABOUT, CMD_QUIT, CMD_REFUSED, CMD_STOP_SERVICE
         };
 
-        enum action_tag { ACT_CHECK = 1, ACT_APPLY_UPDATE, ACT_RESTART, ACT_SCM };
+        enum action_tag { ACT_CHECK = 1, ACT_APPLY_UPDATE, ACT_RESTART, ACT_SCM, ACT_STOP, ACT_START };
 
         struct shell_result
         {
@@ -91,6 +92,13 @@ namespace pseudalis
             // When the service stopped answering (GetTickCount64), and whether the icon warned of it.
             ULONGLONG silent_since = 0;
             bool warned = false;
+            /*
+                The state of the service for the service manager while it does not answer
+                (service_manager_state()), "running" while it does; and whether a user stopped it from
+                this menu, which the icon then does not warn of until the service answers again.
+            */
+            std::string scm_state;
+            bool stopped_by_user = false;
             // The web application opens once the service answers.
             bool open_pending = false;
             bool polling = false;
@@ -156,6 +164,16 @@ namespace pseudalis
             return out;
         }
 
+        // A command of the installer ("/service start|stop|restart"), with the consent of an administrator.
+        void service_command_as_administrator(const wchar_t* command)
+        {
+            // ShellExecute needs COM on this thread.
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            const std::wstring setup = widen(join_path(executable_dir(), "pseudalis-setup.exe"));
+            ShellExecuteW(nullptr, L"runas", setup.c_str(), command, nullptr, SW_HIDE);
+            CoUninitialize();
+        }
+
         /*
             Starts the service, after stopping it when restart is true, through the service
             manager: the installer lets the interactive users do it (allow_service_control()).
@@ -181,15 +199,35 @@ namespace pseudalis
             if (ok) ok = StartServiceW(svc, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
             if (svc) CloseServiceHandle(svc);
             if (scm) CloseServiceHandle(scm);
-            if (!ok)
+            if (!ok) service_command_as_administrator(restart ? L"/service restart" : L"/service start");
+            return out;
+        }
+
+        /*
+            Stops the service through the service manager, and waits for it to stop, thirty
+            seconds at most.  Its start type stays automatic: it starts again with the system,
+            or when a user starts it.  Without the right to stop it, the installer does it, with
+            the consent of an administrator.
+        */
+        json stop_service()
+        {
+            json out = json::object();
+            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SC_HANDLE svc = scm ? OpenServiceW(scm, L"Pseudalis", SERVICE_STOP | SERVICE_QUERY_STATUS) : nullptr;
+            bool ok = svc != nullptr;
+            if (ok)
             {
-                // The consent of an administrator, through the installer, which needs COM on this thread.
-                CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-                const std::wstring setup = widen(join_path(executable_dir(), "pseudalis-setup.exe"));
-                ShellExecuteW(nullptr, L"runas", setup.c_str(), restart ? L"/service restart" : L"/service start",
-                    nullptr, SW_HIDE);
-                CoUninitialize();
+                SERVICE_STATUS st = {};
+                ok = ControlService(svc, SERVICE_CONTROL_STOP, &st) || GetLastError() == ERROR_SERVICE_NOT_ACTIVE;
+                for (int i = 0; ok && i < 300; ++i)
+                {
+                    if (!QueryServiceStatus(svc, &st) || st.dwCurrentState == SERVICE_STOPPED) break;
+                    Sleep(100);
+                }
             }
+            if (svc) CloseServiceHandle(svc);
+            if (scm) CloseServiceHandle(scm);
+            if (!ok) service_command_as_administrator(L"/service stop");
             return out;
         }
 
@@ -481,6 +519,9 @@ namespace pseudalis
                 const ULONGLONG silent = now - tray.silent_since;
                 const json& scm = (*result)["service"];
                 const std::string st = scm["state"].as_string();
+                tray.scm_state = st;
+                // A service a user stopped from this menu stays stopped without a warning.
+                const bool by_user = tray.stopped_by_user && (st == "stopped" || st == "stopping");
                 const ULONGLONG minute = 60000;
                 // How long each state may last before the icon warns.
                 bool starting = false;
@@ -517,7 +558,7 @@ namespace pseudalis
                 }
                 const bool waiting = starting && silent < grace;
                 if (waiting) tip = "tip_starting";
-                if (!tray.warned && silent >= grace)
+                if (!tray.warned && silent >= grace && !by_user)
                 {
                     tray.warned = true;
                     notify(L"Pseudalis", tr(warning), true);
@@ -536,6 +577,8 @@ namespace pseudalis
             tray.warned = false;
             tray.online = true;
             tray.seen_online = true;
+            tray.scm_state = "running";
+            tray.stopped_by_user = false;
             tray.info = (*result)["info"];
             if (result->contains("updates")) tray.updates = (*result)["updates"];
             if (tray.open_pending)
@@ -632,6 +675,12 @@ namespace pseudalis
             case ACT_RESTART:
             case ACT_SCM:
                 notify(L"Pseudalis", tr("notify_restarting"));
+                break;
+            case ACT_STOP:
+                notify(L"Pseudalis", tr("notify_service_stopping"));
+                break;
+            case ACT_START:
+                notify(L"Pseudalis", tr("notify_service_starting"));
                 break;
             default:
                 break;
@@ -826,8 +875,22 @@ namespace pseudalis
             if (on && up["state"].as_string() == "ready")
                 AppendMenuW(m, MF_STRING, CMD_INSTALL_UPDATE,
                     tr("tray_install_update", { { "v", up["latest"].as_string() } }).c_str());
-            if (on) AppendMenuW(m, MF_STRING, CMD_RESTART, tr("tray_restart").c_str());
-            else AppendMenuW(m, MF_STRING, CMD_START_SERVICE, tr("tray_start_service").c_str());
+            /*
+                The management of the service: restart and stop while it runs, start while it is
+                stopped; the commands wait while it starts or stops.
+            */
+            HMENU manage = CreatePopupMenu();
+            const std::string st = on ? std::string("running") : tray.scm_state;
+            const bool running = st == "running";
+            const bool can_start = st == "stopped" || st.empty();
+            AppendMenuW(manage, MF_STRING | (running ? 0 : MF_GRAYED), CMD_RESTART, tr("tray_restart").c_str());
+            if (running || st == "starting")
+                AppendMenuW(manage, MF_STRING | (running ? 0 : MF_GRAYED), CMD_STOP_SERVICE,
+                    tr("tray_stop_service").c_str());
+            else
+                AppendMenuW(manage, MF_STRING | (can_start ? 0 : MF_GRAYED), CMD_START_SERVICE,
+                    tr("tray_start_service").c_str());
+            AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(manage), tr("tray_service").c_str());
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_DOCS, tr("tray_docs").c_str());
             AppendMenuW(m, MF_STRING, CMD_ABOUT, tr("tray_about").c_str());
@@ -865,7 +928,13 @@ namespace pseudalis
             case CMD_INSTALL_UPDATE: post_action("/v1/updates/apply", ACT_APPLY_UPDATE, 30); break;
             case CMD_RESTART: post_action("/v1/restart", ACT_RESTART, 15); break;
             case CMD_START_SERVICE:
-                ui::run_async(tray.hwnd, WM_ACTION_DONE, ACT_SCM, []() { return control_service(false); });
+                tray.stopped_by_user = false;
+                ui::run_async(tray.hwnd, WM_ACTION_DONE, ACT_START, []() { return control_service(false); });
+                break;
+            case CMD_STOP_SERVICE:
+                tray.stopped_by_user = true;
+                tray.warned = false;
+                ui::run_async(tray.hwnd, WM_ACTION_DONE, ACT_STOP, []() { return stop_service(); });
                 break;
             case CMD_DOCS: ui::open_url(page_url("docs/")); break;
             case CMD_ABOUT: show_about(); break;

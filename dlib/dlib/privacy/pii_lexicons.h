@@ -1959,7 +1959,12 @@ namespace dlib
                     "elektronisch meinem erheben vertritt absolviert monatliche taglich rechten netto "
                     "wiederhergestellt jetzt gleich nichts etwas niemand wieder vielleicht gerne genau klar bald "
                     "spater fruh leider sonst trotzdem eigentlich ubrigens ziemlich wirklich naturlich sicher eben "
-                    "halt doch serata notte nottata mattinata tardes noches nacht abend wochenende brexit"
+                    "halt doch serata notte nottata mattinata tardes noches nacht abend wochenende brexit",
+                    // The verbs of the operative part of a judgment, often written in capitals.
+                    "condena condeno condenamos estima estimo estimamos desestima desestimo desestimamos absuelve "
+                    "absuelvo acuerda acuerdo ordena ordeno fallo fallamos dispongo resuelvo resuelve condanna "
+                    "condanniamo accoglie rigetta rigettiamo respinge respingiamo ordina assolve deboute rejette "
+                    "verurteilt"
                 };
                 for (const char* part : frequent)
                 {
