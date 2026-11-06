@@ -166,6 +166,15 @@ namespace pseudalis
 
         std::string anonymize_text(const std::string& text, json& report) const;
         std::string restore_text(const std::string& text, json& report) const;
+        /*
+            [{"begin", "end", "type"}] of the tags of a protected text that this key restores, and
+            of the values that restore_text() wrote in restored in place of the tags of tagged:
+            byte offsets of the text, for the colouring of the web application. The values are
+            given when the tags alone account for the restoration (a tag written in a link, which
+            the restoration also reads, gives none).
+        */
+        json tag_spans(const std::string& text) const;
+        json restored_spans(const std::string& tagged, const std::string& restored) const;
         // [{"begin", "end", "type", "confidence", "text"}] of the values of a text.
         json detect(const std::string& text) const;
 

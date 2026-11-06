@@ -7,6 +7,8 @@
 
   const texts = window.PSEUDALIS_TEXTS;
   let language = 'en';
+  // The text card is ready: its marks follow the language (renderMarks()).
+  let textReady = false;
 
   /* The language of the page: the one chosen in its menu, else the first language of the
      browser, which follows the system unless its user chose otherwise, that the application
@@ -41,6 +43,7 @@
   function translate() {
     document.documentElement.lang = language;
     document.querySelectorAll('[data-t]').forEach(function (e) { e.textContent = t(e.getAttribute('data-t')); });
+    if (textReady) renderMarks();
     refreshStatus();
     if (admin) {
       renderRecords();
@@ -386,6 +389,92 @@
   // ---------------------------------------------------------------------------------------
   // Texts.
 
+  /* The text card: Protect and Restore write their result in place of the text, whose tags
+     and values restored are coloured by kind on marks drawn under the text area; Show the values
+     found lists them below. */
+  const textArea = document.getElementById('text');
+  const textMarks = document.getElementById('text-marks');
+  const textLegend = document.getElementById('text-legend');
+  // The tags of the pseudonymizer: [[KEYWORD:body#CCC]].
+  const tagPattern = new RegExp('\\[\\[(PERSON|ORG|LOCATION|ADDRESS|EMAIL|PHONE|IBAN|CARD|NIR|SIRET|ID|IPV4|IPV6|' +
+    'MAC|URL|DATE|PLATE|GEO|TITLE|GENDER|NATIONALITY):[^\\[\\]]{1,4096}?#[0-9A-Z]{3}\\]\\]', 'g');
+  // The values just restored, in UTF-16 units of the text, until the text changes.
+  let restoredMarks = null;
+
+  function markKind(type) {
+    if (type === 'ORG') return 'org';
+    if (type === 'LOCATION' || type === 'ADDRESS' || type === 'GEO' || type === 'PLATE') return 'place';
+    if (type === 'EMAIL' || type === 'PHONE' || type === 'URL' || type === 'IPV4' || type === 'IPV6' ||
+        type === 'MAC') return 'contact';
+    if (type === 'ID' || type === 'IBAN' || type === 'CARD' || type === 'NIR' || type === 'SIRET') return 'id';
+    if (type === 'DATE') return 'date';
+    return 'person';
+  }
+
+  /* Byte offsets of the UTF-8 text, as the service gives them, in UTF-16 units of the text as the
+     text area holds it, every line break a LF: the LF of a CR LF takes no room of its own. */
+  function unitSpans(text, spans) {
+    const at = new Map([[0, 0]]);
+    let bytes = 0, units = 0, previous = '';
+    for (const ch of text) {
+      const c = ch.codePointAt(0);
+      bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+      if (!(ch === '\n' && previous === '\r')) units += ch.length;
+      previous = ch;
+      at.set(bytes, units);
+    }
+    const out = [];
+    (spans || []).forEach(function (s) {
+      const b = at.get(s.begin), e = at.get(s.end);
+      if (b !== undefined && e !== undefined && e > b) out.push({ begin: b, end: e, type: s.type });
+    });
+    return out;
+  }
+
+  function syncMarks() {
+    // The scroll bar of the text area narrows its text: the marks take the same width.
+    const bar = Math.max(0, textArea.offsetWidth - textArea.clientWidth - 2);
+    textMarks.style.paddingRight = (10 + bar) + 'px';
+    textMarks.scrollTop = textArea.scrollTop;
+    textMarks.scrollLeft = textArea.scrollLeft;
+  }
+
+  function renderMarks() {
+    const text = textArea.value;
+    let spans = [];
+    if (restoredMarks) {
+      spans = restoredMarks;
+    } else {
+      tagPattern.lastIndex = 0;
+      for (let m = tagPattern.exec(text); m; m = tagPattern.exec(text))
+        spans.push({ begin: m.index, end: m.index + m[0].length, type: m[1] });
+    }
+    spans.sort(function (a, b) { return a.begin - b.begin; });
+    textMarks.textContent = '';
+    let pos = 0;
+    spans.forEach(function (s) {
+      if (s.begin < pos) return;
+      textMarks.appendChild(document.createTextNode(text.slice(pos, s.begin)));
+      const mark = el('mark', 'k-' + markKind(s.type) + (restoredMarks ? ' restored' : ''), text.slice(s.begin, s.end));
+      textMarks.appendChild(mark);
+      pos = s.end;
+    });
+    // A final line break keeps the height of a last empty line of the text area.
+    textMarks.appendChild(document.createTextNode(text.slice(pos) + '\n'));
+    textLegend.hidden = spans.length === 0;
+    document.getElementById('text-legend-how').textContent =
+      restoredMarks ? t('legend_restored') : t('legend_protected');
+    syncMarks();
+  }
+
+  textArea.addEventListener('input', function () {
+    restoredMarks = null;
+    renderMarks();
+  });
+  textArea.addEventListener('scroll', syncMarks);
+  if (window.ResizeObserver) new ResizeObserver(syncMarks).observe(textArea);
+  textReady = true;
+
   async function textRoute(route) {
     const out = document.getElementById('text-result');
     let r;
@@ -393,7 +482,7 @@
       r = await fetch(route, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: document.getElementById('text').value })
+        body: JSON.stringify({ text: textArea.value })
       });
     } catch (e) {
       out.hidden = false;
@@ -401,18 +490,24 @@
       return;
     }
     const body = await r.json().catch(function () { return null; });
-    out.hidden = false;
     if (!r.ok || !body) {
+      out.hidden = false;
       out.textContent = errorText(body, r.status);
       return;
     }
     if (body.spans) {
+      out.hidden = false;
       out.textContent = body.spans.length ? body.spans.map(function (s) {
         return s.type + '  ' + s.text + '  (' + Math.round(s.confidence * 100) + ' %)';
       }).join('\n') : t('none_found');
       return;
     }
-    out.textContent = body.text;
+    // Protect and Restore: the result takes the place of the text.
+    out.hidden = true;
+    textArea.value = body.text.replace(/\r\n?/g, '\n');
+    restoredMarks = route === 'v1/text/restore' ? unitSpans(body.text, body.restored) : null;
+    if (restoredMarks && !restoredMarks.length) restoredMarks = null;
+    renderMarks();
   }
 
   document.getElementById('text-protect').addEventListener('click', function () { textRoute('v1/text/anonymize'); });

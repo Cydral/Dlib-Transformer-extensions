@@ -64,6 +64,25 @@ main { max-width: 980px; margin: 24px auto; padding: 0 16px; display: grid; gap:
 textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px;
   font: 14px/1.45 Consolas, monospace;
   resize: vertical; }
+/* The text of the card over its marks: the same box, font and wrapping, the marks alone visible. */
+.editor { position: relative; }
+.editor textarea { position: relative; z-index: 1; display: block; background: transparent; }
+.marks { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; background: #fff;
+  border: 1px solid transparent; border-radius: 8px; padding: 10px; font: 14px/1.45 Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: break-word; color: transparent; }
+.marks mark { color: transparent; border-radius: 3px; }
+.marks mark.restored { background: transparent; border-bottom: 2px solid; border-radius: 0; }
+.k-person { --mark: #cfe0ff; --line-mark: #2f6fd6; }
+.k-org { --mark: #e6d9fb; --line-mark: #7b4bd1; }
+.k-place { --mark: #d3f1dd; --line-mark: #1f9a55; }
+.k-contact { --mark: #fde3c8; --line-mark: #d9731a; }
+.k-id { --mark: #fbd6dc; --line-mark: #c8334f; }
+.k-date { --mark: #d2f2f0; --line-mark: #138f86; }
+.marks mark { background: var(--mark); }
+.marks mark.restored { border-bottom-color: var(--line-mark); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 0; font-size: 13px; color: var(--faint); }
+.legend .key::before { content: ""; display: inline-block; width: 11px; height: 11px; margin-right: 5px;
+  border-radius: 3px; vertical-align: -1px; background: var(--mark); border: 1px solid var(--line-mark); }
 .buttons { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 button, .button { border: 0; border-radius: 7px; padding: 7px 14px; background: var(--navy-2); color: #fff;
   font: inherit;

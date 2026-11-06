@@ -177,7 +177,9 @@ waits for them).
 
 The icon opens the web application of the service, `https://localhost:8444`: files dropped there are
 anonymized or restored and downloaded back, a folder dropped or chosen there as the ZIP archive of its
-tree, texts are anonymized, restored or analyzed, and, opened from the icon, it lists the originals kept
+tree, texts are anonymized or restored in place, their tags highlighted and their values restored
+underlined in the color of their kind, or analyzed, the values found listed below them, and, opened from
+the icon, it lists the originals kept
 (download, forget), exports and imports the key, and changes the settings and the imposed terms. The
 interface it uses is
 described with Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu of the
@@ -192,7 +194,7 @@ by themselves.
 | `POST /v1/restore?name=&object_id=&format=` | restores the file of the body: its original, its picture or its tags |
 | `GET /v1/lookup?sha256=&object_id=` | whether a file is an anonymized file of this computer |
 | `POST /v1/records/{id}/location` | records where an anonymized file was written (token) |
-| `POST /v1/text/anonymize`, `/restore`, `/detect` | the same protection on a text, `{"text": ...}` |
+| `POST /v1/text/anonymize`, `/restore`, `/detect` | the same protection on a text, `{"text": ...}`; the places of the tags written (`tags`) or of the values restored (`restored`) come back with it |
 | `POST /v1/names/anonymize`, `/restore` | a name alone, the one of a folder, `{"name": ...}`, its substitutes recorded |
 | `GET /v1/drive`, `GET /v1/events?since=` | the drive, the files it protected or refused (token for the events) |
 | `GET /v1/albireo` | whether Albireo describes the pictures |

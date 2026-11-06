@@ -114,6 +114,11 @@ namespace dlib
             - Adds to detector the recognizers given, either of which may be null or
               empty: both through combine_pii_recognizers(), or the one given alone with
               min_confidence.
+            - The parts of a name and the organisations that the span model reads below
+              min_confidence, down to 0.2, where no value lies, also reach the detector,
+              under the label "WEAK": no values themselves, they are the weak evidence
+              that a capitalized word joined by a conjunction to a person found is
+              another person ("Martin and Dupont").
             - The detector keeps shared ownership of the models.
     !*/
 

@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -435,11 +435,42 @@
     },
     "responses": {
      "200": {
-      "description": "{\"text\", \"report\"}",
+      "description": "{\"text\", \"report\", \"tags\": [{\"begin\", \"end\", \"type\"}]}",
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "type": "object",
+         "properties": {
+          "text": {
+           "type": "string",
+           "description": "The protected text."
+          },
+          "report": {
+           "type": "object",
+           "description": "The counts by type, without personal values."
+          },
+          "tags": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "begin": {
+              "type": "integer",
+              "description": "Byte offset of the UTF-8 text where the span begins."
+             },
+             "end": {
+              "type": "integer",
+              "description": "Byte offset where the span ends."
+             },
+             "type": {
+              "type": "string",
+              "description": "The type of the value: PERSON, ORG, LOCATION, ADDRESS, EMAIL..."
+             }
+            }
+           },
+           "description": "The tags written in the text, in their order. Empty when the text is not UTF-8 or holds more than 100000 of them."
+          }
+         }
         }
        }
       }
@@ -457,7 +488,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The imposed terms (/v1/terms) are replaced before any other value is read."
+    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The imposed terms (/v1/terms) are replaced before any other value is read. The answer gives the places of the tags written (\"tags\"), which the web application colours by type."
    }
   },
   "/v1/text/restore": {
@@ -486,11 +517,42 @@
     },
     "responses": {
      "200": {
-      "description": "{\"text\", \"report\"}",
+      "description": "{\"text\", \"report\", \"restored\": [{\"begin\", \"end\", \"type\"}]}",
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "type": "object",
+         "properties": {
+          "text": {
+           "type": "string",
+           "description": "The restored text."
+          },
+          "report": {
+           "type": "object",
+           "description": "The counts of the tags restored and refused."
+          },
+          "restored": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "begin": {
+              "type": "integer",
+              "description": "Byte offset of the UTF-8 text where the span begins."
+             },
+             "end": {
+              "type": "integer",
+              "description": "Byte offset where the span ends."
+             },
+             "type": {
+              "type": "string",
+              "description": "The type of the value: PERSON, ORG, LOCATION, ADDRESS, EMAIL..."
+             }
+            }
+           },
+           "description": "The values written in place of the tags, in the restored text. Empty when a tag that a link encodes was restored too, the places being then unknown, when the text is not UTF-8, or beyond 100000 values."
+          }
+         }
         }
        }
       }
@@ -508,7 +570,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
+    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The answer gives the places of the values restored (\"restored\"), which the web application underlines."
    }
   },
   "/v1/text/detect": {

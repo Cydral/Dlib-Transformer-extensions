@@ -616,6 +616,32 @@ int main()
     CHECK(process(e, "detect", "prompt", "Écrire à Jean Dupont", res, out));
     CHECK(res["spans"].size() >= 1 && res["spans"].elements()[0]["type"].str() == "PERSON");
 
+    // The places of the tags written and of the values restored, in bytes of the UTF-8 text.
+    {
+        const std::string text = "Écrire à Jean Dupont, jean.dupont@example.fr";
+        CHECK(process(e, "anonymize_text", "prompt", text, res, out) && res["tags"].size() >= 2);
+        bool tags = true;
+        for (const json& s : res["tags"].elements())
+        {
+            const std::size_t b = static_cast<std::size_t>(s["begin"].as_int());
+            const std::size_t n = static_cast<std::size_t>(s["end"].as_int()) - b;
+            tags = tags && b + n <= out.size() && n > 4 && out.compare(b, 2, "[[") == 0 &&
+                   out.compare(b + n - 2, 2, "]]") == 0;
+        }
+        CHECK(tags);
+        std::string back;
+        CHECK(process(e, "restore_text", "prompt", out, res, back) && back == text);
+        std::vector<std::string> values;
+        for (const json& s : res["restored"].elements())
+            values.push_back(back.substr(static_cast<std::size_t>(s["begin"].as_int()),
+                                         static_cast<std::size_t>(s["end"].as_int() - s["begin"].as_int())));
+        CHECK(std::find(values.begin(), values.end(), "Jean Dupont") != values.end() &&
+              std::find(values.begin(), values.end(), "jean.dupont@example.fr") != values.end());
+        // A text in Windows-1252 gets no places, which the service could not keep in its answer.
+        CHECK(process(e, "anonymize_text", "prompt", "\xC9t\xE9 de Jean Dupont", res, out) &&
+              out.find("Dupont") == std::string::npos && res["tags"].size() == 0);
+    }
+
     // The imposed terms: replaced before anything else, in the texts, the files and the names.
     {
         const std::string terms = "[{\"term\": \"Projet Alpha\", \"type\": \"ORG\"}, "

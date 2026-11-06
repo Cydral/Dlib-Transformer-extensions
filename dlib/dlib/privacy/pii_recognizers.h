@@ -212,6 +212,36 @@ namespace dlib
         return spans;
     }
 
+    namespace privacy_impl
+    {
+        /* The parts of a name and the organisations that the span model reads below
+           min_confidence, down to 0.2, where no span kept lies: no value by themselves, they are
+           the weak evidence that a capitalized word joined by a conjunction to a person found is
+           another person ("Martin and Dupont"), which the detector reads under the label "WEAK". */
+        inline void append_weak_names(
+            const std::vector<pii_span>& model_spans,
+            double min_confidence,
+            std::vector<pii_span>& out
+        )
+        {
+            const std::size_t count = out.size();
+            for (const pii_span& s : model_spans)
+            {
+                if (s.confidence >= min_confidence || s.confidence < 0.2 ||
+                    !(name_part(s) || s.label == "ORGANIZATION"))
+                    continue;
+                bool free = true;
+                for (std::size_t k = 0; k < count && free; ++k)
+                    if (s.begin < out[k].end && out[k].begin < s.end) free = false;
+                if (!free) continue;
+                pii_span w = s;
+                w.label = "WEAK";
+                w.type = pii_type::none;
+                out.push_back(w);
+            }
+        }
+    }
+
     inline void attach_pii_recognizers(
         pii_detector& detector,
         std::shared_ptr<const pii_sequence_tagger> tagger,
@@ -224,12 +254,22 @@ namespace dlib
         if (model && tagger)
         {
             detector.add_recognizer([model, tagger, min_confidence, tagger_min_confidence](const std::string& t) {
-                return combine_pii_recognizers(t, model->find(t), tagger->find(t), min_confidence,
-                                               tagger_min_confidence);
+                const std::vector<pii_span> read = model->find(t);
+                std::vector<pii_span> out = combine_pii_recognizers(t, read, tagger->find(t), min_confidence,
+                                                                    tagger_min_confidence);
+                privacy_impl::append_weak_names(read, min_confidence, out);
+                return out;
             }, 0);
         }
         else if (model)
-            detector.add_recognizer([model](const std::string& t) { return model->find(t); }, min_confidence);
+            detector.add_recognizer([model, min_confidence](const std::string& t) {
+                const std::vector<pii_span> read = model->find(t);
+                std::vector<pii_span> out;
+                for (const pii_span& s : read)
+                    if (s.confidence >= min_confidence) out.push_back(s);
+                privacy_impl::append_weak_names(read, min_confidence, out);
+                return out;
+            }, 0);
         else if (tagger)
             detector.add_recognizer([tagger](const std::string& t) { return tagger->find(t); }, min_confidence);
     }

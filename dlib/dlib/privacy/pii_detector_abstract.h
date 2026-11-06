@@ -253,7 +253,10 @@ namespace dlib
                    before the date of a letter ("Rennes, le 12 mars 2024"). User names come
                    from logs and chats ("user=jdupont", "[10:42] jdupont:", "opened by
                    jdupont"). A capitalized word that a conjunction or an ampersand joins to
-                   a person or an organisation found with a confidence of 0.8 at least,
+                   a person or an organisation found with a confidence of 0.8 at least, or
+                   to a person found with 0.5 at least when the span model reads the word as
+                   a part of a name or an organisation however weakly (the reads that
+                   attach_pii_recognizers() passes under the label "WEAK"),
                    without a value of its own, is another person beside a person ("Martin
                    and Dupont", "Dupont et Martin") and completes the name of an
                    organisation ("Clifford & Chance", "Oficina de Asilo y Refugio", "Porcu e
@@ -288,12 +291,36 @@ namespace dlib
                    field labels ("| Nom | Sexe | Nationalité |", "Civilité;Nom;Prénom",
                    tab separated columns) types the cells of the lines below it.
 
+                   Whatever reads them, a person, a place, an organisation or an address
+                   made of generic words only stays readable: common words and their
+                   plurals, function words and elisions ("Jusqu'"), technical acronyms,
+                   roles, products, regulations, field labels, single letters, numbers and
+                   the vocabulary of business documents ("Le Consortium", "Architecte
+                   junior", "Glossaire RACI", "C I" in a column of roles, "Politique de
+                   sauvegarde", "Google Chrome", "allée du SIEM"), unless the user, a label
+                   or a forced type gives the value. A given name, or a civility, a title or
+                   a label of names just before, keeps a person; a head noun with a word in
+                   capitals after a connector ("ministère de la Pêche"), a word of its
+                   own, a public body in capitals, a known name or the country, the region
+                   or the town that a name opened by a capital serves ("Électricité de
+                   France", "Opéra de Paris") keeps an organisation; a
+                   town among the common words keeps a place; a street type before a word
+                   of its own keeps an address. Pieces of codes joined by underscores
+                   ("REQ_SEC_B2") or of words whose whole is generic ("Shell" in
+                   "PowerShell"), page numbers of a table of contents and the identifiers
+                   of the public catalogues of vulnerabilities ("CVE-2014-0160") name
+                   nothing either.
+
                 3. Document-level propagation. Detection runs in two passes over a
                    document: learn() records the names established with strong evidence,
-                   the places and organisations found in context, and the name fragments
-                   of e-mail addresses; detect() then also flags bare occurrences of
-                   those names ("Dupont a signé"), so that every mention of a person is
-                   replaced, bare surnames included.
+                   the places and organisations found in context, the acronym that an
+                   organisation defines between parentheses after its name, its initials
+                   matching ("ministère de la Pêche et des Eaux intérieures (MPEI)", the
+                   name taking the words in lower case before the parenthesis), and the
+                   name fragments of e-mail addresses; detect() then also flags bare
+                   occurrences of those names ("Dupont a signé", "le MPEI" in capitals),
+                   so that every mention of a person is replaced, bare
+                   surnames included. Generic words are never learned.
 
                 4. User knowledge. Regular expressions added with add_pattern() and
                    terms added with add_term() describe what is specific to an

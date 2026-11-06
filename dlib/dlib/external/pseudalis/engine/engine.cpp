@@ -1543,6 +1543,53 @@ namespace pseudalis
         return out;
     }
 
+    /* The places of the spans of a text are given for UTF-8 only, the text the service sends back, and
+       up to 100000 of them, which the service reads in the result of the engine: beyond, none. */
+    namespace
+    {
+        const std::size_t max_spans = 100000;
+    }
+
+    json engine::tag_spans(const std::string& text) const
+    {
+        json spans = json::array();
+        if (!privacy_impl::utf8_valid(text)) return spans;
+        for (const pseudonymizer::tag_occurrence& o : p_->p->find_tags(text))
+        {
+            if (spans.size() == max_spans) return json::array();
+            json s = json::object();
+            s["begin"] = static_cast<unsigned long long>(o.begin);
+            s["end"] = static_cast<unsigned long long>(o.end);
+            s["type"] = pii_type_keyword(o.type);
+            spans.push_back(s);
+        }
+        return spans;
+    }
+
+    json engine::restored_spans(const std::string& tagged, const std::string& restored) const
+    {
+        json spans = json::array();
+        if (!privacy_impl::utf8_valid(restored)) return spans;
+        std::string rebuilt;
+        std::size_t pos = 0;
+        for (const pseudonymizer::tag_occurrence& o : p_->p->find_tags(tagged))
+        {
+            if (o.begin < pos || spans.size() == max_spans) return json::array();
+            rebuilt.append(tagged, pos, o.begin - pos);
+            json s = json::object();
+            s["begin"] = static_cast<unsigned long long>(rebuilt.size());
+            rebuilt += o.original;
+            s["end"] = static_cast<unsigned long long>(rebuilt.size());
+            s["type"] = pii_type_keyword(o.type);
+            spans.push_back(s);
+            pos = o.end;
+        }
+        rebuilt.append(tagged, pos, std::string::npos);
+        // Tags that a link encodes are restored too: the places are then unknown.
+        if (rebuilt != restored) return json::array();
+        return spans;
+    }
+
     void engine::set_terms(const std::vector<imposed_term>& terms)
     {
         std::vector<pii_imposed_term> converted;

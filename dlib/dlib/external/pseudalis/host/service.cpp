@@ -927,6 +927,8 @@ namespace pseudalis
         {
             out["text"] = output;
             out["report"] = result["report"];
+            if (result.contains("tags")) out["tags"] = result["tags"];
+            if (result.contains("restored")) out["restored"] = result["restored"];
         }
         return true;
     }

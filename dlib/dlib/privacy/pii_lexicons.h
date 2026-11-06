@@ -444,7 +444,21 @@ namespace dlib
                 "sindaco sindaca assessore assessora consigliere consigliera direttore direttrice collega "
                 "colleghi colleghe alcalde alcaldesa concejal concejala consejero consejera colega director "
                 "directora burgermeister burgermeisterin vorsitzender vorsitzende direktor direktorin kollege "
-                "kollegin exzellenz excellence eccellenza excelencia");
+                "kollegin exzellenz excellence eccellenza excelencia "
+                // The roles of the teams that business documents present: "Architecte junior", "Lead Engineer".
+                "auditeur auditrice auditeurs consultant consultante consultants architecte architectes analyste "
+                "analystes formateur formatrice formateurs expert experte experts referent referente animateur "
+                "animatrice ingenieur ingenieure technicien technicienne administrateur administratrice "
+                "pentesteur pentester developpeur developpeuse coordinateur coordinatrice superviseur "
+                "superviseuse planificateur planificatrice observateur observatrice rapporteur rapporteuse chef "
+                "directeur directrice responsable manager auditor auditors consultants architect architects "
+                "analyst analysts trainer trainers engineer engineers administrator developer coordinator lead "
+                "revisore consulente consulenti architetto analista analisti formatore formatrice ingegnere "
+                "amministratore sviluppatore coordinatore referente auditora consultor consultora consultores "
+                "arquitecto arquitecta formador formadora ingeniero ingeniera administrador administradora "
+                "desarrollador desarrolladora coordinador coordinadora auditorin berater beraterin architekt "
+                "architektin analystin trainerin ingenieurin administratorin entwickler entwicklerin koordinator "
+                "koordinatorin projektleiter projektleiterin ansprechpartner ansprechpartnerin");
             return s;
         }
 
@@ -1059,6 +1073,85 @@ namespace dlib
                 "nato nata nati nate residente residenti domiciliato domiciliata domiciliati abitante originario "
                 "originaria nacido nacida nacidos residentes domicilio domiciliado domiciliada vecino vecina "
                 "natural geboren wohnhaft wohnt ansassig geburtig");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& business_words()
+        {
+            /* The vocabulary of proposals, tenders, audit reports and slides of information
+               technology and security services, which their headings, cells and bullets
+               capitalize: "Glossaire", "Gabarit", "Bordereau", "Réversibilité". None of them is
+               a place either, unlike some common words ("Nice", "Tours"). They are common words
+               too (common_words()). */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "accompagnement accord-cadre acheteur adjudicateur anciennete annuaire annuaires apprenant "
+                "apprenants astreinte astreintes attestation auditer audits authentification authentifie "
+                "authentifies automatisation beneficiaires bordereau briefing cadrer cartographie cartographies "
+                "certifications chiffrage chiffrement chronogramme comites comitologie complexite concevoir "
+                "consulte consultee cotech cotraitance cotraitant cotraitants critere criticite cyber "
+                "cyberattaque cyberattaques cyberdefense cybermenace cybermenaces cybersecurite debrief "
+                "debriefing debutant debutants demarches demonstrations detection dimensionnement dispositifs "
+                "documentation durcissement echantillonnage editeurs endpoint evaluations exigence exploitant "
+                "exploitants feries finaliste finalistes firmware forensique fourniture fournitures gabarit "
+                "glossaire gouvernance grilles groupement groupements habilitation habilitations hameconnage "
+                "hebergement hebergeur hebergeurs homologation homologuer industrialisation informee "
+                "initialisation integrateur interlocuteurs intervenants intrusion journalisation junior "
+                "juniors kick-off licences logigramme malware mandataire maquettage maquette matrice matrices "
+                "messagerie methodologie modalite modalites moyen mutualisation notation oeuvre operationnel "
+                "operationnelle outillage outillages ouverture ouvrees ouvres panorama pare-feu passerelle "
+                "penalites pentest pentests phishing pilote plan planificateur planning plannings plateformes "
+                "ponderation porteur porteurs prenantes preselection preselectionner profils "
+                "qualifications questionnaire questionnaires rancongiciel recommander referents relecture "
+                "remediation resilience restitution restitutions retroplanning reversibilite revues sandbox "
+                "sauvegarde sauvegardes scan scanner scans scenarios semestriel seminaire seminaires senior "
+                "seniors sensibilisation serveurs simulation simulations sonde sondes soumissionnaire "
+                "sous-traitance soutenance souveraine stimuli stimulus supervision syntheses template "
+                "titulaires tranches valider variante variantes vulnerabilite vulnerabilites solutions "
+                "adresses hotes hote metiers utilisateurs equipements comptes actifs salles postes "
+                "abnahme abschlussprasentation actividades adjudicatario adjudicatarios approccio auftraggeber "
+                "auftragnehmer beneficiari betreiber bietergemeinschaft capitolato ciberseguridad collaudo "
+                "comitato compliant consortium consultado consultato consulted contractor criteri criterios "
+                "cumple cybersecurity cybersicherheit cybersicurezza documentazione dokumentation "
+                "einspielungen enfoque entregables erfullt esecuzione esercitazione estimulos gewichtung "
+                "gobierno governance governo herramienta herramientas industrialisierung industrializacion "
+                "industrializzazione informado informato injects jornadas konsultiert kriterien "
+                "leistungsbeschreibung lenkungsausschuss liefergegenstande livelli losungsarchitekt mapa mappa "
+                "matrix matriz medios methodik modalidades modalita modalitaten modalities nivel niveles "
+                "operadores operatori perfiles perimetro pilotaggio pliego pliegos ponderacion prioritat "
+                "profili profilo projektleitung raggruppamento requisito ressourcen restitucion restituzione "
+                "revisione schulung schwachstellen seminar seminari seminario simulacion simulazione "
+                "stakeholder stakeholderkarte steuerung stimoli strumenti strumento stufe supplier tender ubung "
+                "ubungssteuerung umfang vulnerabilidades vulnerabilita vulnerabilities weighting werkzeuge "
+                "workshops anforderung annex debrief securite public publique publics publiques prive privee prives "
+                "privees etat cloud firewall internet intranet extranet certification certificat certificats "
+                "metropolitaine metropolitain outre-mer ultramarin ultramarine technologie technologies impliquee "
+                "impliquees aspect aspects fonctionnel fonctionnelle fonctionnels fonctionnelles teaming bounty "
+                "bug automated manual penetration testing benchmark benchmarks assessment assessments hardening "
+                "monitoring act kit quantique finalisation restructuration securisation agile affectee affectees "
+                "habilitee habilitees qualifie qualifiee qualifies qualifiees operateur operateurs entite entites "
+                "departemental departementale departementaux regional regionale regionaux national nationale "
+                "nationaux municipal municipale municipaux territorial territoriale territoriaux interministeriel "
+                "interministerielle guichet tutelle emploi emplois surcout surcouts alliance "
+                "forensic tactique tactiques homogeneisation innovant innovante innovants innovantes evenementiel "
+                "evenementielle sanitaire sanitaires malicieux malicieuse malicieuses environnement environnements "
+                "artificiel artificielle confidentialite capacitaire egalite macro-processus processus amont aval "
+                "planification specifier anticiper alerter technologique technologiques travers demi medium web type "
+                "types site sites salle salles serveur niveau niveaux cle cles succes facteur facteurs annexe annexes "
+                "systeme systemes pilotage qualite synthese livrable livrables maitrise maitrises atelier "
+                "ateliers servira finances "
+                // Verbs in the infinitive that open the bullets of slides: "Vérifier les accès", "Detect".
+                "analyser examiner detecter evaluer optimiser identifier definir alimenter elaborer associer "
+                "accompagner piloter mesurer prevenir proteger repondre retablir verifier valider controler "
+                "surveiller securiser auditer tester qualifier deployer documenter former sensibiliser animer "
+                "coordonner organiser planifier preparer rediger realiser presenter restituer recommander prioriser "
+                "corriger superviser maintenir assurer garantir reviser actualiser consolider capitaliser "
+                "cartographier modeliser concevoir integrer configurer installer migrer exploiter gerer suivre "
+                "collecter formaliser decrire etablir fournir livrer mettre proposer analyze detect identify "
+                "protect respond recover assess evaluate review validate verify monitor deploy deliver implement "
+                "analizzare rilevare identificare proteggere rispondere ripristinare valutare verificare monitorare "
+                "implementare analizar detectar identificar responder recuperar evaluar verificar supervisar "
+                "implementar analysieren erkennen identifizieren schutzen reagieren wiederherstellen bewerten "
+                "prufen uberwachen umsetzen");
             return s;
         }
 
@@ -1964,13 +2057,16 @@ namespace dlib
                     "condena condeno condenamos estima estimo estimamos desestima desestimo desestimamos absuelve "
                     "absuelvo acuerda acuerdo ordena ordeno fallo fallamos dispongo resuelvo resuelve condanna "
                     "condanniamo accoglie rigetta rigettiamo respinge respingiamo ordina assolve deboute rejette "
-                    "verurteilt"
+                    "verurteilt",
+                    // Adjectives that name streets too ("Central Avenue"): common words, no words of a trade.
+                    "central centrale centraux centrales"
                 };
                 for (const char* part : frequent)
                 {
                     const std::unordered_set<std::string> more = make_word_set(part);
                     words.insert(more.begin(), more.end());
                 }
+                words.insert(business_words().begin(), business_words().end());
                 return words;
             }();
             return s;
@@ -2021,6 +2117,8 @@ namespace dlib
             /* Articles, pronouns, possessives, prepositions and conjunctions: a span made of
                them alone names nobody. */
             static const std::unordered_set<std::string> s = make_word_set(
+                // The stems of the elisions: "Jusqu'à", "Lorsqu'il", "Aujourd'hui", "Sull'argomento".
+                "jusqu lorsqu puisqu quoiqu quelqu presqu aujourd dall sull quell "
                 "le la les l un une des du de d au aux a et ou mais donc or ni car ce c cet cette ces "
                 "mon ma mes ton ta tes son sa ses notre nos votre vos leur leurs je j tu il elle on nous "
                 "vous ils elles me m te t se s moi toi lui eux y en qui que qu quoi dont ou ceci cela ca "
@@ -2292,7 +2390,7 @@ namespace dlib
                 "cbi rbi sebi irdai trai isro drdo upsc anvisa ibge bacen cvm detran imss issste inegi condusef "
                 "profeco eba esma eiopa ecb bce eib bei echa efsa edpb edps enisa euipo eurostat eppo cedefop inao "
                 "anru sgami gign ocrtis oclctic sdis samu afpa hadopi ird cirad inrap dgos dgcs dgesco dgesip dsden "
-                "drees cnamts cea ccas cias");
+                "drees cnamts cea ccas cias masa mapa acn agid ccn incibe aepd bfdi");
             return s;
         }
 
@@ -2304,6 +2402,8 @@ namespace dlib
                 "caisse des depots|caisse des depots et consignations|"
                 "conseil d'etat|cour de cassation|cour des comptes|conseil constitutionnel|assemblee nationale|"
                 "senat|education nationale|gendarmerie nationale|police nationale|police municipale|"
+                "marine nationale|armee de terre|armee de l'air|armee de l'air et de l'espace|"
+                "bibliotheque nationale de france|"
                 "tresor public|haute autorite de sante|defenseur des droits|assurance maladie|assurance retraite|"
                 "securite sociale|"
                 "agirc-arrco|france competences|bpifrance|caisse nationale d'assurance vieillesse|"
@@ -2475,7 +2575,8 @@ namespace dlib
                 "elsevier|em lyon business school|emaar|emaar properties|embraer|emeis|emerson electric|"
                 "emirates airline|emirates group|emirates nbd|emlyon|emmaus|enbw|endesa|enedis|enel|engie|"
                 "engie electrabel|enterprise rent-a-car|epfl|epic games|epson|equifax|equinor|eramet|ergo group|"
-                "ernst & young|erste bank|erste group|esade|escp|escp business school|eset|eskom|essec|esselunga|"
+                "ernst & young|erste bank|erste group|esade|escp|escp business school|eset|eskom|essec|esselunga|epita|"
+                "campus cyber|clusif|cesin|cigref|hexatrust|numeum|syntec|syntec numerique|"
                 "essilor|essilorluxottica|estee lauder|eth zurich|ethio telecom|ethiopian airlines|etihad|"
                 "etihad airways|etisalat|euler hermes|eurazeo|euro disney|eurobank|eurofins|euronext|europacorp|"
                 "europcar|europe 1|eurostar|eurowings|eutelsat|evergreen marine|everton fc|eviden|evonik|evri|exelon|"
@@ -2693,7 +2794,10 @@ namespace dlib
                 "deutscher bundestag|bundestag|bundesrat|bundesamt fur sicherheit in der informationstechnik|"
                 "statistisches bundesamt|kraftfahrt-bundesamt|"
                 "bundesbeauftragte fur den datenschutz und die informationsfreiheit|bundesnetzagentur|"
-                "bundeskartellamt|zoll|familienkasse");
+                "bundeskartellamt|zoll|familienkasse|"
+                // Names of common words, known as a whole: "Mutuelle Générale", "Météo-France".
+                "electricite de france|gaz de france|opera de paris|opera national de paris|mutuelle generale|"
+                "la mutuelle generale|francaise des jeux|la francaise des jeux|comedie-francaise|meteo-france");
             return s;
         }
 
@@ -2746,10 +2850,42 @@ namespace dlib
                 "sla kpi roi crm erp sap aws gcp cdr pki vpn ssl tls http https ok nb ps pj ref fyi asap "
                 "siem soc sso mfa ldap edr xdr ndr dmz wifi vlan dns dhcp tcp udp ssh ftp sftp smtp imap sql json "
                 "xml html css csv iot ics scada hmi saas paas iaas cmdb itsm itil cve cvss owasp waf ids ips dlp "
-                "iam mdm byod rpa etl ocr llm gpu cpu ssd hdd usb hdmi bios uefi tpm hsm mwst rrhh hr");
+                "iam mdm byod rpa etl ocr llm gpu cpu ssd hdd usb hdmi bios uefi tpm hsm mwst rrhh hr "
+                // The acronyms of information security, services and public procurement.
+                "ssi smsi pssie cert csirt cti igc pca pra mco mcs iga mdr soar sirp dfir fir ioc iocs ttp ttps "
+                "kev epss cwe misp osint tlpt raci retex mooc uo moe amoa pv poc pov cctp ccap ccp cgv bpu dpgf "
+                "dqe etp hno jno pacs pdis pris passi siiv oiv lpm aipd dpia dicp dict dmia pdma rto rpo mtd nids "
+                "hids ngfw utm casb cnapp cspm cwpp sase ztna sdwan wan mpls ot dcs gpo rdp smb ntlm adfs laps "
+                "rodc wsus sccm vdi rds kms byok hyok byoe csr crl ocsp ip nas ccsp cissp cism cisa ciso cio gpen "
+                "gcih gcfa gnfa gxpn oscp osce ceh issap pmp prince2 scorm lms caas faas esn ssii rti sgsi isms "
+                "kritis rfi rfp rfq itt nda mssp sdlc qa qos ui ux devops devsecops pc ac ah rm hpc bdd grades "
+                "osstm cra rncp rfc csf nc att ck rse cca");
             return s;
         }
 
+
+        inline const std::unordered_set<std::string>& product_names()
+        {
+            /* Operating systems, software, platforms, tools, methods and malware that business
+               and security documents cite: a product names no person, place or organisation, and
+               the maker before it ("Google Chrome", "Mozilla Firefox") cites the product too. Makers
+               known by their own name stay organisations (known_organizations()). */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "windows linux ubuntu debian centos redhat rhel fedora macos ios android chromeos unix freebsd "
+                "esxi vsphere vcenter hyper-v netscaler xenapp xendesktop proxmox openstack kubernetes openshift "
+                "ansible terraform jenkins jira confluence sharepoint onedrive outlook office365 m365 azure entra "
+                "intune bitlocker defender sentinel purview powershell sysmon kape velociraptor encase axiom "
+                "volatility yara opencti thehive kibana logstash graylog qradar arcsight wazuh suricata zeek "
+                "snort osquery bloodhound pingcastle mimikatz metasploit nmap nessus openvas qualysguard nuclei "
+                "sqlmap burp wireshark tcpdump hashcat testssl nikto acunetix sentinelone carbonblack fortigate "
+                "fortianalyzer fortimanager prisma cortex pingfederate pingid keepass bitwarden lastpass anydesk "
+                "webex tchap citadel wannacry notpetya emotet trickbot ryuk lockbit qakbot log4j log4shell "
+                "heartbleed eternalblue printnightmare zerologon proxylogon proxyshell jtagulator kerberos ldaps "
+                "ipsec wireguard openvpn osstmm ptes mitre teamviewer teamviewerqs rsat dxdiag eventvwr regedit "
+                "prefetch amcache shimcache servicenow edge chrome firefox safari excel word powerpoint visio "
+                "teams copilot greenbone zap blueprism trustway zoom system32");
+            return s;
+        }
 
         inline const std::unordered_set<std::string>& regulation_terms()
         {

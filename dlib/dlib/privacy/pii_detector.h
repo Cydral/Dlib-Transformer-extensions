@@ -82,6 +82,8 @@ namespace dlib
             bool strong = false;    // usable to teach the document lexicon
             bool exact = false;     // boundaries of a known name or of a postal layout, matched whole
             bool learned = false;   // read by a recognizer
+            bool kept = false;      // set by the user, a forced type or a label: never read as generic words
+            bool defined = false;   // an acronym defined after the name of its organisation: "(MPEI)"
         };
 
         struct word_token
@@ -376,6 +378,7 @@ namespace dlib
             doc_terms_.clear();
             doc_term_set_.clear();
             doc_term_index_.clear();
+            doc_acronyms_.clear();
             std::lock_guard<std::mutex> lock(cache_->m);
             cache_->spans.clear();
         }
@@ -432,6 +435,8 @@ namespace dlib
             for (const privacy_impl::pii_candidate& c : found)
             {
                 const std::string value = privacy_impl::cp_substr(t, text, c.b, c.e);
+                // "ministère de la Pêche et des Eaux intérieures (MPEI)": "MPEI" anywhere.
+                if (c.type == pii_type::organization && c.defined) doc_acronyms_.insert(value);
                 if (c.type == pii_type::person && c.strong)
                 {
                     doc_names_full_.insert(privacy_impl::fold_key(value));
@@ -602,10 +607,14 @@ namespace dlib
         void add_doc_term(const std::vector<std::string>& keys, pii_type type)
         {
             if (keys.empty()) return;
-            // A single short or common word is too weak to be replaced everywhere.
+            // A single short or common word is too weak to be replaced everywhere, and so are generic words.
             if (keys.size() == 1 &&
                 (keys[0].size() < 4 || privacy_impl::common_words().count(keys[0]) || is_digit_key(keys[0])))
                 return;
+            bool generic = true;
+            for (const std::string& k : keys)
+                if (!generic_key(k, type != pii_type::location)) generic = false;
+            if (generic) return;
             std::string joined = std::string(pii_type_keyword(type)) + ":";
             for (const std::string& k : keys) joined += k + " ";
             if (!doc_term_set_.insert(joined).second) return;
@@ -620,7 +629,8 @@ namespace dlib
             {
                 if (w.e - w.b < 2) continue;
                 if (privacy_impl::person_particles().count(w.key) || privacy_impl::person_titles().count(w.key) ||
-                    privacy_impl::common_words().count(w.key))
+                    privacy_impl::common_words().count(w.key) || generic_key(w.key, true) ||
+                    w.key.find_first_of("0123456789_") != std::string::npos)
                     continue;
                 words.insert(w.key);
             }
@@ -687,6 +697,7 @@ namespace dlib
                     type_value(text, t, b, e, context.forced, c);
                 else if (e > b && masked.empty())
                     add(c, b, e, context.forced, 1.0, 200, true);
+                for (candidate& x : c) x.kept = true;
             }
 
             scan_emails(t, c);
@@ -724,7 +735,11 @@ namespace dlib
                     add(c, b, e, pii_type::date, m.format.has_day() ? 0.95 : 0.9);
                 }
             }
-            scan_labels(text, t, words, context, c);
+            {
+                const std::size_t before = c.size();
+                scan_labels(text, t, words, context, c);
+                for (std::size_t k = before; k < c.size(); ++k) c[k].kept = true;
+            }
             scan_tables(text, t, c);
             scan_attributes(text, t, words, c);
             scan_addresses(t, words, c);
@@ -737,11 +752,13 @@ namespace dlib
             scan_persons(text, t, words, c);
             scan_aliases(t, words, c);
             scan_terms(t, words, c);
+            scan_doc_acronyms(t, words, c);
             scan_cued_references(t, words, c);
             scan_year_references(t, c);
             scan_logins(t, words, c);
             scan_patterns(text, t, c);
-            scan_recognizers(text, t, context, c);
+            std::vector<std::pair<std::size_t, std::size_t>> weak;
+            scan_recognizers(text, t, context, c, weak);
 
             /* "Firma Bauer Logistik GmbH", "Ditta Rossi": the word for a company before its name
                stays readable. */
@@ -779,12 +796,18 @@ namespace dlib
                 else
                     taken[m.first] = m.second;
             }
-            for (const candidate& x : c)
+            for (candidate x : c)
             {
                 if (overlaps(taken, x.b, x.e)) continue;
                 if ((x.type == pii_type::person || x.type == pii_type::organization || x.type == pii_type::location) &&
                     regulation_only(text, t, x.b, x.e))
                     continue;
+                // Words that name nothing, whatever reads them, unless the user, a label or the place says so.
+                if (!x.kept && !x.exact && generic_span(text, t, x.b, x.e, x.type))
+                    continue;
+                // An organisation opened by generic words starts at its head noun: "Politique de sauvegarde
+                // du ministère de la Pêche".
+                if (!x.kept && !x.exact && x.type == pii_type::organization) x.b = generic_opening(text, t, x.b, x.e);
                 if (!allowed_.empty() &&
                     allowed_.count(privacy_impl::fold_key(privacy_impl::cp_substr(t, text, x.b, x.e))))
                     continue;
@@ -793,7 +816,8 @@ namespace dlib
             }
             join_given_and_family_names(text, t, taken, accepted);
             attach_name_edges(t, words, taken, accepted);
-            attach_coordinated_names(text, t, words, taken, accepted);
+            attach_coordinated_names(text, t, words, weak, taken, accepted);
+            attach_acronym_definitions(text, t, taken, accepted);
             attach_department_codes(t, taken, accepted);
             attach_titles(t, words, taken, accepted);
             attach_attributes(text, t, taken, accepted);
@@ -1109,9 +1133,11 @@ namespace dlib
         }
 
         /* A capitalized word that a conjunction or an ampersand joins to a person or an
-           organisation found with a confidence of 0.8 at least, without a value of its own, names
-           the same kind of thing. Beside a person, it is another person: "Martin and Dupont",
-           "Dupont et Martin". Beside an organisation, it completes its name: "Clifford & Chance",
+           organisation found with a confidence of 0.8 at least, or to a person found with 0.5 at
+           least when the span model reads the word as a part of a name however weakly (weak),
+           without a value of its own, names the same kind of thing. Beside a person, it is
+           another person: "Martin and Dupont", "Dupont et Martin". Beside an organisation, it
+           completes its name: "Clifford & Chance",
            "Oficina de Asilo y Refugio", "Porcu e Lo Cascio S.a.s.", unless it follows a name that
            ends with a legal form, where it is an organisation of its own ("Acme Ltd and Zorvane").
            The word stays readable when it is a function word, a civility, a title or a role, a
@@ -1128,6 +1154,7 @@ namespace dlib
            León"). German, which capitalizes its nouns, joins no word after "und" this way. */
         void attach_coordinated_names(const std::string& text, const utf8_text& t,
                                       const std::vector<word_token>& words,
+                                      const std::vector<std::pair<std::size_t, std::size_t>>& weak,
                                       std::map<std::size_t, std::size_t>& taken,
                                       std::vector<candidate>& accepted) const
         {
@@ -1228,10 +1255,19 @@ namespace dlib
                 add(added, words[k].b, words[k].e, type, 0.6);
                 if (added.size() > before) taken[words[k].b] = words[k].e;
             };
+            // A word that the span model reads as a part of a name, below the confidence of a value.
+            auto weak_at = [&](std::size_t b, std::size_t e) {
+                for (const auto& w : weak)
+                    if (w.first < e && b < w.second) return true;
+                return false;
+            };
             for (candidate& x : accepted)
             {
-                if ((x.type != pii_type::person && x.type != pii_type::organization) || x.confidence < 0.8)
-                    continue;
+                if (x.type != pii_type::person && x.type != pii_type::organization) continue;
+                /* A person found with a confidence of 0.5 at least joins a word that the span model
+                   reads as a part of a name, however weakly. */
+                const bool sure = x.confidence >= 0.8;
+                if (!sure && !(x.type == pii_type::person && x.confidence >= 0.5 && !weak.empty())) continue;
                 const bool organization = x.type == pii_type::organization;
                 const std::size_t last = word_ending(x.e), first = word_starting(x.b);
                 // Two acronyms joined by a conjunction name two organisations that the rules read alone:
@@ -1248,7 +1284,8 @@ namespace dlib
                     else if (words[c].b == x.e + 3 && t.cps[x.e] == ' ' && t.cps[x.e + 1] == '&' &&
                              t.cps[x.e + 2] == ' ')
                         k = c;
-                    if (k < n && !(k + 1 < n && spaced(words[k].e, words[k + 1].b) && capital(k + 1)) &&
+                    if (k < n && (sure || weak_at(words[k].b, words[k].e)) &&
+                        !(k + 1 < n && spaced(words[k].e, words[k + 1].b) && capital(k + 1)) &&
                         !opens_name(k) && !(organization && acronym(k)) && !in_list(x.b) &&
                         !named_place(x.b, words[k].e) && eligible(k, last, false))
                     {
@@ -1274,7 +1311,8 @@ namespace dlib
                     else if (x.b >= 3 && words[c].e == x.b - 3 && t.cps[x.b - 3] == ' ' && t.cps[x.b - 2] == '&' &&
                              t.cps[x.b - 1] == ' ')
                         k = c;
-                    if (k < n && !(k >= 1 && spaced(words[k - 1].e, words[k].b) && capital(k - 1)) &&
+                    if (k < n && (sure || weak_at(words[k].b, words[k].e)) &&
+                        !(k >= 1 && spaced(words[k - 1].e, words[k].b) && capital(k - 1)) &&
                         !(organization && acronym(k)) && !in_list(words[k].b) && !named_place(words[k].b, x.e) &&
                         eligible(k, first, at_sentence_start(t, words[k].b)))
                     {
@@ -1401,6 +1439,127 @@ namespace dlib
                     continue;
                 taken[x.b] = d + 1;
                 x.e = d + 1;
+            }
+        }
+
+        /*
+            The acronym that an organisation defines between parentheses right after its name,
+            past the words in lower case that close the name: "Société Nationale de Maintenance
+            Industrielle (SNMI)", "ministère de la Pêche et des Eaux intérieures (MPEI)". The
+            acronym, two to twelve capitals or digits, must follow the
+            initials of the words of the name, the first one first. The name takes the words in
+            lower case, and the acronym becomes an organisation that the document lexicon finds
+            again wherever it is written in capitals (scan_doc_acronyms()).
+        */
+        void attach_acronym_definitions(const std::string& text, const utf8_text& t,
+                                        std::map<std::size_t, std::size_t>& taken,
+                                        std::vector<candidate>& accepted) const
+        {
+            using namespace privacy_impl;
+            if (!enabled(pii_type::organization)) return;
+            const std::size_t n = t.size();
+            std::vector<candidate> defined;
+            for (candidate& x : accepted)
+            {
+                if (x.type != pii_type::organization || x.e >= n) continue;
+                // Up to three words in lower case before the parenthesis.
+                std::size_t q = x.e, end = x.e;
+                int lower_words = 0;
+                for (;;)
+                {
+                    std::size_t r = q;
+                    while (r < n && (t.cps[r] == ' ' || t.cps[r] == 0xA0)) ++r;
+                    if (r == q || r >= n || !is_letter(t.cps[r]) || is_upper(t.cps[r]) || lower_words == 3)
+                    {
+                        q = r;
+                        break;
+                    }
+                    std::size_t w = r;
+                    while (w < n && (is_letter(t.cps[w]) || ((is_hyphen(t.cps[w]) || is_apostrophe(t.cps[w])) &&
+                                                             w + 1 < n && is_letter(t.cps[w + 1]))))
+                        ++w;
+                    ++lower_words;
+                    end = w;
+                    q = w;
+                }
+                if (q >= n || t.cps[q] != '(') continue;
+                std::size_t a = q + 1, z = a;
+                // Letters and initials compared whole, folded: "А" and "М" share their first byte.
+                std::vector<std::string> letters;
+                while (z < n && z - a <= 12 && (is_upper(t.cps[z]) || is_ascii_digit(t.cps[z]) || t.cps[z] == '-' ||
+                                                t.cps[z] == '&'))
+                {
+                    if (is_upper(t.cps[z])) letters.push_back(fold_key(cp_substr(t, text, z, z + 1)));
+                    ++z;
+                }
+                if (z >= n || t.cps[z] != ')' || z - a < 2 || z - a > 12 || letters.size() < 2) continue;
+                // A technical acronym, or the acronym of words that name nothing: "Procédure de Contrôle (PC)".
+                if (generic_key(fold_key(cp_substr(t, text, a, z)), false) ||
+                    (!x.kept && !x.exact && generic_span(text, t, x.b, end, pii_type::organization)))
+                    continue;
+                // The initials of the words of the name, an elided word giving the letter after its apostrophe.
+                std::vector<std::string> initials;
+                for (const auto& w : span_words(t, x.b, end))
+                {
+                    std::size_t f = w.first;
+                    for (std::size_t g = w.first; g + 1 < w.second; ++g)
+                        if (is_apostrophe(t.cps[g])) f = g + 1;
+                    const std::string first = fold_key(cp_substr(t, text, f, f + 1));
+                    if (!first.empty()) initials.push_back(first);
+                    // A compound gives the initial of each part: "Seine-Saint-Denis".
+                    for (std::size_t g = f + 1; g + 1 < w.second; ++g)
+                        if (is_hyphen(t.cps[g]))
+                        {
+                            const std::string part = fold_key(cp_substr(t, text, g + 1, g + 2));
+                            if (!part.empty()) initials.push_back(part);
+                        }
+                }
+                if (initials.empty() || initials[0] != letters[0]) continue;
+                std::size_t m = 0;
+                for (const std::string& c : initials)
+                    if (m < letters.size() && c == letters[m]) ++m;
+                if (m != letters.size()) continue;
+                if (end > x.e && !overlaps(taken, x.e, end))
+                {
+                    taken[x.b] = end;
+                    x.e = end;
+                }
+                // An acronym the user allows stays readable, and the document does not learn it.
+                if (!allowed_.empty() && allowed_.count(fold_key(cp_substr(t, text, a, z)))) continue;
+                if (overlaps(taken, a, z))
+                {
+                    // An acronym read already, as a public body for one: learned all the same.
+                    for (candidate& y : accepted)
+                        if (y.b == a && y.e == z && y.type == pii_type::organization) y.defined = true;
+                    continue;
+                }
+                candidate c;
+                c.b = a;
+                c.e = z;
+                c.type = pii_type::organization;
+                c.priority = pii_priority(pii_type::organization);
+                c.confidence = 0.9;
+                c.kept = true;
+                c.defined = true;
+                defined.push_back(c);
+                taken[a] = z;
+            }
+            accepted.insert(accepted.end(), defined.begin(), defined.end());
+        }
+
+        // The acronyms the document defined (attach_acronym_definitions()), written in capitals: "le MPEI".
+        void scan_doc_acronyms(const utf8_text& t, const std::vector<word_token>& words,
+                               std::vector<candidate>& out) const
+        {
+            if (doc_acronyms_.empty() || !enabled(pii_type::organization)) return;
+            for (const word_token& w : words)
+            {
+                if (w.shape != 2 || !doc_acronyms_.count(w.text)) continue;
+                if (w.b > 0 && (privacy_impl::is_word_char(t.cps[w.b - 1]) || t.cps[w.b - 1] == '_')) continue;
+                if (w.e < t.size() && (privacy_impl::is_word_char(t.cps[w.e]) || t.cps[w.e] == '_')) continue;
+                const std::size_t count = out.size();
+                add(out, w.b, w.e, pii_type::organization, 0.9, 5);
+                if (out.size() > count) out.back().kept = true;
             }
         }
 
@@ -4382,6 +4541,17 @@ namespace dlib
                 std::size_t j = i;
                 while (j < n && t.cps[j] >= 'A' && t.cps[j] <= 'Z') ++j;
                 if (j - i < 2 || j - i > 6 || t.at(j) != '-') continue;
+                // The public catalogues of vulnerabilities and weaknesses: "CVE-2014-0160" names no file.
+                {
+                    std::string prefix;
+                    for (std::size_t q = i; q < j; ++q) prefix.push_back(static_cast<char>(t.cps[q]));
+                    if (prefix == "CVE" || prefix == "CWE" || prefix == "CAPEC" || prefix == "GHSA" ||
+                        prefix == "EUVD" || prefix == "CNVD" || prefix == "JVNDB")
+                    {
+                        i = j;
+                        continue;
+                    }
+                }
                 std::size_t y = j + 1, d = y;
                 while (d < n && is_ascii_digit(t.cps[d]) && d - y < 5) ++d;
                 if (d - y != 4 || t.at(d) != '-') continue;
@@ -4617,7 +4787,8 @@ namespace dlib
         }
 
         void scan_recognizers(const std::string& text, const utf8_text& t, const detection_context& context,
-                              std::vector<candidate>& out) const
+                              std::vector<candidate>& out,
+                              std::vector<std::pair<std::size_t, std::size_t>>& weak) const
         {
             if (recognizers_.empty() || t.size() == 0) return;
             // A column or a field of names: its label announces the person of the whole text.
@@ -4643,7 +4814,24 @@ namespace dlib
                         cache_->spans.emplace(key, spans);
                     }
                 }
-                add_recognized(text, t, spans, r.min_confidence, person_label, out);
+                // The weak reads of the parts of a name (append_weak_names()), in code points.
+                std::vector<pii_span> values;
+                const std::size_t bytes = t.offsets.back();
+                for (const pii_span& s : spans)
+                {
+                    if (s.label != "WEAK")
+                    {
+                        values.push_back(s);
+                        continue;
+                    }
+                    if (s.end <= s.begin || s.end > bytes) continue;
+                    const std::size_t b = static_cast<std::size_t>(
+                        std::upper_bound(t.offsets.begin(), t.offsets.end(), s.begin) - t.offsets.begin()) - 1;
+                    const std::size_t e = static_cast<std::size_t>(
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), s.end) - t.offsets.begin());
+                    if (b < e && e <= t.size()) weak.push_back(std::make_pair(b, e));
+                }
+                add_recognized(text, t, values, r.min_confidence, person_label, out);
             }
         }
 
@@ -4716,6 +4904,27 @@ namespace dlib
             const char32_t c = t.cps[q - 1];
             if (is_line_break(c) || c == '\t' || c == '|' || c == '!' || c == '?' || c == ';')
                 return true;
+            /* The number of a section that opens the line, in groups of one or two digits: "2.1
+               Démarche", "3.2.4 Restitution", not a date ("12.03.2024 Koch"). */
+            if (is_ascii_digit(c))
+            {
+                std::size_t r = q - 1, run = 1, groups = 1;
+                bool section = true;
+                while (r > 0 && (is_ascii_digit(t.cps[r - 1]) || t.cps[r - 1] == '.'))
+                {
+                    --r;
+                    if (t.cps[r] == '.')
+                    {
+                        section = section && run > 0;
+                        run = 0;
+                        ++groups;
+                    }
+                    else if (++run > 2)
+                        section = false;
+                }
+                return section && groups >= 2 && groups <= 4 && run > 0 &&
+                       (r == 0 || is_line_break(t.cps[r - 1]) || t.cps[r - 1] == '\t' || t.cps[r - 1] == '|');
+            }
             if (c != '.' && c != ')') return false;
             // The word before the period or the parenthesis: a number ("1.", "2)") marks a list.
             std::size_t r = q - 1;
@@ -5143,6 +5352,283 @@ namespace dlib
             return bodies.count(key) && (key != "en" || is_upper(t.cps[r + 1]));
         }
 
+        /* A word that names nobody, no place and no organisation by itself: a function word, a
+           technical acronym, a role, a term of a record, a product, a regulation, a field label,
+           a single letter or a number, a word of business documents and, with commons, any common
+           word; also their plurals ("Glossaires"), their compounds ("SIEM-SOAR") and their
+           elisions ("d'habilitation"). key is folded with privacy_impl::fold_key(). */
+        static bool generic_key(const std::string& key, bool commons)
+        {
+            using namespace privacy_impl;
+            if (key.size() <= 1) return true;
+            if (key.find_first_not_of("0123456789") == std::string::npos) return true;
+            auto plain = [commons](const std::string& k) {
+                if ((commons ? common_words().count(k) : business_words().count(k)) || function_words().count(k) ||
+                    acronym_words().count(k) || role_words().count(k) || technical_terms().count(k) ||
+                    product_names().count(k) || regulation_terms().count(k) || field_labels().count(k) ||
+                    person_cues_before().count(k) || greeting_words().count(k))
+                    return true;
+                // The plural of a word of a trade: "Glossaires", "Pentesteurs" ("Verys" is no plural of "very").
+                if (k.size() > 4 && (k.back() == 's' || k.back() == 'x'))
+                {
+                    const std::string one = k.substr(0, k.size() - 1);
+                    return business_words().count(one) || role_words().count(one) || technical_terms().count(one) ||
+                           acronym_words().count(one);
+                }
+                return false;
+            };
+            if (plain(key)) return true;
+            const std::size_t apostrophe = key.find('\'');
+            if (apostrophe != std::string::npos)
+                return function_words().count(key.substr(0, apostrophe)) && apostrophe + 1 < key.size() &&
+                       generic_key(key.substr(apostrophe + 1), commons);
+            if (key.find('-') != std::string::npos)
+            {
+                std::size_t from = 0;
+                while (from <= key.size())
+                {
+                    const std::size_t to = std::min(key.find('-', from), key.size());
+                    const std::string part = key.substr(from, to - from);
+                    if (!part.empty() && !plain(part) &&
+                        part.find_first_not_of("0123456789") != std::string::npos && part.size() > 1)
+                        return false;
+                    from = to + 1;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        /* Whether every word of the value [b, e) of the given type is generic (generic_key()): it
+           names nobody and nothing, such as "Le Consortium", "Architecte junior", "Glossaire
+           RACI", "Politique de sauvegarde" or "C I". A given name, or a civility, a title, a
+           cue or a label of names just before, keeps a person.
+           A head noun or a legal form keeps an organisation when a word in capitals or a word of
+           its own follows it ("ministère de la Pêche", "Groupe Danone", not "Direction
+           Juridique"), and so do a public body written in capitals ("ANSSI"), a known name and the
+           country, the region or the town after a connector in a name that a capital opens
+           ("Électricité de France", "Opéra de Paris"). A
+           common word may name a place or a street ("Bath", "Am Markt"): there, only the words of
+           business documents and the other generic words count. Words joined in one token
+           are read apart ("WebServices"); the maker of a product named after it ("Google Chrome",
+           "Mozilla Firefox"), a colour before a box or a team ("Black Box", "Red Team"), and a
+           country or a region with generic words ("Italie du Nord") name nothing of their own
+           either. An address needs a word of its own, which a common word beside a street type is
+           ("rue des Lilas", "18 Mill Street", while "allée du SIEM" names no street). */
+        bool generic_span(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
+                          pii_type type) const
+        {
+            using namespace privacy_impl;
+            if (type != pii_type::person && type != pii_type::organization && type != pii_type::location &&
+                type != pii_type::address)
+                return false;
+            const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
+            if (words.empty()) return false;
+            static const std::unordered_set<std::string> colours = make_word_set(
+                "black white grey gray red blue purple");
+            static const std::unordered_set<std::string> colour_nouns = make_word_set(
+                "box team teams teaming hat hats");
+            std::vector<std::string> keys, raws;
+            bool product = false;
+            for (const auto& w : words)
+            {
+                raws.push_back(cp_substr(t, text, w.first, w.second));
+                keys.push_back(fold_key(raws.back()));
+                if (product_names().count(keys.back())) product = true;
+            }
+            // The word after the value, on its line: "Box" after "Black".
+            std::string next;
+            {
+                std::size_t q = e;
+                while (q < t.size() && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
+                std::size_t r = q;
+                while (r < t.size() && is_letter(t.cps[r])) ++r;
+                next = fold_key(cp_substr(t, text, q, r));
+            }
+            if (type == pii_type::organization)
+            {
+                // A known name, alone or opening the value: "Crédit Mutuel de Bretagne"; the maker of a
+                // product opens a product ("Google Chrome").
+                for (std::size_t last = product ? 0 : words.size(); last > 0; --last)
+                {
+                    const std::string part = fold_key(cp_substr(t, text, words.front().first, words[last - 1].second));
+                    if (known_organizations().count(part) || public_body_names().count(part)) return false;
+                }
+            }
+            if (type == pii_type::person)
+            {
+                // A name the document or the user established: "Le rapport de Page" after "M. Page".
+                const std::string whole = fold_key(cp_substr(t, text, b, e));
+                if (doc_names_full_.count(whole) || user_names_full_.count(whole)) return false;
+                // "M. Petit", "Dr Blanc", "Nom : PETIT", "Jean PETIT": the word before announces a name.
+                std::size_t q = b;
+                bool colon = false;
+                while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0 || t.cps[q - 1] == '.' ||
+                                 t.cps[q - 1] == ':'))
+                    colon = t.cps[--q] == ':' || colon;
+                std::size_t r = q;
+                while (r > 0 && is_letter(t.cps[r - 1])) --r;
+                const std::string before = fold_key(cp_substr(t, text, r, q));
+                const auto label = field_labels().find(before);
+                if ((colon && label != field_labels().end() && label->second == pii_type::person) ||
+                    civility_words().count(before) || person_titles().count(before) || first_names().count(before) ||
+                    person_cues_before().count(before))
+                    return false;
+            }
+            bool head = false, own = false, street = false, trade = false;
+            // A number alone is the number of a street that a learned piece reads apart ("12" before "rue
+            // des Lilas"): spurious_learned_span() decides about it.
+            if (type == pii_type::address && keys.size() == 1 &&
+                keys[0].find_first_not_of("0123456789") == std::string::npos)
+                return false;
+            if (type == pii_type::address)
+                for (const std::string& key : keys)
+                {
+                    if (street_types().count(key) || english_street_types().count(key)) street = true;
+                    // The floor, the flat or the door of an address: "6. OG", "piso 3", "Flat 2".
+                    static const std::unordered_set<std::string> complements = make_word_set(
+                        "og eg ug dg obergeschoss erdgeschoss stock etage piso planta bajo izq izda dcha drcha puerta "
+                        "flat floor apartment apt unit suite piano scala interno int appartement appt batiment bat "
+                        "escalier porte bis ter quater bp cs cedex");
+                    if (complements.count(key)) return false;
+                    if (acronym_words().count(key) || business_words().count(key) || role_words().count(key) ||
+                        product_names().count(key))
+                        trade = true;
+                }
+            // A street type, numbers and function words make an address ("99 The Avenue"); a word of a
+            // trade beside them makes none ("allée du SIEM").
+            if (type == pii_type::address && street && !trade) return false;
+            for (std::size_t k = 0; k < keys.size(); ++k)
+            {
+                const std::string& key = keys[k];
+                const bool capital = is_upper(t.cps[words[k].first]);
+                if (type == pii_type::person && first_names().count(key) && !ambiguous_first_names().count(key))
+                    return false;
+                if (type == pii_type::organization && capital && public_body_acronyms().count(key) &&
+                    words[k].second - words[k].first >= 2 && is_upper(t.cps[words[k].second - 1]))
+                    return false;
+                // A legal form, partners or a trade make a firm: "Bravo & Sons", "Durand SA".
+                if (type == pii_type::organization &&
+                    (organization_forms().count(key) || organization_partner_words().count(key) ||
+                     organization_trade_words().count(key)))
+                    return false;
+                if (type == pii_type::organization &&
+                    (organization_heads().count(key) || public_body_heads().count(key)))
+                {
+                    head = true;
+                    continue;
+                }
+                if (type == pii_type::address && (street_types().count(key) || english_street_types().count(key)))
+                    continue;
+                // A colour before a box or a team: "Black Box", "Red Team".
+                if (colours.count(key) &&
+                    colour_nouns.count(k + 1 < keys.size() ? keys[k + 1] : next))
+                    continue;
+                /* Places and streets take the names of common words ("Bath", "Essen", "Am Markt"): only the
+                   words of a trade, the acronyms, the other generic words and the common words in lower
+                   case ("avant d'") leave them out. */
+                // The towns among the common words stay places in lower case too: "à rennes".
+                static const std::unordered_set<std::string> towns = make_word_set(
+                    "bordeaux brest lille lyon marseille nantes nice paris rennes toulouse tours sens vienne orange");
+                const bool place = type == pii_type::location || type == pii_type::address;
+                /* A common word alone read as a person is left to spurious_learned_span(), which weighs
+                   its context ("Le rapport de Page"); the words of a trade go at once. */
+                const bool commons = !place && !(type == pii_type::person && keys.size() == 1);
+                bool generic = generic_key(key, commons) ||
+                               (place && is_lower(name_letter(t, words[k])) && generic_key(key, true) &&
+                                !towns.count(key));
+                // A number of four digits at least is a postal code: "93721", "4870".
+                if (generic && type == pii_type::location && key.size() >= 4 &&
+                    key.find_first_not_of("0123456789") == std::string::npos)
+                    generic = false;
+                // Beside a street type, a common word names the street ("rue des Lilas", "18 Mill Street");
+                // a word of a trade does not ("allée du SIEM").
+                if (generic && street && !(key.find_first_not_of("0123456789") == std::string::npos ||
+                                           function_words().count(key) || acronym_words().count(key) ||
+                                           business_words().count(key) || role_words().count(key) ||
+                                           product_names().count(key) || technical_terms().count(key)))
+                    generic = false;
+                // A country or a region names no organisation of its own ("Italie du Nord"); places
+                // and streets keep theirs ("Singapore", "40 Florida Road").
+                if (!generic && type == pii_type::organization &&
+                    (country_names().count(key) || region_names().count(key)))
+                    generic = true;
+                if (!generic && product && known_organizations().count(key)) generic = true;
+                // Words joined in one token, read apart: "WebServices", "CloudSecurity".
+                if (!generic)
+                {
+                    const std::string& raw = raws[k];
+                    std::vector<std::string> parts;
+                    std::string part;
+                    const utf8_text rt(raw);
+                    for (std::size_t q = 0; q < rt.size(); ++q)
+                    {
+                        const bool cut = q > 0 && is_upper(rt.cps[q]) &&
+                                         (is_lower(rt.cps[q - 1]) ||
+                                          (q + 1 < rt.size() && is_upper(rt.cps[q - 1]) && is_lower(rt.cps[q + 1])));
+                        if (cut && !part.empty()) { parts.push_back(part); part.clear(); }
+                        utf8_append(part, rt.cps[q]);
+                    }
+                    if (!part.empty()) parts.push_back(part);
+                    if (parts.size() >= 2)
+                    {
+                        generic = true;
+                        for (const std::string& x : parts)
+                            if (!generic_key(fold_key(x), true)) generic = false;
+                    }
+                }
+                if (generic)
+                {
+                    /* A word in capitals after a head noun and a connector completes the name:
+                       "ministère de la Pêche", "Caisse d'Épargne", not "Direction Juridique". */
+                    static const std::unordered_set<std::string> connectors = make_word_set(
+                        "de du des d l la le les of for the di del della dello dei degli delle dell da dal von vom "
+                        "der fur");
+                    const std::size_t apostrophe = key.find('\'');
+                    const bool elided = apostrophe != std::string::npos &&
+                                        function_words().count(key.substr(0, apostrophe)) != 0;
+                    const bool after_connector = elided || (k > 0 && connectors.count(keys[k - 1]) != 0);
+                    /* The country, the region or the town that a name opened by a capital serves:
+                       "Électricité de France", "Opéra de Paris", not after a word of business documents
+                       ("Plan de relance de la France"). */
+                    bool seat = type == pii_type::organization && k >= 2 && is_upper(name_letter(t, words[0])) &&
+                                (country_names().count(key) || region_names().count(key) || towns.count(key));
+                    for (std::size_t q = 0; q < k && seat; ++q)
+                        if (business_words().count(keys[q])) seat = false;
+                    // A town may be a function word elsewhere: "Questura di Como".
+                    if ((head || seat) && is_upper(name_letter(t, words[k])) && !connectors.count(key) &&
+                        after_connector)
+                        own = true;
+                    continue;
+                }
+                if (type == pii_type::location || type == pii_type::person) return false;
+                own = true;
+            }
+            if (type == pii_type::organization || type == pii_type::address) return !own;
+            return true;
+        }
+
+        /* The start of an organisation past the generic words that open it, at the head noun of a
+           name that is not generic: "ministère de la Pêche" in "Politique de sauvegarde du
+           ministère de la Pêche". b when no such head follows generic words. */
+        std::size_t generic_opening(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e) const
+        {
+            using namespace privacy_impl;
+            const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
+            for (std::size_t k = 0; k < words.size(); ++k)
+            {
+                const std::string key = fold_key(cp_substr(t, text, words[k].first, words[k].second));
+                if (!organization_heads().count(key) && !public_body_heads().count(key))
+                {
+                    if (generic_key(key, true)) continue;
+                    return b;
+                }
+                if (k == 0 || generic_span(text, t, words[k].first, e, pii_type::organization)) return b;
+                return words[k].first;
+            }
+            return b;
+        }
+
         /* A span of a learned recognizer, its pieces merged, where the text holds no personal
            data. A login inside a longer token, a file name ("final.docx" in
            "rapport_final.docx", "journal.log2"), a single character or one repeated, or a common
@@ -5182,6 +5668,12 @@ namespace dlib
                 bool lower_letters = true;
                 for (std::size_t q = b; q < e && lower_letters; ++q)
                     if (!is_letter(t.cps[q]) || is_upper(t.cps[q])) lower_letters = false;
+                // An acronym, a role or a product, in any case: "RACI", "SIEM", "Firefox", "KUBERNETES".
+                bool letters = true;
+                for (std::size_t q = b; q < e && letters; ++q) letters = is_letter(t.cps[q]);
+                if ((letters && (acronym_words().count(key) || role_words().count(key) ||
+                                 business_words().count(key))) || product_names().count(key))
+                    return true;
                 return lower_letters && (common_words().count(key) || function_words().count(key) ||
                                          field_labels().count(key) || greeting_words().count(key));
             }
@@ -5194,7 +5686,8 @@ namespace dlib
                 if (digits)
                 {
                     /* A number alone read as an address, which no street name follows: "60" in "60 –
-                       100", "14" in "à 14 h". */
+                       100", "14" in "à 14 h", and before a common word in lower case that opens no
+                       street ("15 participants", "7 jalons"; "12 rue" stays). */
                     static const std::unordered_set<std::string> units = make_word_set(
                         "h heure heures min mn minute minutes s sec seconde secondes j jour jours semaine semaines "
                         "mois an ans annee annees km m cm mm kg g mg l ml hour hours minute day days week weeks "
@@ -5204,15 +5697,22 @@ namespace dlib
                     if (!(q < n && is_letter(t.cps[q]))) return true;
                     std::size_t r = q;
                     while (r < n && is_letter(t.cps[r])) ++r;
-                    return units.count(fold_key(cp_substr(t, text, q, r))) != 0 && !(r < n && is_word_char(t.cps[r]));
+                    const std::string next = fold_key(cp_substr(t, text, q, r));
+                    if (units.count(next) && !(r < n && is_word_char(t.cps[r]))) return true;
+                    return is_lower(t.cps[q]) && generic_key(next, true) && !street_types().count(next) &&
+                           !english_street_types().count(next) && !address_kept_words().count(next);
                 }
                 /* A field label or a common word alone names no street: "Rédacteur" alone in a
-                   cell. */
+                   cell; nor does a code of three characters ("P1"). */
                 const std::vector<std::pair<std::size_t, std::size_t>> alone = span_words(t, b, e);
                 if (alone.size() == 1 && alone[0].first == b && alone[0].second == e)
                 {
                     const std::string key = fold_key(cp_substr(t, text, b, e));
-                    if (field_labels().count(key) || common_word_or_compound(key)) return true;
+                    bool letter = false;
+                    for (std::size_t q = b; q < e && !letter; ++q) letter = is_letter(t.cps[q]);
+                    if (field_labels().count(key) || common_word_or_compound(key) || (e - b <= 3 && letter) ||
+                        (letter && generic_key(key, true)))
+                        return true;
                 }
                 /* A number before common words in lower case, none of them a word of an address,
                    names no street: "212 doublons", while "9e étage" and "220 broadway" stay. */
@@ -5224,8 +5724,13 @@ namespace dlib
                     for (std::size_t q = w.first; q < w.second && number; ++q) number = is_ascii_digit(t.cps[q]);
                     if (number) continue;
                     const std::string key = fold_key(cp_substr(t, text, w.first, w.second));
-                    if (!is_lower(t.cps[w.first]) || street_types().count(key) || english_street_types().count(key) ||
-                        address_kept_words().count(key) || !common_words().count(key))
+                    // "230 comptes VPN", "4 serveurs SQL": the acronyms and the plurals of common words too.
+                    if (street_types().count(key) || english_street_types().count(key) ||
+                        address_kept_words().count(key))
+                        return false;
+                    if (!(is_lower(t.cps[w.first]) && common_words().count(key)) &&
+                        !(acronym_words().count(key) && !is_lower(t.cps[w.first])) &&
+                        !(is_lower(t.cps[w.first]) && generic_key(key, true)))
                         return false;
                     words_after = true;
                 }
@@ -5234,6 +5739,46 @@ namespace dlib
             if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
                 return false;
             if (type == pii_type::location && standard_number(text, t, b, e)) return true;
+            /* A piece of a code joined by underscores, its parts of three capitals or digits at most:
+               "REQ" in "REQ_SEC_B2"; a name in a file name stays one ("Zhang" in "CV_Zhang_Wei.pdf"). */
+            {
+                bool joined = (b > 0 && t.cps[b - 1] == '_') || (e < n && t.cps[e] == '_');
+                for (std::size_t q = b; q < e && !joined; ++q) joined = t.cps[q] == '_';
+                if (joined)
+                {
+                    bool code = true;
+                    std::size_t pb = b;
+                    for (std::size_t q = b; q <= e && code; ++q)
+                    {
+                        if (q < e && t.cps[q] != '_') continue;
+                        if (q == pb || q - pb > 3) code = false;
+                        for (std::size_t r = pb; r < q && code; ++r)
+                            code = is_upper(t.cps[r]) || is_ascii_digit(t.cps[r]);
+                        pb = q + 1;
+                    }
+                    if (code) return true;
+                }
+            }
+            /* A piece of a word whose whole names nothing: "Shell" in "PowerShell", "Services" in
+               "WebServices"; or that leaves one or two letters out of it ("Martin" in "Martine"). */
+            if ((b > 0 && is_letter(t.cps[b - 1]) && is_letter(t.cps[b])) ||
+                (e < n && is_letter(t.cps[e - 1]) && is_letter(t.cps[e])))
+            {
+                std::size_t tb = b, te = e;
+                while (tb > 0 && is_word_char(t.cps[tb - 1])) --tb;
+                while (te < n && is_word_char(t.cps[te])) ++te;
+                if (b - tb <= 2 && te - e <= 2 && (b > tb || e < te)) return true;
+                if (generic_span(text, t, tb, te, type)) return true;
+                const std::string whole = fold_key(cp_substr(t, text, tb, te));
+                if (generic_key(whole, true)) return true;
+            }
+            // A number of fewer than four digits is no postal code: a page of a table of contents.
+            if (type == pii_type::location && e - b <= 3)
+            {
+                bool digits = true;
+                for (std::size_t q = b; q < e && digits; ++q) digits = is_ascii_digit(t.cps[q]);
+                if (digits) return true;
+            }
             if (b > 0 && is_letter(t.cps[b - 1]) && is_letter(t.cps[b]) && !is_upper(t.cps[b])) return true;
             if (e < n && is_letter(t.cps[e - 1]) && is_letter(t.cps[e]) && !is_upper(t.cps[e])) return true;
             /* A piece of a short word, which no name of that length is cut from: the capitals of
@@ -5261,6 +5806,10 @@ namespace dlib
             }
             if (all_function) return true;
             if (technical_words(text, t, words)) return true;
+            // A family name is no acronym of a trade: "Manuel SIEM", "Glossaire RACI".
+            if (type == pii_type::person && words.size() >= 2 && acronym_words().count(keys.back()) &&
+                !first_names().count(keys.back()))
+                return true;
             /* A common word that opens a line, a cell or a sentence, capitalized by its place, names
                nothing, alone or before words in lower case: "Recette", "Bascule confirmée",
                "Doublon possible", "Médecin-conseil". The towns among the common words stay places:
@@ -6640,9 +7189,13 @@ namespace dlib
                         for (const word_token& w : tokenize_words(vt, value))
                         {
                             if (w.shape == 1 || w.shape == 2 || w.shape == 3) capital = true;
-                            if (!common_words().count(w.key) && !person_titles().count(w.key) &&
+                            /* Initials alone and the words of a trade name nobody: "A, R", "I C" in a
+                               column of roles; a short family name may be a function word ("LE FUR"). */
+                            if (w.e - w.b >= 2 && !common_words().count(w.key) && !person_titles().count(w.key) &&
                                 !acronym_words().count(w.key) && !organization_heads().count(w.key) &&
-                                !street_types().count(w.key))
+                                !street_types().count(w.key) && !role_words().count(w.key) &&
+                                !product_names().count(w.key) && !field_labels().count(w.key) &&
+                                !person_cues_before().count(w.key))
                                 uncommon = true;
                         }
                         if (capital && uncommon && field_labels().count(fold_key(value)) == 0)
@@ -8517,8 +9070,12 @@ namespace dlib
                 if (u != term_index_.end())
                     for (std::size_t index : u->second)
                         if (matches(terms_[index].first, k))
+                        {
+                            const std::size_t count = out.size();
                             add(out, tokens[k].b, tokens[k + terms_[index].first.size() - 1].e, terms_[index].second,
                                 1.0, 10, terms_[index].second == pii_type::person);
+                            if (out.size() > count) out.back().kept = true;
+                        }
             }
         }
 
@@ -8769,6 +9326,7 @@ namespace dlib
         std::vector<std::pair<std::vector<std::string>, pii_type>> doc_terms_;
         std::unordered_set<std::string> doc_term_set_;
         std::unordered_map<std::string, std::vector<std::size_t>> doc_term_index_;   // first key to doc_terms_
+        std::unordered_set<std::string> doc_acronyms_;   // acronyms of organisations defined in the document
         std::vector<std::pair<std::vector<std::string>, pii_type>> terms_;
         std::unordered_map<std::string, std::vector<std::size_t>> term_index_;       // first key to terms_
         std::unordered_set<std::string> allowed_;

@@ -56,7 +56,20 @@
 
     <section class="card">
       <h2 data-t="text_title"></h2>
-      <textarea id="text" rows="7" spellcheck="false"></textarea>
+      <!-- The text, over the marks that colour its tags and the values restored. -->
+      <div class="editor">
+        <div class="marks" id="text-marks" aria-hidden="true"></div>
+        <textarea id="text" rows="7" spellcheck="false"></textarea>
+      </div>
+      <p class="legend" id="text-legend" hidden>
+        <span class="key k-person" data-t="legend_person"></span>
+        <span class="key k-org" data-t="legend_org"></span>
+        <span class="key k-place" data-t="legend_place"></span>
+        <span class="key k-contact" data-t="legend_contact"></span>
+        <span class="key k-id" data-t="legend_id"></span>
+        <span class="key k-date" data-t="legend_date"></span>
+        <span class="how" id="text-legend-how"></span>
+      </p>
       <div class="buttons">
         <button id="text-protect" data-t="text_protect"></button>
         <button id="text-restore" class="secondary" data-t="text_restore"></button>

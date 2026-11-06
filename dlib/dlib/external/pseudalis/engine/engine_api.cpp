@@ -249,6 +249,9 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
             res["kind"] = "text";
             res["report"] = report;
             res["pictures"] = pseudalis::json::array();
+            // The places of the tags written, or of the values restored, for the colouring of the text.
+            if (op == "anonymize_text") res["tags"] = engine->e->tag_spans(out);
+            else res["restored"] = engine->e->restored_spans(bytes, out);
         }
         else if (op == "detect")
         {

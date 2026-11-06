@@ -2767,6 +2767,152 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_business_documents()
+    {
+        /* Proposals, tender answers and audit reports: what a recognizer reads there in generic
+           words stays readable, the acronym an organisation defines is found again, and the
+           identifiers of public catalogues of vulnerabilities name nothing. */
+        auto spans = std::make_shared<std::vector<pii_span>>();
+        auto recognizer = [spans](const string& t) {
+            std::vector<pii_span> out;
+            for (const pii_span& v : *spans)
+            {
+                // The value is given by its text in begin's place: its offsets are found in t.
+                const size_t at = t.find(v.label.substr(v.label.find('|') + 1));
+                if (at == string::npos) continue;
+                pii_span s = v;
+                s.label = v.label.substr(0, v.label.find('|'));
+                s.begin = at;
+                s.end = at + v.label.size() - v.label.find('|') - 1;
+                out.push_back(s);
+            }
+            std::sort(out.begin(), out.end(), [](const pii_span& a, const pii_span& b) { return a.begin < b.begin; });
+            return out;
+        };
+        pii_detector detector;
+        detector.add_recognizer(recognizer, 0);
+        auto value = [](const string& text, const string& label, double confidence) {
+            pii_span s;
+            s.label = label + "|" + text;
+            s.confidence = confidence;
+            return s;
+        };
+        auto read = [&](const string& text, const std::vector<pii_span>& values) {
+            *spans = values;
+            detector.begin_document();
+            detector.learn(text);
+            return detector.detect(text);
+        };
+
+        // Generic words, whatever reads them; a given name, a civility, a head noun followed by
+        // its complement or a known name keeps the value.
+        string text = "Le Consortium mobilise un Architecte junior et la Direction Juridique et Technique. "
+                      "Glossaire RACI : C I. La Politique de sauvegarde du ministère de la Pêche. M. Petit, Danone.";
+        std::vector<pii_entity> e = read(text, {
+            value("Le Consortium", "ORGANIZATION", 0.9), value("Architecte junior", "FAMILY_NAME", 0.9),
+            value("Direction Juridique et Technique", "ORGANIZATION", 0.9), value("Glossaire", "GIVEN_NAME", 0.9),
+            value("RACI", "FAMILY_NAME", 0.9), value("C I", "FAMILY_NAME", 0.9),
+            value("Politique de sauvegarde", "ORGANIZATION", 0.9),
+            value("ministère de la Pêche", "ORGANIZATION", 0.9), value("Petit", "FAMILY_NAME", 0.9) });
+        DLIB_TEST(!covered(e, text, "Consortium") && !covered(e, text, "Architecte"));
+        DLIB_TEST(!covered(e, text, "Direction Juridique") && !covered(e, text, "Glossaire"));
+        DLIB_TEST(!covered(e, text, "RACI") && !covered(e, text, "C I") && !covered(e, text, "Politique"));
+        DLIB_TEST(found(e, text, pii_type::organization, "ministère de la Pêche"));
+        DLIB_TEST(found(e, text, pii_type::person, "Petit") && found(e, text, pii_type::organization, "Danone"));
+        // A product and its maker, a code joined by underscores, an elision, the vocabulary of slides.
+        text = "Google Chrome et Mozilla Firefox ; exigence REQ_SEC_B2 ; Jusqu'à 230 comptes VPN, allée du SIEM. "
+               "Il travaille avec Google.";
+        e = read(text, { value("Google Chrome", "ORGANIZATION", 0.9), value("Mozilla Firefox", "ORGANIZATION", 0.9),
+                         value("REQ", "FAMILY_NAME", 0.9), value("Jusqu", "GIVEN_NAME", 0.9),
+                         value("230 comptes VPN", "STREET_ADDRESS", 0.9),
+                         value("allée du SIEM", "STREET_ADDRESS", 0.9) });
+        DLIB_TEST(!covered(e, text, "Chrome") && !covered(e, text, "Firefox") && !covered(e, text, "REQ_"));
+        DLIB_TEST(!covered(e, text, "Jusqu") && !covered(e, text, "230") && !covered(e, text, "allée du"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Google"));
+        // A number before a common word in lower case, a word of slides after its number, the heading of a
+        // numbered section and a verb that opens a bullet name nothing.
+        text = "Le séminaire réunit 15 participants.\nPlanning 3\n2.1 Démarche\nLe chef de projet suit le planning.\n"
+               "Pour M. Blanc : Vérifier les accès.";
+        e = read(text, { value("15", "STREET_ADDRESS", 0.95), value("Planning 3", "STREET_ADDRESS", 0.8),
+                         value("Démarche", "CITY", 0.7), value("Vérifier", "GIVEN_NAME", 0.9) });
+        DLIB_TEST(!covered(e, text, "15") && !covered(e, text, "Planning") && !covered(e, text, "Démarche"));
+        DLIB_TEST(!covered(e, text, "Vérifier") && found(e, text, pii_type::person, "Blanc"));
+        // A street of common words keeps its street type on either side.
+        text = "Adresse : 18 Mill Street, et 12 rue des Lilas.";
+        e = read(text, { value("18 Mill Street", "STREET_ADDRESS", 0.9),
+                         value("12 rue des Lilas", "STREET_ADDRESS", 0.9) });
+        DLIB_TEST(found(e, text, pii_type::address, "18 Mill Street"));
+        DLIB_TEST(found(e, text, pii_type::address, "12 rue des Lilas"));
+        // Values labelled in a column of roles: initials name nobody, a short family name does.
+        detection_context roles;
+        roles.label = pii_type::person;
+        *spans = {};
+        detector.begin_document();
+        text = "A, R";
+        e = detector.detect(text, roles);
+        DLIB_TEST(e.empty());
+        text = "LE FUR";
+        e = detector.detect(text, roles);
+        DLIB_TEST(found(e, text, pii_type::person, "LE FUR"));
+
+        // The acronym that an organisation defines is found again in capitals, the name taking its
+        // words in lower case; a generic acronym is not learned.
+        text = "Le ministère de la Pêche et des Eaux intérieures (MPEI) pilote le marché. Le "
+               "Bénéficiaire suit la Procédure de Contrôle (PC).\nLe MPEI valide la PC.";
+        e = read(text, { value("ministère de la Pêche et des Eaux", "ORGANIZATION", 0.9),
+                         value("Procédure de Contrôle", "ORGANIZATION", 0.9) });
+        DLIB_TEST(found(e, text, pii_type::organization, "ministère de la Pêche et des Eaux intérieures"));
+        DLIB_TEST(found(e, text, pii_type::organization, "MPEI"));
+        const size_t second = text.find("Le MPEI") + 3;
+        bool again = false;
+        for (const pii_entity& x : e)
+            if (x.begin == second && x.end == second + 4 && x.type == pii_type::organization) again = true;
+        DLIB_TEST(again);
+        DLIB_TEST(!covered(e, text, "PC)") && !covered(e, text, "Procédure"));
+        text = "La Société Nationale de Maintenance Industrielle (SNMI) répond.\nLa SNMI et la snmi signent.";
+        e = read(text, { value("Société Nationale de Maintenance Industrielle", "ORGANIZATION", 0.9) });
+        const size_t snmi = text.find("La SNMI") + 3;
+        bool learned_acronym = false;
+        for (const pii_entity& x : e)
+            if (x.begin == snmi && x.end == snmi + 4 && x.type == pii_type::organization) learned_acronym = true;
+        DLIB_TEST(learned_acronym && !covered(e, text, "snmi"));
+        // An acronym the user allows is never reported, where it is defined included.
+        {
+            pii_detector allowing;
+            allowing.add_recognizer(recognizer, 0);
+            allowing.add_allowed_term("MPEI");
+            text = "Le ministère de la Pêche et des Eaux intérieures (MPEI) pilote le marché.\nLe MPEI valide.";
+            *spans = { value("ministère de la Pêche et des Eaux", "ORGANIZATION", 0.9) };
+            allowing.begin_document();
+            allowing.learn(text);
+            e = allowing.detect(text);
+            DLIB_TEST(found(e, text, pii_type::organization, "ministère de la Pêche et des Eaux intérieures"));
+            DLIB_TEST(!covered(e, text, "MPEI"));
+        }
+        // The letters of an acronym and the initials of the name are compared whole, in any script.
+        text = "Министерство внутренних дел (АБВ) сообщает. Позже АБВ ответило.";
+        e = read(text, { value("Министерство внутренних дел", "ORGANIZATION", 0.9) });
+        DLIB_TEST(!covered(e, text, "АБВ"));
+        // The place that a name opened by a capital serves keeps it an organisation.
+        text = "Le contrat avec Électricité de France et l'Opéra de Paris est signé.";
+        e = read(text, { value("Électricité de France", "ORGANIZATION", 0.9),
+                         value("Opéra de Paris", "ORGANIZATION", 0.9) });
+        DLIB_TEST(found(e, text, pii_type::organization, "Électricité de France"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Opéra de Paris"));
+
+        // Weak reads of the span model: a capitalized word joined to a person found is another person.
+        text = "Our lawyers Martin and Dupont signed the letter.";
+        e = read(text, { value("Martin", "GIVEN_NAME", 0.6), value("Dupont", "WEAK", 0.35) });
+        DLIB_TEST(found(e, text, pii_type::person, "Martin") && found(e, text, pii_type::person, "Dupont"));
+        e = read(text, { value("Martin", "GIVEN_NAME", 0.6) });
+        DLIB_TEST(found(e, text, pii_type::person, "Martin") && !covered(e, text, "Dupont"));
+
+        // Vulnerabilities: their public identifiers stay readable, a reference with a year does not.
+        text = "Faille CVE-2014-0160 corrigée, ticket INC-2026-0147 clos.";
+        e = read(text, {});
+        DLIB_TEST(!covered(e, text, "CVE-2014") && found(e, text, pii_type::identifier, "INC-2026-0147"));
+    }
+
     void test_imposed_terms()
     {
         pii_detector_options options;
@@ -3242,6 +3388,8 @@ namespace
             test_detector_boundaries();
             print_spinner();
             test_five_languages();
+            print_spinner();
+            test_business_documents();
             print_spinner();
             test_imposed_terms();
             print_spinner();
