@@ -6,9 +6,10 @@
 /*
     A GGUF file of a tiny model of the qwen3 architecture, written in memory, for the tests
     that load models: two layers of width 64, a byte-level vocabulary with the control
-    tokens of ChatML, a chat template naming them, and weights in single precision drawn
-    from a fixed sequence.  The file computes nothing meaningful, and loads and runs as a
-    published model does.
+    tokens of ChatML, a chat template naming them (by default that of a model whose
+    reasoning a request switches, or the one given to build()), and weights in single
+    precision drawn from a fixed sequence.  The file computes nothing meaningful, and loads
+    and runs as a published model does.
 
     Every field of the header is recorded with its offset, its size and a label, so that a
     test can damage one field at a time and check that the loader refuses the file.
@@ -67,7 +68,22 @@ namespace albireo_test
     class tiny_gguf_writer
     {
     public:
-        tiny_gguf build()
+        // The chat template of a model whose reasoning a request switches.
+        static std::string switchable_template()
+        {
+            return "{%- if tools %}<tool_call>{%- endif %}{{- '<|im_start|>' + message.role + '\\n' }}"
+                "{%- if enable_thinking is defined %}<think>{%- endif %}";
+        }
+
+        // The chat template of a model that reasons before every answer, as the thinking variants of Qwen3-VL.
+        static std::string thinking_template()
+        {
+            return "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\\n' + message.content + "
+                "'<|im_end|>\\n' }}{%- endfor %}{%- if add_generation_prompt %}"
+                "{{- '<|im_start|>assistant\\n<think>\\n' }}{%- endif %}";
+        }
+
+        tiny_gguf build(const std::string& chat_template = switchable_template())
         {
             out_ = tiny_gguf();
             const long d = 64, ff = 128, heads = 4, kv_heads = 2, hd = 16, layers = 2;
@@ -135,8 +151,7 @@ namespace albireo_test
             kv_u64("tokenizer.ggml.eos_token_id", 258); ++kv;
             kv_u64("tokenizer.ggml.bos_token_id", 256); ++kv;
             kv_u64("tokenizer.ggml.add_bos_token", 0); ++kv;
-            kv_str("tokenizer.chat_template", "{%- if tools %}<tool_call>{%- endif %}{{- '<|im_start|>' + "
-                "message.role + '\\n' }}{%- if enable_thinking is defined %}<think>{%- endif %}"); ++kv;
+            kv_str("tokenizer.chat_template", chat_template); ++kv;
             for (size_t i = 0; i < 8; ++i) out_.bytes[kv_count_at + i] = static_cast<unsigned char>(kv >> (8 * i));
 
             uint64_t offset = 0;

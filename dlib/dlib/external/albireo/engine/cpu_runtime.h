@@ -50,11 +50,12 @@ namespace albireo
                 With a matmul_offload, the products with the weight matrices go through it,
                 and it decides, product by product, whether a device computes them.  When the
                 offload computes whole layers (layer_pass), the runtime of a dense model hands
-                it the layers of its passes, once the logits of a pass of the device over
-                probe_tokens tokens agreed with those of the processor alone: the hidden
-                states then stay on the device, and the processor keeps the attention.  The
-                batches with DeepStack slices keep the products, as does every pass after a
-                failure of the device.
+                it the layers of its passes, once the logits of passes of the device over
+                probe_tokens tokens, and over the tokens from which it expands the weights by
+                tiles, agreed with those of the processor alone: the hidden states then stay
+                on the device, and the processor keeps the attention.  The batches with
+                DeepStack slices keep the products, as does every pass after a failure of the
+                device.
 
                 A batch that gives the rotary positions of its tokens (forward_batch::
                 positions) rotates each pair of a head by the position component its
@@ -165,6 +166,7 @@ namespace albireo
         */
         bool run(const forward_batch& batch, std::vector<float>& logits, bool on_device);
         bool takes_layer_pass(const forward_batch& batch) const;
+        int probe_layer_pass(long n, std::string& detail);
         void check_layer_pass();
         void drop_layer_pass(const std::string& why);
         // Y = X W^T through the offload when there is one, with the kernels of qkernels.h

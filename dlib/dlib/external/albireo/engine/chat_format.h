@@ -83,6 +83,9 @@ namespace albireo
         virtual ~output_parser() {}
         virtual void feed(const std::string& text, std::vector<output_event>& events) = 0;
         virtual void finish(std::vector<output_event>& events) = 0;
+
+        // Whether the text fed so far leaves the model inside its reasoning.
+        virtual bool in_reasoning() const { return false; }
     };
 
     class chat_format
@@ -117,10 +120,20 @@ namespace albireo
                   <tool_call>) and a reasoning closed at once by "<think></think>" when the
                   request asks for none.
                 - phi: Phi-4-mini, each message between <|role|> and <|end|>.
-                - foundation-sec: Foundation-Sec-8B-Reasoning, turns opened on a new line by
-                  <|system|>, <|user|> and <|assistant|>, answers ended by the end of text
-                  token, and a reasoning that the prompt opens with <think> and the model
-                  closes with </think> before its answer.
+                - foundation-sec: Foundation-Sec-8B-Reasoning, turns opened by <|system|>,
+                  <|user|> and <|assistant|>, answers ended by the end of text token, and a
+                  reasoning that the prompt opens with <think> and the model closes with
+                  </think> before its answer.
+                - role-tags: Foundation-Sec 1.1 8B Instruct, each message after <|system|>,
+                  <|user|> or <|assistant|> and a line break, these markers being plain text
+                  of its vocabulary, an answer ended by the end of text token.
+
+            REASONING
+                A format whose template opens the reasoning of every answer (the thinking
+                variants of Qwen3 and Qwen3-VL, Foundation-Sec-8B-Reasoning) always reasons:
+                the model was trained to, and an answer whose reasoning the prompt closes at
+                once is outside what it learned.  The engine bounds the length of such a
+                reasoning instead (reasoning_close()).
         !*/
     public:
         virtual ~chat_format() {}
@@ -128,6 +141,25 @@ namespace albireo
         virtual const char* name() const = 0;
         virtual bool supports_tools() const = 0;
         virtual bool supports_reasoning() const = 0;
+
+        // Whether the template opens the reasoning of every answer, which the model then always writes.
+        virtual bool always_reasons() const { return false; }
+
+        /*
+            ensures
+                - Returns the text that ends a reasoning before the model ends it, so that it
+                  answers from what it has thought: a sentence that gives the reason, then the
+                  closing marker of the reasoning and the separation of the answer, as the
+                  authors of the Qwen3 models describe the budget of a reasoning.  Empty for a
+                  format without reasoning.
+        !*/
+        virtual std::vector<prompt_piece> reasoning_close() const { return std::vector<prompt_piece>(); }
+
+        /*
+            Texts that end the turn of the model besides its tokens, for the formats whose
+            role markers are plain text of the vocabulary.
+        !*/
+        const std::vector<std::string>& stop_strings() const { return stop_strings_; }
 
         virtual void render(const std::vector<chat_message>& messages, const render_options& options,
             std::vector<prompt_piece>& out) const = 0;
@@ -157,7 +189,16 @@ namespace albireo
 
         std::vector<int> stop_tokens_;
         std::vector<int> marker_tokens_;
+        std::vector<std::string> stop_strings_;
     };
+
+    /*
+        ensures
+            - Returns the chat template of the repository of a model whose GGUF files were
+              published without one, from the general.name of the file, or "" for the other
+              models.
+    !*/
+    std::string published_template(const std::string& general_name);
 
     // Length of the complete JSON value at the start of text, after optional white space,
     // or 0 when text does not hold a complete value yet (or holds something else).

@@ -251,13 +251,14 @@ int main()
     // A template that always opens the reasoning (the thinking variants of Qwen3 and Qwen3-VL).
     {
         const std::unique_ptr<chat_format> t = chat_format::detect(tok, "{{- '<|im_start|>assistant\\n<think>\\n' }}");
-        expect(t->supports_reasoning(), "thinking template detected");
+        expect(t->supports_reasoning() && t->always_reasons(), "thinking template detected");
         std::vector<chat_message> m(1);
         m[0].role = "user";
         m[0].content = "Capital of France?";
+        // The template opens the reasoning whatever the request asks, as the model was trained.
         render_options off;
         expect(render(*t, m, off) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
-            "<think>\n\n</think>\n\n", "an empty reasoning when the request asks for none");
+            "<think>\n", "the reasoning opened when the request asks for none");
         render_options on;
         on.reasoning = true;
         expect(render(*t, m, on) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
@@ -265,8 +266,48 @@ int main()
         const parsed p = read_all_ways(*t, on, "\nThe capital is Paris.\n</think>\n\nParis.", "opened reasoning");
         expect(p.reasoning == "The capital is Paris." && p.content == "Paris.", "reasoning then answer: "
             + p.reasoning + " / " + p.content);
-        const parsed q = read_all_ways(*t, off, "Paris.", "no reasoning");
-        expect(q.reasoning.empty() && q.content == "Paris.", "answer without reasoning: " + q.content);
+        const parsed q = read_all_ways(*t, off, "Paris is the capital.\n</think>\n\nParis.", "reasoning of a request "
+            "without reasoning");
+        expect(q.reasoning == "Paris is the capital." && q.content == "Paris.", "reasoning then answer without "
+            "reasoning asked: " + q.reasoning + " / " + q.content);
+        // The end of a reasoning cut at its budget: a sentence, then </think> and the separation of the answer.
+        std::string closing;
+        for (const auto& piece : t->reasoning_close()) closing += piece.text;
+        expect(closing == "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+            "thinking directly now.\n</think>\n\n", "the end of a reasoning cut: " + closing);
+        const parsed c = read_all_ways(*t, off, "Paris is the capital." + closing + "Paris.", "a reasoning cut");
+        expect(c.content == "Paris." && c.reasoning.find("Considering the limited time") != std::string::npos,
+            "the answer after a reasoning cut: " + c.content);
+        // A switchable template closes the reasoning when the request asks for none.
+        const std::unique_ptr<chat_format> h = chat_format::detect(tok, "{%- if enable_thinking %}{{- '<think>' }}");
+        expect(h->supports_reasoning() && !h->always_reasons(), "switchable template detected");
+        expect(render(*h, m, off) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n", "the reasoning closed by a switchable template");
+        // A switchable template whose switch opens the reasoning in one of its branches opens it when asked.
+        const std::unique_ptr<chat_format> b = chat_format::detect(tok, "{%- if enable_thinking %}"
+            "{{- '<|im_start|>assistant\\n<think>\\n' }}{%- else %}{{- '<|im_start|>assistant\\n' }}{%- endif %}");
+        expect(b->supports_reasoning() && !b->always_reasons(), "switchable template with an open branch detected");
+        expect(render(*b, m, on) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
+            "<think>\n", "the reasoning opened by the branch of the switch: " + render(*b, m, on));
+        expect(render(*b, m, off) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n", "the reasoning closed without it");
+        const parsed r = read_all_ways(*b, on, "The capital is Paris.\n</think>\n\nParis.", "opened by the switch");
+        expect(r.reasoning == "The capital is Paris." && r.content == "Paris.", "the parser starts in the reasoning: "
+            + r.reasoning + " / " + r.content);
+    }
+
+    // Qwen2.5: the form of a call between the double braces its template leaves in the prompt.
+    {
+        const std::unique_ptr<chat_format> q = chat_format::detect(tok,
+            "<tool_call>\\n{{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}}\\n</tool_call>");
+        render_options qopt;
+        qopt.tools = json::parse_or_null("[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]");
+        std::vector<chat_message> m(1);
+        m[0].role = "user";
+        m[0].content = "Hi";
+        const std::string prompt = render(*q, m, qopt);
+        expect(prompt.find("<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n"
+            "</tool_call>") != std::string::npos, "double braces of Qwen2.5: " + prompt);
     }
 
     // Granite 4.2: ChatML with the XML form of the calls.
@@ -355,13 +396,13 @@ int main()
         m[3].content = "Give an example.";
         render_options fopt;
         fopt.reasoning = true;
-        // The prompts the template of the model gives for these conversations, line breaks included.
-        expect(render(*f2, m, fopt) == "<|begin_of_text|>\n<|system|>\nYou are a security analyst.\n<|user|>\nWhat "
-            "is XSS?\n<|assistant|>\nCross-site scripting is an injection.\n<|end_of_text|>\n<|user|>\nGive an "
-            "example.\n<|assistant|>\n<think>", "Foundation-Sec prompt: " + render(*f2, m, fopt));
+        // The prompts the template of the model gives for these conversations, rendered as apply_chat_template does.
+        expect(render(*f2, m, fopt) == "<|begin_of_text|><|system|>\nYou are a security analyst.<|user|>\nWhat is "
+            "XSS?<|assistant|>Cross-site scripting is an injection.<|end_of_text|><|user|>\nGive an example."
+            "<|assistant|>\n<think>", "Foundation-Sec prompt: " + render(*f2, m, fopt));
         std::vector<chat_message> q(m.begin() + 3, m.end());
-        expect(render(*f2, q, fopt) == "<|begin_of_text|>\n<|system|>\nYou are Metis.\n<|user|>\nGive an example."
-            "\n<|assistant|>\n<think>", "the system prompt of the template");
+        expect(render(*f2, q, fopt) == "<|begin_of_text|><|system|>\nYou are Metis.<|user|>\nGive an example."
+            "<|assistant|>\n<think>", "the system prompt of the template");
         /*
             The tokens of the prompt end with the token <think> of the vocabulary, an added token of the model,
             and a control token in its GGUF file.
@@ -383,12 +424,42 @@ int main()
             + p.reasoning + " / " + p.content);
         const parsed r = read_all_ways(*f2, fopt, "<think>\nShort.\n</think>\nDone.", "reasoning opened again");
         expect(r.reasoning == "Short." && r.content == "Done.", "opening marker written again: " + r.reasoning);
-        // A request without reasoning: the prompt closes the reasoning, and the output is the answer.
+        // A request without reasoning: the template opens it all the same, the engine bounding its length.
         render_options plain;
-        expect(render(*f2, q, plain) == "<|begin_of_text|>\n<|system|>\nYou are Metis.\n<|user|>\nGive an example."
-            "\n<|assistant|>\n<think>\n\n</think>\n\n", "the reasoning closed: " + render(*f2, q, plain));
-        const parsed a = read_all_ways(*f2, plain, "An example: <script>.", "an answer without reasoning");
-        expect(a.reasoning.empty() && a.content == "An example: <script>.", "answer: " + a.content);
+        expect(f2->always_reasons(), "Foundation-Sec always reasons");
+        expect(render(*f2, q, plain) == "<|begin_of_text|><|system|>\nYou are Metis.<|user|>\nGive an example."
+            "<|assistant|>\n<think>", "the reasoning opened: " + render(*f2, q, plain));
+        const parsed a = read_all_ways(*f2, plain, "Short.</think>\n\nAn example: <script>.", "a short reasoning");
+        expect(a.reasoning == "Short." && a.content == "An example: <script>.", "answer: " + a.content);
+    }
+
+    // Foundation-Sec 1.1 8B Instruct: its GGUF files carry no template, which the repository of the model gives.
+    {
+        const dlib::hf_tokenizer itok = tokenizer({ "<|begin_of_text|>", "<|end_of_text|>", "<|start_header_id|>",
+            "<|end_header_id|>", "<|eot_id|>" }, {});
+        const std::string itmpl = published_template("Foundation Sec 1.1 8B Instruct");
+        expect(!itmpl.empty() && published_template("Foundation Sec 8B Reasoning").empty(), "published template");
+        const std::unique_ptr<chat_format> i = chat_format::detect(itok, itmpl);
+        expect(std::string(i->name()) == "role-tags" && !i->supports_tools() && !i->supports_reasoning(),
+            "Foundation-Sec 1.1 detected: " + std::string(i->name()));
+        std::vector<chat_message> m(4);
+        m[0].role = "system";
+        m[0].content = "You are a security analyst.";
+        m[1].role = "user";
+        m[1].content = "What is XSS?";
+        m[2].role = "assistant";
+        m[2].content = "An injection.";
+        m[3].role = "user";
+        m[3].content = "Give an example.";
+        render_options iopt;
+        // As the template renders it: "<|role|>\n", the message, a line break, the end of text after an answer.
+        expect(render(*i, m, iopt) == "<|system|>\nYou are a security analyst.\n<|user|>\nWhat is XSS?\n"
+            "<|assistant|>\nAn injection.<|end_of_text|>\n<|user|>\nGive an example.\n<|assistant|>\n",
+            "Foundation-Sec 1.1 prompt: " + render(*i, m, iopt));
+        // The markers are text of the vocabulary: they end the turn as stop strings.
+        expect(i->stop_strings().size() == 3, "the markers of the roles stop the turn");
+        // A file without template and without these names keeps the families of its vocabulary.
+        expect(std::string(chat_format::detect(itok, "")->name()) == "llama3", "Llama 3 by its vocabulary");
     }
 
     // Phi-4-mini.

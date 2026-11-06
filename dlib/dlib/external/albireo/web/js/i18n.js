@@ -17,6 +17,9 @@ const texts = {
     roleHint_security: 'Security analysis, audits, hardening, incidents',
     roleServedBy: 'Model: {model}', roleShared: 'Served by the general model',
     reasoning: 'Deep reasoning', reasoningHint: 'The model thinks step by step before it answers',
+    reasoningAlwaysHint: 'This model always thinks before it answers: without deep reasoning, ' +
+      'its thinking is kept short',
+    answerRepeated: 'The answer was stopped: the model was repeating itself.',
     agent: 'Agent', agentHint: 'The model may use tools: calculation, code, documents, files',
     attach: 'Attach files', send: 'Send', stop: 'Stop', placeholder: 'Ask Albireo anything…',
     placeholderProject: 'Ask about {project}…',
@@ -292,6 +295,9 @@ const texts = {
     roleHint_security: 'Analyse de sécurité, audits, durcissement, incidents',
     roleServedBy: 'Modèle : {model}', roleShared: 'Assuré par le modèle général',
     reasoning: 'Raisonnement approfondi', reasoningHint: 'Le modèle réfléchit étape par étape avant de répondre',
+    reasoningAlwaysHint: 'Ce modèle réfléchit toujours avant de répondre : sans raisonnement approfondi, ' +
+      'sa réflexion reste courte',
+    answerRepeated: 'Réponse arrêtée : le modèle se répétait.',
     agent: 'Agent', agentHint: 'Le modèle peut utiliser des outils : calcul, code, documents, fichiers',
     attach: 'Joindre des fichiers', send: 'Envoyer', stop: 'Arrêter', placeholder: 'Posez votre question à Albireo…',
     placeholderProject: 'Une question sur {project}…',
@@ -580,6 +586,9 @@ const texts = {
     roleHint_security: 'Sicherheitsanalysen, Audits, Härtung, Vorfälle',
     roleServedBy: 'Modell: {model}', roleShared: 'Vom allgemeinen Modell übernommen',
     reasoning: 'Gründliches Nachdenken', reasoningHint: 'Das Modell denkt Schritt für Schritt nach, bevor es antwortet',
+    reasoningAlwaysHint: 'Dieses Modell denkt vor jeder Antwort nach: ohne gründliches Nachdenken ' +
+      'bleibt seine Überlegung kurz',
+    answerRepeated: 'Antwort angehalten: Das Modell wiederholte sich.',
     agent: 'Agent', agentHint: 'Das Modell darf Werkzeuge nutzen: Berechnungen, Code, Dokumente, Dateien',
     attach: 'Dateien anhängen', send: 'Senden', stop: 'Stoppen', placeholder: 'Fragen Sie Albireo…',
     placeholderProject: 'Eine Frage zu {project}…',
@@ -861,6 +870,9 @@ const texts = {
     roleHint_security: 'Analisi di sicurezza, audit, hardening, incidenti',
     roleServedBy: 'Modello: {model}', roleShared: 'Servito dal modello generale',
     reasoning: 'Ragionamento approfondito', reasoningHint: 'Il modello ragiona passo dopo passo prima di rispondere',
+    reasoningAlwaysHint: 'Questo modello ragiona sempre prima di rispondere: senza ragionamento approfondito, ' +
+      'il suo ragionamento resta breve',
+    answerRepeated: 'Risposta interrotta: il modello si ripeteva.',
     agent: 'Agente', agentHint: 'Il modello può usare strumenti: calcolo, codice, documenti, file',
     attach: 'Allega file', send: 'Invia', stop: 'Interrompi', placeholder: 'Chiedi qualsiasi cosa ad Albireo…',
     placeholderProject: 'Una domanda su {project}…',
@@ -1142,6 +1154,9 @@ const texts = {
     roleHint_security: 'Análisis de seguridad, auditorías, bastionado, incidentes',
     roleServedBy: 'Modelo: {model}', roleShared: 'Atendido por el modelo general',
     reasoning: 'Razonamiento profundo', reasoningHint: 'El modelo razona paso a paso antes de responder',
+    reasoningAlwaysHint: 'Este modelo razona siempre antes de responder: sin razonamiento profundo, ' +
+      'su reflexión es breve',
+    answerRepeated: 'Respuesta detenida: el modelo se repetía.',
     agent: 'Agente', agentHint: 'El modelo puede usar herramientas: cálculo, código, documentos, archivos',
     attach: 'Adjuntar archivos', send: 'Enviar', stop: 'Detener', placeholder: 'Pregunte lo que quiera a Albireo…',
     placeholderProject: 'Una pregunta sobre {project}…',

@@ -402,7 +402,7 @@ namespace albireo
             static const char* const taken[] = { "messages", "prompt", "tools", "tool_choice", "max_tokens",
                 "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "stop", "seed", "presence_penalty",
                 "frequency_penalty", "repeat_penalty", "repetition_penalty", "repeat_last_n", "logit_bias",
-                "reasoning_effort", "reasoning", "chat_template_kwargs" };
+                "reasoning_effort", "reasoning", "reasoning_budget", "chat_template_kwargs" };
             for (const char* k : taken)
                 for (auto& member : source.items())
                     if (member.first == k)
@@ -665,6 +665,8 @@ namespace albireo
                 out["choices"] = choices;
                 out["usage"] = usage_of(done);
                 out["timings"] = done["timings"];
+                // An answer the engine stopped because it repeated itself.
+                if (done["repetition"].as_bool(false)) out["repetition"] = true;
                 out["system_fingerprint"] = std::string("albireo-") + ALBIREO_VERSION;
                 send_json(res, 200, out);
                 return;
@@ -678,12 +680,14 @@ namespace albireo
             res.set_chunked_content_provider("text/event-stream",
                 [ch, cid, created, model_name, chat, include_usage, first, tool_index, s, id](
                     size_t, httplib::DataSink& sink) {
-                    auto chunk = [&](const json& delta, const json& finish) {
+                    auto chunk = [&](const json& delta, const json& finish, bool repetition) {
                         json c = json::object();
                         c["id"] = cid;
                         c["object"] = chat ? "chat.completion.chunk" : "text_completion";
                         c["created"] = created;
                         c["model"] = model_name;
+                        // The last chunk of an answer the engine stopped because it repeated itself.
+                        if (repetition) c["repetition"] = true;
                         json choice = json::object();
                         choice["index"] = 0;
                         if (chat) choice["delta"] = delta;
@@ -724,23 +728,23 @@ namespace albireo
                         json delta = json::object();
                         delta["role"] = "assistant";
                         delta["content"] = "";
-                        if (!chunk(delta, json())) return false;
+                        if (!chunk(delta, json(), false)) return false;
                     }
                     json delta = json::object();
                     switch (e.first)
                     {
                     case ALBIREO_EVENT_CONTENT:
                         delta["content"] = e.second;
-                        return chunk(delta, json());
+                        return chunk(delta, json(), false);
                     case ALBIREO_EVENT_REASONING:
                         delta["reasoning_content"] = e.second;
-                        return chunk(delta, json());
+                        return chunk(delta, json(), false);
                     case ALBIREO_EVENT_TOOL_CALL:
                     {
                         json list = json::array();
                         list.push_back(tool_call_of(json::parse_or_null(e.second), (*tool_index)++));
                         delta["tool_calls"] = list;
-                        return chunk(delta, json());
+                        return chunk(delta, json(), false);
                     }
                     case ALBIREO_EVENT_PROGRESS:
                     {
@@ -754,7 +758,8 @@ namespace albireo
                         const json done = json::parse_or_null(e.second);
                         s->record_usage(static_cast<long>(done["usage"]["prompt_tokens"].as_int(0)),
                             static_cast<long>(done["usage"]["completion_tokens"].as_int(0)));
-                        if (!chunk(json::object(), done["finish_reason"])) return false;
+                        const bool repetition = done["repetition"].as_bool(false);
+                        if (!chunk(json::object(), done["finish_reason"], repetition)) return false;
                         if (include_usage)
                         {
                             json c = json::object();

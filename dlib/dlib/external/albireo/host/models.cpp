@@ -463,6 +463,16 @@ namespace albireo
             }
             d["reasoning"] = !embedding && (tmpl.find("think") != std::string::npos
                 || tmpl.find("[THINK]") != std::string::npos);
+            /*
+                A model that reasons before every answer (chat_format::always_reasons()): the
+                thinking variants of Qwen3 and Qwen3-VL, whose template opens the reasoning without
+                a switch, and Foundation-Sec-8B-Reasoning, whose files carry a template without
+                <|end|> that takes the reasoning out of the earlier answers.
+            */
+            const auto holds = [&](const char* s) { return tmpl.find(s) != std::string::npos; };
+            d["reasoning_always"] = !embedding
+                && ((holds("<|im_start|>assistant\\n<think>\\n'") && !holds("enable_thinking"))
+                || (holds("<|assistant|>") && holds("'</think>' in content") && !holds("<|end|>")));
             d["tools"] = !embedding && tmpl.find("tool") != std::string::npos;
             // The inputs the engine reads from the model, and the identity a file prepared
             // by the build of Albireo carries (tools/albireo_builtin.cpp).

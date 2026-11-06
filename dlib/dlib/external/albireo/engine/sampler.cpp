@@ -50,6 +50,7 @@ namespace albireo
     void sampler::accept(int token)
     {
         history_.push_back(token);
+        if (p_.repeat_last_n < 0) ++counts_[token];
     }
 
     int sampler::sample(float* logits, long vocab)
@@ -57,13 +58,16 @@ namespace albireo
         for (const auto& b : p_.logit_bias)
             if (b.first >= 0 && b.first < vocab) logits[b.first] += b.second;
 
-        // Penalties over the recent tokens.
+        // Penalties over the recent tokens, or over the whole history with the counts kept as it grew.
         if (p_.repeat_penalty != 1.0f || p_.presence_penalty != 0.0f || p_.frequency_penalty != 0.0f)
         {
-            std::unordered_map<int, int> counts;
-            const size_t n = p_.repeat_last_n < 0 ? history_.size()
-                : std::min(history_.size(), static_cast<size_t>(p_.repeat_last_n));
-            for (size_t i = history_.size() - n; i < history_.size(); ++i) ++counts[history_[i]];
+            std::unordered_map<int, int> recent;
+            if (p_.repeat_last_n >= 0)
+            {
+                const size_t n = std::min(history_.size(), static_cast<size_t>(p_.repeat_last_n));
+                for (size_t i = history_.size() - n; i < history_.size(); ++i) ++recent[history_[i]];
+            }
+            const std::unordered_map<int, int>& counts = p_.repeat_last_n < 0 ? counts_ : recent;
             for (const auto& c : counts)
             {
                 if (c.first < 0 || c.first >= vocab) continue;

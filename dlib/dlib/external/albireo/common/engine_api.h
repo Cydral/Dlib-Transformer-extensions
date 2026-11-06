@@ -78,7 +78,7 @@ enum
     ALBIREO_EVENT_REASONING = 2,  /* UTF-8 text appended to the reasoning trace */
     ALBIREO_EVENT_TOOL_CALL = 3,  /* JSON {"index","id","name","arguments"} of a complete call */
     ALBIREO_EVENT_PROGRESS = 4,   /* JSON {"prompt_done","prompt_total","cached"} while reading */
-    ALBIREO_EVENT_DONE = 5,       /* JSON {"finish_reason","usage","timings"}, final event */
+    ALBIREO_EVENT_DONE = 5,       /* JSON {"finish_reason","usage","timings"}, final event; see submit */
     ALBIREO_EVENT_ERROR = 6       /* JSON {"code","message"}, final event */
 };
 
@@ -151,11 +151,22 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
    A language model takes the members of an OpenAI chat completion request:
      "model", "messages" (or "prompt", a text read as it is), "tools", "tool_choice",
      "reasoning" (true or false) or "reasoning_effort" or
-     "chat_template_kwargs":{"enable_thinking"}, "max_tokens" or "max_completion_tokens",
-     "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
-     "repeat_penalty", "repeat_last_n", "seed", "stop", "logit_bias".
+     "chat_template_kwargs":{"enable_thinking"}, "reasoning_budget", "max_tokens" or
+     "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
+     "frequency_penalty", "repeat_penalty", "repeat_last_n", "seed", "stop", "logit_bias".
    "top_k" is limited to 1024, and the keys of "logit_bias" must be token identifiers of the
-   vocabulary.  A model loaded with its projector reads the parts "image_url" of the messages,
+   vocabulary.  The sampling settings a request leaves out take the values the authors of the
+   family of the model advise.  The engine ends a reasoning after "reasoning_budget" tokens
+   (-1 without limit) with a sentence that asks for the answer; without that member, the
+   effort "low" gives the reasoning 512 tokens, 256 with "priority":"background".  A model
+   whose template opens the reasoning of every answer ("reasoning_always" in the "models"
+   query) reasons whatever the request asks, with that short reasoning when the request asks
+   for none; its answer then receives the "max_tokens" of the request once the reasoning
+   ends, and the stop sequences apply to that answer alone.  When nine tenths of the last 384
+   tokens of a reasoning repeat passages of 16 tokens it wrote twice before, the engine ends
+   the reasoning in the same way; an answer that repeats itself so ends with the finish reason
+   "length" and "repetition":true in the JSON of DONE.  A model loaded with its projector
+   reads the parts "image_url" of the messages,
    {"url": a data URL of a PNG or JPEG file, "detail": "low", "auto" or "high"}, 16 at most;
    another model refuses them.  Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then
    DONE, or ERROR with the code "out_of_memory" when the answers being written fill the memory

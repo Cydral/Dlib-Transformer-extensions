@@ -293,6 +293,22 @@ namespace albireo
                 else out.push_back(prompt_piece{ s, false });
             }
         };
+
+        /*
+            The end of a reasoning that reached its budget (chat_format::reasoning_close()): the
+            sentence the authors of Qwen3 give for it, then the closing marker of the format and
+            the separation of the answer.
+        */
+        std::vector<prompt_piece> closing(const std::string& marker, const std::string& after)
+        {
+            std::vector<prompt_piece> out;
+            piece_writer w{ out };
+            w.text("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking "
+                "directly now.\n");
+            w.markup(marker);
+            w.markup(after);
+            return out;
+        }
     }
 
     // Output parsing
@@ -340,6 +356,8 @@ namespace albireo
                 buffer_ += text;
                 process(events, false);
             }
+
+            bool in_reasoning() const override { return state_ == state::reasoning; }
 
             void finish(std::vector<output_event>& events) override
             {
@@ -923,20 +941,34 @@ namespace albireo
                 if (eot >= 0) stop_tokens_.push_back(eot);
                 tools_ = tmpl.find("<tool_call>") != std::string::npos || tmpl.find("tools") != std::string::npos;
                 const bool think_tokens = tok.token_id("<think>") >= 0 && tok.token_id("</think>") >= 0;
-                always_thinks_ = think_tokens && tmpl.find("<|im_start|>assistant\\n<think>\\n'") != std::string::npos;
                 switchable_ = think_tokens && tmpl.find("enable_thinking") != std::string::npos;
+                // A template whose switch opens the reasoning in one of its branches reasons on demand.
+                opens_ = think_tokens && tmpl.find("<|im_start|>assistant\\n<think>\\n'") != std::string::npos;
+                always_thinks_ = opens_ && !switchable_;
                 const std::string qwen = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
                 const std::string smollm = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
                 if (tmpl.find(qwen) != std::string::npos) default_system_ = qwen;
                 else if (tmpl.find(smollm) != std::string::npos) default_system_ = smollm;
                 // The templates that trim the text of the messages (EuroLLM).
                 trims_ = tmpl.find("message['content'] | trim") != std::string::npos;
+                /*
+                    The template of Qwen2.5 writes the form of a call between double braces in a
+                    string of the template, which Jinja leaves as they are: the models of that
+                    family read "{{" and "}}" there.
+                */
+                doubled_ = tmpl.find("{{\\\"name\\\": <function-name>") != std::string::npos;
                 add_markers(tok, { "<think>", "</think>", "<tool_call>", "</tool_call>" });
             }
 
             const char* name() const override { return "chatml"; }
             bool supports_tools() const override { return tools_; }
             bool supports_reasoning() const override { return always_thinks_ || switchable_; }
+            bool always_reasons() const override { return always_thinks_; }
+
+            std::vector<prompt_piece> reasoning_close() const override
+            {
+                return supports_reasoning() ? closing("</think>", "\n\n") : std::vector<prompt_piece>();
+            }
 
             void render(const std::vector<chat_message>& messages, const render_options& opt,
                 std::vector<prompt_piece>& out) const override
@@ -957,9 +989,10 @@ namespace albireo
                         w.markup("\n");
                         w.text(t.dump_formatted());
                     }
+                    const std::string open = doubled_ ? "{{" : "{", close = doubled_ ? "}}" : "}";
                     w.markup("\n</tools>\n\nFor each function call, return a json object with function name and "
-                        "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, "
-                        "\"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n");
+                        "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n" + open + "\"name\": "
+                        "<function-name>, \"arguments\": <args-json-object>" + close + "\n</tool_call><|im_end|>\n");
                 }
                 else if (has_system)
                 {
@@ -1055,11 +1088,11 @@ namespace albireo
                 {
                     w.markup("<|im_start|>assistant\n");
                     /*
-                        A template that always opens the reasoning (the thinking variants) gets
-                        an empty reasoning when the request asks for none, as the switchable
-                        templates write it, so that the model answers at once.
+                        A template that always opens the reasoning (the thinking variants) opens
+                        it whatever the request asks, the engine bounding its length; a
+                        switchable template closes it at once when the request asks for none.
                     */
-                    if (always_thinks_) w.markup(opt.reasoning ? "<think>\n" : "<think>\n\n</think>\n\n");
+                    if (opens(opt)) w.markup("<think>\n");
                     else if (switchable_ && !opt.reasoning) w.markup("<think>\n\n</think>\n\n");
                 }
             }
@@ -1071,7 +1104,7 @@ namespace albireo
                 {
                     c.think_open = "<think>";
                     c.think_close = "</think>";
-                    c.starts_in_reasoning = always_thinks_ && opt.add_generation_prompt && opt.reasoning;
+                    c.starts_in_reasoning = opens(opt) && opt.add_generation_prompt;
                 }
                 if (tools_ && opt.tools.is_array() && !opt.tools.empty())
                 {
@@ -1084,9 +1117,17 @@ namespace albireo
 
         private:
             bool tools_ = false;
+            // Whether the prompt opens the reasoning: always, or when asked for a switchable template that does.
+            bool opens(const render_options& opt) const
+            {
+                return always_thinks_ || (switchable_ && opens_ && opt.reasoning);
+            }
+
+            bool opens_ = false;
             bool always_thinks_ = false;
             bool switchable_ = false;
             bool trims_ = false;
+            bool doubled_ = false;
             std::string default_system_;
         };
 
@@ -1107,6 +1148,11 @@ namespace albireo
             const char* name() const override { return "mistral"; }
             bool supports_tools() const override { return true; }
             bool supports_reasoning() const override { return reasoning_; }
+
+            std::vector<prompt_piece> reasoning_close() const override
+            {
+                return reasoning_ ? closing("[/THINK]", "") : std::vector<prompt_piece>();
+            }
 
             void render(const std::vector<chat_message>& messages, const render_options& opt,
                 std::vector<prompt_piece>& out) const override
@@ -1412,6 +1458,8 @@ namespace albireo
             const char* name() const override { return "granite4"; }
             bool supports_tools() const override { return true; }
             bool supports_reasoning() const override { return true; }
+            // The template writes a line break after </think>, before the answer.
+            std::vector<prompt_piece> reasoning_close() const override { return closing("</think>", "\n"); }
 
             void render(const std::vector<chat_message>& messages, const render_options& opt,
                 std::vector<prompt_piece>& out) const override
@@ -1595,17 +1643,20 @@ namespace albireo
         };
 
         /*
-            The format of Foundation-Sec-8B-Reasoning, as the current template of the model lays
-            it out: each turn starts on a new line with <|system|>, <|user|> or <|assistant|>
-            followed by a line break, and an answer ends with a line break and the end of text
-            token.  The template gives its own system prompt when the conversation has none, and
-            keeps of the earlier answers the text after their reasoning.  The other roles are
-            left out, as the template leaves them.  The prompt opens the reasoning with <think>
-            after <|assistant|>, as the template of the model does since its update of February
-            2026, everything before </think> being the reasoning.  The template of the GGUF file
-            of the catalog, an earlier one, leaves that marker to the model, which then may answer
-            without reasoning, an answer read as a reasoning never closed.  A request without
-            reasoning finds it closed at once, "<think>\n\n</think>\n\n", and the model answers.
+            The format of Foundation-Sec-8B-Reasoning, as its template lays it out once rendered
+            with the line breaks after the tags and the spaces before them removed, as the
+            libraries that apply chat templates render it: <|system|> and <|user|> followed by a
+            line break and their text, <|assistant|> followed at once by its answer and the end of
+            text token, each turn after the previous one without a line break between them.  The
+            template gives its own system prompt when the conversation has none, and keeps of the
+            earlier answers the text after their reasoning.  The other roles are left out, as the
+            template leaves them.  The prompt opens the reasoning with <think> after <|assistant|>
+            and a line break, as the template of the model does since its update of February 2026,
+            everything before </think> being the reasoning.  The template of the GGUF file of the
+            catalog, an earlier one, leaves that marker to the model, which then may answer
+            without reasoning, an answer read as a reasoning never closed.  The template opens the
+            reasoning of every answer: the model always reasons, the engine bounding the length of
+            the reasoning of a request that asks for none.
         */
         class foundation_sec_format : public chat_format
         {
@@ -1630,6 +1681,8 @@ namespace albireo
             const char* name() const override { return "foundation-sec"; }
             bool supports_tools() const override { return false; }
             bool supports_reasoning() const override { return true; }
+            bool always_reasons() const override { return true; }
+            std::vector<prompt_piece> reasoning_close() const override { return closing("</think>", "\n\n"); }
 
             void render(const std::vector<chat_message>& messages, const render_options& opt,
                 std::vector<prompt_piece>& out) const override
@@ -1637,18 +1690,18 @@ namespace albireo
                 piece_writer w{ out };
                 w.markup(bos_);
                 const bool has_system = !messages.empty() && messages[0].role == "system";
-                if (!has_system && !default_system_.empty()) w.markup("\n<|system|>\n" + default_system_);
+                if (!has_system && !default_system_.empty()) w.markup("<|system|>\n" + default_system_);
                 for (size_t i = 0; i < messages.size(); ++i)
                 {
                     const chat_message& m = messages[i];
                     if (i == 0 && has_system)
                     {
-                        w.markup("\n<|system|>\n");
+                        w.markup("<|system|>\n");
                         w.text(m.content);
                     }
                     else if (m.role == "user")
                     {
-                        w.markup("\n<|user|>\n");
+                        w.markup("<|user|>\n");
                         w.text(m.content);
                     }
                     else if (m.role == "assistant")
@@ -1657,13 +1710,12 @@ namespace albireo
                         const size_t close = content.rfind("</think>");
                         if (i + 1 < messages.size() && close != std::string::npos)
                             content = strip_spaces(content.substr(close + 8));
-                        w.markup("\n<|assistant|>\n");
+                        w.markup("<|assistant|>");
                         w.text(content);
-                        w.markup("\n" + eos_);
+                        w.markup(eos_);
                     }
                 }
-                if (opt.add_generation_prompt)
-                    w.markup(opt.reasoning ? "\n<|assistant|>\n<think>" : "\n<|assistant|>\n<think>\n\n</think>\n\n");
+                if (opt.add_generation_prompt) w.markup("<|assistant|>\n<think>");
             }
 
             std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
@@ -1671,12 +1723,73 @@ namespace albireo
                 parser_config c;
                 c.think_open = "<think>";
                 c.think_close = "</think>";
-                c.starts_in_reasoning = opt.add_generation_prompt && opt.reasoning;
+                c.starts_in_reasoning = opt.add_generation_prompt;
                 return std::unique_ptr<output_parser>(new tag_parser(c));
             }
 
         private:
             std::string bos_, eos_, default_system_;
+        };
+
+        /*
+            The format of Foundation-Sec 1.1 8B Instruct, as the template of the repository of
+            the model lays it out (its GGUF files come without one, published_template()): each
+            message after <|system|>, <|user|> or <|assistant|> and a line break, followed by a
+            line break, an answer ended by the end of text token, and <|assistant|> with a line
+            break to let the model answer.  These markers are plain text of the Llama 3.1
+            vocabulary of the model, so that a model that goes on past its answer writes one of
+            them as text, which ends its turn (stop_strings()).  The other roles are left out, as
+            the template leaves them.
+        */
+        class role_tags_format : public chat_format
+        {
+        public:
+            explicit role_tags_format(const dlib::hf_tokenizer& tok)
+            {
+                for (const char* t : { "<|end_of_text|>", "<|eot_id|>" })
+                {
+                    const int id = tok.token_id(t);
+                    if (id >= 0) stop_tokens_.push_back(id);
+                }
+                eos_ = tok.eos_id() >= 0 ? tok.id_to_token(tok.eos_id()) : std::string("<|end_of_text|>");
+                stop_strings_ = { "<|user|>", "<|system|>", "<|assistant|>" };
+            }
+
+            const char* name() const override { return "role-tags"; }
+            bool supports_tools() const override { return false; }
+            bool supports_reasoning() const override { return false; }
+
+            void render(const std::vector<chat_message>& messages, const render_options& opt,
+                std::vector<prompt_piece>& out) const override
+            {
+                piece_writer w{ out };
+                for (size_t i = 0; i < messages.size(); ++i)
+                {
+                    const chat_message& m = messages[i];
+                    const bool last = i + 1 == messages.size();
+                    if (m.role == "system" || m.role == "user")
+                    {
+                        w.markup("<|" + m.role + "|>\n");
+                        w.text(m.content);
+                        w.markup("\n");
+                    }
+                    else if (m.role == "assistant")
+                    {
+                        w.markup("<|assistant|>\n");
+                        w.text(m.content);
+                        w.markup(last ? eos_ : eos_ + "\n");
+                    }
+                }
+                if (opt.add_generation_prompt) w.markup("<|assistant|>\n");
+            }
+
+            std::unique_ptr<output_parser> make_parser(const render_options&) const override
+            {
+                return std::unique_ptr<output_parser>(new tag_parser(parser_config()));
+            }
+
+        private:
+            std::string eos_;
         };
 
         // Plain
@@ -1784,6 +1897,10 @@ namespace albireo
         if (has("<|system|>") && has("<|user|>") && has("<|assistant|>") && !has("<|end|>")
             && tok.token_id("<|system|>") >= 0 && tok.token_id("<|user|>") >= 0 && tok.token_id("<|assistant|>") >= 0)
             return std::unique_ptr<chat_format>(new foundation_sec_format(tok, tmpl));
+        // The same markers as plain text of the vocabulary (Foundation-Sec 1.1 8B Instruct).
+        if (has("'<|system|>\n' + message['content']") && has("'<|assistant|>\n'") && !has("<|end|>")
+            && tok.token_id("<|system|>") < 0)
+            return std::unique_ptr<chat_format>(new role_tags_format(tok));
         // A file published without its template: the control tokens of the vocabulary name
         // the family of the model.
         if (tmpl.empty())
@@ -1848,6 +1965,23 @@ namespace albireo
         }
         flush();
         return ids;
+    }
+
+    std::string published_template(const std::string& general_name)
+    {
+        /*
+            Foundation-Sec 1.1 8B Instruct: the chat_template.jinja of fdtn-ai/Foundation-Sec-1.1-8B-Instruct,
+            whose GGUF files carry none.
+        */
+        if (general_name.find("Foundation Sec 1.1") != std::string::npos
+            && general_name.find("Instruct") != std::string::npos)
+            return "{% for message in messages %}{% if message['role'] == 'system' %}{{ '<|system|>\n' + "
+                "message['content'] + '\n' }}{% elif message['role'] == 'user' %}{{ '<|user|>\n' + "
+                "message['content'] + '\n' }}{% elif message['role'] == 'assistant' %}{% if not loop.last %}{{ "
+                "'<|assistant|>\n'  + message['content'] + eos_token + '\n' }}{% else %}{{ '<|assistant|>\n'  + "
+                "message['content'] + eos_token }}{% endif %}{% endif %}{% if loop.last and add_generation_prompt %}"
+                "{{ '<|assistant|>\n' }}{% endif %}{% endfor %}";
+        return std::string();
     }
 
 }

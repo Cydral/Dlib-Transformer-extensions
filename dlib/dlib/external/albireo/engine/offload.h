@@ -122,6 +122,13 @@ namespace albireo
         // The tokens a pass needs at least for begin() to take it.
         virtual long min_tokens() const = 0;
 
+        /*
+            The tokens from which a pass computes its products another way, from tiles of the
+            weights expanded rather than from their blocks in place, which the runtime checks
+            apart; 0 for a pass that computes them one way.
+        */
+        virtual long tiled_tokens() const { return 0; }
+
         /*!
             ensures
                 - Writes in the log of the device the outcome of the comparison that the

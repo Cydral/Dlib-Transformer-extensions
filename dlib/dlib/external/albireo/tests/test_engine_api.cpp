@@ -76,6 +76,45 @@ namespace
         return t.cv.wait_for(lock, std::chrono::seconds(seconds), [&]() { return t.finals > 0; });
     }
 
+    // The texts of the answer and of the reasoning of one request, and its final event.
+    struct collector
+    {
+        std::mutex m;
+        std::condition_variable cv;
+        std::string content;
+        std::string reasoning;
+        std::string final_json;
+        int finals = 0;
+    };
+
+    void ALBIREO_ENGINE_CALL collect_event(void* user, int kind, const char* data, size_t size)
+    {
+        collector& c = *static_cast<collector*>(user);
+        std::lock_guard<std::mutex> lock(c.m);
+        if (kind == ALBIREO_EVENT_CONTENT) c.content.append(data, size);
+        else if (kind == ALBIREO_EVENT_REASONING) c.reasoning.append(data, size);
+        else if (kind == ALBIREO_EVENT_DONE || kind == ALBIREO_EVENT_ERROR)
+        {
+            ++c.finals;
+            c.final_json.assign(data, size);
+            c.cv.notify_all();
+        }
+    }
+
+    bool wait_collected(collector& c, int seconds)
+    {
+        std::unique_lock<std::mutex> lock(c.m);
+        return c.cv.wait_for(lock, std::chrono::seconds(seconds), [&]() { return c.finals > 0; });
+    }
+
+    // The text without the white space at its ends.
+    std::string trimmed(const std::string& s)
+    {
+        const size_t a = s.find_first_not_of(" \n");
+        if (a == std::string::npos) return std::string();
+        return s.substr(a, s.find_last_not_of(" \n") - a + 1);
+    }
+
     std::string chat(const std::string& text, const std::string& extra = "")
     {
         return "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"" + text + "\"}]" + extra + "}";
@@ -334,6 +373,130 @@ int main(int argc, char** argv)
                 "the question at once after an answer ends once");
         }
         std::printf("  the history of an answer read ahead of the next question (%lld tokens)\n", warmed);
+    }
+
+    /*
+        The guard against loops and the budget of a reasoning, the token "a" favoured by a bias
+        of 100 at temperature 0 so that every answer repeats it.  The engine stops an answer
+        once nine tenths of its last 384 tokens end a passage of 16 tokens it wrote before.  A
+        model whose template opens the reasoning of every answer reasons when the request asks
+        for none: the engine ends its reasoning after the tokens of its budget with the sentence
+        of the authors of Qwen3 and the marker that closes it, and the answer then receives the
+        tokens the request gave it.
+    */
+    {
+        const std::string thinking_path = folder + "test_engine_api_thinking.gguf";
+        const albireo_test::tiny_gguf thinking =
+            albireo_test::tiny_gguf_writer().build(albireo_test::tiny_gguf_writer::thinking_template());
+        expect(thinking.save(thinking_path, thinking.bytes), "the model that always reasons is written");
+        expect(lib.load_model(e, "t", thinking_path.c_str(), options, err, sizeof(err)) == ALBIREO_OK,
+            std::string("the model that always reasons loads: ") + err);
+        auto ask = [&](const std::string& model, const std::string& extra, collector& c) {
+            const std::string req = "{\"model\":\"" + model + "\",\"messages\":[{\"role\":\"user\","
+                "\"content\":\"hello\"}],\"temperature\":0,\"logit_bias\":{\"97\":100}" + extra + "}";
+            uint64_t rid = 0;
+            const int rc = lib.submit(e, req.c_str(), &collect_event, &c, &rid, err, sizeof(err));
+            expect(rc == ALBIREO_OK, "request accepted: " + extra + " " + err);
+            if (rc == ALBIREO_OK) expect(wait_collected(c, 120), "request ended: " + extra);
+            std::lock_guard<std::mutex> lock(c.m);
+            return json::parse_or_null(c.final_json);
+        };
+        const std::string sentence = "Considering the limited time by the user, I have to give the solution based on "
+            "the thinking directly now.";
+
+        collector looping;
+        const json f = ask("m", ",\"reasoning\":false,\"max_tokens\":1000", looping);
+        const long long n = f["usage"]["completion_tokens"].as_int(0);
+        expect(f["finish_reason"].as_string() == "length" && f["repetition"].as_bool(false) && n >= 384 && n < 450,
+            "an answer that repeats itself is stopped (" + std::to_string(n) + " tokens)");
+        expect(looping.content == std::string(static_cast<size_t>(std::max(0LL, n)), 'a'),
+            "the answer stopped keeps the tokens it wrote");
+
+        json models;
+        expect(lib.run_query(e, json::parse_or_null("{\"op\":\"models\"}"), models) == ALBIREO_OK, "models query");
+        int always = 0, switched = 0;
+        for (const auto& m : models["models"].elements())
+        {
+            if (m["id"].as_string() == "t" && m["reasoning_always"].as_bool(false)) ++always;
+            if (m["id"].as_string() == "m" && !m["reasoning_always"].as_bool(true)) ++switched;
+        }
+        expect(always == 1 && switched == 1, "the description of a model tells whether it always reasons");
+
+        // The tokens of the end of a reasoning the engine writes.
+        json counted;
+        json q = json::object();
+        q["op"] = "tokenize";
+        q["model"] = "t";
+        q["text"] = "\n\n" + sentence + "\n</think>\n\n";
+        q["special"] = true;
+        expect(lib.run_query(e, q, counted) == ALBIREO_OK, "tokenize query");
+        const long long closing = static_cast<long long>(counted["tokens"].size());
+
+        collector brief;
+        const json g = ask("t", ",\"reasoning\":false,\"reasoning_budget\":24,\"max_tokens\":40", brief);
+        expect(brief.reasoning.compare(0, 26, std::string(24, 'a') + "\n\n") == 0
+            && brief.reasoning.find(sentence) == 26,
+            "a reasoning ends after its budget with the sentence that asks for the answer: " + brief.reasoning);
+        expect(trimmed(brief.content) == std::string(40, 'a') && g["finish_reason"].as_string() == "length"
+            && g["usage"]["completion_tokens"].as_int(0) == 24 + closing + 40 && !g["repetition"].as_bool(false),
+            "the answer that follows a short reasoning receives its own tokens: " + g.dump());
+
+        collector none;
+        ask("t", ",\"reasoning\":false,\"reasoning_budget\":0,\"max_tokens\":8", none);
+        expect(trimmed(none.reasoning) == sentence && trimmed(none.content) == std::string(8, 'a'),
+            "a budget of 0 ends the reasoning at once: " + none.reasoning);
+
+        collector background;
+        ask("t", ",\"reasoning\":false,\"priority\":\"background\",\"max_tokens\":4", background);
+        expect(background.reasoning.compare(0, 258, std::string(256, 'a') + "\n\n") == 0
+            && background.reasoning.find(sentence) == 258,
+            "the work in the background reasons for 256 tokens at most");
+
+        // A reasoning asked for has no budget by default, even for the work in the background.
+        collector deep;
+        const json h = ask("t", ",\"reasoning\":true,\"priority\":\"background\",\"max_tokens\":300", deep);
+        expect(deep.reasoning == std::string(300, 'a') && deep.content.empty()
+            && h["finish_reason"].as_string() == "length", "a reasoning asked for has no budget by default");
+
+        // The repetitions of the reasoning and those of the answer are counted apart.
+        collector parts;
+        const json i = ask("t", ",\"reasoning\":false,\"reasoning_budget\":300,\"max_tokens\":390", parts);
+        expect(trimmed(parts.content) == std::string(390, 'a') && !i["repetition"].as_bool(false)
+            && i["usage"]["completion_tokens"].as_int(0) == 300 + closing + 390,
+            "the answer after a reasoning of 300 tokens receives its 390 tokens: " + i.dump());
+
+        /*
+            A reasoning that goes round in circles ends as at its budget, and the answer then
+            receives the tokens of the request, whatever is left of the budget.
+        */
+        collector circles;
+        const json j = ask("t", ",\"reasoning\":false,\"reasoning_budget\":1000,\"max_tokens\":40", circles);
+        const size_t looped = circles.reasoning.find('\n');
+        expect(looped >= 384 && looped < 450 && circles.reasoning.find(sentence) == looped + 2
+            && circles.reasoning.compare(0, looped, std::string(looped, 'a')) == 0,
+            "a reasoning that repeats itself is ended: " + std::to_string(looped) + " tokens");
+        expect(trimmed(circles.content) == std::string(40, 'a') && j["finish_reason"].as_string() == "length"
+            && !j["repetition"].as_bool(false)
+            && j["usage"]["completion_tokens"].as_int(0) == static_cast<long long>(looped) + closing + 40,
+            "the answer after a reasoning ended early receives the tokens of the request: " + j.dump());
+
+        // The same with a reasoning asked for, whose answer then loops in turn.
+        collector both;
+        const json k = ask("t", ",\"reasoning\":true,\"max_tokens\":1500", both);
+        expect(both.reasoning.find(sentence) != std::string::npos && trimmed(both.content).size() >= 384
+            && trimmed(both.content).find_first_not_of('a') == std::string::npos && k["repetition"].as_bool(false)
+            && k["finish_reason"].as_string() == "length", "a reasoning asked for that loops, then its answer: "
+            + k.dump());
+
+        // The stop sequences of a request apply to its answer, not to the short reasoning the engine gives it.
+        collector stopped;
+        const json l = ask("t", ",\"reasoning\":false,\"reasoning_budget\":24,\"max_tokens\":40,"
+            "\"stop\":[\"\\n\\n\"]", stopped);
+        expect(trimmed(stopped.content) == std::string(40, 'a') && l["finish_reason"].as_string() == "length",
+            "the stop sequences apply to the answer: " + l.dump());
+
+        expect(lib.unload_model(e, "t") == ALBIREO_OK, "the model that always reasons unloads");
+        std::printf("  the answers that loop stopped, the reasoning of a model that always reasons bounded\n");
     }
 
     /*

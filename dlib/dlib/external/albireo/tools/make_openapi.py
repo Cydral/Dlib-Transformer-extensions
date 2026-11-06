@@ -110,23 +110,33 @@ schemas = {
         "function": {"type": "object", "required": ["name"], "properties": {
             "name": {"type": "string"}, "description": {"type": "string"},
             "parameters": {"type": "object", "description": "JSON Schema of the arguments."}}}}},
-    "Sampling": {"type": "object", "properties": {
+    "Sampling": {"type": "object", "description": "A setting the request leaves out takes the value the authors of "
+                 "the family of the model advise: temperature 1, top_p 0.95 and top_k 20 for the thinking variants "
+                 "of Qwen3-VL; temperature 0.7, top_p 0.8, top_k 20 and presence_penalty 1.5 over the whole answer "
+                 "for its instruct variants; temperature 0.7, top_p 0.8 and top_k 20 for Qwen3 without reasoning; "
+                 "the same with repeat_penalty 1.05 for Qwen2.5; temperature 0.3, top_p 0.95 and top_k 20 for "
+                 "Foundation-Sec-8B-Reasoning; temperature 0.6, top_p 0.95 and top_k 20 for the other models that "
+                 "reason, and 0.7, 0.9 and 40 for the others; min_p 0 for all of them.",
+                 "properties": {
         "max_tokens": {"type": "integer",
                        "description": "Tokens to generate at most; by default up to the end of the context."},
         "max_completion_tokens": {"type": "integer"},
         "temperature": {"type": "number", "minimum": 0, "maximum": 2},
         "top_p": {"type": "number"},
-        "top_k": {"type": "integer", "minimum": 0, "maximum": 1024, "default": 40,
+        "top_k": {"type": "integer", "minimum": 0, "maximum": 1024,
                   "description": "Keeps the k most likely tokens, among which top_p and min_p then choose; 0 sets "
-                                 "no limit, and the 1024 most likely tokens are kept. Without it, 40, or 20 for a "
-                                 "model of the ChatML format that reasons. A value outside 0 to 1024 is refused "
-                                 "(400). Without effect at temperature 0, which takes the most likely token."},
+                                 "no limit, and the 1024 most likely tokens are kept. A value outside 0 to 1024 is "
+                                 "refused (400). Without effect at temperature 0, which takes the most likely "
+                                 "token."},
         "min_p": {"type": "number"},
         "presence_penalty": {"type": "number"}, "frequency_penalty": {"type": "number"},
         "repeat_penalty": {"type": "number"},
         "repetition_penalty": {"type": "number", "description": "The same setting as repeat_penalty, under the "
                                "name other clients give it."},
-        "repeat_last_n": {"type": "integer"},
+        "repeat_last_n": {"type": "integer", "minimum": -1,
+                          "description": "The tokens of the answer the penalties read, the last ones; -1 reads the "
+                                         "whole answer. Without it, 64, or the whole answer for a model whose "
+                                         "authors advise a presence penalty."},
         "seed": {"type": "integer"},
         "stop": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "maxItems": 16}]},
         "logit_bias": {"type": "object", "additionalProperties": {"type": "number"},
@@ -149,10 +159,27 @@ schemas = {
             "tool_choice": {"description": "none disables the tools.",
                             "oneOf": [{"type": "string"}, {"type": "object"}]},
             "reasoning": {"type": "boolean", "description": "Enables or disables the reasoning of the models that "
-                          "support both modes. The reasoning streams in reasoning_content."},
+                          "support both modes. The reasoning streams in reasoning_content. A model whose template "
+                          "opens the reasoning of every answer (reasoning_always in the description of the model: "
+                          "the thinking variants of Qwen3 and Qwen3-VL, Foundation-Sec-8B-Reasoning) reasons "
+                          "whatever the request asks; without reasoning, its reasoning is short (reasoning_budget)."},
             "think": {"type": "boolean", "description": "The same setting as reasoning, under the name other "
                       "clients give it; when both are given, think applies."},
-            "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high"]},
+            "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high"],
+                                 "description": "none disables the reasoning; low gives it the budget of a short "
+                                                "reasoning (reasoning_budget)."},
+            "reasoning_budget": {"type": "integer", "minimum": -1,
+                                 "description": "The tokens the reasoning may take: beyond them, the engine ends it "
+                                                "with a sentence that asks the model to answer from what it has "
+                                                "thought, then the marker that closes the reasoning. -1 sets no "
+                                                "limit, 0 ends the reasoning at once. Without it, no limit, except "
+                                                "for a model that always reasons asked for no reasoning and for the "
+                                                "effort low: 512 tokens, 256 for the work in the background "
+                                                "(albireo-background). The answer of a model asked for no reasoning "
+                                                "receives max_tokens once its reasoning ends, and the stop sequences "
+                                                "apply to that answer alone. A reasoning whose last 384 tokens repeat, "
+                                                "for nine tenths of them, passages of 16 tokens it wrote twice before "
+                                                "ends in the same way."},
             "chat_template_kwargs": {"type": "object", "properties": {"enable_thinking": {"type": "boolean"}}},
             "n": {"type": "integer", "enum": [1]}}}],
         "example": {"model": "albireo-general", "messages": [{"role": "user", "content": "Hello!"}],
@@ -170,6 +197,9 @@ schemas = {
         "choices": {"type": "array", "items": {"type": "object", "properties": {
             "index": {"type": "integer"}, "message": ref("Message"),
             "finish_reason": {"type": "string", "enum": ["stop", "length", "tool_calls", "cancelled"]}}}},
+        "repetition": {"type": "boolean", "description": "Present and true when the engine stopped the answer "
+                       "because it repeated itself (finish_reason length): nine tenths of its last 384 tokens "
+                       "repeated passages of 16 tokens it had written twice before."},
         "usage": ref("Usage"), "timings": ref("Timings"), "system_fingerprint": {"type": "string"}}},
     "ChatCompletionChunk": {"type": "object", "description": "One event of a stream (text/event-stream), as "
                             "'data: <chunk>' lines ended by 'data: [DONE]'. With stream_options.include_usage, a "
@@ -187,6 +217,8 @@ schemas = {
                                                        "tool_calls": {"type": "array", "items": ref("ToolCall")}}},
             "logprobs": {"nullable": True, "description": "Always null."},
             "finish_reason": {"type": "string", "nullable": True}}}},
+        "repetition": {"type": "boolean", "description": "In the chunk of the finish_reason, present and true when "
+                       "the engine stopped the answer because it repeated itself."},
         "usage": ref("Usage"), "timings": ref("Timings")}},
     "StreamError": {"type": "object", "description": "The last event of a stream that an error ended, without "
                     "'data: [DONE]' after it.", "properties": {"error": {"type": "object", "properties": {

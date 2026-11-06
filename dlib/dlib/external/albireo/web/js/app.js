@@ -77,6 +77,16 @@ const maxQuestionProjectImages = 4;
 const maxProjectImages = 10;
 // The items of the knowledge of a project, its documents and its images together.
 const maxProjectItems = 100;
+/*
+    The tokens of the short reasoning the engine gives a model that always reasons when the request asks for none:
+    512, and the sentence and the marker that end it.
+*/
+const briefReasoningTokens = 544;
+
+// The tokens a discussion keeps free for the answer of the model of caps, with or without its reasoning.
+function answerReserve(caps, reasoning) {
+  return (state.settings.maxTokens || 2048) + (caps.reasoningAlways && !reasoning ? briefReasoningTokens : 0);
+}
 
 // Tokens of a text, estimated from its characters.
 function estimateTokens(text) {
@@ -637,12 +647,21 @@ function acceptFor(role, room) {
   return accept;
 }
 
+/*
+    The capabilities of the model of a function: reasoning, reasoningAlways for a model that reasons before every
+    answer (Deep reasoning then lifts the bound the engine sets on the length of its reasoning), tools, and its
+    context.
+*/
 function roleCapabilities(role) {
   const id = roleModel(role);
   const loaded = loadedModel(id);
-  if (loaded) return { reasoning: loaded.reasoning !== false, tools: loaded.tools !== false, context: loaded.context || 0 };
+  if (loaded) {
+    return { reasoning: loaded.reasoning !== false, reasoningAlways: loaded.reasoning_always === true,
+      tools: loaded.tools !== false, context: loaded.context || 0 };
+  }
   const m = modelInfo(id);
-  return { reasoning: m ? m.reasoning !== false : true, tools: m ? m.tools !== false : true, context: 0 };
+  return { reasoning: m ? m.reasoning !== false : true, reasoningAlways: !!(m && m.reasoning_always === true),
+    tools: m ? m.tools !== false : true, context: 0 };
 }
 
 /*
@@ -686,7 +705,8 @@ function toolSet(c, caps) {
 /*
     The work done in the background (titles, summaries, memory) goes to the model that comes
     with Albireo, which the service keeps loaded, without reasoning; the service gives it to
-    the general model when there is none.
+    the general model when there is none.  A model that always reasons gets a short reasoning
+    from the engine, outside the answer and its max_tokens.
 */
 const backgroundModel = 'albireo-background';
 
@@ -713,12 +733,13 @@ function backgroundText(system, user, maxTokens, signal) {
 */
 const backgroundTimeout = 10 * 60 * 1000;
 
-// The text the background model writes after a list of messages; signal, when given, stops it too.
+/*
+    The text the background model writes after a list of messages; signal, when given, stops it too.  Without a
+    temperature, the engine samples as the authors of the model advise.
+*/
 async function backgroundChat(messages, maxTokens, signal, temperature) {
-  const body = {
-    model: backgroundModel, reasoning: false, temperature: temperature == null ? 0.2 : temperature,
-    max_tokens: maxTokens, messages
-  };
+  const body = { model: backgroundModel, reasoning: false, max_tokens: maxTokens, messages };
+  if (temperature != null) body.temperature = temperature;
   let text = '';
   let finish = null;
   const limit = api.limitedSignal(signal, backgroundTimeout);
@@ -1576,8 +1597,9 @@ async function rewriteSummary(c) {
   const start = c.contextStart || 0;
   c.summary = null;
   if (start === 0 || !roleModel(c.role)) return;
-  const context = roleCapabilities(c.role).context || 8192;
-  const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
+  const caps = roleCapabilities(c.role);
+  const context = caps.context || 8192;
+  const room = context - Math.min(answerReserve(caps, !!(c.reasoning && caps.reasoning)), Math.floor(context / 2));
   toast(t('compacting'));
   cancelWarmup(c.id);
   const abort = new AbortController();
@@ -1818,7 +1840,9 @@ function describeMessages(url, name) {
 
 // A description as the model writes it, without a heading, within 4,000 characters.
 function cleanDescription(text) {
-  const s = String(text || '').replace(/^\s*(description|beschreibung|descrizione|descripci[oó]n)\s*:\s*/i, '').trim();
+  // A description that repeats its lines, written by a model that looped, keeps each of them once.
+  const label = /^\s*(description|beschreibung|descrizione|descripci[oó]n)\s*:\s*/i;
+  const s = distinctLines(String(text || '').replace(label, ''));
   return s.length > 4000 ? keepStart(s, 4000) : s;
 }
 
@@ -1875,7 +1899,7 @@ async function describeImage(projectId, imageId) {
         const url = await images.dataUrl(imageId).catch(() => null);
         if (url) {
           try {
-            const r = await backgroundChat(describeMessages(url, img.name), 1024, job.signal, 0.2);
+            const r = await backgroundChat(describeMessages(url, img.name), 1024, job.signal);
             text = cleanDescription(r.text);
           } catch (e) {
             console.warn('Albireo: the description of an image failed', e);
@@ -3685,6 +3709,7 @@ function noteElements(m, live, steps) {
   if (m.imagesNamed) note(h('span', { html: icon('image') }), t('imagesNamed', { model: modelName(m.model) }));
   if (m.error) out.push(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
   if (m.cancelled) note(t('cancelled'));
+  if (m.repetition && !m.cancelled) note(h('span', { html: icon('info') }), t('answerRepeated'));
   if (!live && !m.error && !m.cancelled && !steps.some((s) => s.content || (s.toolCalls || []).length)) {
     note(t('emptyAnswer'));
   }
@@ -3829,6 +3854,8 @@ function renderComposerState() {
   ui.reasonButton.classList.toggle('on', reasoning);
   ui.reasonButton.setAttribute('aria-pressed', String(reasoning));
   ui.reasonButton.disabled = !caps.reasoning;
+  // A model that reasons before every answer: the button gives its reasoning its whole length.
+  ui.reasonButton.title = caps.reasoningAlways ? t('reasoningAlwaysHint') : t('reasoningHint');
   ui.agentButton.classList.toggle('on', agent);
   ui.agentButton.setAttribute('aria-pressed', String(agent));
   ui.agentButton.disabled = !caps.tools;
@@ -4324,7 +4351,8 @@ function apiMessages(c, system, cuts, media) {
   const sent = read ? sentImages(messages) : null;
   let last = null;
   for (const m of messages) if (m.role === 'user') last = m;
-  let summary = start > 0 && c.summary && c.summary.text ? c.summary.text : '';
+  // A summary an earlier version kept with its lines repeated gives each of them once.
+  let summary = start > 0 && c.summary && c.summary.text ? distinctLines(c.summary.text) : '';
   if (summary && cuts && cuts.summary != null) summary = keepEnd(summary, cuts.summary);
   for (const m of messages) {
     if (m.role === 'user') {
@@ -4536,6 +4564,42 @@ function transcriptOf(messages) {
   return lines.join('\n\n');
 }
 
+/*
+    The lines of a text written by a model that looped, compared without case and spaces: a line of 24 characters
+    or more that comes three times or more keeps its first place alone, and a run of blank lines one of them.  The
+    lines of code between fences, the short ones and those that come twice stay, as a summary or a description
+    writes them.
+*/
+function distinctLines(text) {
+  const lines = String(text || '').split('\n');
+  const keyOf = (line) => line.trim().replace(/\s+/g, ' ').toLowerCase();
+  const fenced = [];
+  let inCode = false;
+  for (const line of lines) {
+    const fence = /^\s*(```|~~~)/.test(line);
+    fenced.push(inCode || fence);
+    if (fence) inCode = !inCode;
+  }
+  const times = new Map();
+  lines.forEach((line, i) => {
+    const key = keyOf(line);
+    if (!fenced[i] && key.length >= 24) times.set(key, (times.get(key) || 0) + 1);
+  });
+  const seen = new Set();
+  const out = [];
+  lines.forEach((line, i) => {
+    const key = keyOf(line);
+    if (!fenced[i] && (times.get(key) || 0) >= 3) {
+      if (seen.has(key)) return;
+      seen.add(key);
+    } else if (!key && !fenced[i] && (!out.length || !out[out.length - 1].trim())) {
+      return;
+    }
+    out.push(line);
+  });
+  return out.join('\n').trim();
+}
+
 function summaryInstructions(words) {
   return 'You keep the memory of a long discussion between a user and an assistant. Rewrite the previous summary, '
     + 'when there is one, together with the new exchanges, into a single summary that the assistant will read in '
@@ -4551,7 +4615,8 @@ async function summarize(c, previous, transcript, limit, signal) {
   const r = await backgroundText(summaryInstructions(Math.floor(limit * 0.6)),
     (previous ? '<previous_summary>\n' + previous + '\n</previous_summary>\n\n' : '')
       + '<exchanges>\n' + transcript + '\n</exchanges>', limit, signal);
-  const text = r.text;
+  // A summary that repeats its lines, written by a model that looped, keeps each of them once.
+  const text = distinctLines(r.text);
   const finish = r.finish;
   if (!text) throw new Error('empty summary');
   // A summary stopped by its length ends with its last whole sentence.
@@ -4977,7 +5042,7 @@ async function runTurn(c, abort, turn) {
       const build = (x) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
       }), system, x, media);
-      const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, signal, () => {
+      const fitted = await fitContext(c, build, toolDefs, answerReserve(caps, reasoning), signal, () => {
         turn.compacting = true;
         scheduleRender(c);
       }, 'albireo-' + role, cuts);
@@ -5011,6 +5076,8 @@ async function runTurn(c, abort, turn) {
           } : chunk.usage;
           turn.timings = chunk.timings || turn.timings;
         }
+        // An answer the engine stopped because it repeated itself.
+        if (chunk.repetition) turn.repetition = true;
         const choice = chunk.choices && chunk.choices[0];
         if (!choice) continue;
         const d = choice.delta || {};
@@ -5861,7 +5928,8 @@ async function compactInBackground(c, signal) {
   const [all, base] = await Promise.all([api.count(model, text, toolDefs),
     api.count(model, text.slice(0, 1), toolDefs).catch(() => null)]);
   if (signal.aborted || !all || typeof all.tokens !== 'number' || !all.context) return;
-  const room = all.context - Math.min(state.settings.maxTokens || 2048, Math.floor(all.context / 2));
+  const reserve = answerReserve(caps, !!(view.reasoning && caps.reasoning));
+  const room = all.context - Math.min(reserve, Math.floor(all.context / 2));
   const estimate = tokenEstimate(text, all.tokens, model);
   const media = estimateMedia(role);
   const build = () => apiMessages(view, system, null, media);

@@ -629,17 +629,13 @@ namespace albireo
     }
 
     /*
-        Runs probe_tokens tokens in a sequence of their own through the layers of the device,
-        then through the processor alone, and keeps the layer pass when their logits agree: a
-        defect of the device or of its kernels would otherwise reach every answer.  The state
-        stays unchecked when the keys and values or the device lack room for the probe, so that
-        a later pass checks again.
+        Runs n tokens in a sequence of their own through the layers of the device, then through
+        the processor alone, and compares their logits: 1 when they agree, 0 when they differ, -1
+        when the keys and values or the device lack room for the probe.  detail describes the
+        comparison.
     */
-    void cpu_runtime::check_layer_pass()
+    int cpu_runtime::probe_layer_pass(long n, std::string& detail)
     {
-        long n = probe_tokens;
-        n = std::max(n, layer_pass_->min_tokens());
-        if (cfg_.ctx_train > 0) n = std::min(n, cfg_.ctx_train);
         const long V = cfg_.vocab;
         const int seq = create_sequence();
         struct release
@@ -648,16 +644,16 @@ namespace albireo
             int seq;
             ~release() { rt.release_sequence(seq); }
         } guard{ *this, seq };
-        if (!reserve_sequence(seq, n)) return;
+        if (!reserve_sequence(seq, n)) return -1;
         forward_batch b;
         for (long i = 0; i < n; ++i) b.tokens.push_back(static_cast<int>((1009 + 7919 * i) % V));
         b.segments.push_back({ seq, 0, n });
         for (long i = 0; i < n; ++i) b.logit_rows.push_back(i);
         std::vector<float> reference, device;
-        if (!run(b, device, true)) return;
+        if (!run(b, device, true)) return -1;
         // The truncation gives the blocks back.
         truncate_sequence(seq, 0);
-        if (!reserve_sequence(seq, n)) return;
+        if (!reserve_sequence(seq, n)) return -1;
         {
             struct processor_only
             {
@@ -689,17 +685,47 @@ namespace albireo
             if (relative > worst) worst = relative;
             if (ia == id) ++same;
         }
-        std::ostringstream detail;
-        detail << "logits of " << n << " probe tokens within " << worst * 100 << "% of those of the processor"
+        std::ostringstream o;
+        o << "logits of " << n << " probe tokens within " << worst * 100 << "% of those of the processor"
             << (apart && worst <= 0.01 ? ", some not numbers" : "") << ", " << same << " of " << n
             << " most likely tokens the same";
-        if (!apart && same >= n - 1)
+        detail = o.str();
+        // Two candidates whose logits are nearly equal may change places: one row in sixteen may differ.
+        return !apart && same >= n - std::max<long>(1, n / 16) ? 1 : 0;
+    }
+
+    /*
+        Keeps the layer pass when passes of the device agree with the processor, a defect of the
+        device or of its kernels otherwise reaching every answer: a probe of probe_tokens tokens,
+        whose products read the blocks of the weights in place, and one of tiled_tokens() tokens,
+        whose products go through the tiles of the weights expanded.  The state stays unchecked
+        when the keys and values or the device lack room for a probe, so that a later pass checks
+        again.
+    */
+    void cpu_runtime::check_layer_pass()
+    {
+        // A copy of the constant, which std::max() takes by reference.
+        long first = probe_tokens;
+        first = std::max(first, layer_pass_->min_tokens());
+        if (cfg_.ctx_train > 0) first = std::min(first, cfg_.ctx_train);
+        std::vector<long> sizes(1, first);
+        const long tiled = layer_pass_->tiled_tokens();
+        if (tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train)) sizes.push_back(tiled);
+        std::string details;
+        for (long n : sizes)
         {
-            layer_pass_checked_ = true;
-            layer_pass_->report(true, detail.str());
+            std::string detail;
+            const int outcome = probe_layer_pass(n, detail);
+            if (outcome < 0) return;
+            details += (details.empty() ? "" : "; ") + detail;
+            if (outcome == 0)
+            {
+                drop_layer_pass(details);
+                return;
+            }
         }
-        else
-            drop_layer_pass(detail.str());
+        layer_pass_checked_ = true;
+        layer_pass_->report(true, details);
     }
 
     void cpu_runtime::forward(const forward_batch& batch, std::vector<float>& logits)

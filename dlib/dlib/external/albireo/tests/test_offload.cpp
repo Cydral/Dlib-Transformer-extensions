@@ -3,19 +3,22 @@
 /*
     Checks the products a device takes from the processor runtime.
 
-        test_offload model.gguf [device] [threads]
+        test_offload model.gguf [device] [threads] [budget]
 
     device is the device of the build: the index of a card with CUDA, "NPU", "GPU" or
     "CPU" with OpenVINO (the CPU plugin of OpenVINO runs the device code on a machine
-    without NPU), ignored with the host code of dlib.
+    without NPU), ignored with the host code of dlib.  budget gives the megabytes of the
+    copies of the weights of the first pass below, 0 (by default) for the automatic budget,
+    a share of the free memory of the device.
 
     The program runs the same token sequence, a prompt of 130 tokens then 16 single steps,
     through the runtime alone and through the runtime with the device:
         1. every product on the device, against the processor kernels computing in
            single precision (qk_set_exact_products), so that the logits agree to the
            rounding of the device; with CUDA and the host code of dlib, the layers of a
-           dense model run on the device (layer_pass), the prompt through tiles of the
-           weights expanded for cuBLAS and the steps through the blocks read in place;
+           dense model run on the device (layer_pass) when the budget holds the matrices
+           of its layers, the prompt through tiles of the weights expanded for cuBLAS and
+           the steps through the blocks read in place;
         2. the same with a budget of 16 MB for the copies of the weights, so that most
            matrices cross the bus at each product of the prompt, or are left to the
            processor;
@@ -155,11 +158,12 @@ static int run_checks(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: test_offload model.gguf [device] [threads]\n");
+        std::printf("usage: test_offload model.gguf [device] [threads] [budget]\n");
         return 2;
     }
     const std::string device = argc > 2 ? argv[2] : "";
     const int threads = argc > 3 ? std::atoi(argv[3]) : 2;
+    const long first_budget = argc > 4 ? std::max(0L, std::atol(argv[4])) : 0L;
     // The devices of OpenVINO are chosen once per process, before the first query.
     if (!device.empty())
     {
@@ -192,6 +196,19 @@ static int run_checks(int argc, char** argv)
     const long T = static_cast<long>(tokens.size());
     const long k = 130;
 
+    // The bytes of the matrices of the layers in their GGUF formats, which the layer pass keeps on the device.
+    double layer_bytes = 0;
+    for (const auto& t : file->reader().tensors())
+    {
+        const std::string& n = t.name;
+        const size_t dot = n.rfind(".weight");
+        if (n.compare(0, 4, "blk.") != 0 || dot == std::string::npos || dot + 7 != n.size()) continue;
+        const std::string kind = n.substr(n.rfind('.', dot - 1) + 1, dot - n.rfind('.', dot - 1) - 1);
+        if (kind == "attn_q" || kind == "attn_k" || kind == "attn_v" || kind == "attn_qkv" || kind == "attn_output"
+            || kind == "ffn_gate" || kind == "ffn_up" || kind == "ffn_down")
+            layer_bytes += static_cast<double>(t.nbytes);
+    }
+
     thread_pool pool(threads);
     const size_t kv = size_t(256) << 20;
     double ms = 0;
@@ -206,19 +223,20 @@ static int run_checks(int argc, char** argv)
         exact = run(rt, tokens, k, ms);
         std::printf("processor, exact products: %.1f ms\n", ms);
     }
-    const long budgets[] = { 0, 16 };
-    for (long budget : budgets)
+    for (int pass = 0; pass < 2; ++pass)
     {
+        const bool small = pass == 1;
+        const long budget = small ? 16 : first_budget;
         tensor_device dev(device_config(device, budget, "device"), pool, print_log);
         cpu_runtime rt(file, cfg, pool, kv, 16);
         rt.set_offload(dev.make_offload());
         std::printf("%s\n", rt.description().c_str());
         const std::vector<float> got = run(rt, tokens, k, ms);
         const json st = dev.stats();
-        std::printf("device, every product, budget %s: %.1f ms, %s\n", budget ? "16 MB" : "automatic", ms,
-            st.dump().c_str());
+        std::printf("device, every product, budget %s: %.1f ms, %s\n",
+            budget ? (std::to_string(budget) + " MB").c_str() : "automatic", ms, st.dump().c_str());
         const stats d = compare(exact.data(), got.data(), T, V);
-        report(budget ? "device (small budget) vs exact" : "device vs exact", d);
+        report(small ? "device (small budget) vs exact" : "device vs exact", d);
         if (half)
             expect(d.mean_kl < 0.02 && d.top1 >= 0.9, "device products in half precision");
         else if (cfg.is_moe())
@@ -228,9 +246,15 @@ static int run_checks(int argc, char** argv)
         else
             expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97, "device products");
         expect(st["device_products"].as_int() > 0 || st["layer_passes"].as_int() > 0, "the device computed products");
-        if ((backend == "cuda" || backend == "dlib") && !budget && !cfg.is_moe())
-            expect(st["layer_passes"].as_int() > 0, "the layers ran on the device");
-        if (backend != "openvino" && !budget && !cfg.is_moe())
+        if ((backend == "cuda" || backend == "dlib") && !small && !cfg.is_moe())
+        {
+            if (st["weights_budget"].as_double(0) >= layer_bytes)
+                expect(st["layer_passes"].as_int() > 0, "the layers ran on the device");
+            else
+                std::printf("  the budget holds %.0f MB of the %.0f MB of the matrices of the layers: they stay "
+                    "on the processor\n", st["weights_budget"].as_double(0) / 1048576.0, layer_bytes / 1048576.0);
+        }
+        if (backend != "openvino" && !small && !budget && !cfg.is_moe())
         {
             // Every product stays on the device when the automatic budget, a share of the free
             // memory, holds every matrix, even in single precision.

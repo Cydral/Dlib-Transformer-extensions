@@ -62,6 +62,8 @@ namespace albireo
         sampling_params p_;
         std::mt19937_64 rng_;
         std::vector<int> history_;
+        // The times each token of the history occurs, kept as it grows when the penalties read all of it.
+        std::unordered_map<int, int> counts_;
         std::vector<std::pair<float, int>> candidates_;
         float last_p_ = 1.0f;
     };

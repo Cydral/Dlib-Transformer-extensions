@@ -76,10 +76,11 @@ application, the description of the interface and the list of the programs of Wi
 - **Three functions**, general, code and security, each served by a language model of the
   catalog, chosen in the Models window or by the service when a model arrives, and an embedding
   model for the search in documents, which the service installs in every case.
-- **Models that come with Albireo**: the complete installer carries Qwen3-VL-2B-Thinking-albireo,
-  which reads images and text, reasons when asked, and serves the three functions as soon as
-  Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the search, both retrieved and
-  checked by the build (see [Models that come with Albireo](#models-that-come-with-albireo)).
+- **Models that come with Albireo**: the complete installer carries Qwen3-VL-4B-Thinking-albireo,
+  which reads images and text, reasons before each answer, at length when asked, and serves the
+  three functions as soon as Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the
+  search, both retrieved and checked by the build (see
+  [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
   sandboxed frame, outline, reading and search of the documents, search of the other
   discussions, date, files to download), up to 100 steps per answer, the context fitted before
@@ -116,9 +117,8 @@ application, the description of the interface and the list of the programs of Wi
 
 ## Screenshots
 
-The web application served by the service, the windows of the icon and the installer, with
-Qwen3-VL-4B-Thinking-albireo, the model that came with Albireo up to version 1.0.8, on a processor
-of two cores.
+The web application served by the service, the windows of the icon and the installer, with the
+model that comes with Albireo (Qwen3-VL-4B-Thinking-albireo) on a processor of two cores.
 
 | | |
 |---|---|
@@ -246,11 +246,13 @@ the attention over the paged keys and values, the biases, the normalizations of 
 and the rotary positions. A layer crosses the bus once each way, the queries, keys and values of
 its tokens to the processor and the outputs of their attention back, through pinned memory and
 asynchronous copies, where the products alone crossed it twice per product. Before its first use,
-a pass of the card over 8 probe tokens must give the logits of the processor alone within 1 %,
-or the layers stay with the products; a check that the keys and values or the card put off is
-made again 64 passes later. A failure of the card brings the pass back to the processor, which
-computes it again. A model with a mixture of experts, and the passes that add the
-DeepStack slices of an image, keep the products.
+a pass of the card over 8 probe tokens, whose products read the blocks in place, and a pass over
+64, whose products go through the tiles, must give the logits of the processor alone within 1 %,
+the most likely token differing for one of the 8 probe tokens and four of the 64 at most, or the
+layers stay with the products; a check that the keys and values or the card put off is made
+again 64 passes later. A failure of the card brings the pass back to the processor, which
+computes it again. A model with a mixture of experts, and the passes that add the DeepStack
+slices of an image, keep the products.
 
 With OpenVINO, the products of a single token often stay on the processor, which serves them from
 the compact weights; the products of the prompts go to the device. The image encoder of a model sends its
@@ -302,18 +304,41 @@ quantized weights.
 The conversation formats are written natively ([`engine/chat_format.cpp`](engine/chat_format.cpp)),
 the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
 reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2), Llama 3,
-Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini
-and the format of Foundation-Sec-8B-Reasoning. The tests compare the prompts with those of the
-reference templates rendered by Jinja, byte for byte. A model that always reasons, such as the
-Thinking variants of Qwen3-VL and Foundation-Sec-8B-Reasoning, answers at once when the request
-asks for no reasoning: the prompt then closes its reasoning before it starts, as the switchable
-templates do. The prompt of Foundation-Sec-8B-Reasoning opens its reasoning with `<think>`, as the
-current template of the model does; the template of its GGUF file, an earlier one, leaves that
-marker to the model, whose answer written without it would read as a reasoning. The tokenizer of dlib
-reads the byte-level BPE vocabularies, with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and
-GPT-4o (Phi-4-mini) among others, and the SentencePiece ones (EuroLLM), whose leading space it puts
-after each control token as the reference tokenizers do; the token identifiers of the tests are
-those of llama.cpp.
+Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini,
+the format of Foundation-Sec-8B-Reasoning and that of Foundation-Sec 1.1 8B Instruct, whose role
+markers `<|system|>`, `<|user|>` and `<|assistant|>` are plain text of its vocabulary: its GGUF files
+carry no template, the engine takes the one of the repository of the model, and these markers end
+its answer as its end of text token does. The instructions of the tools of Qwen2.5 keep the doubled
+braces of the example of its template. The tests compare the prompts with those of the reference
+templates rendered by Jinja, byte for byte, as the libraries that apply chat templates render them,
+the line break after each tag and the spaces before it removed: the template of
+Foundation-Sec-8B-Reasoning, written over several lines, gives its turns one after the other, the
+answer right after `<|assistant|>`. The tokenizer of dlib reads the byte-level BPE vocabularies,
+with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and GPT-4o (Phi-4-mini) among others, and
+the SentencePiece ones (EuroLLM), whose leading space it puts after each control token as the
+reference tokenizers do; the token identifiers of the tests are those of llama.cpp.
+
+A model whose template opens the reasoning of every answer, the Thinking variants of Qwen3 and
+Qwen3-VL and Foundation-Sec-8B-Reasoning, was trained to reason before each answer: a prompt that
+closes its reasoning before it starts puts it outside what it learned, and its answer then takes up
+the corrections and returns of a reasoning, which can loop. Such a model therefore reasons before
+every answer. When the request asks for no reasoning, or for the effort `low`, the engine ends that
+reasoning after 512 tokens, 256 for the work in the background, by writing in place of the model the
+sentence its authors give for that purpose ("Considering the limited time by the user, I have to
+give the solution based on the thinking directly now.") and the marker `</think>`; the model then
+answers from what it has thought. `reasoning_budget` sets that limit for any request, -1 lifting
+it; the answer of a request that asked for no reasoning then receives its `max_tokens` once the
+reasoning ends, and its stop sequences apply to that answer alone. The prompt of
+Foundation-Sec-8B-Reasoning opens its reasoning with `<think>`, as the current template of the model
+does; the template of its GGUF file, an earlier one, leaves that marker to the model.
+
+The engine watches the repetitions of the reasoning and of the answer apart: a part loops when nine
+tenths of its last 384 tokens end a passage of 16 tokens that it wrote twice before. A reasoning
+that loops ends as a reasoning that reached its budget, and the model answers; an answer that loops
+ends with the reason `length` and the field `repetition`, and the web application says that the
+model repeated itself. A passage written again once, a code shown before and after its correction,
+does not count; nor do the passages of the prompt, so that an answer that takes up a document or
+code given to it goes on, nor those of the reasoning for the answer, which may take up its draft.
 
 ### Images
 
@@ -559,8 +584,9 @@ of the discussion stops it, and its failure is silent.
 
 The work the application does in the background, the titles, the summaries and the memory, goes
 to the background model: the model that comes with Albireo (`albireo-background`), which the
-service keeps loaded whatever the functions, without reasoning; without it, the general model
-serves it.
+service keeps loaded whatever the functions, without reasoning, or with the short reasoning of a
+model that always reasons; without it, the general model serves it. It samples as its authors
+advise, and a summary that repeats its lines keeps each of them once.
 
 The memory of the discussions holds short sentences on the user, one after the other in one
 paragraph (profession, projects, preferences, the way to answer), the lasting facts the user
@@ -835,7 +861,9 @@ cmake --build build-albireo-win -j
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
-runs the layers of a dense model as the card does.
+runs the layers of a dense model as the card does. A fourth argument gives the megabytes of the
+copies of its first pass, so that the layers of a larger model run there on a computer whose
+automatic budget does not hold them: `test_offload qwen3-vl-4b-thinking-albireo.gguf "" 2 2400`.
 
 Two scripts run these programs and the service, then print one line per step with its result:
 
@@ -862,7 +890,7 @@ A build gives two installers. `albireo-setup.exe` is complete: it carries the mo
 with Albireo and installs a computer that answers at once, without network. `albireo-setup-online.exe`
 is the same program without them: the updates take it, and on a new computer the service
 downloads the default models of the catalog. Windows runs no program of 4 GiB or more: when the
-program and its models would reach that size, as the installer of 1.0.8 does with the libraries of
+program and its models would reach that size, as the complete installer does with the libraries of
 CUDA and of OpenVINO, its models lie beside it in `albireo-setup.models`, which the installer reads
 when it carries none; the two files travel together and are renamed together
 (`albireo-setup-complete-<version>.exe` and `albireo-setup-complete-<version>.models`).
@@ -1031,12 +1059,26 @@ of `/v1/embeddings` takes `albireo-embedding`.
 
 The sampling of every model goes through the sampler of Albireo, whatever the architecture of
 the model and the engine: `temperature`, `top_p`, `top_k`, `min_p` and the penalties apply the
-same way to all of them. `top_k`, 40 by default (20 for a model of the ChatML format while it
-reasons), keeps the most likely tokens, at most 1,024 even with 0; a value outside 0 to 1024, or
+same way to all of them. The settings a request leaves out take the values the authors of the
+family of the model advise on its card, or the temperature of their evaluations for
+Foundation-Sec-8B-Reasoning, `min_p` being 0 for all of them:
+
+| Models                                   | `temperature` | `top_p` | `top_k` | Penalty                                   |
+|------------------------------------------|---------------|---------|---------|-------------------------------------------|
+| Qwen3-VL Thinking                        | 1             | 0.95    | 20      | none                                      |
+| Qwen3-VL Instruct                        | 0.7           | 0.8     | 20      | `presence_penalty` 1.5 over the answer    |
+| Qwen3 without reasoning                  | 0.7           | 0.8     | 20      | none                                      |
+| Qwen2.5                                  | 0.7           | 0.8     | 20      | `repeat_penalty` 1.05 over 64 tokens      |
+| Foundation-Sec-8B-Reasoning              | 0.3           | 0.95    | 20      | none                                      |
+| Other models, while they reason          | 0.6           | 0.95    | 20      | none                                      |
+| Other models                             | 0.7           | 0.9     | 40      | none                                      |
+
+`top_k` keeps the most likely tokens, at most 1,024 even with 0; a value outside 0 to 1024, or
 one that is not a whole number, is refused with 400. At temperature 0, the most likely token is
-taken, which `top_k` 1 gives too. The engine refuses the other values out of their bounds:
-`temperature` 0 to 10,000, `top_p` and `min_p` 0 to 1, `repeat_penalty` above 0 and up to 100,
-`presence_penalty`, `frequency_penalty` and the values of `logit_bias` -100 to 100, each stop
+taken, which `top_k` 1 gives too. `repeat_last_n` gives the tokens of the answer the penalties
+read, 64 by default and -1 for the whole answer. The engine refuses the other values out of their
+bounds: `temperature` 0 to 10,000, `top_p` and `min_p` 0 to 1, `repeat_penalty` above 0 and up to
+100, `presence_penalty`, `frequency_penalty` and the values of `logit_bias` -100 to 100, each stop
 sequence 1,024 bytes at most. A pass that the memory of the system cannot hold ends its requests
 with `out_of_memory` and gives back the pages of the cache.
 
@@ -1246,9 +1288,9 @@ and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------|---------|
-| Qwen3-VL 2B Thinking (default) | Alibaba            | general, code, security | text, image   | 1.55 GB  | Apache-2.0 |
+| Qwen3-VL 4B Thinking (default) | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
 | Qwen3 Embedding 0.6B (default) | Alibaba            | embedding               | text          | 0.64 GB  | Apache-2.0 |
-| Qwen3-VL 4B Thinking           | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
+| Qwen3-VL 2B Thinking           | Alibaba            | general, code, security | text, image   | 1.55 GB  | Apache-2.0 |
 | Qwen3-VL 2B Instruct           | Alibaba            | general                 | text, image   | 1.55 GB  | Apache-2.0 |
 | Qwen3-VL 4B Instruct           | Alibaba            | general, code           | text, image   | 2.95 GB  | Apache-2.0 |
 | Qwen3-VL 8B Instruct           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
@@ -1342,7 +1384,7 @@ and the quantization Albireo ships:
 
 | Model                        | From                                                     | Shipped         | Functions               |
 |------------------------------|----------------------------------------------------------|-----------------|-------------------------|
-| Qwen3-VL-2B-Thinking-albireo | Qwen3VL-2B-Thinking-Q4_K_M.gguf of Qwen, 1.11 GB, and its projector mmproj-Qwen3VL-2B-Thinking-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 1.55 GB | general, code, security |
+| Qwen3-VL-4B-Thinking-albireo | Qwen3VL-4B-Thinking-Q4_K_M.gguf of Qwen, 2.50 GB, and its projector mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 2.95 GB | general, code, security |
 | Qwen3-Embedding-0.6B-albireo | Qwen3-Embedding-0.6B-Q8_0.gguf, 0.64 GB                  | Q8_0, 0.64 GB   | document search         |
 
 The build retrieves and converts them as the import example of dlib reads a GGUF file
@@ -1365,7 +1407,7 @@ of the engine:
    down projections of the first and last eighths of the layers and of one layer in three between
    them), with the search and the mix of the reference quantizer of the format, whose output it
    matches byte for byte, and the first and last rows of each matrix are checked against their
-   source; a model published in Q4_K_M, as Qwen3-VL-2B-Thinking is, keeps its weights. The
+   source; a model published in Q4_K_M, as Qwen3-VL-4B-Thinking is, keeps its weights. The
    metadata receive the identity of the model in Albireo. The projector of a model that reads
    images is checked against its SHA-256, read by the image encoder of the engine and installed
    beside its model (`<id>.mmproj.gguf`);
@@ -1376,8 +1418,8 @@ of the engine:
    `albireo-setup.models` beside it when both would reach the 4 GiB Windows runs; the overlay is
    read back before it takes its name.
 
-The conversion takes a few minutes and the cache holds about 4.0 GB, the downloaded files and the
-converted ones; the models of the complete installer weigh about 2.2 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
+The conversion takes a few minutes and the cache holds about 6.8 GB, the downloaded files and the
+converted ones; the models of the complete installer weigh about 3.6 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
 `-NoBuiltinModels` of `build_windows.ps1`, builds without them; a cross build gives
 `ALBIREO_BUILTIN_TOOL`, the `albireo-builtin` of the build machine.
 

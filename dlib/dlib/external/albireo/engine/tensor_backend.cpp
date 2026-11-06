@@ -1429,6 +1429,11 @@ namespace albireo
             return std::max<long>(1, o_.d_.min_tokens);
         }
 
+        long tiled_tokens() const override
+        {
+            return expanded_product_tokens;
+        }
+
         void report(bool ok, const std::string& detail) override
         {
             if (ok)
