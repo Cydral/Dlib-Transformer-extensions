@@ -911,6 +911,21 @@ g++ -std=c++14 -O3 -s -DSLM_DECOMPRESSOR_ONLY=1 -I../.. ../slm_tok_predictive_co
 ./slm_tok_decompressor --input data.txt.dlc --output data.txt.out
 ```
 
+### Measured on enwik9
+The program compressed and decompressed enwik9, the gigabyte of English Wikipedia text in XML that the Large Text Compression Benchmark uses, with the header of the repository and the default options, on one core of an Intel Core Ultra 9 275HX and with the AVX-VNNI kernels it chose for that processor.
+
+| Measure | Value |
+|---|---|
+| Archive | 117,169,624 bytes, 0.937 bits per byte |
+| Decompressor (`SLM_DECOMPRESSOR_ONLY`), compiled-in data included | 7,063,888 bytes |
+| Archive and decompressor | 124,233,512 bytes |
+| Program that compresses and decompresses (`SLM_CODEC_ONLY`) | 7,129,424 bytes |
+| Compiled-in data, tokenizer and network | 6,742,715 bytes |
+| Compression | 24 h 48 min, 5.97 GiB of memory at most |
+| Decompression | 25 h 12 min, 5.09 GiB of memory at most |
+
+The decompressed file is identical to the input, byte for byte. The previous version of the engine, without the AVX2 kernels of the softmax, the gates and the normalisations and without the pass that serves two query heads at once, wrote the same archive in 30 h 18 min on the same processor.
+
 ### Useful reminders
 - The repository provides a header with a tokenizer and a network quantized to 6 bits and trained on encyclopaedic text, so that a fresh build compresses at once; its second line gives the form of the tokenizer and the shape of the network. That network, eight blocks of width 256 trained by an earlier version, has an input table of its own. Trained for 16,000 steps of 16 windows through the ten slices of a gigabyte of encyclopaedic text, starting from its blocks and its head, the network with the shared table coded 4.3 % and 4.6 % more bytes than it on two samples of 2 MB, network alone, for 22 % less compiled-in data; the shared form has yet to be trained as long as its predecessor was. `--train` and `--embed` write the tokenizer and the new network together; `--build-tokenizer` writes a header without a network, since a network belongs to the tokenizer it was trained with.
 - For the same reason, `slm_tok_predictive_compressor.dat` holds the network followed by its tokenizer, and the checkpoint of a run has its tokenizer in `chkpt-slm_tok_predictive_compressor.dat.tokenizer`. `--train` and `--embed` stop at once on a saved network or a checkpoint whose tokenizer differs from the compiled-in one, and name the files to delete before a training from scratch. A network saved by an earlier version, without its tokenizer, is taken with a warning.
