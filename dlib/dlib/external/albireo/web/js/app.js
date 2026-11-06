@@ -78,14 +78,14 @@ const maxProjectImages = 10;
 // The items of the knowledge of a project, its documents and its images together.
 const maxProjectItems = 100;
 /*
-    The tokens of the short reasoning the engine gives a model that always reasons when the request asks for none:
-    512, and the sentence and the marker that end it.
+    The tokens of the end of reasoning the engine writes at once for a model that always reasons when the request asks
+    for no reasoning: the sentence and the marker that end it.
 */
-const briefReasoningTokens = 544;
+const closedReasoningTokens = 32;
 
 // The tokens a discussion keeps free for the answer of the model of caps, with or without its reasoning.
 function answerReserve(caps, reasoning) {
-  return (state.settings.maxTokens || 2048) + (caps.reasoningAlways && !reasoning ? briefReasoningTokens : 0);
+  return (state.settings.maxTokens || 2048) + (caps.reasoningAlways && !reasoning ? closedReasoningTokens : 0);
 }
 
 // Tokens of a text, estimated from its characters.
@@ -95,7 +95,7 @@ function estimateTokens(text) {
 
 const defaults = {
   theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null, topK: null,
-  maxTokens: 0, sendOnEnter: true, systemPrompt: '', lastReasoning: false, lastAgent: false, sidebar: true,
+  maxTokens: 0, sendOnEnter: true, systemPrompt: '', sidebar: true,
   memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', storagePersisted: null
 };
 
@@ -648,9 +648,8 @@ function acceptFor(role, room) {
 }
 
 /*
-    The capabilities of the model of a function: reasoning, reasoningAlways for a model that reasons before every
-    answer (Deep reasoning then lifts the bound the engine sets on the length of its reasoning), tools, and its
-    context.
+    The capabilities of the model of a function: reasoning, reasoningAlways for a model trained to reason before
+    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, and its context.
 */
 function roleCapabilities(role) {
   const id = roleModel(role);
@@ -665,12 +664,23 @@ function roleCapabilities(role) {
 }
 
 /*
-    Why the web access cannot serve a discussion whose model has the capabilities caps, '' when it can: a model that
-    calls no tool, a service set offline, a web access the administrator turned off (the "web" member of the status),
-    or a status without it.
+    Whether the tools of the agent and of the web can come with the questions to a model of the capabilities caps,
+    reasoning telling whether the deep reasoning of the discussion is on: a model that can reason calls them with its
+    deep reasoning only, so that it reasons before each call; a model that cannot reason calls them as it answers.
 */
-function webUnavailable(caps) {
+function toolsAvailable(caps, reasoning) {
+  return !!caps.tools && (!caps.reasoning || !!reasoning);
+}
+
+/*
+    Why the web access cannot serve a discussion whose model has the capabilities caps, reasoning telling whether its
+    deep reasoning is on, '' when it can: a model that calls no tool, a model that can reason without its deep
+    reasoning, a service set offline, a web access the administrator turned off (the "web" member of the status), or
+    a status without it.
+*/
+function webUnavailable(caps, reasoning) {
   if (!caps.tools) return t('webNoTools');
+  if (!toolsAvailable(caps, reasoning)) return t('webNeedsReasoning');
   const s = state.status;
   if (!s || !s.web || typeof s.web !== 'object') return t('webUnavailable');
   if (s.web.available) return '';
@@ -695,8 +705,9 @@ function searchProvider() {
     that the beginning of the prompt stays the same from one question to the next.
 */
 function toolSet(c, caps) {
-  const agent = !!(c.agent && caps.tools);
-  const webOn = !!(c.web && !webUnavailable(caps));
+  const reasoning = !!(c.reasoning && caps.reasoning);
+  const agent = !!(c.agent && toolsAvailable(caps, reasoning));
+  const webOn = !!(c.web && !webUnavailable(caps, reasoning));
   const search = webOn && state.status.web.search === 'wikipedia';
   const definitions = (agent ? tools.definitions : []).concat(webOn ? web.definitions(search) : []);
   return { agent, web: webOn, search, definitions: definitions.length ? definitions : null };
@@ -705,8 +716,8 @@ function toolSet(c, caps) {
 /*
     The work done in the background (titles, summaries, memory) goes to the model that comes
     with Albireo, which the service keeps loaded, without reasoning; the service gives it to
-    the general model when there is none.  A model that always reasons gets a short reasoning
-    from the engine, outside the answer and its max_tokens.
+    the general model when there is none.  A model that always reasons has its reasoning ended
+    at once by the engine, outside the answer and its max_tokens.
 */
 const backgroundModel = 'albireo-background';
 
@@ -735,10 +746,11 @@ const backgroundTimeout = 10 * 60 * 1000;
 
 /*
     The text the background model writes after a list of messages; signal, when given, stops it too.  Without a
-    temperature, the engine samples as the authors of the model advise.
+    temperature, the engine samples as the authors of the model advise, without the presence penalty some of them give:
+    the titles, the summaries and the quotes of the memory take up the words of the discussion.
 */
 async function backgroundChat(messages, maxTokens, signal, temperature) {
-  const body = { model: backgroundModel, reasoning: false, max_tokens: maxTokens, messages };
+  const body = { model: backgroundModel, reasoning: false, max_tokens: maxTokens, messages, presence_penalty: 0 };
   if (temperature != null) body.temperature = temperature;
   let text = '';
   let finish = null;
@@ -2749,12 +2761,15 @@ async function keepImages(c, list) {
   }
 }
 
-// Conversations.  The web access starts off in every discussion, whatever the previous ones did.
+/*
+    Conversations.  The deep reasoning, the agent and the web access start off in every discussion, in a project or
+    not, whatever the previous ones did; each discussion then keeps its own choice.
+*/
 function newConversation(projectId) {
   return {
     id: store.uid(), title: '', projectId: projectId || null, created: Date.now(), updated: Date.now(), pinned: false,
-    role: state.settings.defaultRole || 'general', reasoning: !!state.settings.lastReasoning, agent: !!state.settings.lastAgent,
-    web: false, messages: [], incognito: state.incognito
+    role: state.settings.defaultRole || 'general', reasoning: false, agent: false, web: false, messages: [],
+    incognito: state.incognito
   };
 }
 
@@ -3007,7 +3022,8 @@ function renderWelcome() {
   if (state.statusError) notice = h('div', { class: 'error-box' }, t('serviceDown'));
   else if (state.status && !roleModel(c.role)) notice = h('div', { class: 'error-box' }, t('noModel'));
   // With the agent on, what it does and the tools it has.
-  const agent = c.agent && roleCapabilities(c.role).tools
+  const caps = roleCapabilities(c.role);
+  const agent = c.agent && toolsAvailable(caps, c.reasoning && caps.reasoning)
     ? h('div', { class: 'agent-note' }, h('span', { html: icon('tool') }), h('span', null, t('agentHelp'))) : null;
   ui.content.replaceChildren(h('div', { class: 'welcome' },
     h('img', { class: 'hero', src: 'img/albireo-mark.svg', alt: '' }),
@@ -3850,18 +3866,21 @@ function renderComposerState() {
   const c = state.current;
   const caps = roleCapabilities(c ? c.role : 'general');
   const reasoning = !!(c && c.reasoning && caps.reasoning);
-  const agent = !!(c && c.agent && caps.tools);
+  // The agent and the web of a model that can reason come with its deep reasoning (toolsAvailable()).
+  const ready = toolsAvailable(caps, reasoning);
+  const agent = !!(c && c.agent && ready);
   ui.reasonButton.classList.toggle('on', reasoning);
   ui.reasonButton.setAttribute('aria-pressed', String(reasoning));
   ui.reasonButton.disabled = !caps.reasoning;
-  // A model that reasons before every answer: the button gives its reasoning its whole length.
-  ui.reasonButton.title = caps.reasoningAlways ? t('reasoningAlwaysHint') : t('reasoningHint');
+  // A model trained to reason before every answer answers directly without the button, as the other models do.
+  ui.reasonButton.title = t('reasoningHint');
   ui.agentButton.classList.toggle('on', agent);
   ui.agentButton.setAttribute('aria-pressed', String(agent));
-  ui.agentButton.disabled = !caps.tools;
-  // The Web button is off and disabled, with the reason as its title, while the model calls no tool or the service
-  // gives no web access.
-  const reason = webUnavailable(caps);
+  ui.agentButton.disabled = !ready;
+  ui.agentButton.title = ready ? t('agentHint') : caps.tools ? t('agentNeedsReasoning') : t('agentNoTools');
+  // The Web button is off and disabled, with the reason as its title, while the model calls no tool, while a model
+  // that can reason lacks its deep reasoning, or while the service gives no web access.
+  const reason = webUnavailable(caps, reasoning);
   const webOn = !!(c && c.web && !reason);
   ui.webButton.classList.toggle('on', webOn);
   ui.webButton.setAttribute('aria-pressed', String(webOn));
@@ -6639,8 +6658,12 @@ function buildLayout() {
     onclick: async () => {
       const c = state.current;
       c.reasoning = !c.reasoning;
+      // The agent and the web of a model that can reason end with its deep reasoning.
+      if (!c.reasoning) {
+        c.agent = false;
+        c.web = false;
+      }
       renderComposerState();
-      await saveSetting('lastReasoning', c.reasoning);
       if (c.messages.length) await persist(c);
       refreshViews();
     }
@@ -6651,14 +6674,13 @@ function buildLayout() {
       const c = state.current;
       c.agent = !c.agent;
       renderComposerState();
-      await saveSetting('lastAgent', c.agent);
       if (c.messages.length) await persist(c);
       refreshViews();
     }
   });
   /*
-      The web access of the discussion shown, off in every new discussion: the choice belongs to its discussion and
-      never becomes the default of the next ones.
+      The web access of the discussion shown, off in every new discussion as the deep reasoning and the agent are: the
+      choice belongs to its discussion and never becomes the default of the next ones.
   */
   ui.webButton = h('button', {
     class: 'toggle web', type: 'button', title: t('webHint'), 'aria-label': t('webAccess'), 'aria-pressed': 'false',

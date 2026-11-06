@@ -17,6 +17,7 @@
       ],
       "tools": true,
       "reasoning": true,
+      "reasoning_always": true,
       "quantization": "Q4_K_M",
       "description": {
         "en": "Model that comes with Albireo, the Q4_K_M version published by Qwen with its image encoder: an assistant that reads images and text and reasons step by step before answering, which serves the conversation, the code and the security from the installation on, without network. Without deep reasoning, it answers at once. The larger models of the catalog answer in more depth.",

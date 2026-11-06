@@ -13,8 +13,12 @@
 
     Options:
         --reasoning on|off   reasoning of the models that can reason
+        --budget N           tokens of the reasoning after which the engine ends it (reasoning_budget):
+                             0 ends it at once, -1 lifts the limit
         --max N              tokens generated at most per answer
-        --temperature T      0 for the most likely tokens
+        --temperature T      0 for the most likely tokens; auto leaves the temperature, top-p,
+                             top-k and penalties to the values the authors of the model advise
+        --presence P         presence penalty over the whole answer
         --parallel           submits every question at once instead of one after the other
         --turns              chains the questions as the turns of one conversation
         --pause SECONDS      waits between the turns, as a user reads the answer (the engine
@@ -328,6 +332,9 @@ int main(int argc, char** argv)
     std::string reasoning = "";
     long max_tokens = 256;
     double temperature = 0.0;
+    bool advised = false;
+    long budget = -2;
+    double presence = -1000.0;
     bool parallel = false, turns = false, tools = false, warm = true;
     double pause = 0;
     int threads = 0;
@@ -341,7 +348,13 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         if (a == "--reasoning" && i + 1 < argc) reasoning = argv[++i];
         else if (a == "--max" && i + 1 < argc) max_tokens = std::atol(argv[++i]);
-        else if (a == "--temperature" && i + 1 < argc) temperature = std::atof(argv[++i]);
+        else if (a == "--temperature" && i + 1 < argc)
+        {
+            advised = std::string(argv[++i]) == "auto";
+            temperature = advised ? 0.0 : std::atof(argv[i]);
+        }
+        else if (a == "--budget" && i + 1 < argc) budget = std::atol(argv[++i]);
+        else if (a == "--presence" && i + 1 < argc) presence = std::atof(argv[++i]);
         else if (a == "--parallel") parallel = true;
         else if (a == "--turns") turns = true;
         else if (a == "--pause" && i + 1 < argc) pause = std::atof(argv[++i]);
@@ -530,8 +543,14 @@ int main(int argc, char** argv)
             req["messages"] = list;
         }
         req["max_tokens"] = max_tokens;
-        req["temperature"] = temperature;
+        if (!advised) req["temperature"] = temperature;
         if (!reasoning.empty()) req["reasoning"] = reasoning == "on";
+        if (budget >= -1) req["reasoning_budget"] = budget;
+        if (presence > -1000.0)
+        {
+            req["presence_penalty"] = presence;
+            req["repeat_last_n"] = -1;
+        }
         if (tools) req["tools"] = tool_list;
 
         std::unique_ptr<pending> p(new pending());

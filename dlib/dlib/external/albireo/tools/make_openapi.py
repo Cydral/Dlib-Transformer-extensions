@@ -110,13 +110,19 @@ schemas = {
         "function": {"type": "object", "required": ["name"], "properties": {
             "name": {"type": "string"}, "description": {"type": "string"},
             "parameters": {"type": "object", "description": "JSON Schema of the arguments."}}}}},
-    "Sampling": {"type": "object", "description": "A setting the request leaves out takes the value the authors of "
-                 "the family of the model advise: temperature 1, top_p 0.95 and top_k 20 for the thinking variants "
-                 "of Qwen3-VL; temperature 0.7, top_p 0.8, top_k 20 and presence_penalty 1.5 over the whole answer "
-                 "for its instruct variants; temperature 0.7, top_p 0.8 and top_k 20 for Qwen3 without reasoning; "
-                 "the same with repeat_penalty 1.05 for Qwen2.5; temperature 0.3, top_p 0.95 and top_k 20 for "
-                 "Foundation-Sec-8B-Reasoning; temperature 0.6, top_p 0.95 and top_k 20 for the other models that "
-                 "reason, and 0.7, 0.9 and 40 for the others; min_p 0 for all of them.",
+    "Sampling": {"type": "object", "description": "A setting the request leaves out takes the value the authors of the "
+                 "family of the model advise, for a request of text alone or one with images: temperature 1, top_p "
+                 "0.95 and top_k 20 for the thinking variants of Qwen3-VL, with presence_penalty 1.5 over the whole "
+                 "answer for text alone, and temperature 0.7, top_p 0.8, top_k 20 and presence_penalty 1.5 when the "
+                 "engine ends their reasoning at once; for its instruct variants, temperature 1, top_p 1, top_k 40 and "
+                 "presence_penalty 2 for text alone, temperature 0.7, top_p 0.8, top_k 20 and presence_penalty 1.5 "
+                 "with images; temperature 0.3, top_p 0.8 and top_k 20 for CyberSecQwen-4B; temperature 0.7, top_p 0.8 "
+                 "and top_k 20 for Qwen3 without reasoning; the same with repeat_penalty 1.05 for Qwen2.5; temperature "
+                 "0.3, top_p 0.95 and top_k 20 for Foundation-Sec 1.1 8B Instruct and Foundation-Sec-8B-Reasoning; "
+                 "temperature 1 and top_p 0.95 without top_k for Granite 4.2, with and without reasoning; temperature "
+                 "0.1 for Ministral 3 and 0.15 for Devstral and the other Mistral models without reasoning, without "
+                 "top_p or top_k; temperature 0.6, top_p 0.95 and top_k 20 for the other models that reason, and 0.7, "
+                 "0.9 and 40 for the others; min_p 0 for all of them.",
                  "properties": {
         "max_tokens": {"type": "integer",
                        "description": "Tokens to generate at most; by default up to the end of the context."},
@@ -134,9 +140,11 @@ schemas = {
         "repetition_penalty": {"type": "number", "description": "The same setting as repeat_penalty, under the "
                                "name other clients give it."},
         "repeat_last_n": {"type": "integer", "minimum": -1,
-                          "description": "The tokens of the answer the penalties read, the last ones; -1 reads the "
-                                         "whole answer. Without it, 64, or the whole answer for a model whose "
-                                         "authors advise a presence penalty."},
+                          "description": "The tokens the penalties read, the last ones, the end of the prompt "
+                                         "included; -1 reads the whole answer alone, without the prompt and "
+                                         "without the end of a reasoning the engine writes. Without it, 64, or "
+                                         "the whole answer for a model whose authors advise a presence "
+                                         "penalty."},
         "seed": {"type": "integer"},
         "stop": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "maxItems": 16}]},
         "logit_bias": {"type": "object", "additionalProperties": {"type": "number"},
@@ -161,8 +169,9 @@ schemas = {
             "reasoning": {"type": "boolean", "description": "Enables or disables the reasoning of the models that "
                           "support both modes. The reasoning streams in reasoning_content. A model whose template "
                           "opens the reasoning of every answer (reasoning_always in the description of the model: "
-                          "the thinking variants of Qwen3 and Qwen3-VL, Foundation-Sec-8B-Reasoning) reasons "
-                          "whatever the request asks; without reasoning, its reasoning is short (reasoning_budget)."},
+                          "the thinking variants of Qwen3 and Qwen3-VL, Foundation-Sec-8B-Reasoning) has that "
+                          "reasoning opened whatever the request asks; without reasoning, the engine ends it at once "
+                          "and the model answers directly (reasoning_budget)."},
             "think": {"type": "boolean", "description": "The same setting as reasoning, under the name other "
                       "clients give it; when both are given, think applies."},
             "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high"],
@@ -171,15 +180,17 @@ schemas = {
             "reasoning_budget": {"type": "integer", "minimum": -1,
                                  "description": "The tokens the reasoning may take: beyond them, the engine ends it "
                                                 "with a sentence that asks the model to answer from what it has "
-                                                "thought, then the marker that closes the reasoning. -1 sets no "
-                                                "limit, 0 ends the reasoning at once. Without it, no limit, except "
-                                                "for a model that always reasons asked for no reasoning and for the "
-                                                "effort low: 512 tokens, 256 for the work in the background "
-                                                "(albireo-background). The answer of a model asked for no reasoning "
-                                                "receives max_tokens once its reasoning ends, and the stop sequences "
-                                                "apply to that answer alone. A reasoning whose last 384 tokens repeat, "
-                                                "for nine tenths of them, passages of 16 tokens it wrote twice before "
-                                                "ends in the same way."},
+                                                "thought, then the marker that closes the reasoning; that end counts "
+                                                "among the tokens of the answer and stays out of reasoning_content. "
+                                                "-1 sets no limit, 0 ends the reasoning at once. Without it, no "
+                                                "limit, except for a model that always reasons asked for no "
+                                                "reasoning, whose reasoning ends at once, and for the effort low: 512 "
+                                                "tokens, 256 for the work in the background (albireo-background). "
+                                                "The answer of a model asked for no reasoning receives max_tokens "
+                                                "once its reasoning ends, and the stop sequences apply to that answer "
+                                                "alone. A reasoning whose last 384 tokens repeat, for nine tenths of "
+                                                "them, passages of 16 tokens it wrote twice before ends in the same "
+                                                "way."},
             "chat_template_kwargs": {"type": "object", "properties": {"enable_thinking": {"type": "boolean"}}},
             "n": {"type": "integer", "enum": [1]}}}],
         "example": {"model": "albireo-general", "messages": [{"role": "user", "content": "Hello!"}],

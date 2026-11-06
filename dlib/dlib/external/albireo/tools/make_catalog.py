@@ -14,7 +14,10 @@ GitHub release, is listed with its "files" given in full instead of "hub".
 A model that reads images names its projector, the image encoder published beside the
 decoder ("projector": repository, file and quantization of the mmproj GGUF file); its entry
 then carries the files, the size and the SHA-256 of the projector, which the service
-downloads with the decoder.  "inputs" gives what a model reads, text and images.
+downloads with the decoder.  "inputs" gives what a model reads, text and images; "tools",
+"reasoning" and "reasoning_always" what its chat format gives it in the engine (a model that
+reasons before every answer, whatever the request asks), which the web application follows
+while the model is not loaded.
 
 The catalog names one default language model, which the service downloads when no language
 model is installed, and one default embedding model, which it downloads in every case: the
@@ -46,6 +49,7 @@ MODELS = [
         "default": True,
         "tools": True,
         "reasoning": True,
+        "reasoning_always": True,
         "license": "Apache-2.0",
         "description": {
             "en": "Multimodal assistant that reads images and text and reasons step by step before answering: "
@@ -76,6 +80,7 @@ MODELS = [
         "inputs": ["text", "image"],
         "tools": True,
         "reasoning": True,
+        "reasoning_always": True,
         "license": "Apache-2.0",
         "description": {
             "en": "Multimodal assistant that reads images and text and reasons step by step before answering: "
@@ -234,6 +239,7 @@ MODELS = [
         "inputs": ["text", "image"],
         "tools": True,
         "reasoning": True,
+        "reasoning_always": True,
         "license": "Apache-2.0",
         "description": {
             "en": "Larger multimodal assistant that reasons step by step before answering, for the hardest questions "
@@ -475,55 +481,38 @@ MODELS = [
         },
     },
     {
-        "id": "qwen3-8b",
-        "name": "Qwen3 8B",
+        "id": "qwen3-vl-30b-a3b-thinking",
+        "name": "Qwen3-VL 30B A3B Thinking",
         "publisher": "Alibaba",
-        "hub": ("Qwen/Qwen3-8B-GGUF", "Qwen3-8B-Q4_K_M.gguf"),
+        "hub": ("Qwen/Qwen3-VL-30B-A3B-Thinking-GGUF", "Qwen3VL-30B-A3B-Thinking-Q4_K_M.gguf"),
+        "projector": ("Qwen/Qwen3-VL-30B-A3B-Thinking-GGUF", "mmproj-Qwen3VL-30B-A3B-Thinking-Q8_0.gguf", "Q8_0"),
         "quantization": "Q4_K_M",
         "roles": ["general", "code", "security"],
-        "inputs": ["text"],
+        "inputs": ["text", "image"],
         "tools": True,
         "reasoning": True,
+        "reasoning_always": True,
         "license": "Apache-2.0",
         "description": {
-            "en": "Larger general assistant with step by step reasoning and tool use, at ease with code and with the "
-                  "knowledge of cybersecurity, for computers with 16 GB of memory or a graphics processor.",
-            "fr": "Assistant généraliste plus grand, avec raisonnement étape par étape et usage d'outils, à l'aise "
-                  "avec le code et les connaissances en cybersécurité, pour les ordinateurs dotés de 16 Go de mémoire "
-                  "ou d'un processeur graphique.",
-            "de": "Größerer allgemeiner Assistent mit schrittweisem Denken und Werkzeugnutzung, sicher im Code und im "
-                  "Wissen der Cybersicherheit, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
-            "it": "Assistente generale più grande, con ragionamento passo dopo passo e uso di strumenti, a suo agio "
-                  "con il codice e le conoscenze di cybersicurezza, per computer con 16 GB di memoria o un processore "
-                  "grafico.",
-            "es": "Asistente general más grande, con razonamiento paso a paso y uso de herramientas, cómodo con el "
-                  "código y los conocimientos de ciberseguridad, para ordenadores con 16 GB de memoria o un "
-                  "procesador gráfico.",
-        },
-    },
-    {
-        "id": "qwen3-30b-a3b",
-        "name": "Qwen3 30B A3B",
-        "publisher": "Alibaba",
-        "hub": ("Qwen/Qwen3-30B-A3B-GGUF", "Qwen3-30B-A3B-Q4_K_M.gguf"),
-        "quantization": "Q4_K_M",
-        "roles": ["general", "code", "security"],
-        "inputs": ["text"],
-        "tools": True,
-        "reasoning": True,
-        "license": "Apache-2.0",
-        "description": {
-            "en": "Mixture of experts of 30 billion parameters, 3 billion of which compute each token: it generates "
+            "en": "Multimodal mixture of experts of 30 billion parameters, 3 billion of which compute each token, that "
+                  "reasons step by step before answering: the depth of a large model on images, code and security, "
                   "at the pace of a model of 3 billion parameters. It needs 24 GB of memory.",
-            "fr": "Mélange d'experts de 30 milliards de paramètres, dont 3 milliards calculent chaque jeton : il "
-                  "génère au rythme d'un modèle de 3 milliards de paramètres. Il demande 24 Go de mémoire.",
-            "de": "Mixture of Experts mit 30 Milliarden Parametern, von denen 3 Milliarden jedes Token berechnen: "
-                  "es erzeugt Text im Tempo eines Modells mit 3 Milliarden Parametern. Es benötigt 24 GB "
-                  "Arbeitsspeicher.",
-            "it": "Mixture of experts da 30 miliardi di parametri, di cui 3 miliardi calcolano ogni token: genera al "
-                  "ritmo di un modello da 3 miliardi di parametri. Richiede 24 GB di memoria.",
-            "es": "Mezcla de expertos de 30 000 millones de parámetros, de los que 3000 millones calculan cada token: "
-                  "genera al ritmo de un modelo de 3000 millones de parámetros. Necesita 24 GB de memoria.",
+            "fr": "Mélange d'experts multimodal de 30 milliards de paramètres, dont 3 milliards calculent chaque "
+                  "jeton, qui raisonne étape par étape avant de répondre : la profondeur d'un grand modèle sur les "
+                  "images, le code et la sécurité, au rythme d'un modèle de 3 milliards de paramètres. Il demande "
+                  "24 Go de mémoire.",
+            "de": "Multimodale Mixture of Experts mit 30 Milliarden Parametern, von denen 3 Milliarden jedes Token "
+                  "berechnen, die vor der Antwort Schritt für Schritt nachdenkt: die Tiefe eines großen Modells bei "
+                  "Bildern, Code und Sicherheit, im Tempo eines Modells mit 3 Milliarden Parametern. Sie benötigt "
+                  "24 GB Arbeitsspeicher.",
+            "it": "Mixture of experts multimodale da 30 miliardi di parametri, di cui 3 miliardi calcolano ogni "
+                  "token, che ragiona passo dopo passo prima di rispondere: la profondità di un grande modello su "
+                  "immagini, codice e sicurezza, al ritmo di un modello da 3 miliardi di parametri. Richiede 24 GB "
+                  "di memoria.",
+            "es": "Mezcla de expertos multimodal de 30 000 millones de parámetros, de los que 3000 millones calculan "
+                  "cada token, que razona paso a paso antes de responder: la profundidad de un modelo grande en "
+                  "imágenes, código y seguridad, al ritmo de un modelo de 3000 millones de parámetros. Necesita "
+                  "24 GB de memoria.",
         },
     },
     {
@@ -612,6 +601,40 @@ MODELS = [
         },
     },
     {
+        "id": "cybersecqwen-4b",
+        "name": "CyberSecQwen 4B",
+        "publisher": "athena129 (lablab.ai)",
+        "hub": ("mradermacher/CyberSecQwen-4B-GGUF", "CyberSecQwen-4B.Q4_K_M.gguf"),
+        "quantization": "Q4_K_M",
+        "roles": ["security"],
+        "inputs": ["text"],
+        "tools": False,
+        "reasoning": False,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "Cybersecurity model of 4 billion parameters fine-tuned from Qwen3-4B-Instruct-2507: maps the "
+                  "descriptions of vulnerabilities to their weaknesses (CWE) and answers questions of threat "
+                  "intelligence, close to Foundation-Sec 8B at half its size. It answers in English, without tools "
+                  "or reasoning, from 8 GB of memory on.",
+            "fr": "Modèle de cybersécurité de 4 milliards de paramètres affiné à partir de Qwen3-4B-Instruct-2507 : "
+                  "il rattache les descriptions de vulnérabilités à leurs faiblesses (CWE) et répond aux questions de "
+                  "renseignement sur les menaces, proche de Foundation-Sec 8B pour la moitié de sa taille. Il répond "
+                  "en anglais, sans outils ni raisonnement, dès 8 Go de mémoire.",
+            "de": "Cybersicherheitsmodell mit 4 Milliarden Parametern, feinabgestimmt aus Qwen3-4B-Instruct-2507: "
+                  "es ordnet Beschreibungen von Schwachstellen ihren Schwächen (CWE) zu und beantwortet Fragen der "
+                  "Bedrohungsinformationen, nahe an Foundation-Sec 8B bei halber Größe. Es antwortet auf Englisch, "
+                  "ohne Werkzeuge und ohne Nachdenken, ab 8 GB Arbeitsspeicher.",
+            "it": "Modello di cybersicurezza da 4 miliardi di parametri ottimizzato a partire da "
+                  "Qwen3-4B-Instruct-2507: associa le descrizioni delle vulnerabilità alle loro debolezze (CWE) e "
+                  "risponde alle domande di threat intelligence, vicino a Foundation-Sec 8B con metà delle "
+                  "dimensioni. Risponde in inglese, senza strumenti né ragionamento, a partire da 8 GB di memoria.",
+            "es": "Modelo de ciberseguridad de 4000 millones de parámetros ajustado a partir de "
+                  "Qwen3-4B-Instruct-2507: asocia las descripciones de vulnerabilidades con sus debilidades (CWE) y "
+                  "responde a preguntas de inteligencia de amenazas, cerca de Foundation-Sec 8B con la mitad de su "
+                  "tamaño. Responde en inglés, sin herramientas ni razonamiento, desde 8 GB de memoria.",
+        },
+    },
+    {
         "id": "foundation-sec-8b",
         "name": "Foundation-Sec 1.1 8B",
         "publisher": "Cisco",
@@ -650,6 +673,7 @@ MODELS = [
         "inputs": ["text"],
         "tools": False,
         "reasoning": True,
+        "reasoning_always": True,
         "license": "Llama 3.1 Community License; Apache-2.0 for the changes of Cisco",
         "description": {
             "en": "Cybersecurity assistant that reasons step by step before answering: threat intelligence, mapping "
@@ -744,6 +768,8 @@ def check_models(models):
               "%s: the inputs start with text and are among %s" % (m["id"], ", ".join(INPUTS)))
         check(("image" in m["inputs"]) == ("projector" in m),
               "%s: a model reads images when it names a projector, and only then" % m["id"])
+        check(not m.get("reasoning_always") or m.get("reasoning"),
+              "%s: a model that always reasons is a model that reasons" % m["id"])
     ids = [m["id"] for m in models]
     check(len(ids) == len(set(ids)), "identifiers listed twice: %s"
           % ", ".join(sorted({i for i in ids if ids.count(i) > 1})))

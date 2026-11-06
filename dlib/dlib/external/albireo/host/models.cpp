@@ -461,19 +461,30 @@ namespace albireo
                 roles.push_back("embedding");
                 d["roles"] = roles;
             }
-            d["reasoning"] = !embedding && (tmpl.find("think") != std::string::npos
-                || tmpl.find("[THINK]") != std::string::npos);
             /*
-                A model that reasons before every answer (chat_format::always_reasons()): the
-                thinking variants of Qwen3 and Qwen3-VL, whose template opens the reasoning without
-                a switch, and Foundation-Sec-8B-Reasoning, whose files carry a template without
-                <|end|> that takes the reasoning out of the earlier answers.
+                The capabilities the formats of the engine give a model of this template, read from
+                the template alone (chat_format::detect() reads the vocabulary as well):
+                    - tools: the formats of Mistral, Llama 3, Granite 3 and Granite 4.2, and the
+                      ChatML templates that describe tools; Phi-4-mini, Foundation-Sec and the
+                      other formats call none;
+                    - reasoning: the ChatML templates that open the reasoning or switch it, Granite
+                      4.2, Foundation-Sec-8B-Reasoning and the templates with [THINK];
+                    - reasoning always: the thinking variants of Qwen3 and Qwen3-VL, whose template
+                      opens the reasoning without a switch, and Foundation-Sec-8B-Reasoning, whose
+                      files carry a template without <|end|> that takes the reasoning out of the
+                      earlier answers.
             */
             const auto holds = [&](const char* s) { return tmpl.find(s) != std::string::npos; };
-            d["reasoning_always"] = !embedding
-                && ((holds("<|im_start|>assistant\\n<think>\\n'") && !holds("enable_thinking"))
-                || (holds("<|assistant|>") && holds("'</think>' in content") && !holds("<|end|>")));
-            d["tools"] = !embedding && tmpl.find("tool") != std::string::npos;
+            const bool chatml = holds("<|im_start|>");
+            const bool granite4 = chatml && holds("<function=") && holds("<think></think>");
+            const bool opens = chatml && holds("<|im_start|>assistant\\n<think>\\n'");
+            const bool switchable = chatml && holds("enable_thinking");
+            const bool foundation_sec = !chatml && holds("<|assistant|>") && holds("'</think>' in content")
+                && !holds("<|end|>");
+            d["reasoning"] = !embedding && (granite4 || opens || switchable || foundation_sec || holds("[THINK]"));
+            d["reasoning_always"] = !embedding && ((opens && !switchable) || foundation_sec);
+            d["tools"] = !embedding && (holds("[INST]") || holds("<|start_header_id|>") || holds("<|start_of_role|>")
+                || granite4 || (chatml && (holds("<tool_call>") || holds("tools"))));
             // The inputs the engine reads from the model, and the identity a file prepared
             // by the build of Albireo carries (tools/albireo_builtin.cpp).
             json inputs = json::array();

@@ -105,7 +105,9 @@ namespace albireo
 
             FORMATS
                 - chatml: Qwen 2, 2.5 and 3 (reasoning between <think> and </think>, tool
-                  calls in <tool_call> elements), SmolLM and the other ChatML models.
+                  calls in <tool_call> elements), SmolLM and the other ChatML models, among
+                  which the templates that give a system message the turn of the user
+                  (CyberSecQwen-4B).
                 - mistral: the formats of the Mistral models with the tekken vocabulary
                   (Ministral 3, Mistral Small 3, Magistral): [SYSTEM_PROMPT], [INST],
                   [AVAILABLE_TOOLS], [TOOL_CALLS]name[ARGS]{...} (name[CALL_ID]id[ARGS]{...}

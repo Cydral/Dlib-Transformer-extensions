@@ -310,6 +310,32 @@ int main()
             "</tool_call>") != std::string::npos, "double braces of Qwen2.5: " + prompt);
     }
 
+    /*
+        CyberSecQwen-4B: the template of its training gives a system message the turn of the user,
+        and has neither tools nor reasoning, although the vocabulary of Qwen3 holds their markers.
+    */
+    {
+        const std::unique_ptr<chat_format> c = chat_format::detect(tok, "{%- for message in messages -%}\n"
+            "<|im_start|>{{ message['role'] if message['role'] != 'system' else 'user' }}\n"
+            "{{ message['content'] }}<|im_end|>\n{% endfor -%}\n{%- if add_generation_prompt -%}\n"
+            "<|im_start|>assistant\n{% endif -%}\n");
+        expect(std::string(c->name()) == "chatml" && !c->supports_tools() && !c->supports_reasoning(),
+            "CyberSecQwen-4B: ChatML without tools nor reasoning");
+        std::vector<chat_message> m(4);
+        m[0].role = "system";
+        m[0].content = "Answer with the CWE.";
+        m[1].role = "user";
+        m[1].content = "CVE-2024-0001: SQL injection in the login form.";
+        m[2].role = "assistant";
+        m[2].content = "CWE-89";
+        m[3].role = "user";
+        m[3].content = "And a buffer overflow?";
+        expect(render(*c, m, render_options()) == "<|im_start|>user\nAnswer with the CWE.<|im_end|>\n"
+            "<|im_start|>user\nCVE-2024-0001: SQL injection in the login form.<|im_end|>\n<|im_start|>assistant\n"
+            "CWE-89<|im_end|>\n<|im_start|>user\nAnd a buffer overflow?<|im_end|>\n<|im_start|>assistant\n",
+            "CyberSecQwen-4B: the system message in the turn of the user: " + render(*c, m, render_options()));
+    }
+
     // Granite 4.2: ChatML with the XML form of the calls.
     {
         const std::unique_ptr<chat_format> g = chat_format::detect(tok,

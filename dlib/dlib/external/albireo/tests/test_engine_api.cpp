@@ -379,10 +379,11 @@ int main(int argc, char** argv)
         The guard against loops and the budget of a reasoning, the token "a" favoured by a bias
         of 100 at temperature 0 so that every answer repeats it.  The engine stops an answer
         once nine tenths of its last 384 tokens end a passage of 16 tokens it wrote before.  A
-        model whose template opens the reasoning of every answer reasons when the request asks
-        for none: the engine ends its reasoning after the tokens of its budget with the sentence
-        of the authors of Qwen3 and the marker that closes it, and the answer then receives the
-        tokens the request gave it.
+        model whose template opens the reasoning of every answer, asked for no reasoning, has its
+        reasoning ended at once, or after the tokens of the budget the request gives: the engine
+        writes the sentence of the authors of Qwen3 and the marker that closes the reasoning,
+        which the client does not receive as reasoning, and the answer then receives the tokens
+        the request gave it.
     */
     {
         const std::string thinking_path = folder + "test_engine_api_thinking.gguf";
@@ -432,25 +433,50 @@ int main(int argc, char** argv)
         expect(lib.run_query(e, q, counted) == ALBIREO_OK, "tokenize query");
         const long long closing = static_cast<long long>(counted["tokens"].size());
 
+        /*
+            The end of a reasoning that reached its budget, which the engine writes, counts among the
+            tokens of the answer and stays out of the reasoning the client receives.
+        */
         collector brief;
         const json g = ask("t", ",\"reasoning\":false,\"reasoning_budget\":24,\"max_tokens\":40", brief);
-        expect(brief.reasoning.compare(0, 26, std::string(24, 'a') + "\n\n") == 0
-            && brief.reasoning.find(sentence) == 26,
-            "a reasoning ends after its budget with the sentence that asks for the answer: " + brief.reasoning);
+        expect(brief.reasoning == std::string(24, 'a') && brief.content.find(sentence) == std::string::npos,
+            "a reasoning ends after its budget, its end left out of the reasoning received: " + brief.reasoning);
         expect(trimmed(brief.content) == std::string(40, 'a') && g["finish_reason"].as_string() == "length"
             && g["usage"]["completion_tokens"].as_int(0) == 24 + closing + 40 && !g["repetition"].as_bool(false),
             "the answer that follows a short reasoning receives its own tokens: " + g.dump());
 
         collector none;
-        ask("t", ",\"reasoning\":false,\"reasoning_budget\":0,\"max_tokens\":8", none);
-        expect(trimmed(none.reasoning) == sentence && trimmed(none.content) == std::string(8, 'a'),
-            "a budget of 0 ends the reasoning at once: " + none.reasoning);
+        const json g0 = ask("t", ",\"reasoning\":false,\"reasoning_budget\":0,\"max_tokens\":8", none);
+        expect(none.reasoning.empty() && trimmed(none.content) == std::string(8, 'a')
+            && g0["usage"]["completion_tokens"].as_int(0) == closing + 8,
+            "a budget of 0 ends the reasoning at once: " + g0.dump());
+
+        // A model that always reasons, asked for no reasoning: the engine ends its reasoning at once.
+        collector plain;
+        const json g1 = ask("t", ",\"reasoning\":false,\"max_tokens\":8", plain);
+        expect(plain.reasoning.empty() && trimmed(plain.content) == std::string(8, 'a')
+            && g1["usage"]["completion_tokens"].as_int(0) == closing + 8,
+            "a model that always reasons, asked for no reasoning, answers at once: " + g1.dump());
+
+        // A budget given as null is no budget.
+        collector unset;
+        const json g2 = ask("t", ",\"reasoning\":false,\"reasoning_budget\":null,\"max_tokens\":8", unset);
+        expect(unset.reasoning.empty() && trimmed(unset.content) == std::string(8, 'a')
+            && g2["usage"]["completion_tokens"].as_int(0) == closing + 8,
+            "a budget given as null ends the reasoning at once as no budget does: " + g2.dump());
 
         collector background;
         ask("t", ",\"reasoning\":false,\"priority\":\"background\",\"max_tokens\":4", background);
-        expect(background.reasoning.compare(0, 258, std::string(256, 'a') + "\n\n") == 0
-            && background.reasoning.find(sentence) == 258,
-            "the work in the background reasons for 256 tokens at most");
+        expect(background.reasoning.empty() && trimmed(background.content) == std::string(4, 'a'),
+            "the work in the background answers at once: " + background.reasoning);
+
+        // The effort low gives a short reasoning, 256 tokens for the work in the background, within max_tokens.
+        collector low;
+        ask("t", ",\"reasoning_effort\":\"low\",\"priority\":\"background\",\"max_tokens\":"
+            + std::to_string(256 + closing + 4), low);
+        expect(low.reasoning == std::string(256, 'a') && trimmed(low.content) == std::string(4, 'a'),
+            "the effort low of the work in the background reasons for 256 tokens: "
+            + std::to_string(low.reasoning.size()));
 
         // A reasoning asked for has no budget by default, even for the work in the background.
         collector deep;
@@ -471,9 +497,8 @@ int main(int argc, char** argv)
         */
         collector circles;
         const json j = ask("t", ",\"reasoning\":false,\"reasoning_budget\":1000,\"max_tokens\":40", circles);
-        const size_t looped = circles.reasoning.find('\n');
-        expect(looped >= 384 && looped < 450 && circles.reasoning.find(sentence) == looped + 2
-            && circles.reasoning.compare(0, looped, std::string(looped, 'a')) == 0,
+        const size_t looped = circles.reasoning.size();
+        expect(looped >= 384 && looped < 450 && circles.reasoning == std::string(looped, 'a'),
             "a reasoning that repeats itself is ended: " + std::to_string(looped) + " tokens");
         expect(trimmed(circles.content) == std::string(40, 'a') && j["finish_reason"].as_string() == "length"
             && !j["repetition"].as_bool(false)
@@ -483,7 +508,8 @@ int main(int argc, char** argv)
         // The same with a reasoning asked for, whose answer then loops in turn.
         collector both;
         const json k = ask("t", ",\"reasoning\":true,\"max_tokens\":1500", both);
-        expect(both.reasoning.find(sentence) != std::string::npos && trimmed(both.content).size() >= 384
+        expect(both.reasoning.size() >= 384 && both.reasoning.find_first_not_of('a') == std::string::npos
+            && trimmed(both.content).size() >= 384
             && trimmed(both.content).find_first_not_of('a') == std::string::npos && k["repetition"].as_bool(false)
             && k["finish_reason"].as_string() == "length", "a reasoning asked for that loops, then its answer: "
             + k.dump());

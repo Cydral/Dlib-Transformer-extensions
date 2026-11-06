@@ -951,6 +951,8 @@ namespace albireo
                 else if (tmpl.find(smollm) != std::string::npos) default_system_ = smollm;
                 // The templates that trim the text of the messages (EuroLLM).
                 trims_ = tmpl.find("message['content'] | trim") != std::string::npos;
+                // The templates that give a system message the turn of the user (CyberSecQwen-4B).
+                system_role_ = tmpl.find("!= 'system' else 'user'") != std::string::npos ? "user" : "system";
                 /*
                     The template of Qwen2.5 writes the form of a call between double braces in a
                     string of the template, which Jinja leaves as they are: the models of that
@@ -996,7 +998,7 @@ namespace albireo
                 }
                 else if (has_system)
                 {
-                    w.markup("<|im_start|>system\n");
+                    w.markup("<|im_start|>" + system_role_ + "\n");
                     w.text(body(messages[0].content));
                     w.markup("<|im_end|>\n");
                 }
@@ -1024,7 +1026,7 @@ namespace albireo
                     const chat_message& m = messages[i];
                     if (m.role == "user" || (m.role == "system" && i != 0))
                     {
-                        w.markup("<|im_start|>" + m.role + "\n");
+                        w.markup("<|im_start|>" + (m.role == "system" ? system_role_ : m.role) + "\n");
                         w.text(body(m.content));
                         w.markup("<|im_end|>\n");
                     }
@@ -1123,6 +1125,7 @@ namespace albireo
                 return always_thinks_ || (switchable_ && opens_ && opt.reasoning);
             }
 
+            std::string system_role_;
             bool opens_ = false;
             bool always_thinks_ = false;
             bool switchable_ = false;

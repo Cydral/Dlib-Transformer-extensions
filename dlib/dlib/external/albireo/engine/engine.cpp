@@ -408,10 +408,11 @@ namespace albireo
             The reasoning of the answer: the tokens it may take before the engine ends it (-1
             without bound), the tokens it took, the tokens of the end the engine writes in place
             of the model (closing), those of that end still to write, one per step (forced), and
-            whether the token being handled is one of them (forcing).  brief marks the short
-            reasoning of a model that always reasons, for a request that asked for none; its
-            answer then receives answer_tokens tokens once the reasoning ends (-1 without a
-            limit of its own).
+            whether the token being handled is one of them (forcing), which the client does not
+            receive as reasoning.  brief marks the reasoning of a model that always reasons, for a
+            request that asked for none, which the engine ends at once unless the request gives
+            a budget; its answer then receives answer_tokens tokens once the reasoning ends (-1
+            without a limit of its own).
         */
         long reasoning_budget = -1;
         long reasoning_tokens = 0;
@@ -444,48 +445,82 @@ namespace albireo
         }
 
         /*
-            The tokens of the short reasoning of a model that always reasons, for a request that
-            asks for no reasoning (or for a low effort): an answer of a user, and a work in the
-            background (titles, summaries, memory), which waits for less.
+            The tokens of the short reasoning of a request that asks for a low effort: an answer of
+            a user, and a work in the background (titles, summaries, memory), which waits for less.
         */
-        const long brief_reasoning_budget = 512;
-        const long background_reasoning_budget = 256;
+        const long low_effort_budget = 512;
+        const long background_low_effort_budget = 256;
 
         /*
             The sampling the authors of a family of models advise on the cards of their models,
-            for the requests that give none:
-                - Qwen3-VL Thinking: temperature 1, top-p 0.95, top-k 20;
+            for the requests that give none, reasoning telling whether the model reasons before
+            its answer and images whether the request holds images:
+                - Qwen3-VL Thinking: temperature 1, top-p 0.95, top-k 20, and a presence penalty
+                  of 1.5 over the whole answer for a request of text alone; the reasoning ended
+                  at once, the model answers as a model without reasoning, with the values the
+                  authors of Qwen3 advise for that mode, temperature 0.7, top-p 0.8 and top-k 20,
+                  and the presence penalty of 1.5 they give against repetitions;
                 - Qwen3-VL Instruct: temperature 0.7, top-p 0.8, top-k 20 and a presence penalty
-                  of 1.5 over the whole answer;
+                  of 1.5 over the whole answer with images, temperature 1, top-p 1, top-k 40 and a
+                  presence penalty of 2 for text alone;
+                - CyberSecQwen-4B: temperature 0.3, that of the use and of the evaluations its
+                  card describes, top-p 0.8 and top-k 20;
                 - Qwen3: temperature 0.6, top-p 0.95, top-k 20 with reasoning, 0.7, 0.8 and 20
                   without;
                 - Qwen2.5: temperature 0.7, top-p 0.8, top-k 20 and a repetition penalty of 1.05;
-                - Foundation-Sec-8B-Reasoning: temperature 0.3, the setting of the evaluations of
-                  its authors, top-p 0.95 and top-k 20;
+                - Foundation-Sec-8B-Reasoning and Foundation-Sec 1.1 8B Instruct: temperature 0.3,
+                  the setting of the evaluations of their authors, top-p 0.95 and top-k 20;
+                - Granite 4.2: temperature 1 and top-p 0.95 for every task, with and without
+                  reasoning, without top-k;
+                - Ministral 3: temperature 0.1; Devstral and the other Mistral models without
+                  reasoning: temperature 0.15; without top-p or top-k;
                 - the other models: temperature 0.6, top-p 0.95 and top-k 20 when they reason,
                   0.7, 0.9 and 40 otherwise.
             None of them selects by min-p.
         */
-        sampling_params advised_sampling(const loaded_model& m, bool reasoning)
+        sampling_params advised_sampling(const loaded_model& m, bool reasoning, bool images)
         {
             sampling_params p;
             p.min_p = 0.0f;
             const std::string& arch = m.cfg.arch;
-            const bool chatml = std::string(m.format->name()) == "chatml";
+            const std::string format = m.format->name();
+            const bool chatml = format == "chatml";
             const bool qwen3vl = arch == "qwen3vl" || arch == "qwen3vlmoe";
-            if (chatml && qwen3vl && m.format->always_reasons())
+            std::string name = m.cfg.name;
+            for (char& c : name)
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if (chatml && qwen3vl && m.format->always_reasons() && reasoning)
             {
                 p.temperature = 1.0f;
                 p.top_p = 0.95f;
                 p.top_k = 20;
+                if (!images)
+                {
+                    p.presence_penalty = 1.5f;
+                    p.repeat_last_n = -1;
+                }
             }
-            else if (chatml && qwen3vl)
+            else if (chatml && qwen3vl && m.format->always_reasons())
             {
                 p.temperature = 0.7f;
                 p.top_p = 0.8f;
                 p.top_k = 20;
                 p.presence_penalty = 1.5f;
                 p.repeat_last_n = -1;
+            }
+            else if (chatml && qwen3vl)
+            {
+                p.temperature = images ? 0.7f : 1.0f;
+                p.top_p = images ? 0.8f : 1.0f;
+                p.top_k = images ? 20 : 40;
+                p.presence_penalty = images ? 1.5f : 2.0f;
+                p.repeat_last_n = -1;
+            }
+            else if (chatml && name.find("cybersecqwen") != std::string::npos)
+            {
+                p.temperature = 0.3f;
+                p.top_p = 0.8f;
+                p.top_k = 20;
             }
             else if (chatml && (arch == "qwen3" || arch == "qwen3moe") && !reasoning)
             {
@@ -500,11 +535,23 @@ namespace albireo
                 p.top_k = 20;
                 p.repeat_penalty = 1.05f;
             }
-            else if (std::string(m.format->name()) == "foundation-sec")
+            else if (format == "foundation-sec" || format == "role-tags")
             {
                 p.temperature = 0.3f;
                 p.top_p = 0.95f;
                 p.top_k = 20;
+            }
+            else if (format == "granite4")
+            {
+                p.temperature = 1.0f;
+                p.top_p = 0.95f;
+                p.top_k = 0;
+            }
+            else if (format == "mistral" && !m.format->supports_reasoning())
+            {
+                p.temperature = name.find("ministral") != std::string::npos ? 0.1f : 0.15f;
+                p.top_p = 1.0f;
+                p.top_k = 0;
             }
             else if (reasoning)
             {
@@ -1331,12 +1378,15 @@ namespace albireo
             reasoning = req["chat_template_kwargs"]["enable_thinking"].as_bool(reasoning);
         opt.reasoning = reasoning && m->format->supports_reasoning();
         /*
-            The budget of the reasoning: the tokens it may take before the engine ends it.  A
-            model that always reasons reasons whatever the request asks, and a request that asks
-            for no reasoning, or for a low effort, receives a short one, whose tokens do not take
-            from those of its answer.
+            The budget of the reasoning: the tokens it may take before the engine ends it.  The
+            template of a model that always reasons opens its reasoning whatever the request asks:
+            for a request that asks for no reasoning, the engine ends it at once with the sentence
+            its authors give for a budget, so that the model answers without reasoning and without
+            a prompt outside what it learned, the tokens of that end not taking from those of the
+            answer; a request that asks for a low effort receives a short reasoning, within its
+            max_tokens.  A budget given as null is no budget.
         */
-        const bool budget_given = req.contains("reasoning_budget");
+        const bool budget_given = req["reasoning_budget"].is_number();
         long budget = budget_given ? static_cast<long>(bounded(req["reasoning_budget"], -1, -1, 1 << 24)) : -1;
         bool brief = false;
         if (m->format->always_reasons() && !opt.reasoning)
@@ -1344,8 +1394,9 @@ namespace albireo
             opt.reasoning = true;
             brief = true;
         }
-        if (!budget_given && (brief || effort == "low"))
-            budget = req["priority"].as_string() == "background" ? background_reasoning_budget : brief_reasoning_budget;
+        if (!budget_given && brief) budget = 0;
+        else if (!budget_given && effort == "low")
+            budget = req["priority"].as_string() == "background" ? background_low_effort_budget : low_effort_budget;
         if (!opt.reasoning) budget = -1;
         if (req["tool_choice"].as_string() != "none" && req["tools"].is_array() && !req["tools"].empty())
         {
@@ -1398,8 +1449,12 @@ namespace albireo
             throw std::invalid_argument("the prompt holds " + std::to_string(r->prompt.size())
                 + " tokens, beyond the context of " + std::to_string(m->context) + " tokens of the model");
 
-        // Sampling: the values of the request, or those the authors of the model advise.
-        const sampling_params advised = advised_sampling(*m, opt.reasoning);
+        /*
+            Sampling: the values of the request, or those the authors of the model advise for an
+            answer with or without a reasoning of the model, a reasoning ended at once counting as
+            none.
+        */
+        const sampling_params advised = advised_sampling(*m, opt.reasoning && budget != 0, !r->images.empty());
         sampling_params sp;
         sp.temperature = static_cast<float>(req["temperature"].as_double(advised.temperature));
         sp.top_p = static_cast<float>(req["top_p"].as_double(advised.top_p));
@@ -2374,9 +2429,16 @@ namespace albireo
             if (r.ph == request_state::phase::prefill)
             {
                 r.prompt_end = clock_type::now();
-                // The penalties see the end of the prompt as the reference servers do.
-                const size_t tail = std::min<size_t>(r.prompt.size(), 64);
-                for (size_t i = r.prompt.size() - tail; i < r.prompt.size(); ++i) r.smp->accept(r.prompt[i]);
+                /*
+                    The penalties over the last tokens see the end of the prompt as the reference
+                    servers do; those over the whole answer read the answer alone, as the servers
+                    whose values the authors of the models give.
+                */
+                if (r.smp->params().repeat_last_n >= 0)
+                {
+                    const size_t tail = std::min<size_t>(r.prompt.size(), 64);
+                    for (size_t i = r.prompt.size() - tail; i < r.prompt.size(); ++i) r.smp->accept(r.prompt[i]);
+                }
                 r.ph = request_state::phase::decode;
             }
             if (r.cancelled)
@@ -2437,7 +2499,8 @@ namespace albireo
             return;
         }
         ++r.generated;
-        r.smp->accept(token);
+        // The end of a reasoning the engine writes is not a text of the model for its penalties.
+        if (!r.forcing) r.smp->accept(token);
         // Control tokens are not text, except the markers the output parser reads.
         if (m.tok.token_type(token) != dlib::hf_tokenizer::TT_CONTROL
             || std::binary_search(m.format->marker_tokens().begin(), m.format->marker_tokens().end(), token))
@@ -2536,7 +2599,25 @@ namespace albireo
             end of a reasoning the engine writes, nor to the short reasoning of a request that
             asked for none.
         */
-        if (r.stops.empty() || r.forcing || (r.brief && r.parser->in_reasoning()))
+        if (r.forcing)
+        {
+            /*
+                The end of a reasoning the engine writes in place of the model is not shown as its
+                reasoning; the text of the model held back for the stop sequences goes first.
+            */
+            if (!r.held.empty())
+            {
+                r.parser->feed(r.held, events);
+                r.held.clear();
+                deliver(r, events);
+            }
+            r.parser->feed(text, events);
+            events.erase(std::remove_if(events.begin(), events.end(),
+                [](const output_event& e) { return e.kind == output_kind::reasoning; }), events.end());
+            deliver(r, events);
+            return;
+        }
+        if (r.stops.empty() || (r.brief && r.parser->in_reasoning()))
         {
             r.parser->feed(r.held + text, events);
             r.held.clear();

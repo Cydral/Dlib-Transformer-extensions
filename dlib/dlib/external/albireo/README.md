@@ -77,8 +77,8 @@ application, the description of the interface and the list of the programs of Wi
   catalog, chosen in the Models window or by the service when a model arrives, and an embedding
   model for the search in documents, which the service installs in every case.
 - **Models that come with Albireo**: the complete installer carries Qwen3-VL-4B-Thinking-albireo,
-  which reads images and text, reasons before each answer, at length when asked, and serves the
-  three functions as soon as Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the
+  which reads images and text, reasons before its answer when deep reasoning is on and answers
+  directly otherwise, and serves the three functions as soon as Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the
   search, both retrieved and checked by the build (see
   [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
@@ -87,8 +87,8 @@ application, the description of the interface and the list of the programs of Wi
   each step. The help next to its button describes the tools; each step of an answer shows
   its tool, its arguments, its result, its state and its duration. The calculator reads the
   percentages ("17,5 % de 2 340"), the decimal commas and the thousands written with spaces.
-- **Web access**: the Web button of the composer, off in each new discussion, gives the model a
-  search of Wikipedia and the reading of the pages and PDF files of public addresses, which the
+- **Web access**: the Web button of the composer, off in each new discussion as the deep
+  reasoning and the agent are, gives the model a search of Wikipedia and the reading of the pages and PDF files of public addresses, which the
   service fetches; the model reads only the addresses that the discussion holds (see
   [Web access](#web-access)).
 - **Several conversations at once**: the requests of every client are computed together, one
@@ -309,7 +309,8 @@ the format of Foundation-Sec-8B-Reasoning and that of Foundation-Sec 1.1 8B Inst
 markers `<|system|>`, `<|user|>` and `<|assistant|>` are plain text of its vocabulary: its GGUF files
 carry no template, the engine takes the one of the repository of the model, and these markers end
 its answer as its end of text token does. The instructions of the tools of Qwen2.5 keep the doubled
-braces of the example of its template. The tests compare the prompts with those of the reference
+braces of the example of its template, and CyberSecQwen 4B receives a system message in the turn of
+the user, as the template of its training writes it. The tests compare the prompts with those of the reference
 templates rendered by Jinja, byte for byte, as the libraries that apply chat templates render them,
 the line break after each tag and the spaces before it removed: the template of
 Foundation-Sec-8B-Reasoning, written over several lines, gives its turns one after the other, the
@@ -319,16 +320,18 @@ the SentencePiece ones (EuroLLM), whose leading space it puts after each control
 reference tokenizers do; the token identifiers of the tests are those of llama.cpp.
 
 A model whose template opens the reasoning of every answer, the Thinking variants of Qwen3 and
-Qwen3-VL and Foundation-Sec-8B-Reasoning, was trained to reason before each answer: a prompt that
-closes its reasoning before it starts puts it outside what it learned, and its answer then takes up
-the corrections and returns of a reasoning, which can loop. Such a model therefore reasons before
-every answer. When the request asks for no reasoning, or for the effort `low`, the engine ends that
-reasoning after 512 tokens, 256 for the work in the background, by writing in place of the model the
-sentence its authors give for that purpose ("Considering the limited time by the user, I have to
-give the solution based on the thinking directly now.") and the marker `</think>`; the model then
-answers from what it has thought. `reasoning_budget` sets that limit for any request, -1 lifting
-it; the answer of a request that asked for no reasoning then receives its `max_tokens` once the
-reasoning ends, and its stop sequences apply to that answer alone. The prompt of
+Qwen3-VL and Foundation-Sec-8B-Reasoning, was trained to reason before each answer, and its prompt
+opens that reasoning whatever the request asks. When the request asks for no reasoning, the engine
+ends it at once by writing in place of the model the sentence its authors give for the budget of a
+reasoning ("Considering the limited time by the user, I have to give the solution based on the
+thinking directly now.") and the marker `</think>`; the model then answers directly, the prompt
+staying within what it learned, where a reasoning closed empty before it starts led its answer to
+take up the corrections and returns of a reasoning, which could loop. With the effort `low`, the
+engine ends the reasoning after 512 tokens, 256 for the work in the background, and
+`reasoning_budget` sets that limit for any request, -1 lifting it. The end the engine writes counts
+among the tokens of the answer and stays out of the `reasoning_content` the client receives; the
+answer of a request that asked for no reasoning receives its `max_tokens` once the reasoning ends,
+and its stop sequences apply to that answer alone. The prompt of
 Foundation-Sec-8B-Reasoning opens its reasoning with `<think>`, as the current template of the model
 does; the template of its GGUF file, an earlier one, leaves that marker to the model.
 
@@ -584,9 +587,11 @@ of the discussion stops it, and its failure is silent.
 
 The work the application does in the background, the titles, the summaries and the memory, goes
 to the background model: the model that comes with Albireo (`albireo-background`), which the
-service keeps loaded whatever the functions, without reasoning, or with the short reasoning of a
-model that always reasons; without it, the general model serves it. It samples as its authors
-advise, and a summary that repeats its lines keeps each of them once.
+service keeps loaded whatever the functions, without reasoning, the reasoning of a model that
+always reasons ended at once; without it, the general model serves it. It samples as its authors
+advise, without the presence penalty some of them give, so that the titles, the summaries and the
+quotes of the memory take up the words of the discussion, and a summary that repeats its lines keeps
+each of them once.
 
 The memory of the discussions holds short sentences on the user, one after the other in one
 paragraph (profession, projects, preferences, the way to answer), the lasting facts the user
@@ -856,7 +861,7 @@ cmake --build build-albireo-win -j
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning, parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
@@ -1060,23 +1065,35 @@ of `/v1/embeddings` takes `albireo-embedding`.
 The sampling of every model goes through the sampler of Albireo, whatever the architecture of
 the model and the engine: `temperature`, `top_p`, `top_k`, `min_p` and the penalties apply the
 same way to all of them. The settings a request leaves out take the values the authors of the
-family of the model advise on its card, or the temperature of their evaluations for
-Foundation-Sec-8B-Reasoning, `min_p` being 0 for all of them:
+family of the model advise on its card, for a request of text alone or with images as the cards of
+Qwen3-VL distinguish them, or the temperature of the use and of the evaluations their cards describe
+for CyberSecQwen 4B and the Foundation-Sec models, `min_p` being 0 for all of them. A Thinking model
+of Qwen3-VL whose reasoning the engine ends at once answers as a model without reasoning, with the
+values the authors of Qwen3 advise for that mode. The "Generation" tab of the web application leaves
+them out while its settings stay on automatic:
 
 | Models                                   | `temperature` | `top_p` | `top_k` | Penalty                                   |
 |------------------------------------------|---------------|---------|---------|-------------------------------------------|
-| Qwen3-VL Thinking                        | 1             | 0.95    | 20      | none                                      |
-| Qwen3-VL Instruct                        | 0.7           | 0.8     | 20      | `presence_penalty` 1.5 over the answer    |
+| Qwen3-VL Thinking, text alone            | 1             | 0.95    | 20      | `presence_penalty` 1.5 over the answer    |
+| Qwen3-VL Thinking, with images           | 1             | 0.95    | 20      | none                                      |
+| Qwen3-VL Thinking, reasoning ended at once | 0.7         | 0.8     | 20      | `presence_penalty` 1.5 over the answer    |
+| Qwen3-VL Instruct, text alone            | 1             | 1       | 40      | `presence_penalty` 2 over the answer      |
+| Qwen3-VL Instruct, with images           | 0.7           | 0.8     | 20      | `presence_penalty` 1.5 over the answer    |
+| CyberSecQwen 4B                          | 0.3           | 0.8     | 20      | none                                      |
 | Qwen3 without reasoning                  | 0.7           | 0.8     | 20      | none                                      |
 | Qwen2.5                                  | 0.7           | 0.8     | 20      | `repeat_penalty` 1.05 over 64 tokens      |
-| Foundation-Sec-8B-Reasoning              | 0.3           | 0.95    | 20      | none                                      |
+| Foundation-Sec 1.1 8B and 8B Reasoning   | 0.3           | 0.95    | 20      | none                                      |
+| Granite 4.2, with and without reasoning  | 1             | 0.95    | none    | none                                      |
+| Ministral 3                              | 0.1           | 1       | none    | none                                      |
+| Devstral, other Mistral without reasoning | 0.15         | 1       | none    | none                                      |
 | Other models, while they reason          | 0.6           | 0.95    | 20      | none                                      |
 | Other models                             | 0.7           | 0.9     | 40      | none                                      |
 
 `top_k` keeps the most likely tokens, at most 1,024 even with 0; a value outside 0 to 1024, or
 one that is not a whole number, is refused with 400. At temperature 0, the most likely token is
-taken, which `top_k` 1 gives too. `repeat_last_n` gives the tokens of the answer the penalties
-read, 64 by default and -1 for the whole answer. The engine refuses the other values out of their
+taken, which `top_k` 1 gives too. `repeat_last_n` gives the tokens the penalties read: the last 64
+by default, the end of the prompt included as the reference servers read it, and -1 for the whole
+answer alone, neither the prompt nor the end of a reasoning the engine writes. The engine refuses the other values out of their
 bounds: `temperature` 0 to 10,000, `top_p` and `min_p` 0 to 1, `repeat_penalty` above 0 and up to
 100, `presence_penalty`, `frequency_penalty` and the values of `logit_bias` -100 to 100, each stop
 sequence 1,024 bytes at most. A pass that the memory of the system cannot hold ends its requests
@@ -1197,13 +1214,16 @@ The administrator sets the web access through the settings route of the administ
 {"web_search": "wikipedia"}
 ```
 
-In the web application, the Web button stands beside Agent. It is off in every new discussion,
-whatever the earlier ones chose: its state belongs to its discussion, which keeps it with its
-messages, after an answer, a regeneration, an edit and a reload and in the other tabs, until the
-user turns it off, while the last choice of Agent and of the reasoning becomes the default of the
-next discussions. The button is disabled, with the reason as its title, while the model of the function
-calls no tools, while the service works offline and once the administrator turned the web access
-off. With Web on, each question carries `web_search`, when the service offers the search of
+In the web application, the Web button stands beside Agent. The buttons of the deep reasoning, of
+the agent and of the web are off in every new discussion, in a project or not, whatever the earlier
+ones chose: their state belongs to their discussion, which keeps it with its messages, after an
+answer, a regeneration, an edit and a reload and in the other tabs, so that another discussion may
+show another state. With a model that can reason, Agent and Web come with the deep reasoning, so
+that the model reasons before each call of a tool: they are disabled while it is off, and turning
+it off turns them off; a model that calls tools without reasoning (Qwen3-VL Instruct, Ministral 3,
+Devstral Small 2, Qwen2.5 Coder) takes them alone. The Web button is disabled, with the reason as
+its title, while the model of the function calls no tools, while it lacks the deep reasoning it
+needs, while the service works offline and once the administrator turned the web access off. With Web on, each question carries `web_search`, when the service offers the search of
 Wikipedia, and `fetch_page`, after the tools of the agent while Agent is on, and the answer runs the
 calls of the tools even with Agent off. The tools and the system message stay the same from one
 question to the next while the buttons and the provider do not change, so that the beginning of
@@ -1302,11 +1322,11 @@ and its projector.
 | EuroLLM 9B Instruct            | EuroLLM consortium | general                 | text          | 5.58 GB  | Apache-2.0 |
 | Granite 4.2 3B                 | IBM                | general, code           | text          | 2.24 GB  | Apache-2.0 |
 | Granite 4.2 8B                 | IBM                | general, code           | text          | 5.35 GB  | Apache-2.0 |
-| Qwen3 8B                       | Alibaba            | general, code, security | text          | 5.03 GB  | Apache-2.0 |
-| Qwen3 30B A3B                  | Alibaba            | general, code, security | text          | 18.56 GB | Apache-2.0 |
+| Qwen3-VL 30B A3B Thinking      | Alibaba            | general, code, security | text, image   | 19.27 GB | Apache-2.0 |
 | Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | 1.12 GB  | Apache-2.0 |
 | Qwen2.5 Coder 7B               | Alibaba            | code                    | text          | 4.68 GB  | Apache-2.0 |
 | Devstral Small 2               | Mistral AI         | code                    | text, image   | 15.21 GB | Apache-2.0 |
+| CyberSecQwen 4B                | athena129 (lablab.ai) | security             | text          | 2.50 GB  | Apache-2.0 |
 | Foundation-Sec 1.1 8B          | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
 | Foundation-Sec 8B Reasoning    | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
 
@@ -1316,16 +1336,20 @@ programming agent for those of 32 GB:
 
 | Function | Text and images | Text |
 |----------|-----------------|------|
-| General  | Qwen3-VL 2B, 4B and 8B, Ministral 3 3B and 8B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B, Qwen3 8B, Qwen3 30B A3B |
-| Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B, Qwen3 8B, Qwen3 30B A3B |
-| Security | Qwen3-VL 2B and 4B Thinking, Qwen3-VL 8B (Instruct and Thinking) | Foundation-Sec 1.1 8B and 8B Reasoning, Qwen3 8B, Qwen3 30B A3B |
+| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B |
+| Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking, Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B |
+| Security | Qwen3-VL 2B and 4B Thinking, Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking | CyberSecQwen 4B, Foundation-Sec 1.1 8B and 8B Reasoning |
 
 The choices follow the published measures: Qwen3-VL gives the best scores of the models that read
 images and that the engine runs (MMMU 67.4 for the 4B Instruct, 74.1 for the 8B Thinking, OCRBench
 881 and 896); Granite 4.2 gives the best scores of reasoning and code under 6 GB (LiveCodeBench v6
 69.7 for the 3B and 73.2 for the 8B); Foundation-Sec 8B Reasoning maps the vulnerabilities to their
-weaknesses best among the models of 8B (CTIBench-RCM 0.753), and Qwen3 8B leads them on the
-knowledge of security (CyberMetric-2000 0.903, SecEval 0.886, measured by Cisco). Ministral 3,
+weaknesses best among the models of 8B (CTIBench-RCM 0.753), and CyberSecQwen 4B, fine-tuned from
+Qwen3-4B-Instruct-2507, keeps 97 % of the score of Foundation-Sec 8B Instruct on that task at half
+its size (CTI-RCM 0.666) and exceeds it on the questions of threat intelligence (CTI-MCQ 0.587,
+measured by its authors under the protocol of Cisco). Qwen3-VL 30B A3B Thinking, a mixture of 128
+experts of which 8 compute each token, reads images and reasons as the other Qwen3-VL Thinking
+models do, at the pace of a model of 3B. Ministral 3,
 which Mistral AI trained in partnership with NVIDIA, reads images through its Pixtral encoder, as
 does Devstral Small 2, the programming agent of 24B of Mistral AI, which reads screenshots and
 diagrams; Phi-4-mini is the latest small model of Microsoft with a standard decoder. EuroLLM 9B
