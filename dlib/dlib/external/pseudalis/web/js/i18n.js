@@ -80,14 +80,21 @@ window.PSEUDALIS_TEXTS = {
     btn_close: 'Close',
     dialog_error: 'Operation not done',
     records_untagged: 'protected without tags',
-    tags_option: 'Write the tags of the values, which give them back from any copy with the key of this computer',
+    tags_option: 'Write the tags in these files',
+    tags_option_hint: 'With them, any copy is restored with the key of this computer. This box applies to the ' +
+      'files dropped here alone; the general setting, which the drive follows, is in the Settings of the ' +
+      'application opened from the icon.',
     no_restore_hint: 'Without tags and without the original kept, the protected files cannot be restored.',
     protected_untagged: 'without tags',
     not_restorable: 'it cannot be restored',
-    text_tags: 'Write the tags',
+    text_tags: 'Write the tags in this text',
+    text_tags_hint: 'This box applies to this text alone; the general setting, which the drive follows, is ' +
+      'in the Settings of the application opened from the icon.',
     text_untagged_hint: 'Without tags, this page alone restores the text, while it stays open.',
-    set_tags: 'Write the tags of the values in the files of the drive, of the web application and of the ' +
-      'interface (without them, a file comes back only while its original is kept)',
+    set_tags: 'Write the tags by default',
+    set_tags_hint: 'The drive follows this setting, the interface applies it to the requests without the ' +
+      'parameter tags, and the boxes of the cards Protect files and Protect a text start from it. Without tags, a ' +
+      'file comes back only while its original is kept.',
     err_tagless_forgotten: 'This file was protected without tags and its original was forgotten on {date}: its ' +
       'values cannot come back.',
     key_title: 'Key of this computer',
@@ -257,14 +264,21 @@ window.PSEUDALIS_TEXTS = {
     btn_close: 'Fermer',
     dialog_error: 'Opération impossible',
     records_untagged: 'protégé sans balises',
-    tags_option: 'Écrire les balises des valeurs, qui les rendent depuis toute copie avec la clé de cet ordinateur',
+    tags_option: 'Écrire les balises dans ces fichiers',
+    tags_option_hint: 'Avec elles, toute copie se restaure avec la clé de cet ordinateur. Cette case ne vaut ' +
+      'que pour les fichiers déposés ici ; le réglage général, que suit le lecteur, est dans les Réglages ' +
+      'de l’application ouverte depuis l’icône.',
     no_restore_hint: 'Sans balises ni original conservé, les fichiers protégés ne pourront pas être restaurés.',
     protected_untagged: 'sans balises',
     not_restorable: 'il ne pourra pas être restauré',
-    text_tags: 'Écrire les balises',
+    text_tags: 'Écrire les balises dans ce texte',
+    text_tags_hint: 'Cette case ne vaut que pour ce texte ; le réglage général, que suit le lecteur, est ' +
+      'dans les Réglages de l’application ouverte depuis l’icône.',
     text_untagged_hint: 'Sans balises, seule cette page restaure le texte, tant qu’elle reste ouverte.',
-    set_tags: 'Écrire les balises des valeurs dans les fichiers du lecteur, de l’application web et de ' +
-      'l’interface (sans elles, un fichier ne revient que tant que son original est conservé)',
+    set_tags: 'Écrire les balises par défaut',
+    set_tags_hint: 'Le lecteur suit ce réglage, l’interface l’applique aux requêtes sans paramètre tags, et ' +
+      'les cases des encadrés Protéger des fichiers et Protéger un texte en partent. Sans balises, un fichier ne ' +
+      'revient que tant que son original est conservé.',
     err_tagless_forgotten: 'Ce fichier a été protégé sans balises et son original a été oublié le {date} : ses ' +
       'valeurs ne peuvent plus revenir.',
     key_title: 'Clé de cet ordinateur',
@@ -437,16 +451,22 @@ window.PSEUDALIS_TEXTS = {
     btn_close: 'Schließen',
     dialog_error: 'Vorgang nicht möglich',
     records_untagged: 'ohne Markierungen geschützt',
-    tags_option: 'Die Markierungen der Werte schreiben, die sie aus jeder Kopie mit dem Schlüssel dieses Computers ' +
-      'zurückgeben',
+    tags_option: 'Markierungen in diese Dateien schreiben',
+    tags_option_hint: 'Mit ihnen lässt sich jede Kopie mit dem Schlüssel dieses Computers wiederherstellen. ' +
+      'Dieses Kästchen gilt nur für die hier abgelegten Dateien; die allgemeine Einstellung, der das ' +
+      'Laufwerk folgt, steht in den Einstellungen der über das Symbol geöffneten Anwendung.',
     no_restore_hint: 'Ohne Markierungen und ohne aufbewahrtes Original lassen sich die geschützten Dateien nicht ' +
       'wiederherstellen.',
     protected_untagged: 'ohne Markierungen',
     not_restorable: 'sie lässt sich nicht wiederherstellen',
-    text_tags: 'Markierungen schreiben',
+    text_tags: 'Markierungen in diesen Text schreiben',
+    text_tags_hint: 'Dieses Kästchen gilt nur für diesen Text; die allgemeine Einstellung, der das ' +
+      'Laufwerk folgt, steht in den Einstellungen der über das Symbol geöffneten Anwendung.',
     text_untagged_hint: 'Ohne Markierungen stellt nur diese Seite den Text wieder her, solange sie geöffnet bleibt.',
-    set_tags: 'Die Markierungen der Werte in die Dateien des Laufwerks, der Webanwendung und der Schnittstelle ' +
-      'schreiben (ohne sie kehrt eine Datei nur zurück, solange ihr Original aufbewahrt wird)',
+    set_tags: 'Markierungen standardmäßig schreiben',
+    set_tags_hint: 'Das Laufwerk folgt dieser Einstellung, die Schnittstelle wendet sie auf Anfragen ohne den ' +
+      'Parameter tags an, und die Kästchen der Karten Dateien schützen und Einen Text schützen gehen von ihr aus. ' +
+      'Ohne Markierungen kehrt eine Datei nur zurück, solange ihr Original aufbewahrt wird.',
     err_tagless_forgotten: 'Diese Datei wurde ohne Markierungen geschützt und ihr Original am {date} vergessen: ' +
       'Ihre Werte können nicht zurückkehren.',
     key_title: 'Schlüssel dieses Computers',
@@ -622,14 +642,21 @@ window.PSEUDALIS_TEXTS = {
     btn_close: 'Chiudi',
     dialog_error: 'Operazione non riuscita',
     records_untagged: 'protetto senza tag',
-    tags_option: 'Scrivere i tag dei valori, che li restituiscono da qualsiasi copia con la chiave di questo computer',
+    tags_option: 'Scrivere i tag in questi file',
+    tags_option_hint: 'Con essi, ogni copia si ripristina con la chiave di questo computer. Questa casella ' +
+      'vale solo per i file depositati qui; l’impostazione generale, che l’unità segue, è nelle ' +
+      'Impostazioni dell’applicazione aperta dall’icona.',
     no_restore_hint: 'Senza tag e senza l’originale conservato, i file protetti non potranno essere ripristinati.',
     protected_untagged: 'senza tag',
     not_restorable: 'non potrà essere ripristinato',
-    text_tags: 'Scrivere i tag',
+    text_tags: 'Scrivere i tag in questo testo',
+    text_tags_hint: 'Questa casella vale solo per questo testo; l’impostazione generale, che l’unità ' +
+      'segue, è nelle Impostazioni dell’applicazione aperta dall’icona.',
     text_untagged_hint: 'Senza tag, solo questa pagina ripristina il testo, finché resta aperta.',
-    set_tags: 'Scrivere i tag dei valori nei file dell’unità, dell’applicazione web e dell’interfaccia (senza di ' +
-      'essi, un file torna solo finché il suo originale è conservato)',
+    set_tags: 'Scrivere i tag per impostazione predefinita',
+    set_tags_hint: 'L’unità segue questa impostazione, l’interfaccia la applica alle richieste senza il ' +
+      'parametro tags e le caselle delle schede Proteggere file e Proteggere un testo partono da essa. Senza tag, ' +
+      'un file ritorna solo finché il suo originale è conservato.',
     err_tagless_forgotten: 'Questo file è stato protetto senza tag e il suo originale è stato dimenticato il {date}: ' +
       'i suoi valori non possono più tornare.',
     key_title: 'Chiave di questo computer',
@@ -803,15 +830,21 @@ window.PSEUDALIS_TEXTS = {
     btn_close: 'Cerrar',
     dialog_error: 'Operación imposible',
     records_untagged: 'protegido sin etiquetas',
-    tags_option: 'Escribir las etiquetas de los valores, que los devuelven desde cualquier copia con la clave de ' +
-      'este equipo',
+    tags_option: 'Escribir las etiquetas en estos archivos',
+    tags_option_hint: 'Con ellas, cualquier copia se restaura con la clave de este equipo. Esta casilla ' +
+      'solo vale para los archivos depositados aquí; el ajuste general, que sigue la unidad, está en los ' +
+      'Ajustes de la aplicación abierta desde el icono.',
     no_restore_hint: 'Sin etiquetas ni original conservado, los archivos protegidos no podrán restaurarse.',
     protected_untagged: 'sin etiquetas',
     not_restorable: 'no podrá restaurarse',
-    text_tags: 'Escribir las etiquetas',
+    text_tags: 'Escribir las etiquetas en este texto',
+    text_tags_hint: 'Esta casilla solo vale para este texto; el ajuste general, que sigue la unidad, ' +
+      'está en los Ajustes de la aplicación abierta desde el icono.',
     text_untagged_hint: 'Sin etiquetas, solo esta página restaura el texto, mientras siga abierta.',
-    set_tags: 'Escribir las etiquetas de los valores en los archivos de la unidad, de la aplicación web y de la ' +
-      'interfaz (sin ellas, un archivo solo vuelve mientras se conserve su original)',
+    set_tags: 'Escribir las etiquetas por defecto',
+    set_tags_hint: 'La unidad sigue este ajuste, la interfaz lo aplica a las peticiones sin el parámetro tags ' +
+      'y las casillas de las tarjetas Proteger archivos y Proteger un texto parten de él. Sin etiquetas, un ' +
+      'archivo solo vuelve mientras se conserva su original.',
     err_tagless_forgotten: 'Este archivo se protegió sin etiquetas y su original se olvidó el {date}: sus valores ' +
       'ya no pueden volver.',
     key_title: 'Clave de este equipo',

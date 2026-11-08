@@ -840,11 +840,15 @@
     message('settings-message', t(r.body.restart ? 'saved_restart' : 'saved'));
     loadSettings();
     refreshStatus();
-    applyTagsDefault(r.body.tags !== false);
+    // The boxes of the cards start again from the setting of the tags when it changes, and only then.
+    if ((r.body.tags !== false) !== tagsDefault) applyTagsDefault(r.body.tags !== false);
   }
 
-  // The options of the cards follow the setting of the tags, which the page reads at its start.
+  /* The setting of the tags by default, which the page reads at its start: the boxes of the cards
+     Protect files and Protect a text start from it, and each applies to its files or its text alone. */
+  let tagsDefault = true;
   function applyTagsDefault(tags) {
+    tagsDefault = tags;
     document.getElementById('tags').checked = tags;
     document.getElementById('text-tags').checked = tags;
     document.getElementById('text-untagged').hidden = tags;

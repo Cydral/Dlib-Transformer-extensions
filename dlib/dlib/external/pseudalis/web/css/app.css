@@ -90,6 +90,9 @@ button, .button { border: 0; border-radius: 7px; padding: 7px 14px; background: 
 button.secondary, .button.secondary { background: #e7eef4; color: var(--navy); }
 button.danger { background: var(--bad); }
 .hint.warn { color: var(--bad); margin: 8px 0 0; }
+/* What a box of options decides, under it, aligned with its label. */
+.hint.sub { margin: 4px 0 0 22px; font-size: 13px; }
+.hint.sub + .fields { margin-top: 16px; }
 
 /* The window of the application over the page, in place of those of the browser. */
 dialog.modal { border: 0; border-radius: 12px; padding: 22px 24px 18px; width: calc(100% - 32px); max-width: 480px;

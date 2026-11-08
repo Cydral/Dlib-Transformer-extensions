@@ -39,7 +39,9 @@
       <div class="buttons"><label class="button secondary file"><input type="file" id="protect-folder" webkitdirectory>
         <span data-t="choose_folder"></span></label></div>
       <label class="option"><input type="checkbox" id="keep" checked> <span data-t="keep"></span></label>
+      <!-- The tags of these files alone, from the setting of the tags by default. -->
       <label class="option"><input type="checkbox" id="tags" checked> <span data-t="tags_option"></span></label>
+      <p class="hint sub" data-t="tags_option_hint"></p>
       <p class="hint warn" id="no-restore" data-t="no_restore_hint" hidden></p>
       <ul class="results" id="protect-results"></ul>
     </section>
@@ -77,8 +79,10 @@
         <button id="text-restore" class="secondary" data-t="text_restore"></button>
         <button id="text-detect" class="secondary" data-t="text_detect"></button>
       </div>
+      <!-- The tags of this text alone, the parameter of the interface tried here, from the setting. -->
       <label class="option"><input type="checkbox" id="text-tags" checked> <span data-t="text_tags"></span></label>
-      <p class="hint" id="text-untagged" data-t="text_untagged_hint" hidden></p>
+      <p class="hint sub" data-t="text_tags_hint"></p>
+      <p class="hint warn" id="text-untagged" data-t="text_untagged_hint" hidden></p>
       <pre id="text-result" class="output" hidden></pre>
     </section>
 
@@ -117,6 +121,9 @@
 
     <section class="card" id="settings-card" hidden>
       <h2 data-t="settings_title"></h2>
+      <!-- The tags by default: the drive follows them, the interface and the boxes of the cards start from them. -->
+      <label class="option"><input type="checkbox" id="set-tags"> <span data-t="set_tags"></span></label>
+      <p class="hint sub" data-t="set_tags_hint"></p>
       <div class="fields">
         <label><span data-t="set_language"></span>
           <select id="set-language">
@@ -140,7 +147,6 @@
           <input type="number" id="set-history" min="1" max="1048576" step="1"></label>
       </div>
       <p class="hint" data-t="set_removed_hint"></p>
-      <label class="option"><input type="checkbox" id="set-tags"> <span data-t="set_tags"></span></label>
       <label class="option"><input type="checkbox" id="set-albireo"> <span data-t="set_albireo"></span></label>
       <label class="option"><input type="checkbox" id="set-updates"> <span data-t="set_updates"></span></label>
       <div class="buttons"><button id="settings-save" data-t="btn_save"></button></div>

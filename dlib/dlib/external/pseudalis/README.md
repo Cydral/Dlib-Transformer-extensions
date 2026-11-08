@@ -38,9 +38,12 @@ copy edited since included, as long as the substitutes stay in place.
 The values can also be written without their tags, their substitutes alone, as the names already are:
 the file then reads as an ordinary document, for a prompt sent to an assistant, test or training data,
 or a file sent outside, but nothing in it tells a value from its substitute any more, and its record
-alone gives its values back. The setting `tags` (on by default) decides for the drive, the web
-application and the interface; the commands of the Explorer offer both, and a request says it with
-`tags=false`.
+alone gives its values back. The setting Write the tags by default, at the top of the Settings card
+of the web application (`tags`, on by default, kept with the other settings when the service starts
+again), decides for the drive and for the requests of the interface that do not say it (`tags=false`
+or `true`); the boxes of the cards Protect files and Protect a text start from it, and each applies to
+its files or to its text alone, which tries the interface live; the commands of the Explorer offer
+both.
 
 - The record of a file protected without tags keeps its original, as any record, and the substitutes of
   its text with the tags they stand for, never its values in clear: its copies give back the original,
@@ -124,7 +127,8 @@ included. The anonymized file takes its place, the original goes to the encrypte
 written is deleted.
 
 - A document keeps its kind and its layout, its values replaced by tags in its content, or by their
-  substitutes alone when the setting `tags` is off, and by substitutes in its name and its properties.
+  substitutes alone when the setting Write the tags by default is off, and by substitutes in its name and
+  its properties.
 - A picture becomes `<name>.txt`, its marker `[Image@<id> : <description>]`, or `[Image@<id>]` when no
   description is available, and the picture goes to the vault.
 - A ZIP, TAR or TAR.GZ archive keeps its kind, the values of its name replaced; its documents are
@@ -220,13 +224,12 @@ The icon opens the web application of the service, `https://localhost:8444`: fil
 anonymized or restored and downloaded back, a folder dropped or chosen there as the ZIP archive of its
 tree, texts are anonymized or restored in place, their tags highlighted and their values restored
 underlined in the color of their kind, or analyzed, the values found listed below them, and, opened from
-the icon, it lists the originals kept
-(download, forget), exports and imports the key, and changes the settings and the imposed terms. Its
-files and its texts take their tags or not as their option says, which the setting `tags` sets, and it
-asks and tells in a window of its own, over the page, Escape or a click beside it cancelling. The
-interface it uses is
-described with Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu of the
-icon), without account: the operations of administration take the token of the data folder in the header
+the icon, it lists the originals kept (download, forget), exports and imports the key, and changes the
+settings and the imposed terms. Its files and its texts take their tags or not as the box of their card
+says, which starts from the setting Write the tags by default, and it asks and tells in a window of its
+own, over the page, Escape or a click beside it cancelling. The interface it uses is described with
+Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu of the icon), without
+account: the operations of administration take the token of the data folder in the header
 `X-Pseudalis-Admin`, which the pages opened by the icon receive in the fragment of their address and use
 by themselves.
 

@@ -124,6 +124,10 @@ int main()
         CHECK(!s.to_json().contains("feed_url") && host_settings::from_json(s.to_json()).feed_url == default_feed_url);
         s.feed_url = "https://example.org/feed.json";
         CHECK(host_settings::from_json(s.to_json()).feed_url == "https://example.org/feed.json");
+        // The tags by default: written unless the setting says otherwise, a file of a version before keeping them.
+        CHECK(host_settings().tags && host_settings::from_json(earlier).tags);
+        s.tags = false;
+        CHECK(!host_settings::from_json(s.to_json()).tags);
     }
     // A damaged settings.json keeps the originals without limit of time, in the largest space.
     {
@@ -135,7 +139,11 @@ int main()
         host_settings changed;
         CHECK(damaged.update([](host_settings& s) { s.removed_days = 45; }, changed) && changed.removed_days == 45);
         settings_store again(path);
-        CHECK(again.get().removed_days == 45);
+        CHECK(again.get().removed_days == 45 && again.get().tags);
+        // The setting of the tags, saved, is read again when the service starts again.
+        CHECK(again.update([](host_settings& s) { s.tags = false; }, changed) && !changed.tags);
+        settings_store restarted(path);
+        CHECK(!restarted.get().tags && restarted.get().removed_days == 45);
     }
 
     // The imposed terms: a list the service takes, or the reason and the place of its refusal.

@@ -1570,7 +1570,7 @@
      },
      "tags": {
       "type": "boolean",
-      "description": "Whether the values of the files of the drive, of the web application and of the interface take their tags (true by default); false writes their substitutes alone, which the record of a file alone gives back while it lasts. The parameter tags of a request decides for it."
+      "description": "Write the tags by default, at the top of the Settings card of the web application: whether the values of the files of the drive and of the requests of the interface without the parameter tags take their tags (true by default); false writes their substitutes alone, which the record of a file alone gives back while it lasts. The parameter tags of a request decides for it, and the boxes of the cards of the web application start from it."
      },
      "check_updates": {
       "type": "boolean"
