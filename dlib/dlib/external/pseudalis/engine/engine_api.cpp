@@ -58,9 +58,25 @@ namespace
             pseudalis::json one = pseudalis::json::object();
             one["substitute"] = s.substitute;
             one["tag"] = s.tag;
+            if (s.text) one["text"] = true;
             list.push_back(one);
         }
         return list;
+    }
+
+    // The substitutes of the text a request gives: [{"substitute", "tag"}].
+    std::vector<pseudalis::substitution> substitutions_in(const pseudalis::json& list)
+    {
+        std::vector<pseudalis::substitution> out;
+        for (const pseudalis::json& one : list.elements())
+        {
+            pseudalis::substitution s;
+            s.substitute = one["substitute"].str();
+            s.tag = one["tag"].str();
+            s.text = true;
+            if (!s.substitute.empty() && !s.tag.empty()) out.push_back(s);
+        }
+        return out;
     }
 
     pseudalis::json result_of(const pseudalis::engine_result& r)
@@ -220,11 +236,14 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
             };
         pseudalis::json res = pseudalis::json::object();
         std::string out;
+        // Without tags, the values of the text take substitutes; the substitutes of the text known.
+        const bool tags = req["tags"].as_bool(true);
+        const std::vector<pseudalis::substitution> known = substitutions_in(req["substitutions"]);
         if (op == "anonymize" || op == "restore")
         {
             pseudalis::engine_result r = op == "anonymize"
-                ? engine->e->anonymize(bytes, name, handler, tags_of)
-                : engine->e->restore(bytes, name, tags_of);
+                ? engine->e->anonymize(bytes, name, handler, tags_of, tags, known)
+                : engine->e->restore(bytes, name, tags_of, known);
             res = result_of(r);
             out = std::move(r.bytes);
         }
@@ -243,15 +262,23 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
         else if (op == "anonymize_text" || op == "restore_text")
         {
             pseudalis::json report;
-            out = op == "anonymize_text" ? engine->e->anonymize_text(bytes, report)
-                                         : engine->e->restore_text(bytes, report);
+            std::vector<pseudalis::substitution> made;
+            out = op == "anonymize_text" ? engine->e->anonymize_text(bytes, report, tags, &made)
+                                         : engine->e->restore_text(bytes, report, known);
             res["name"] = name;
             res["kind"] = "text";
             res["report"] = report;
             res["pictures"] = pseudalis::json::array();
-            // The places of the tags written, or of the values restored, for the colouring of the text.
-            if (op == "anonymize_text") res["tags"] = engine->e->tag_spans(out);
-            else res["restored"] = engine->e->restored_spans(bytes, out);
+            // The places of the tags or substitutes written, or of the values restored, for the colouring.
+            if (op == "anonymize_text")
+            {
+                res["tags"] = engine->e->tag_spans(out, made);
+                if (!tags) res["substitutions"] = substitutions_of(made);
+            }
+            else
+            {
+                res["restored"] = engine->e->restored_spans(bytes, out, known);
+            }
         }
         else if (op == "detect")
         {

@@ -1151,7 +1151,9 @@ namespace pseudalis
             bool ok = false;
             try
             {
-                ok = svc.protect(data, base_of(path), "drive", true, r, e);
+                // The files of the drive take their tags, or their substitutes alone, as the settings say.
+                // A version replacing another keeps the substitutes of its record, without tags.
+                ok = svc.protect(data, base_of(path), "drive", true, svc.settings().get().tags, r, e, before.record);
             }
             catch (const std::exception& x)
             {

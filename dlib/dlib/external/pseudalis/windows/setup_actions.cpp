@@ -2223,11 +2223,16 @@ namespace setup
         };
         // ECF_SEPARATORBEFORE (0x40) sets the restorations apart from the protections.
         const verb verbs[] = {
-            { L"1protect", label("protect", L"Anonymize", IDS_VERB_PROTECT), L"protect", 0 },
-            { L"2protectcopy", label("protect_copy", L"Anonymize as a copy", IDS_VERB_PROTECT_COPY), L"protect --copy",
-              0 },
-            { L"3restore", label("restore", L"Restore the original", IDS_VERB_RESTORE), L"restore", 0x40 },
-            { L"4restorecopy", label("restore_copy", L"Restore as a copy", IDS_VERB_RESTORE_COPY), L"restore --copy",
+            { L"1protect", label("protect", L"Anonymize with tags", IDS_VERB_PROTECT_TAGS), L"protect", 0 },
+            { L"2protectbare", label("protect_bare", L"Anonymize without tags", IDS_VERB_PROTECT_BARE),
+              L"protect --no-tags", 0 },
+            { L"3protectcopy", label("protect_copy", L"Anonymize as a copy, with tags", IDS_VERB_PROTECT_COPY_TAGS),
+              L"protect --copy", 0 },
+            { L"4protectcopybare",
+              label("protect_copy_bare", L"Anonymize as a copy, without tags", IDS_VERB_PROTECT_COPY_BARE),
+              L"protect --copy --no-tags", 0 },
+            { L"5restore", label("restore", L"Restore the original", IDS_VERB_RESTORE), L"restore", 0x40 },
+            { L"6restorecopy", label("restore_copy", L"Restore as a copy", IDS_VERB_RESTORE_COPY), L"restore --copy",
               0 },
         };
         bool ok = true;
@@ -2257,6 +2262,9 @@ namespace setup
                     continue;
                 }
                 set_string(vk, L"MUIVerb", v.text);
+                /* A selection of up to 100 files, instead of 15: the Explorer starts the command once for
+                   each, and pseudalis.exe processes them two at a time. */
+                set_string(vk, L"MultiSelectModel", L"Player");
                 if (v.flags) RegSetValueExW(vk, L"CommandFlags", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v.flags),
                     sizeof(v.flags));
                 RegCloseKey(vk);

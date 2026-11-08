@@ -19,9 +19,13 @@ namespace dlib
         /*!
             WHAT THIS OBJECT REPRESENTS
                 A value written without its tag: its substitute and the tag it stands for.
+                text is true for a value of the text of a document written without its tag
+                (document_anonymizer::set_untagged_text()), false for a value of a name or
+                of a property.
         !*/
         std::string substitute;
         std::string tag;
+        bool text = false;
     };
 
 // ----------------------------------------------------------------------------------------
@@ -53,9 +57,12 @@ namespace dlib
                 removed         - the parts, pictures, objects and properties removed
                 notes           - the limitations met, each written once
                 substitutions   - anonymization of names and properties without tags
-                                  (document_anonymizer::set_untagged_properties()): each
-                                  substitute written (pseudonymizer::substitute()) with the
-                                  tag it stands for, which the caller keeps to restore it
+                                  (document_anonymizer::set_untagged_properties()), and of
+                                  the text without tags (document_anonymizer::
+                                  set_untagged_text()): each substitute written
+                                  (pseudonymizer::substitute()) with the tag it stands for,
+                                  which the caller keeps to restore it, once for each place
+                                  it is written in
                 substitutes_restored - restoration: the number of substitutes put back
                 pictures_removed - restoration: the number of picture texts removed
                                   (document_anonymizer::set_picture_text_finder())

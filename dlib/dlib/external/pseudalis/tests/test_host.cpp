@@ -310,6 +310,31 @@ int main()
             CHECK(migrated.get_picture("aaaaaaaaaaaaaaaa", q) && q.description.empty() && !q.blob.empty());
             CHECK(migrated.get_picture("bbbbbbbbbbbbbbbb", q) && q.description == kept);
         }
+        // A database of the version 2, as Pseudalis 1.0.4 left it: its files hold their tags, and the
+        // substitutes of the files protected without tags are kept from then on.
+        const std::string v2_path = join_path(dir, "version2.db");
+        {
+            store fresh(v2_path);
+            CHECK(fresh.add_file(r) > 0);
+        }
+        CHECK(sqlite3_open(v2_path.c_str(), &raw) == SQLITE_OK);
+        CHECK(sqlite3_exec(raw, "ALTER TABLE files DROP COLUMN tags; ALTER TABLE forgotten DROP COLUMN tags;"
+                                "DROP TABLE text_substitutes; PRAGMA user_version = 2;",
+                           nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+        {
+            store migrated(v2_path);
+            file_record tagged;
+            CHECK(migrated.find_by_output(r.output_sha256, tagged) && tagged.tags);
+            file_record bare = r;
+            bare.output_sha256 = std::string(64, 'd');
+            bare.tags = false;
+            const long long id = migrated.add_file(bare);
+            migrated.add_text_substitutes(id, { { "Xoydoeh", "[[PERSON:Xoydoeh#EKR]]" } });
+            file_record back;
+            CHECK(migrated.find_by_output(bare.output_sha256, back) && !back.tags &&
+                  migrated.text_substitutes(id).size() == 1);
+        }
 
         // The files of the folder of the drive as the service left them, and what they weigh.
         folder_file note;

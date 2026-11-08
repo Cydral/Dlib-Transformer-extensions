@@ -8,6 +8,8 @@
         pseudalis protect <file or folder>...          anonymizes each one in its place
         pseudalis protect --copy <file or folder>...   writes the anonymized copy beside each one,
                                                        "name (anonymized).ext"
+        pseudalis protect --no-tags ...                writes the values without their tags: the
+                                                       original comes back while the service keeps it
         pseudalis restore <file or folder>...          puts the original back in the place of each one
         pseudalis restore --copy <file or folder>...   writes the original beside each one,
                                                        "name (restored).ext"
@@ -33,6 +35,10 @@
     The results go to the icon of the session, which notifies them together; without the
     icon, a message box tells them, and from a console they are printed there.  The exit
     code is 0 when every file was processed, 1 otherwise.
+
+    The Explorer starts the command once for each file of a selection, of up to 100 files:
+    the processes take their turn, two at a time, so that a large selection does not hold
+    the service at once.
 */
 
 #include "ui.h"
@@ -587,7 +593,7 @@ namespace pseudalis
         class commands
         {
         public:
-            explicit commands(bool copy) : copy_(copy)
+            commands(bool copy, bool tags) : copy_(copy), tags_(tags)
             {
                 json info;
                 std::string error;
@@ -643,7 +649,9 @@ namespace pseudalis
                     return o;
                 }
                 service_client::raw_answer a;
-                if (!client_.post_bytes("/v1/anonymize?source=shell&name=" + query_value(name), data, a, error))
+                // With or without tags, as the command says, whatever the settings of the service.
+                if (!client_.post_bytes("/v1/anonymize?source=shell&tags=" + std::string(tags_ ? "true" : "false") +
+                                        "&name=" + query_value(name), data, a, error))
                     return failure(name, error_text(failed_answer(json(), error)));
                 if (a.status != 200) return answer_failure(name, a);
                 const std::string made = header(a, "x-pseudalis-name");
@@ -690,8 +698,9 @@ namespace pseudalis
                     client_.send("POST", "/v1/records/" + std::to_string(record) + "/location", body, out, error);
                 }
                 const std::string shown = narrow(file_of(target));
-                outcome o = success(tr_count(moved ? "shell_protected" : "shell_protected_copy", values,
-                    { { "f", shown } }), shown);
+                const char* key = moved ? (tags_ ? "shell_protected" : "shell_protected_untagged")
+                                        : (tags_ ? "shell_protected_copy" : "shell_protected_copy_untagged");
+                outcome o = success(tr_count(key, values, { { "f", shown } }), shown);
                 o.values = values;
                 return o;
             }
@@ -708,7 +717,8 @@ namespace pseudalis
                 const std::string how = header(a, "x-pseudalis-restored");
                 const std::string original = header(a, "x-pseudalis-name");
                 const json report = json::parse_or_null(header(a, "x-pseudalis-report"));
-                const long long values = report["tags_restored"].as_int(0);
+                // The values of the tags, and those of the substitutes of a file protected without tags.
+                const long long values = report["tags_restored"].as_int(0) + report["substitutes_restored"].as_int(0);
                 // The name of an original kept is the one it had; a name restored from its substitutes
                 // loses the suffix of an anonymized copy.
                 const std::string base = how == "original" && !original.empty()
@@ -974,13 +984,14 @@ namespace pseudalis
                 return folder_outcome(protect, true, top, t);
             }
 
-            static outcome folder_outcome(bool protect, bool copied, const std::wstring& top, const folder_tally& t)
+            outcome folder_outcome(bool protect, bool copied, const std::wstring& top, const folder_tally& t) const
             {
                 const std::string shown = narrow(file_of(top));
                 const char* key = protect ? (copied ? "shell_folder_protected_copy" : "shell_folder_protected")
                                           : (copied ? "shell_folder_restored_copy" : "shell_folder_restored");
-                std::wstring text = tr(key, { { "f", shown },
-                    { "files", narrow(tr_count(protect ? "count_files_anonymized" : "count_files_restored", t.done)) },
+                const char* files = !protect ? "count_files_restored"
+                                             : tags_ ? "count_files_anonymized" : "count_files_anonymized_untagged";
+                std::wstring text = tr(key, { { "f", shown }, { "files", narrow(tr_count(files, t.done)) },
                     { "values", narrow(tr_count("count_values_replaced", t.values)) } });
                 if (t.already) text += L" " + tr_count("shell_folder_already", t.already);
                 if (t.other)
@@ -1013,6 +1024,7 @@ namespace pseudalis
             }
 
             bool copy_;
+            bool tags_;             // the values of the files anonymized keep their tags
             file_stamp stamp_;      // of the file being processed, as it was read
             service_client client_;
             bool online_ = false;
@@ -1062,8 +1074,42 @@ namespace pseudalis
 
         const wchar_t usage[] =
             L"Pseudalis " PSEUDALIS_VERSION L"\r\n"
-            L"  pseudalis protect [--copy] <file or folder>...   anonymize each one, in its place or as a copy\r\n"
+            L"  pseudalis protect [--copy] [--no-tags] <file or folder>...   anonymize each one, in its place or as a "
+            L"copy, with or without tags\r\n"
             L"  pseudalis restore [--copy] <file or folder>...   restore the original, in its place or as a copy";
+
+        /*
+            The turn of this process among those that the Explorer starts for a selection: one of two
+            mutexes of the session, which a process that stops without giving it back leaves to the
+            next.  Without a turn within thirty minutes, the process goes on.
+        */
+        class turn
+        {
+        public:
+            turn()
+            {
+                mutexes_[0] = CreateMutexW(nullptr, FALSE, L"Local\\PseudalisShellTurn0");
+                mutexes_[1] = CreateMutexW(nullptr, FALSE, L"Local\\PseudalisShellTurn1");
+                if (!mutexes_[0] || !mutexes_[1]) return;
+                const DWORD r = WaitForMultipleObjects(2, mutexes_, FALSE, 30 * 60 * 1000);
+                if (r < WAIT_OBJECT_0 + 2)
+                    held_ = static_cast<int>(r - WAIT_OBJECT_0);
+                else if (r >= WAIT_ABANDONED_0 && r < WAIT_ABANDONED_0 + 2)
+                    held_ = static_cast<int>(r - WAIT_ABANDONED_0);
+            }
+            ~turn()
+            {
+                if (held_ >= 0) ReleaseMutex(mutexes_[held_]);
+                for (HANDLE m : mutexes_)
+                    if (m) CloseHandle(m);
+            }
+            turn(const turn&) = delete;
+            turn& operator=(const turn&) = delete;
+
+        private:
+            HANDLE mutexes_[2] = { nullptr, nullptr };
+            int held_ = -1;
+        };
     }
 
 }
@@ -1086,11 +1132,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
     const bool protect = !args.empty() && args[0] == L"protect";
     const bool restore = !args.empty() && args[0] == L"restore";
-    bool copy = false;
+    bool copy = false, tags = true;
     std::vector<std::wstring> files;
     for (size_t i = 1; i < args.size(); ++i)
     {
         if (args[i] == L"--copy") copy = true;
+        else if (args[i] == L"--no-tags") tags = false;
         else files.push_back(args[i]);
     }
     if ((!protect && !restore) || files.empty())
@@ -1100,7 +1147,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         return 2;
     }
 
-    commands c(copy);
+    const turn mine;
+    commands c(copy, tags);
     int code = 0;
     for (const auto& f : files)
     {

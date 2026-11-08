@@ -110,6 +110,16 @@ namespace pseudalis
                 protected values or protected here before its original was forgotten, puts
                 back the values of its tags, its picture markers removed; a text file holding
                 the marker of a known picture gives that picture back.
+
+                Without tags, the values of a file take their substitutes alone, and its
+                record keeps them with the tags they stand for: the copies of the file give
+                back their original, and a copy edited since, known by its NTFS identifier,
+                its values from those substitutes.  Once the record forgotten, its values
+                cannot come back, and a file protected without record never gives them back.
+                A protected file protected again, by a newer engine for instance, keeps the
+                values protected before as they are: its restoration gives back the original
+                of each record of the chain that still keeps it, and the values of the tags
+                of the others.
         !*/
     public:
         service();
@@ -138,9 +148,16 @@ namespace pseudalis
         // The language of the descriptions and of the messages: the setting, else the one of the system.
         std::string language() const;
 
-        // Protects a file; with record, keeps its original (out.record), unless it is larger than history_mb.
+        /*
+            Protects a file; with record, keeps its original (out.record), unless it is larger than
+            history_mb; without tags, its values take their substitutes, which the record keeps.
+            out.report["tags"] tells which, out.report["restorable"] whether the file can be restored.
+            A file protected without tags and protected again, a copy of its protected file or, previous,
+            the record of the version it replaces on the drive, keeps the substitutes of that record as
+            they are, and its record inherits them, which give back the values of its original.
+        */
         bool protect(const std::string& bytes, const std::string& name, const std::string& source, bool record,
-            protect_result& out, user_error& error);
+            bool tags, protect_result& out, user_error& error, long long previous = 0);
         /*!
             The original of a protected file: the original of its record, that of an entry of
             a protected archive when it was extracted from one, a picture from its marker, else
@@ -149,8 +166,12 @@ namespace pseudalis
         !*/
         bool restore(const std::string& bytes, const std::string& name, const std::string& object_id,
             restore_result& out, user_error& error);
-        // The original of record r as restore() gives it: its tags restored when it holds some.
-        bool recorded_original(const file_record& r, restore_result& out, user_error& error);
+        /*
+            The original of record r as restore() gives it: the original of its own record when it is
+            a protected file that a record keeps, eight records deep at most, else its tags and the
+            substitutes that r inherited restored when it holds some.
+        */
+        bool recorded_original(const file_record& r, restore_result& out, user_error& error, int depth = 0);
         /*!
             A file of the drive whose content is an entry of a protected archive that the
             database records, extracted from it, is recorded with the original of that entry,
@@ -164,8 +185,13 @@ namespace pseudalis
         bool protect_name(const std::string& name, std::string& out, user_error& error);
         // A name with the substitutes the database knows given back, or the name as it is.
         std::string restore_name(const std::string& name);
-        // operation: "anonymize_text", "restore_text" or "detect".
-        bool text(const std::string& operation, const std::string& text, json& out, user_error& error);
+        /*
+            operation: "anonymize_text", "restore_text" or "detect".  Without tags, the text keeps no
+            tag and out["substitutions"] lists the substitutes written, which restore_text gives back
+            when substitutions holds them: nothing else keeps them.
+        */
+        bool text(const std::string& operation, const std::string& text, json& out, user_error& error,
+            bool tags = true, const json& substitutions = json());
         /*!
             Deletes a record, its original and the pictures no other record shows.  With a
             reason, "forgotten" when a user asked for it, "expired" when its time is over or
@@ -221,7 +247,11 @@ namespace pseudalis
         void background_loop();
         // The lookup of the engine: the tags recorded for a substitute.
         std::function<std::vector<std::string>(const std::string&)> substitute_lookup();
+        // Records the substitutes of the names and the properties of a result of the engine.
         bool record_substitutes(const json& result, user_error& error);
+        // The substitutes of the text of record, or those it inherited alone, as the engine reads them.
+        json text_substitutes_of(long long record, bool inherited_only = false);
+        json text_substitutes_of_inherited(long long record) { return text_substitutes_of(record, true); }
 
         std::string program_dir_, data_dir_, admin_token_;
         int port_ = 8444;

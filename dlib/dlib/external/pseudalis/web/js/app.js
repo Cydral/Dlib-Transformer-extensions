@@ -78,6 +78,67 @@
     return e;
   }
 
+  /* A window of the application over the page, in place of those of the browser: its title, its text and
+     its buttons, {title, text, confirm, cancel, danger}.  Escape and a click beside it close it as its
+     cancel button does; the focus goes back where it was.  Resolves with true for the confirm button. */
+  function dialog(o) {
+    return new Promise(function (resolve) {
+      if (typeof HTMLDialogElement !== 'function') {
+        resolve(o.cancel ? window.confirm(o.text) : (window.alert(o.text), true));
+        return;
+      }
+      const previous = document.activeElement;
+      const d = el('dialog', 'modal');
+      d.setAttribute('aria-labelledby', 'modal-title');
+      d.setAttribute('aria-describedby', 'modal-text');
+      if (o.cancel) d.setAttribute('role', 'alertdialog');
+      const title = el('h3', '', o.title || '');
+      title.id = 'modal-title';
+      const text = el('p', '', o.text || '');
+      text.id = 'modal-text';
+      const buttons = el('div', 'buttons');
+      let result = false;
+      const close = function (value) {
+        result = value;
+        d.close();
+      };
+      let no = null;
+      if (o.cancel) {
+        no = el('button', 'secondary', o.cancel);
+        no.type = 'button';
+        no.addEventListener('click', function () { close(false); });
+        buttons.appendChild(no);
+      }
+      const yes = el('button', o.danger ? 'danger' : '', o.confirm || t('btn_close'));
+      yes.type = 'button';
+      yes.addEventListener('click', function () { close(true); });
+      buttons.appendChild(yes);
+      d.appendChild(title);
+      d.appendChild(text);
+      d.appendChild(buttons);
+      d.addEventListener('click', function (e) {
+        // A click on its buttons, from the keyboard too (at 0, 0), is theirs.
+        if (e.target !== d) return;
+        const r = d.getBoundingClientRect();
+        if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) close(!o.cancel);
+      });
+      d.addEventListener('close', function () {
+        d.remove();
+        if (previous && previous.focus) previous.focus();
+        resolve(result);
+      });
+      document.body.appendChild(d);
+      d.showModal();
+      // The choice that changes nothing takes the focus first.
+      (no || yes).focus();
+    });
+  }
+
+  // A failure told in a window of the application.
+  function failureDialog(text) {
+    return dialog({ title: t('dialog_error'), text: text, confirm: t('btn_close') });
+  }
+
   // ---------------------------------------------------------------------------------------
   // The status of the service.
 
@@ -333,8 +394,10 @@
   function protectDetail(body) {
     const report = body.report || {};
     let s = tn('values', report.total || 0);
+    if (report.tags === false) s += ', ' + t('protected_untagged');
     const dropped = (report.dropped || []).length;
     if (dropped) s += ', ' + tn('dropped', dropped);
+    if (report.restorable === false) s += ', ' + t('not_restorable');
     return s;
   }
 
@@ -344,7 +407,7 @@
     if (body.restored === 'original') return t('restored_original');
     if (body.restored === 'picture') return t('restored_picture');
     const report = body.report || {};
-    let s = tn('restored_tags', report.tags_restored || 0);
+    let s = tn('restored_tags', (report.tags_restored || 0) + (report.substitutes_restored || 0));
     const forgotten = report.original_forgotten;
     if (forgotten && /^\d{4}-\d{2}-\d{2}$/.test(forgotten.date || '')) {
       const p = forgotten.date.split('-').map(Number);
@@ -389,9 +452,18 @@
 
   wire('protect-drop', 'protect-input', 'protect-folder', function (item) {
     const keep = document.getElementById('keep').checked;
-    send(item, 'v1/anonymize?format=json&source=web&record=' + (keep ? 'true' : 'false'),
-      document.getElementById('protect-results'), protectDetail).then(refreshStatus);
+    const tags = document.getElementById('tags').checked;
+    send(item, 'v1/anonymize?format=json&source=web&record=' + (keep ? 'true' : 'false') + '&tags=' +
+      (tags ? 'true' : 'false'), document.getElementById('protect-results'), protectDetail).then(refreshStatus);
   });
+
+  // Without tags and without the originals kept, the files protected cannot come back: the card says so.
+  function protectOptions() {
+    document.getElementById('no-restore').hidden =
+      document.getElementById('keep').checked || document.getElementById('tags').checked;
+  }
+  document.getElementById('keep').addEventListener('change', protectOptions);
+  document.getElementById('tags').addEventListener('change', protectOptions);
   wire('restore-drop', 'restore-input', 'restore-folder', function (item) {
     send(item, 'v1/restore?format=json', document.getElementById('restore-results'), restoreDetail);
   });
@@ -410,6 +482,12 @@
     'MAC|URL|DATE|PLATE|GEO|TITLE|GENDER|NATIONALITY):[^\\[\\]]{1,4096}?#[0-9A-Z]{3}\\]\\]', 'g');
   // The values just restored, in UTF-16 units of the text, until the text changes.
   let restoredMarks = null;
+  /* The substitutes of the texts protected without tags in this page, which alone gives their values back:
+     they leave with the page. */
+  const textSubstitutions = [];
+  const textSubstitutionKeys = new Set();
+  // The protected values of the text as the service placed them, in UTF-16 units: tags and substitutes.
+  let protectedMarks = null;
 
   function markKind(type) {
     if (type === 'ORG') return 'org';
@@ -454,6 +532,8 @@
     let spans = [];
     if (restoredMarks) {
       spans = restoredMarks;
+    } else if (protectedMarks) {
+      spans = protectedMarks.slice();
     } else {
       tagPattern.lastIndex = 0;
       for (let m = tagPattern.exec(text); m; m = tagPattern.exec(text))
@@ -479,6 +559,7 @@
 
   textArea.addEventListener('input', function () {
     restoredMarks = null;
+    protectedMarks = null;
     renderMarks();
   });
   textArea.addEventListener('scroll', syncMarks);
@@ -487,12 +568,15 @@
 
   async function textRoute(route) {
     const out = document.getElementById('text-result');
+    const request = { text: textArea.value };
+    if (route === 'v1/text/anonymize') request.tags = document.getElementById('text-tags').checked;
+    if (route === 'v1/text/restore' && textSubstitutions.length) request.substitutions = textSubstitutions;
     let r;
     try {
       r = await fetch(route, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: textArea.value })
+        body: JSON.stringify(request)
       });
     } catch (e) {
       out.hidden = false;
@@ -515,10 +599,22 @@
     // Protect and Restore: the result takes the place of the text.
     out.hidden = true;
     textArea.value = body.text.replace(/\r\n?/g, '\n');
+    (body.substitutions || []).forEach(function (x) {
+      const key = x.substitute + '\u0000' + x.tag;
+      if (textSubstitutionKeys.has(key) || textSubstitutions.length >= 100000) return;
+      textSubstitutionKeys.add(key);
+      textSubstitutions.push({ substitute: x.substitute, tag: x.tag });
+    });
     restoredMarks = route === 'v1/text/restore' ? unitSpans(body.text, body.restored) : null;
     if (restoredMarks && !restoredMarks.length) restoredMarks = null;
+    // The substitutes of a text without tags are coloured where the service found them.
+    protectedMarks = route === 'v1/text/anonymize' && body.substitutions ? unitSpans(body.text, body.tags) : null;
     renderMarks();
   }
+
+  document.getElementById('text-tags').addEventListener('change', function () {
+    document.getElementById('text-untagged').hidden = document.getElementById('text-tags').checked;
+  });
 
   document.getElementById('text-protect').addEventListener('click', function () { textRoute('v1/text/anonymize'); });
   document.getElementById('text-restore').addEventListener('click', function () { textRoute('v1/text/restore'); });
@@ -566,6 +662,8 @@
       tr.appendChild(el('td', 'name', r.original_name));
       tr.appendChild(el('td', '', new Date(r.created).toLocaleString(language)));
       const source = el('td', '', t('source_' + r.source));
+      // Protected without tags: its values come back from this record alone.
+      if (r.tags === false) source.appendChild(el('div', 'note', t('records_untagged')));
       // A file that left the drive: its original stays until a day, or without limit of time.
       if (r.forgotten) {
         const until = new Date(r.forgotten).toLocaleDateString(language);
@@ -611,29 +709,36 @@
     try {
       answer = await adminFetch('v1/records/' + r.id + '/original');
     } catch (e) {
-      window.alert(t('s_offline'));
+      await failureDialog(t('s_offline'));
       return;
     }
     if (!answer.ok) {
       const body = await answer.json().catch(function () { return null; });
-      window.alert(errorText(body, answer.status));
+      await failureDialog(errorText(body, answer.status));
       return;
     }
     save(await answer.blob(), r.original_name);
   }
 
   async function forgetRecord(r) {
-    if (!window.confirm(t('confirm_forget', { f: r.original_name }))) return;
+    const sure = await dialog({
+      title: t('forget_title'),
+      text: t(r.tags === false ? 'confirm_forget_untagged' : 'confirm_forget', { f: r.original_name }),
+      cancel: t('btn_cancel'),
+      confirm: t('btn_forget'),
+      danger: true
+    });
+    if (!sure) return;
     let answer;
     try {
       answer = await adminFetch('v1/records/' + r.id, { method: 'DELETE' });
     } catch (e) {
-      window.alert(t('s_offline'));
+      await failureDialog(t('s_offline'));
       return;
     }
     if (!answer.ok) {
       const body = await answer.json().catch(function () { return null; });
-      window.alert(errorText(body, answer.status));
+      await failureDialog(errorText(body, answer.status));
     }
     await loadRecords(false);
     refreshStatus();
@@ -695,12 +800,14 @@
     document.getElementById('set-history').value = s.history_mb;
     document.getElementById('set-albireo').checked = s.albireo !== 'off';
     document.getElementById('set-updates').checked = !!s.check_updates;
+    document.getElementById('set-tags').checked = s.tags !== false;
   }
 
   // The settings that the card shows, by their name in the interface, with the key of their label.
   const settingLabels = {
     language: 'set_language', drive_letter: 'set_drive', date_order: 'set_dates', max_file_mb: 'set_max',
-    removed_days: 'set_removed', history_mb: 'set_history', albireo: 'set_albireo', check_updates: 'set_updates'
+    removed_days: 'set_removed', history_mb: 'set_history', albireo: 'set_albireo', check_updates: 'set_updates',
+    tags: 'set_tags'
   };
 
   // A whole number of a field, or null when it holds none: the service refuses it with its range.
@@ -718,7 +825,8 @@
       removed_days: wholeNumber('set-removed'),
       history_mb: wholeNumber('set-history'),
       albireo: document.getElementById('set-albireo').checked ? 'auto' : 'off',
-      check_updates: document.getElementById('set-updates').checked
+      check_updates: document.getElementById('set-updates').checked,
+      tags: document.getElementById('set-tags').checked
     }, 'PUT');
     if (!r.ok) {
       const b = r.body || {};
@@ -732,6 +840,15 @@
     message('settings-message', t(r.body.restart ? 'saved_restart' : 'saved'));
     loadSettings();
     refreshStatus();
+    applyTagsDefault(r.body.tags !== false);
+  }
+
+  // The options of the cards follow the setting of the tags, which the page reads at its start.
+  function applyTagsDefault(tags) {
+    document.getElementById('tags').checked = tags;
+    document.getElementById('text-tags').checked = tags;
+    document.getElementById('text-untagged').hidden = tags;
+    protectOptions();
   }
 
   // ---------------------------------------------------------------------------------------
@@ -886,6 +1003,9 @@
     translate();
   });
   translate();
+  fetch('v1/info', { cache: 'no-store' }).then(function (r) { return r.json(); })
+    .then(function (info) { if (info && info.tags === false) applyTagsDefault(false); })
+    .catch(function () { /* the service does not answer: the options keep their tags */ });
   startAdmin();
   setInterval(refreshStatus, 15000);
 })();

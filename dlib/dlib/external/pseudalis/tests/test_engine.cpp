@@ -112,9 +112,8 @@ namespace
     }
 
     bool process(psd_engine* e, const std::string& op, const std::string& name, const std::string& data, json& result,
-                 std::string& output, bool pictures = true, bool failure_expected = false)
+                 std::string& output, bool pictures = true, bool failure_expected = false, json req = json::object())
     {
-        json req = json::object();
         req["operation"] = op;
         req["name"] = name;
         psd_buffer r = { nullptr, 0 }, o = { nullptr, 0 }, err = { nullptr, 0 };
@@ -127,12 +126,29 @@ namespace
         psd_free(&r);
         psd_free(&o);
         psd_free(&err);
+        // The substitutes of the names and the properties, as the service records them for any file.
         for (const json& s : result["substitutions"].elements())
         {
+            if (s["text"].as_bool(false)) continue;
             std::vector<std::string>& tags = recorded[s["substitute"].str()];
             if (std::find(tags.begin(), tags.end(), s["tag"].str()) == tags.end()) tags.push_back(s["tag"].str());
         }
         return ok == 1;
+    }
+
+    // The substitutes of the text of a result, without tags, as the record of a file keeps them.
+    json text_substitutes(const json& result)
+    {
+        json list = json::array();
+        for (const json& s : result["substitutions"].elements())
+            if (s["text"].as_bool(false))
+            {
+                json one = json::object();
+                one["substitute"] = s["substitute"];
+                one["tag"] = s["tag"];
+                list.push_back(one);
+            }
+        return list;
     }
 }
 
@@ -700,6 +716,94 @@ int main()
         CHECK(psd_set_terms(e, "[]", 2, &err) == 1);
         psd_free(&err);
         CHECK(process(e, "anonymize_text", "prompt", plain, res, out) && out == plain);
+    }
+
+    // Without tags: substitutes alone, which the substitutes of the record alone give back.
+    {
+        json untagged = json::object();
+        untagged["tags"] = false;
+        std::string bare, restored;
+        CHECK(process(e, "anonymize", "lettre.txt", letter, res, bare, true, false, untagged));
+        CHECK(bare.find("[[") == std::string::npos && bare.find("Dupont") == std::string::npos &&
+              bare.find("06 12 34 56 78") == std::string::npos);
+        const json kept = text_substitutes(res);
+        CHECK(kept.size() >= 3);
+        // Without its substitutes, nothing comes back; with them, the letter.
+        CHECK(process(e, "restore", "lettre.txt", bare, res, restored) && restored == bare &&
+              res["report"]["tags_restored"].as_int() == 0 && res["report"]["substitutes_restored"].as_int() == 0);
+        json known = json::object();
+        known["substitutions"] = kept;
+        CHECK(process(e, "restore", "lettre.txt", bare, res, restored, false, false, known) && restored == letter);
+        CHECK(res["report"]["substitutes_restored"].as_int() == static_cast<long long>(kept.size()));
+        // Protected again with its substitutes known, it stays as it is.
+        json again = known;
+        again["tags"] = false;
+        std::string twice;
+        CHECK(process(e, "anonymize", "lettre.txt", bare, res, twice, true, false, again) && twice == bare);
+        // Protected again with tags, by a newer engine for instance: its old substitutes stay, and come back.
+        json tagged_again = known;
+        std::string mixed, mixed_back;
+        CHECK(process(e, "anonymize", "lettre.txt", "Visa : Hélène Martin.\n" + bare, res, mixed, true, false,
+                      tagged_again));
+        CHECK(mixed.find("Martin") == std::string::npos && mixed.find("[[PERSON:") != std::string::npos);
+        CHECK(process(e, "restore", "lettre.txt", mixed, res, mixed_back, false, false, known));
+        CHECK(mixed_back == "Visa : Hélène Martin.\n" + letter);
+        // Protected with tags, then again without them: its tags give way to substitutes, which come back.
+        std::string tagged_letter, converted, converted_back;
+        CHECK(process(e, "anonymize", "lettre.txt", letter, res, tagged_letter));
+        CHECK(process(e, "anonymize", "lettre.txt", tagged_letter, res, converted, true, false, untagged));
+        CHECK(converted.find("[[") == std::string::npos && converted.find("Dupont") == std::string::npos);
+        json converted_known = json::object();
+        converted_known["substitutions"] = text_substitutes(res);
+        CHECK(process(e, "restore", "lettre.txt", converted, res, converted_back, false, false, converted_known) &&
+              converted_back == letter);
+
+        // A picture: its description takes substitutes too.
+        CHECK(process(e, "anonymize", "photo.png", png, res, bare, true, false, untagged));
+        CHECK(bare.find("[[") == std::string::npos && bare.find("Dupont") == std::string::npos &&
+              bare.find("[Image@") == 0 && text_substitutes(res).size() >= 3);
+
+        // A Word document: the runs of its text, its name with substitutes as with tags.
+        dlib::zip_archive_writer w;
+        w.add("[Content_Types].xml",
+              "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+              "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+              "<Override PartName=\"/word/document.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+              "</Types>");
+        w.add("_rels/.rels", "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+              "package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/"
+              "officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>");
+        w.add("word/document.xml",
+              "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/"
+              "main\"><w:body><w:p><w:r><w:t>Madame Jeanne Marchand habite à Quimper.</w:t></w:r></w:p></w:body>"
+              "</w:document>");
+        const std::string docx = w.finish();
+        CHECK(process(e, "anonymize", "Jeanne Marchand.docx", docx, res, bare, true, false, untagged));
+        const dlib::zip_archive_reader z(bare);
+        const std::string xml = z.contains("word/document.xml") ? z.read("word/document.xml") : std::string();
+        CHECK(xml.find("[[") == std::string::npos && xml.find("Marchand") == std::string::npos &&
+              res["name"].str().find("Marchand") == std::string::npos);
+        json docx_known = json::object();
+        docx_known["substitutions"] = text_substitutes(res);
+        CHECK(process(e, "restore", res["name"].str(), bare, res, restored, false, false, docx_known));
+        const dlib::zip_archive_reader rz(restored);
+        CHECK(rz.contains("word/document.xml") &&
+              rz.read("word/document.xml").find("Madame Jeanne Marchand habite à Quimper.") != std::string::npos &&
+              res["name"].str() == "Jeanne Marchand.docx");
+
+        // A text: its substitutes listed, which the caller keeps to give it back.
+        const std::string prompt = "Résumer le dossier de Jean Dupont, né le 12/03/1980 à Rennes.";
+        CHECK(process(e, "anonymize_text", "text", prompt, res, bare, false, false, untagged));
+        CHECK(bare.find("[[") == std::string::npos && bare.find("Dupont") == std::string::npos &&
+              res["substitutions"].size() >= 2 && res["tags"].size() == res["substitutions"].size());
+        json text_known = json::object();
+        text_known["substitutions"] = res["substitutions"];
+        const std::string answer = "Le dossier de " + bare.substr(bare.find("de ") + 3);
+        CHECK(process(e, "restore_text", "text", bare, res, restored, false, false, text_known) && restored == prompt);
+        CHECK(res["restored"].size() >= 2);
+        CHECK(process(e, "restore_text", "text", answer, res, restored, false, false, text_known) &&
+              restored.find("Jean Dupont") != std::string::npos);
     }
 
     psd_buffer fp = { nullptr, 0 };

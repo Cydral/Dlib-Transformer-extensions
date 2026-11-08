@@ -15,7 +15,8 @@
 # drive, an archive whose original was forgotten coming back and the copies of a file, saves the
 # settings as the web application does, imposes terms, makes room for newer originals, restores from
 # their tags an archive whose picture was forgotten and a text written elsewhere from anonymized
-# values, and stops.
+# values, protects files, a text and the drive without tags, restores files protected twice, and
+# stops.
 # The exit code is the number of failed steps.
 
 set -u
@@ -438,6 +439,103 @@ PY
     record "written elsewhere" PASS "from its tags without the marker, recorded: from its original, values back"
   else record "written elsewhere" FAIL \
     "$(head -c 120 "$WORK/reponse.back.txt") / $(head -c 120 "$WORK/reponse.again.txt")"
+  fi
+  # Without tags: substitutes alone, the original from its record; once forgotten, nothing comes back (410).
+  printf 'nom;prenom;email\nMarchand;Jeanne;jeanne.marchand@exemple.fr\n' > "$WORK/bare.csv"
+  api -X POST --data-binary @"$WORK/bare.csv" -D "$WORK/bare.headers" -o "$WORK/bare.anon.csv" \
+    "$URL/v1/anonymize?name=bare.csv&tags=false&record=true"
+  BARE_ID=$(grep -i '^x-pseudalis-record:' "$WORK/bare.headers" | tr -dc '0-9')
+  api -X POST --data-binary @"$WORK/bare.anon.csv" -o "$WORK/bare.back.csv" "$URL/v1/restore?name=bare.csv"
+  BARE_TAGS=$(records | python3 -c 'import json, sys
+print(next((r["tags"] for r in json.load(sys.stdin)["records"] if str(r["id"]) == sys.argv[1]), "none"))' "$BARE_ID")
+  api -X DELETE -H "X-Pseudalis-Admin: $TOKEN" -o /dev/null "$URL/v1/records/$BARE_ID"
+  BARE_GONE=$(api -X POST --data-binary @"$WORK/bare.anon.csv" -o "$WORK/bare.gone.json" -w '%{http_code}' \
+    "$URL/v1/restore?name=bare.csv")
+  if ! grep -q -e '\[\[' -e Marchand "$WORK/bare.anon.csv" && cmp -s "$WORK/bare.csv" "$WORK/bare.back.csv" &&
+     [ "$BARE_TAGS" = False ] && [ "$BARE_GONE" = 410 ] && grep -q '"code":"tagless_forgotten"' "$WORK/bare.gone.json"
+  then
+    record "files without tags" PASS "from the record, the record says so, forgotten: refused (410)"
+  else record "files without tags" FAIL "$(head -c 100 "$WORK/bare.anon.csv") / tags $BARE_TAGS / $BARE_GONE"
+  fi
+  # Without tags and without record: nothing can come back, which the report tells.
+  printf 'nom;prenom;email\nLemoine;Paul;paul.lemoine@exemple.fr\n' > "$WORK/bare2.csv"
+  api -X POST --data-binary @"$WORK/bare2.csv" -D "$WORK/bare2.headers" -o "$WORK/bare2.anon.csv" \
+    "$URL/v1/anonymize?name=bare2.csv&tags=false&record=false"
+  BARE2=$(api -X POST --data-binary @"$WORK/bare2.anon.csv" -o /dev/null -w '%{http_code}' \
+    "$URL/v1/restore?name=bare2.csv")
+  if [ "$BARE2" = 404 ] && report_of "$WORK/bare2.headers" | grep -q '"restorable":false'; then
+    record "without tags nor record" PASS "nothing kept, not restorable (404)"
+  else record "without tags nor record" FAIL "$BARE2 / $(report_of "$WORK/bare2.headers" | head -c 160)"
+  fi
+  # A text without tags: its substitutes listed, which give it back when they come with it.
+  BARE_TEXT=$(api -X POST -H "Content-Type: application/json" --data "{\"text\": \"$TEXT\", \"tags\": false}" \
+    "$URL/v1/text/anonymize")
+  BARE_BACK=$(printf '%s' "$BARE_TEXT" | python3 -c 'import json, sys
+j = json.load(sys.stdin)
+print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])}))' |
+    api -X POST -H "Content-Type: application/json" --data @- "$URL/v1/text/restore" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["text"])')
+  BARE_WRITTEN=$(printf '%s' "$BARE_TEXT" | python3 -c 'import json, sys; print(json.load(sys.stdin)["text"])')
+  if ! printf '%s' "$BARE_WRITTEN" | grep -q -e '\[\[' -e 'Dupont' && [ "$BARE_BACK" = "$TEXT" ]; then
+    record "text without tags" PASS "substitutes alone, given back with their list"
+  else record "text without tags" FAIL "$(printf '%s' "$BARE_WRITTEN" | head -c 160) / $BARE_BACK"
+  fi
+  # Protected twice, by a newer engine for instance: tagged with its record forgotten, then with or without
+  # tags; without tags with its record kept, then with or without; the values of both come back without warning.
+  printf 'Dossier de Paul Lemaire, paul.lemaire@exemple.fr.\n' > "$WORK/twice.txt"
+  api -X POST --data-binary @"$WORK/twice.txt" -D "$WORK/twice1.headers" -o "$WORK/twice1.txt" \
+    "$URL/v1/anonymize?name=twice.txt&tags=true"
+  T1=$(grep -i '^x-pseudalis-record:' "$WORK/twice1.headers" | tr -dc '0-9')
+  api -X DELETE -H "X-Pseudalis-Admin: $TOKEN" -o /dev/null "$URL/v1/records/$T1"
+  printf 'Visa de Hélène Martin.\n' >> "$WORK/twice1.txt"
+  api -X POST --data-binary @"$WORK/twice1.txt" -o "$WORK/twice2.txt" "$URL/v1/anonymize?name=twice.txt&tags=true"
+  api -X POST --data-binary @"$WORK/twice2.txt" -D "$WORK/twice.back.headers" -o "$WORK/twice.back.txt" \
+    "$URL/v1/restore?name=twice.txt"
+  api -X POST --data-binary @"$WORK/twice1.txt" -o "$WORK/bare4.txt" "$URL/v1/anonymize?name=twice.txt&tags=false"
+  api -X POST --data-binary @"$WORK/bare4.txt" -o "$WORK/bare4.back.txt" "$URL/v1/restore?name=twice.txt"
+  api -X POST --data-binary @"$WORK/twice.txt" -o "$WORK/bare1.txt" "$URL/v1/anonymize?name=twice.txt&tags=false"
+  api -X POST --data-binary @"$WORK/bare1.txt" -o "$WORK/bare2.txt" "$URL/v1/anonymize?name=twice.txt&tags=true"
+  api -X POST --data-binary @"$WORK/bare1.txt" -o "$WORK/bare3.txt" "$URL/v1/anonymize?name=twice.txt&tags=false"
+  api -X POST --data-binary @"$WORK/bare2.txt" -o "$WORK/bare2.back.txt" "$URL/v1/restore?name=twice.txt"
+  api -X POST --data-binary @"$WORK/bare3.txt" -o "$WORK/bare3.back.txt" "$URL/v1/restore?name=twice.txt"
+  TWICE=$(printf 'Dossier de Paul Lemaire, paul.lemaire@exemple.fr.\nVisa de Hélène Martin.')
+  if [ "$(cat "$WORK/twice.back.txt")" = "$TWICE" ] &&
+     cmp -s "$WORK/twice.txt" "$WORK/bare2.back.txt" && cmp -s "$WORK/twice.txt" "$WORK/bare3.back.txt" &&
+     ! grep -q -e '\[\[' -e Lemaire -e Martin "$WORK/bare4.txt" && [ "$(cat "$WORK/bare4.back.txt")" = "$TWICE" ] &&
+     ! grep -q '"code"' "$WORK/twice.back.txt"; then
+    record "protected twice" PASS "tags then with or without, without tags then with or without: the values of both"
+  else record "protected twice" FAIL "$(head -c 120 "$WORK/twice.back.txt") / $(head -c 80 "$WORK/bare2.back.txt")"
+  fi
+  # The drive without tags, as the settings say: its file holds no tag, its original comes back.
+  admin_json PUT /v1/settings '{"tags": false}' > /dev/null
+  printf 'Courrier de Paul Lemaire, 06 11 22 33 44.\n' > "$WORK/courrier.txt"
+  cp "$WORK/courrier.txt" "$DRIVE/courrier.txt"
+  courrier_done() {
+    ! cmp -s "$WORK/courrier.txt" "$DRIVE/courrier.txt" && [ -n "$(record_of "$DRIVE/courrier.txt")" ]
+  }
+  wait_for 60 courrier_done
+  cp "$DRIVE/courrier.txt" "$WORK/courrier.anon.txt"
+  restore_to "$WORK/courrier.anon.txt" "$WORK/courrier.back.txt"
+  DRIVE_TAGS=$(api "$URL/v1/info" | python3 -c 'import json, sys; print(json.load(sys.stdin)["tags"])')
+  # Edited on the drive, as an editor saves it: protected again, its values protected before come back too.
+  { cat "$WORK/courrier.anon.txt"; printf 'Visa de Hélène Martin.\n'; } > "$WORK/courrier.edit.txt"
+  cp "$WORK/courrier.edit.txt" "$DRIVE/courrier.txt"
+  edited_done() {
+    ! cmp -s "$WORK/courrier.edit.txt" "$DRIVE/courrier.txt" && [ -n "$(record_of "$DRIVE/courrier.txt")" ]
+  }
+  wait_for 60 edited_done
+  cp "$DRIVE/courrier.txt" "$WORK/courrier.anon2.txt"
+  restore_to "$WORK/courrier.anon2.txt" "$WORK/courrier.back2.txt"
+  admin_json PUT /v1/settings '{"tags": true}' > /dev/null
+  if ! grep -q -e '\[\[' -e Lemaire "$WORK/courrier.anon.txt" &&
+     cmp -s "$WORK/courrier.txt" "$WORK/courrier.back.txt" && [ "$DRIVE_TAGS" = False ] &&
+     ! grep -q -e '\[\[' -e Martin "$WORK/courrier.anon2.txt" &&
+     [ "$(cat "$WORK/courrier.back2.txt")" = "$(printf 'Courrier de Paul Lemaire, 06 11 22 33 44.\nVisa de %s.' \
+       'Hélène Martin')" ]
+  then
+    record "drive without tags" PASS "the setting followed, the original back, edited: the values of both"
+  else record "drive without tags" FAIL "$(head -c 100 "$WORK/courrier.anon.txt") / $DRIVE_TAGS / \
+    $(head -c 100 "$WORK/courrier.back2.txt")"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

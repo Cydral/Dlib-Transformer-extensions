@@ -39,6 +39,8 @@
       <div class="buttons"><label class="button secondary file"><input type="file" id="protect-folder" webkitdirectory>
         <span data-t="choose_folder"></span></label></div>
       <label class="option"><input type="checkbox" id="keep" checked> <span data-t="keep"></span></label>
+      <label class="option"><input type="checkbox" id="tags" checked> <span data-t="tags_option"></span></label>
+      <p class="hint warn" id="no-restore" data-t="no_restore_hint" hidden></p>
       <ul class="results" id="protect-results"></ul>
     </section>
 
@@ -75,6 +77,8 @@
         <button id="text-restore" class="secondary" data-t="text_restore"></button>
         <button id="text-detect" class="secondary" data-t="text_detect"></button>
       </div>
+      <label class="option"><input type="checkbox" id="text-tags" checked> <span data-t="text_tags"></span></label>
+      <p class="hint" id="text-untagged" data-t="text_untagged_hint" hidden></p>
       <pre id="text-result" class="output" hidden></pre>
     </section>
 
@@ -136,6 +140,7 @@
           <input type="number" id="set-history" min="1" max="1048576" step="1"></label>
       </div>
       <p class="hint" data-t="set_removed_hint"></p>
+      <label class="option"><input type="checkbox" id="set-tags"> <span data-t="set_tags"></span></label>
       <label class="option"><input type="checkbox" id="set-albireo"> <span data-t="set_albireo"></span></label>
       <label class="option"><input type="checkbox" id="set-updates"> <span data-t="set_updates"></span></label>
       <div class="buttons"><button id="settings-save" data-t="btn_save"></button></div>

@@ -294,6 +294,8 @@ namespace dlib
                 - A substitute carries no check: restore() does not read it back. The caller
                   keeps the tag it stands for, *tag_out when tag_out != nullptr, and gives it
                   to find_substitutes() to restore the value.
+                - A value that is a verified tag of type, written by a protection before,
+                  stands for its original value: the substitute is that of the original.
         !*/
 
         struct substitution
@@ -395,6 +397,19 @@ namespace dlib
                 - If report != nullptr, the verified and rejected tags are counted in it.
         !*/
 
+        std::vector<pii_entity> with_tag_entities(
+            const std::string& text,
+            std::vector<pii_entity> entities
+        ) const;
+        /*!
+            ensures
+                - Returns entities, ordered by their beginning, with an entity of its type
+                  added for each verified raw tag of text that no entity overlaps. A text
+                  protected before with tags and protected again without them writes the
+                  substitutes of their values in their place (substitute() reads a verified
+                  tag as its value), and its restoration gives them back with the others.
+        !*/
+
         bool decode(const std::string& tag_text, pii_type& type, std::string& original) const;
         /*!
             ensures
@@ -456,6 +471,15 @@ namespace dlib
         ensures
             - Returns tag with every byte outside [A-Za-z0-9-._~] percent-encoded, the
               form used when a tag replaces part of a URI (hyperlink targets).
+    !*/
+
+    std::string percent_encode_substitute(const std::string& substitute);
+    /*!
+        ensures
+            - Returns substitute with the bytes that a URI cannot hold as they are
+              percent-encoded: the controls, the space, the bytes outside ASCII and
+              "<>\^`{|}, the form used when a substitute replaces part of a URI. The
+              letters, digits and marks of a protected address or link stay as they are.
     !*/
 
 // ----------------------------------------------------------------------------------------

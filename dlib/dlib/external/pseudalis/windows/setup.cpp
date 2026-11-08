@@ -246,8 +246,9 @@ namespace pseudalis
             */
             if (o.context_menu)
                 setup::register_context_menu(o.program_dir, {
-                    { "menu", tr("verb_menu") }, { "protect", tr("verb_protect") },
-                    { "protect_copy", tr("verb_protect_copy") }, { "restore", tr("verb_restore") },
+                    { "menu", tr("verb_menu") }, { "protect", tr("verb_protect_tags") },
+                    { "protect_bare", tr("verb_protect_bare") }, { "protect_copy", tr("verb_protect_copy_tags") },
+                    { "protect_copy_bare", tr("verb_protect_copy_bare") }, { "restore", tr("verb_restore") },
                     { "restore_copy", tr("verb_restore_copy") } }, o.language == "auto");
             else if (update)
                 setup::remove_context_menu();

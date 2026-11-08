@@ -880,6 +880,201 @@ namespace
         DLIB_TEST(read_pdf_text(a.anonymize(pdf, document_format::pdf, plain)).info.empty());
     }
 
+    void test_untagged_text()
+    {
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x38')));
+        pii_detector detector;
+
+        // A text without tags: substitutes alone, listed with their tags, which alone give the values back.
+        const string text = "Contrat de M. Jean Dupont, signé à Rennes le 12/03/2024.\n\n"
+                            "Contact : jean.dupont@exemple.fr, 06 12 34 56 78.\n";
+        document_anonymizer a(p, detector);
+        a.set_untagged_text(true);
+        document_report report;
+        const string out = a.anonymize(text, document_format::text, report);
+        DLIB_TEST_MSG(out.find("[[") == string::npos && out.find("Dupont") == string::npos, out);
+        DLIB_TEST_MSG(out.find("dupont@") == string::npos && out.find("06 12 34 56 78") == string::npos, out);
+        DLIB_TEST(!report.substitutions.empty() && report.substitutions.size() >= report.total_entities());
+        for (const document_substitution& s : report.substitutions)
+            DLIB_TEST_MSG(s.text && out.find(s.substitute) != string::npos && s.tag.compare(0, 2, "[[") == 0,
+                          s.substitute);
+        document_anonymizer b(p, detector);
+        document_report none;
+        DLIB_TEST(b.restore(out, document_format::text, none) == out);
+        DLIB_TEST(none.tags_restored == 0 && none.substitutes_restored == 0);
+        b.set_text_substitute_resolver(resolver_of(report.substitutions));
+        document_report back;
+        const string values = b.restore(out, document_format::text, back);
+        DLIB_TEST_MSG(values == text, values);
+        DLIB_TEST(back.substitutes_restored == report.substitutions.size());
+
+        // Protected again with the substitutes known, the text keeps them as they are.
+        document_anonymizer again(p, detector);
+        again.set_untagged_text(true);
+        again.set_text_substitute_resolver(resolver_of(report.substitutions));
+        document_report second;
+        const string twice = again.anonymize(out, document_format::text, second);
+        DLIB_TEST_MSG(twice == out, twice);
+        DLIB_TEST(second.substitutions.empty());
+
+        // A text holding tags and substitutes, the old values of a file protected again: both come back.
+        const string tagged = p.tag(pii_type::person, "Hélène Martin");
+        const string mixed = "Visa de " + tagged + ". " + out;
+        document_report both;
+        const string mixed_back = b.restore(mixed, document_format::text, both);
+        DLIB_TEST_MSG(mixed_back == "Visa de Hélène Martin. " + text, mixed_back);
+        DLIB_TEST(both.tags_restored == 1 && both.substitutes_restored == report.substitutions.size());
+
+        // A text protected before with tags, by an older engine for instance, and protected again
+        // without them: its tags take the substitutes of their values, given back with the others.
+        DLIB_TEST(p.substitute(pii_type::person, tagged) == p.substitute(pii_type::person, "Hélène Martin"));
+        DLIB_TEST(p.substitute(pii_type::organization, tagged) != p.substitute(pii_type::person, "Hélène Martin"));
+        const string old_tags = "Visa de " + tagged + ".\n\n" + text;
+        document_report converted;
+        const string bare = a.anonymize(old_tags, document_format::text, converted);
+        DLIB_TEST_MSG(bare.find("[[") == string::npos && bare.find("Martin") == string::npos &&
+                      bare.find("Dupont") == string::npos, bare);
+        DLIB_TEST(bare.find(p.substitute(pii_type::person, "Hélène Martin")) != string::npos);
+        document_anonymizer bare_back(p, detector);
+        bare_back.set_text_substitute_resolver(resolver_of(converted.substitutions));
+        document_report bare_report;
+        const string bare_values = bare_back.restore(bare, document_format::text, bare_report);
+        DLIB_TEST_MSG(bare_values == "Visa de Hélène Martin.\n\n" + text, bare_values);
+        // A tag that an entity overlaps stays out; the others join the entities in text order.
+        const string two = "ab" + tagged + " cd " + tagged;
+        std::vector<pii_entity> one(1);
+        one[0].begin = 2;
+        one[0].end = 10;
+        one[0].type = pii_type::location;
+        const std::vector<pii_entity> with = p.with_tag_entities(two, one);
+        DLIB_TEST(with.size() == 2 && with[0].type == pii_type::location && with[1].type == pii_type::person);
+        DLIB_TEST(with[1].begin == two.size() - tagged.size() && with[1].end == two.size());
+        DLIB_TEST(p.with_tag_entities("Jean [[PERSON:abc#XYZ]]", one).size() == 1);
+
+        // The cells of a CSV file.
+        const string csv = "nom;prenom;email\nDupont;Jean;jean.dupont@exemple.fr\nMartin;Hélène;h.martin@exemple.fr\n";
+        document_report creport;
+        const string cout_ = a.anonymize(csv, document_format::delimited, creport);
+        DLIB_TEST_MSG(cout_.find("[[") == string::npos && cout_.find("Dupont") == string::npos, cout_);
+        document_anonymizer c(p, detector);
+        c.set_text_substitute_resolver(resolver_of(creport.substitutions));
+        document_report cback;
+        const string cvalues = c.restore(cout_, document_format::delimited, cback);
+        DLIB_TEST_MSG(cvalues == csv, cvalues);
+
+        // Markup: the text and a link, whose substitute stays a valid address.
+        const string html = "<html><body><p>Écrire à <a href=\"mailto:jean.dupont@exemple.fr\">M. Jean Dupont</a>."
+                            "</p></body></html>";
+        document_report hreport;
+        const string hout = a.anonymize(html, document_format::markup, hreport);
+        DLIB_TEST_MSG(hout.find("[[") == string::npos && hout.find("Dupont") == string::npos, hout);
+        DLIB_TEST_MSG(hout.find("href=\"mailto:") != string::npos && hout.find("%5B") == string::npos, hout);
+        document_anonymizer h(p, detector);
+        h.set_text_substitute_resolver(resolver_of(hreport.substitutions));
+        document_report hback;
+        const string hvalues = h.restore(hout, document_format::markup, hback);
+        DLIB_TEST_MSG(hvalues == html, hvalues);
+
+        // A Word document: the runs of its text.
+        zip_archive_writer w;
+        w.add("[Content_Types].xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+              "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+              "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+              "<Override PartName=\"/word/document.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+              "</Types>");
+        w.add("_rels/.rels",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+              "<Relationship Id=\"rId1\" "
+              "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+              "Target=\"word/document.xml\"/></Relationships>");
+        w.add("word/document.xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>"
+              "<w:p><w:r><w:t>Je soussigné, M. Jean </w:t></w:r><w:r><w:t>Dupont, demeurant à Rennes, atteste.</w:t>"
+              "</w:r></w:p><w:sectPr/></w:body></w:document>");
+        const string docx = w.finish();
+        document_report dreport;
+        const string dout = a.anonymize(docx, document_format::docx, dreport);
+        const string body = zip_archive_reader(dout).read("word/document.xml");
+        DLIB_TEST_MSG(body.find("[[") == string::npos && body.find("Dupont") == string::npos, body);
+        document_anonymizer d(p, detector);
+        d.set_text_substitute_resolver(resolver_of(dreport.substitutions));
+        document_report dback;
+        const string dtext =
+            zip_archive_reader(d.restore(dout, document_format::docx, dback)).read("word/document.xml");
+        // A value written across runs comes back in the first one, as from its tag.
+        DLIB_TEST_MSG(dtext.find("<w:t>Je soussigné, M. Jean Dupont</w:t>") != string::npos &&
+                      dtext.find("<w:t>, demeurant à Rennes, atteste.</w:t>") != string::npos, dtext);
+        DLIB_TEST(dback.substitutes_restored == dreport.substitutions.size() && dback.tags_restored == 0);
+        // Its tags, written by a protection before, take substitutes too.
+        zip_archive_writer w2;
+        w2.add("[Content_Types].xml", zip_archive_reader(docx).read("[Content_Types].xml"));
+        w2.add("_rels/.rels", zip_archive_reader(docx).read("_rels/.rels"));
+        w2.add("word/document.xml",
+               "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+               "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>"
+               "<w:p><w:r><w:t>Visa de " + tagged + ", demeurant à Rennes.</w:t></w:r></w:p><w:sectPr/>"
+               "</w:body></w:document>");
+        document_report treport;
+        const string tout = a.anonymize(w2.finish(), document_format::docx, treport);
+        const string tbody = zip_archive_reader(tout).read("word/document.xml");
+        DLIB_TEST_MSG(tbody.find("[[") == string::npos && tbody.find("Martin") == string::npos, tbody);
+        document_anonymizer t(p, detector);
+        t.set_text_substitute_resolver(resolver_of(treport.substitutions));
+        document_report tback;
+        const string ttext =
+            zip_archive_reader(t.restore(tout, document_format::docx, tback)).read("word/document.xml");
+        DLIB_TEST_MSG(ttext.find("<w:t>Visa de Hélène Martin, demeurant à Rennes.</w:t>") != string::npos, ttext);
+
+        // A PDF: the text of its pages.
+        pdf_text_document source;
+        source.pages.resize(1);
+        source.pages[0].x1 = 595;
+        source.pages[0].y1 = 842;
+        std::vector<std::vector<pdf_text_segment>> lines(1);
+        pdf_text_segment seg;
+        seg.text = "Je soussigné, M. Jean Dupont, demeurant à Rennes, atteste.";
+        seg.x = 72;
+        seg.y = 700;
+        seg.font_size = 11;
+        seg.width = 330;
+        lines[0].push_back(seg);
+        const string pdf = write_pdf_text(source, lines);
+        document_report preport;
+        const string pout = a.anonymize(pdf, document_format::pdf, preport);
+        string pall;
+        for (const auto& page : layout_pdf_text(read_pdf_text(pout)))
+            for (const pdf_text_segment& ps : page) pall += ps.text + " ";
+        DLIB_TEST_MSG(pall.find("[[") == string::npos && pall.find("Dupont") == string::npos, pall);
+        document_anonymizer q(p, detector);
+        q.set_text_substitute_resolver(resolver_of(preport.substitutions));
+        document_report pback;
+        string prestored;
+        for (const auto& page : layout_pdf_text(read_pdf_text(q.restore(pout, document_format::pdf, pback))))
+            for (const pdf_text_segment& ps : page) prestored += ps.text + " ";
+        DLIB_TEST_MSG(prestored.find("M. Jean Dupont") != string::npos && prestored.find("Rennes") != string::npos,
+                      prestored);
+        // Its tags, each in one piece of its text, take substitutes too.
+        lines[0][0].text = "Visa de " + tagged + ", demeurant à Rennes.";
+        document_report p2report;
+        const string p2out = a.anonymize(write_pdf_text(source, lines), document_format::pdf, p2report);
+        string p2all;
+        for (const auto& page : layout_pdf_text(read_pdf_text(p2out)))
+            for (const pdf_text_segment& ps : page) p2all += ps.text + " ";
+        DLIB_TEST_MSG(p2all.find("[[") == string::npos && p2all.find("Martin") == string::npos, p2all);
+        document_anonymizer q2(p, detector);
+        q2.set_text_substitute_resolver(resolver_of(p2report.substitutions));
+        document_report p2back;
+        string p2restored;
+        for (const auto& page : layout_pdf_text(read_pdf_text(q2.restore(p2out, document_format::pdf, p2back))))
+            for (const pdf_text_segment& ps : page) p2restored += ps.text + " ";
+        DLIB_TEST_MSG(p2restored.find("Visa de Hélène Martin") != string::npos, p2restored);
+    }
+
     // A PDF written by hand, its objects numbered from 1, with a cross-reference table.
     string pdf_file(const std::vector<string>& objects)
     {
@@ -3559,6 +3754,7 @@ namespace
             test_office_document();
             print_spinner();
             test_untagged_values();
+            test_untagged_text();
             print_spinner();
             test_pdf_document();
             test_pdf_layout();

@@ -22,9 +22,12 @@
     keeps the text it read for an indirect string ("@pseudalis.exe,-511"): new identifiers make it
     read these tables again.
 */
-#define IDS_VERB_PROTECT 511
-#define IDS_VERB_PROTECT_COPY 512
 #define IDS_VERB_RESTORE 513
 #define IDS_VERB_RESTORE_COPY 514
+// The protections with or without tags, from version 1.0.5, in place of 511 and 512.
+#define IDS_VERB_PROTECT_TAGS 515
+#define IDS_VERB_PROTECT_BARE 516
+#define IDS_VERB_PROTECT_COPY_TAGS 517
+#define IDS_VERB_PROTECT_COPY_BARE 518
 
 #endif // PSEUDALIS_WINDOWS_RESOURCE_H_

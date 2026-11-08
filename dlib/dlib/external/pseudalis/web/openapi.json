@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -69,7 +69,7 @@
      "Service"
     ],
     "summary": "The state of the service",
-    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drive, Albireo, the number of originals kept (records) and the space they take: {\"bytes\", \"limit\"} in history, limit being history_mb of the settings.",
+    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drive, Albireo, the number of originals kept (records) and the space they take: {\"bytes\", \"limit\"} in history, limit being history_mb of the settings. tags tells whether the files take their tags unless a request says otherwise.",
     "responses": {
      "200": {
       "description": "The state",
@@ -90,7 +90,7 @@
      "Files"
     ],
     "summary": "Protect a file",
-    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have. A file of any other extension, or without extension, is protected as a text when its content is text through and through: no binary signature, the measures of a text, every character decoded with no control character but the tabulation, the ends of lines and the form feed, and no encoded part: a block of base64, base64url or hexadecimal digits (1024 characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or of a program too), data or JSON in base64, bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or marks among them), a message with parts in base64, quoted-printable or uuencode or with encoded words, an RTF document, a vCard or an iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a string too, uuencode or ASCII85, and, by its first line, a PostScript program or an export of the registry; without extension, a picture, an Office document, an archive or a PDF is also taken by its signature. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch), and so is a text of another extension that holds an encoded part (code encoded_content). Their content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed, its values replaced by tags as those of the text of its document; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file; the originals first kept are forgotten when the originals would take more than history_mb of the settings, or leave less than 256 MB free on the disk when forgetting them gives that room; a file larger than history_mb is protected without keeping its original (record 0). The imposed terms (/v1/terms) are replaced before any other value is read. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have. A file of any other extension, or without extension, is protected as a text when its content is text through and through: no binary signature, the measures of a text, every character decoded with no control character but the tabulation, the ends of lines and the form feed, and no encoded part: a block of base64, base64url or hexadecimal digits (1024 characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or of a program too), data or JSON in base64, bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or marks among them), a message with parts in base64, quoted-printable or uuencode or with encoded words, an RTF document, a vCard or an iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a string too, uuencode or ASCII85, and, by its first line, a PostScript program or an export of the registry; without extension, a picture, an Office document, an archive or a PDF is also taken by its signature. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch), and so is a text of another extension that holds an encoded part (code encoded_content). Their content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed, its values replaced by tags as those of the text of its document; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. With tags=false, every value of the file takes its substitute in the same way, the descriptions of its pictures included, and the file holds no tag: its record keeps the substitutes of its text with their tags, and its values come back only while that record lasts (/v1/restore); without record, nothing gives them back, which the report tells (\"tags\": false, \"restorable\": false). Without the parameter, the setting tags decides. A protected file protected again, by a newer engine for instance, keeps the values protected before as they are, the substitutes that its record keeps included; with tags=false, its tags give way to the substitutes of their values, which its record keeps. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file; the originals first kept are forgotten when the originals would take more than history_mb of the settings, or leave less than 256 MB free on the disk when forgetting them gives that room; a file larger than history_mb is protected without keeping its original (record 0). The imposed terms (/v1/terms) are replaced before any other value is read. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -109,6 +109,15 @@
       "schema": {
        "type": "boolean",
        "default": true
+      }
+     },
+     {
+      "name": "tags",
+      "in": "query",
+      "required": false,
+      "description": "false writes the values without their tags, their substitutes alone; true writes the tags. Without it, the setting tags (true by default) decides",
+      "schema": {
+       "type": "boolean"
       }
      },
      {
@@ -205,7 +214,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding the marker of a picture the vault keeps (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. A protected file whose original was forgotten, at the request of a user, at the end of its time after the file left the drive or to make room for newer originals, and a file written elsewhere from protected values, an answer of a language model for instance, are restored from their tags; the report then gives \"original_forgotten\": {\"date\", \"reason\"} for the first, the reason \"forgotten\", \"expired\" or \"space\". A restoration from the tags cannot give a picture back: the markers of the pictures leave the document (its runs, the gray text boxes of its slides, the texts over the gray boxes of a PDF, which stay), the text files of pictures leave an archive, and \"pictures_removed\" counts them. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected (code not_protected), or when it is the text file of a picture the vault does not keep (code picture_missing); 410 when that picture was forgotten (code picture_forgotten), its date in args.date. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding the marker of a picture the vault keeps (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. A file protected without tags gives back its original while its record lasts, a copy edited since, known by its object identifier, the values of the substitutes that its record keeps (tags then counts them with the tags, in \"substitutes_restored\"). The original of a file protected again is a protected file itself: the original that its own record keeps comes back in its place, and the values of its tags otherwise, so that the values of both protections come back. A protected file whose original was forgotten, at the request of a user, at the end of its time after the file left the drive or to make room for newer originals, and a file written elsewhere from protected values, an answer of a language model for instance, are restored from their tags; the report then gives \"original_forgotten\": {\"date\", \"reason\"} for the first, the reason \"forgotten\", \"expired\" or \"space\". A restoration from the tags cannot give a picture back: the markers of the pictures leave the document (its runs, the gray text boxes of its slides, the texts over the gray boxes of a PDF, which stay), the text files of pictures leave an archive, and \"pictures_removed\" counts them. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected (code not_protected), or when it is the text file of a picture the vault does not keep (code picture_missing); 410 when that picture was forgotten (code picture_forgotten), its date in args.date. 410 too when the file was protected without tags and its original was forgotten, its values gone with its record (code tagless_forgotten), the date in args.date. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -421,6 +430,10 @@
         "properties": {
          "text": {
           "type": "string"
+         },
+         "tags": {
+          "type": "boolean",
+          "description": "false writes the values without their tags, their substitutes alone, listed in the answer (substitutions); without it, the setting tags decides."
          }
         },
         "required": [
@@ -428,14 +441,14 @@
         ]
        },
        "example": {
-        "text": "Jean Dupont habite 12 rue des Lilas à Rennes."
+        "text": "Jean Dupont habite 12 rue des Lilas \u00e0 Rennes."
        }
       }
      }
     },
     "responses": {
      "200": {
-      "description": "{\"text\", \"report\", \"tags\": [{\"begin\", \"end\", \"type\"}]}",
+      "description": "{\"text\", \"report\", \"tags\": [{\"begin\", \"end\", \"type\"}], \"substitutions\": [{\"substitute\", \"tag\", \"text\"}] without tags}",
       "content": {
        "application/json": {
         "schema": {
@@ -468,7 +481,27 @@
              }
             }
            },
-           "description": "The tags written in the text, in their order. Empty when the text is not UTF-8 or holds more than 100000 of them."
+           "description": "The tags written in the text, or without tags its substitutes, in their order. Empty when the text is not UTF-8 or holds more than 100000 of them."
+          },
+          "substitutions": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "substitute": {
+              "type": "string",
+              "description": "The value as written, without its tag."
+             },
+             "tag": {
+              "type": "string",
+              "description": "The tag it stands for, encrypted under the key of this installation."
+             },
+             "text": {
+              "type": "boolean"
+             }
+            }
+           },
+           "description": "Without tags: each substitute written, with its tag. Nothing else keeps them: /v1/text/restore gives the values back when they come with the text."
           }
          }
         }
@@ -488,7 +521,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The imposed terms (/v1/terms) are replaced before any other value is read. The answer gives the places of the tags written (\"tags\"), which the web application colours by type."
+    "description": "The body is {\"text\"}, with \"tags\" false for a text without tags: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The imposed terms (/v1/terms) are replaced before any other value is read. The answer gives the places of the tags written (\"tags\"), which the web application colours by type."
    }
   },
   "/v1/text/restore": {
@@ -496,7 +529,7 @@
     "tags": [
      "Texts"
     ],
-    "summary": "Restore the tags of a text",
+    "summary": "Restore the tags and the substitutes of a text",
     "requestBody": {
      "required": true,
      "content": {
@@ -506,6 +539,21 @@
         "properties": {
          "text": {
           "type": "string"
+         },
+         "substitutions": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {
+            "substitute": {
+             "type": "string"
+            },
+            "tag": {
+             "type": "string"
+            }
+           }
+          },
+          "description": "The substitutes of a text protected without tags, as /v1/text/anonymize listed them: their values come back with those of the tags. A list that is not an array is refused (400, code bad_request)."
          }
         },
         "required": [
@@ -570,7 +618,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "The body is {\"text\"}: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The answer gives the places of the values restored (\"restored\"), which the web application underlines."
+    "description": "The body is {\"text\"}, with \"substitutions\" for a text protected without tags: a JSON object, refused otherwise (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy). The answer gives the places of the values restored (\"restored\"), which the web application underlines."
    }
   },
   "/v1/text/detect": {
@@ -876,7 +924,7 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "Each record gives its file (original_name, output_name, sizes, kind, output_sha256, object_id, path) and, when its file left the drive, the time it left (removed) and the time its original is forgotten (forgotten), removed_days later, empty when removed_days is 0 and the original stays without limit of time. total counts the records of the source asked, or all of them. The originals first kept are forgotten whatever their time when they take more than history_mb, or when a new original would leave less than 256 MB free on the disk and forgetting them gives that room."
+    "description": "Each record gives its file (original_name, output_name, sizes, kind, output_sha256, object_id, path), whether its protected file holds tags (tags, false for a file protected without tags, whose values come back from this record alone) and, when its file left the drive, the time it left (removed) and the time its original is forgotten (forgotten), removed_days later, empty when removed_days is 0 and the original stays without limit of time. total counts the records of the source asked, or all of them. The originals first kept are forgotten whatever their time when they take more than history_mb, or when a new original would leave less than 256 MB free on the disk and forgetting them gives that room."
    }
   },
   "/v1/records/{id}/original": {
@@ -1519,6 +1567,10 @@
       "maximum": 1048576,
       "default": 10240,
       "description": "The space the originals kept may take, in MB, max_file_mb at least: beyond it, the originals first kept are forgotten, the oldest first (reason space), and so they are when a new original would leave less than 256 MB free on the disk of the data folder and forgetting them would give that room; an original larger than the space is not kept. A settings.json of a version before 1.0.2, without this member, takes the maximum, and its 30 days of removed_days become 45"
+     },
+     "tags": {
+      "type": "boolean",
+      "description": "Whether the values of the files of the drive, of the web application and of the interface take their tags (true by default); false writes their substitutes alone, which the record of a file alone gives back while it lasts. The parameter tags of a request decides for it."
      },
      "check_updates": {
       "type": "boolean"

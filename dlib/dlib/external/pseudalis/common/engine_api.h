@@ -21,6 +21,11 @@
         "name"          the name of the file, whose extension tells its kind when its
                         content does not
         "entry"         "extract": the path of an entry in the archive given as data
+        "tags"          "anonymize" and "anonymize_text": false writes each value of the text
+                        as its substitute, without its tag (true by default)
+        "substitutions" [{"substitute", "tag"}]: the substitutes of the text of a file or of
+                        a text protected without tags, which "restore" and "restore_text" give
+                        back and "anonymize" leaves as they are
     result receives a JSON object: "name" (the name of the output, protected or restored:
     "photo.png.txt" for a picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx",
     "pdf", "image", "zip", "tar", "tar.gz" or "text"), "report" ({"values": {type: count},
@@ -30,8 +35,9 @@
     document)}), "pictures"
     (the identifiers of the pictures found) and, for "anonymize" and "anonymize_name",
     "substitutions" ([{"substitute", "tag"}]: the values written without their tags in the
-    names and the properties, which the caller records for "restore"); "spans" for
-    "detect".  output receives the bytes of the file written.  "anonymize_name" and
+    names and the properties, which the caller records for "restore", and, "text": true, in
+    the text without tags, once for each place); "substitutions" too for "anonymize_text"
+    without tags; "spans" for "detect".  output receives the bytes of the file written.  "anonymize_name" and
     "restore_name" take a name alone as data, a folder for instance, and give the new name
     as output and as "name".
     "anonymize" of an archive also gives "entries", each entry written: [{"original" (its

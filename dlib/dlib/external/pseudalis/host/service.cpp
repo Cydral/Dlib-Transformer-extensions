@@ -449,6 +449,8 @@ namespace pseudalis
         engine["avx2"] = cpu_has_avx2();
         j["engine"] = engine;
         j["key_fingerprint"] = key_fingerprint_;
+        // Whether the files take their tags unless a request says otherwise.
+        j["tags"] = settings_ ? settings_->get().tags : true;
         {
             std::lock_guard<std::mutex> lock(counts_m_);
             const auto now = std::chrono::steady_clock::now();
@@ -475,7 +477,7 @@ namespace pseudalis
     }
 
     bool service::protect(const std::string& bytes, const std::string& name, const std::string& source, bool record,
-                          protect_result& out, user_error& error)
+                          bool tags, protect_result& out, user_error& error, long long previous)
     {
         std::shared_lock<std::shared_timed_mutex> work(work_m_);
         if (key_replaced_)
@@ -538,6 +540,25 @@ namespace pseudalis
         json request = json::object();
         request["operation"] = "anonymize";
         request["name"] = name;
+        request["tags"] = tags;
+        /* A file protected here without tags, protected again, by a newer engine for instance, or
+           edited on the drive: the substitutes that its record keeps stay as they are, and the new
+           record inherits them, which give back the values of its original. */
+        std::vector<long long> sources;
+        {
+            file_record before;
+            if (db_->find_by_output(sha256_hex(bytes), before) && !before.tags) sources.push_back(before.id);
+            if (previous > 0 && db_->get_file(previous, before) && !before.tags &&
+                std::find(sources.begin(), sources.end(), previous) == sources.end())
+                sources.push_back(previous);
+            json known = json::array();
+            for (long long id : sources)
+            {
+                const json list = text_substitutes_of(id);
+                for (const json& one : list.elements()) known.push_back(one);
+            }
+            if (!known.empty()) request["substitutions"] = known;
+        }
         json result;
         std::string e;
         if (!engine_->process(request, bytes, result, out.bytes, pictures, e, substitute_lookup()))
@@ -550,8 +571,24 @@ namespace pseudalis
         out.report = result["report"];
         out.sha256 = sha256_hex(out.bytes);
         out.record = 0;
+        /* A protected file that holds nothing more to protect comes back as it is: the record that keeps
+           its original stays the only one of its content, so that its restoration still reaches it. */
+        if (record && out.bytes == bytes)
+        {
+            file_record known;
+            if (db_->find_by_output(out.sha256, known))
+            {
+                out.record = known.id;
+                record = false;
+            }
+        }
         // The substitutes of the names and the properties come back through their tags, kept here.
         if (!record_substitutes(result, error)) return false;
+        // Without tags, the substitutes of the text, which the record of the file alone keeps.
+        std::vector<std::pair<std::string, std::string>> text_made;
+        for (const json& one : result["substitutions"].elements())
+            if (one["text"].as_bool(false))
+                text_made.push_back(std::make_pair(one["substitute"].str(), one["tag"].str()));
         // An original larger than the space of the originals is not kept: the file is protected without record.
         if (record && !make_room(bytes.size())) record = false;
         if (record)
@@ -573,6 +610,7 @@ namespace pseudalis
             r.original_size = static_cast<long long>(bytes.size());
             r.output_size = static_cast<long long>(out.bytes.size());
             r.kind = out.kind;
+            r.tags = tags;
             std::vector<entry_record> entries;
             for (const json& w : result["entries"].elements())
             {
@@ -588,6 +626,8 @@ namespace pseudalis
                 out.record = db_->add_file(r);
                 for (const json& id : result["pictures"].elements()) db_->link_picture(out.record, id.str());
                 db_->add_entries(out.record, entries);
+                db_->add_text_substitutes(out.record, text_made);
+                for (long long id : sources) db_->copy_text_substitutes(id, out.record, true);
                 counts_changed();
             }
             catch (const std::exception& x)
@@ -599,6 +639,9 @@ namespace pseudalis
                 return false;
             }
         }
+        // Without tags and without record, nothing gives the values of the file back.
+        out.report["tags"] = tags;
+        out.report["restorable"] = tags || out.record > 0;
         return true;
     }
 
@@ -616,7 +659,7 @@ namespace pseudalis
         }
     }
 
-    bool service::recorded_original(const file_record& r, restore_result& out, user_error& error)
+    bool service::recorded_original(const file_record& r, restore_result& out, user_error& error, int depth)
     {
         if (!vault_->get(r.original_blob, out.bytes))
         {
@@ -627,18 +670,40 @@ namespace pseudalis
         out.how = "original";
         out.record = r.id;
         out.report = json::object();
+        /* The original of a file protected again, by a newer engine for instance, is a protected file
+           itself: the original that its own record keeps comes back in its place, so that the values
+           protected before come back with the others, with or without tags. */
+        file_record before;
+        if (depth < 8 && db_->find_by_output(sha256_hex(out.bytes), before) && before.id != r.id)
+        {
+            restore_result inner;
+            user_error unused;
+            if (recorded_original(before, inner, unused, depth + 1))
+            {
+                wipe(out.bytes);
+                out.bytes = std::move(inner.bytes);
+                out.name = inner.name;
+                out.report = inner.report;
+                return true;
+            }
+        }
         /* The original of a protected file edited on the drive, or of a file written elsewhere
            from protected values, is that file: the tags it kept are restored too, with the
            substitutes of its properties, and the markers of its pictures leave it, as from any
            restoration without the original.  The parts of an Office document, of a PDF or of an
            archive are compressed: only a text shows its tags to a search. */
         const bool text = r.kind == "txt" || r.kind == "csv" || r.kind == "xml" || r.kind == "text";
+        /* The substitutes that a protection without tags wrote in the original before, which the record
+           inherited: those of its own protection are not in its original, which they would change. */
+        const json inherited = text_substitutes_of_inherited(r.id);
         if (engine_ && r.kind != "image" &&
-            (!text || out.bytes.find("[[") != std::string::npos || out.bytes.find("[Image@") != std::string::npos))
+            (!text || !inherited.empty() || out.bytes.find("[[") != std::string::npos ||
+             out.bytes.find("[Image@") != std::string::npos))
         {
             json request = json::object(), result;
             request["operation"] = "restore";
             request["name"] = r.original_name;
+            if (!inherited.empty()) request["substitutions"] = inherited;
             std::string restored, e;
             const bool done =
                 engine_->process(request, out.bytes, result, restored, nullptr, e, substitute_lookup());
@@ -721,12 +786,15 @@ namespace pseudalis
         r.original_size = static_cast<long long>(bytes.size());
         r.output_size = size;
         r.kind = e.kind;
+        r.tags = archive.tags;
         wipe(bytes);
         try
         {
             record = db_->add_file(r);
             // An archive extracted from the archive keeps the entries inside it, for the files extracted from it.
             db_->add_entries(record, db_->entries_inside(e));
+            // Without tags, the substitutes of the archive, which hold those of the entry.
+            if (!archive.tags) db_->copy_text_substitutes(archive.id, record);
             counts_changed();
         }
         catch (const std::exception& x)
@@ -755,8 +823,10 @@ namespace pseudalis
            since. */
         int64_t when = 0;
         std::string reason;
+        bool forgotten_tags = true;
         const bool tracked = db_->find_by_object(object_id, r);
-        const bool forgotten = db_->find_forgotten(sha, tracked ? std::string() : object_id, when, reason);
+        const bool forgotten = db_->find_forgotten(sha, tracked ? std::string() : object_id, when, reason,
+                                                   &forgotten_tags);
         const std::string day = forgotten ? iso_time(when).substr(0, 10) : std::string();
         // A file extracted from a protected archive: the entry of the original archive.
         entry_record entry;
@@ -812,6 +882,8 @@ namespace pseudalis
         json request = json::object();
         request["operation"] = "restore";
         request["name"] = name;
+        // A file protected without tags and edited since, known by its object identifier: its substitutes.
+        if (tracked && !r.tags) request["substitutions"] = text_substitutes_of(r.id);
         json result;
         std::string e;
         if (!engine_->process(request, bytes, result, out.bytes, nullptr, e, substitute_lookup()))
@@ -820,8 +892,18 @@ namespace pseudalis
             return false;
         }
         out.report = result["report"];
-        if (!forgotten && out.report["tags_restored"].as_int(0) == 0 &&
-            out.report["substitutes_restored"].as_int(0) == 0 && out.report["pictures_removed"].as_int(0) == 0)
+        const bool values =
+            out.report["tags_restored"].as_int(0) > 0 || out.report["substitutes_restored"].as_int(0) > 0;
+        /* Protected without tags, a file whose record was forgotten gives no value back: its substitutes
+           alone are left, which nothing reads any more. */
+        if (forgotten && !forgotten_tags && !values)
+        {
+            wipe(out.bytes);
+            error.set("this file was protected without tags and its original was forgotten on " + day +
+                      ": its values cannot come back", "tagless_forgotten").arg("date", day);
+            return false;
+        }
+        if (!forgotten && !values && out.report["pictures_removed"].as_int(0) == 0)
         {
             error.set("this file holds no value that Pseudalis protected with this key", "not_protected");
             return false;
@@ -859,11 +941,32 @@ namespace pseudalis
         };
     }
 
+    json service::text_substitutes_of(long long record, bool inherited_only)
+    {
+        json list = json::array();
+        try
+        {
+            for (const auto& t : db_->text_substitutes(record, inherited_only))
+            {
+                json one = json::object();
+                one["substitute"] = t.first;
+                one["tag"] = t.second;
+                list.push_back(one);
+            }
+        }
+        catch (const std::exception& x)
+        {
+            log_error("substitutes: " + std::string(x.what()));
+        }
+        return list;
+    }
+
     bool service::record_substitutes(const json& result, user_error& error)
     {
         std::vector<std::pair<std::string, std::string>> made;
+        // Those of the text, without tags, belong to the record of their file alone.
         for (const json& s : result["substitutions"].elements())
-            made.push_back(std::make_pair(s["substitute"].str(), s["tag"].str()));
+            if (!s["text"].as_bool(false)) made.push_back(std::make_pair(s["substitute"].str(), s["tag"].str()));
         try
         {
             db_->add_substitutes(made);
@@ -913,7 +1016,8 @@ namespace pseudalis
         return out;
     }
 
-    bool service::text(const std::string& operation, const std::string& text, json& out, user_error& error)
+    bool service::text(const std::string& operation, const std::string& text, json& out, user_error& error,
+                       bool tags, const json& substitutions)
     {
         if (!engine_)
         {
@@ -923,6 +1027,8 @@ namespace pseudalis
         json request = json::object();
         request["operation"] = operation;
         request["name"] = "text";
+        request["tags"] = tags;
+        if (substitutions.is_array()) request["substitutions"] = substitutions;
         json result;
         std::string output, e;
         if (!engine_->process(request, text, result, output, nullptr, e))
@@ -941,6 +1047,7 @@ namespace pseudalis
             out["report"] = result["report"];
             if (result.contains("tags")) out["tags"] = result["tags"];
             if (result.contains("restored")) out["restored"] = result["restored"];
+            if (result.contains("substitutions")) out["substitutions"] = result["substitutions"];
         }
         return true;
     }

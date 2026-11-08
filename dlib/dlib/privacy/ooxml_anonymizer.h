@@ -315,6 +315,11 @@ namespace dlib
 
         void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
         void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
+        void set_untagged_text(bool untagged) { untagged_text_ = untagged; }
+        void set_text_substitute_resolver(const pseudonymizer::substitute_resolver& resolve)
+        {
+            text_resolve_ = resolve;
+        }
         void set_picture_text_finder(const document_picture_text_finder& find) { pictures_ = find; }
 
         std::string anonymize(const std::string& package_bytes)
@@ -337,6 +342,61 @@ namespace dlib
 
     private:
         typedef privacy_impl::ooxml_ns ns;
+
+        // The protected form of a value of the text: its tag, or its substitute listed in the report.
+        std::string text_value(pii_type type, const std::string& value)
+        {
+            if (!untagged_text_) return p_.tag(type, value);
+            document_substitution s;
+            s.substitute = p_.substitute(type, value, &s.tag);
+            s.text = true;
+            report_.substitutions.push_back(s);
+            return s.substitute;
+        }
+
+        std::string text_values(const std::string& text, const std::vector<pii_entity>& entities)
+        {
+            if (!untagged_text_) return p_.apply(text, entities);
+            std::vector<pseudonymizer::substitution> made;
+            const std::string out = p_.apply_substitutes(text, entities, &made);
+            for (const pseudonymizer::substitution& s : made)
+                report_.substitutions.push_back(document_substitution{ s.substitute, s.tag, true });
+            return out;
+        }
+
+        // The entities but those that cover a substitute the text resolver knows.
+        std::vector<pii_entity> without_known(const std::string& text, std::vector<pii_entity> entities) const
+        {
+            if (!text_resolve_ || entities.empty()) return entities;
+            const std::vector<pseudonymizer::substitute_occurrence> known = p_.find_substitutes(text, text_resolve_);
+            if (known.empty()) return entities;
+            std::vector<pii_entity> out;
+            for (const pii_entity& e : entities)
+            {
+                bool written = false;
+                for (const auto& o : known)
+                    if (e.begin < o.end && o.begin < e.end) written = true;
+                if (!written) out.push_back(e);
+            }
+            return out;
+        }
+
+        /* The entities of a text to protect: those found but those that cover a known substitute, and,
+           without tags, the tags of a text protected before with them, whose values take substitutes. */
+        std::vector<pii_entity> to_write(const std::string& text, std::vector<pii_entity> entities) const
+        {
+            entities = without_known(text, std::move(entities));
+            return untagged_text_ ? p_.with_tag_entities(text, std::move(entities)) : entities;
+        }
+
+        std::string with_text_substitutes(const std::string& text)
+        {
+            if (!text_resolve_) return text;
+            pseudonymizer::restore_report sr;
+            const std::string out = p_.restore_substitutes(text, text_resolve_, &sr);
+            report_.substitutes_restored += sr.restored;
+            return out;
+        }
 
         struct text_node
         {
@@ -1688,12 +1748,12 @@ namespace dlib
                          it->second == pii_type::iban || it->second == pii_type::payment_card) &&
                         !c.v_text.empty() && c.v_text.find_first_not_of("0123456789") == std::string::npos)
                     {
-                        const std::string tag = p_.tag(it->second, c.v_text);
+                        const std::string written = text_value(it->second, c.v_text);
                         report_.count(it->second);
                         std::string cell = "<c";
                         for (const auto& a : c.attrs)
                             if (a.first != "t") cell += " " + a.first + "=\"" + a.second + "\"";
-                        cell += " t=\"inlineStr\"><is><t>" + xml_escape_text(tag) + "</t></is></c>";
+                        cell += " t=\"inlineStr\"><is><t>" + xml_escape_text(written) + "</t></is></c>";
                         st.edits.replace(c.c_begin, c.c_end, cell);
                         continue;
                     }
@@ -1767,6 +1827,20 @@ namespace dlib
                 std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
                 report_.tags_restored += rr.restored - std::min(inside, rr.restored);
                 report_.tags_rejected += rr.rejected;
+                // The substitutes of an untagged text, outside its tags and the texts of its pictures.
+                if (!property && text_resolve_)
+                {
+                    for (const auto& o : p_.find_substitutes(u.text, text_resolve_))
+                    {
+                        bool covered = false;
+                        for (const span& s : edits)
+                            if (o.begin < s.e && s.b < o.end) covered = true;
+                        if (covered) continue;
+                        edits.push_back(span{ o.begin, o.end, o.original });
+                        ++report_.substitutes_restored;
+                    }
+                    std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
+                }
                 if (property)
                 {
                     pseudonymizer::restore_report sr;
@@ -1805,7 +1879,7 @@ namespace dlib
             }
             else
             {
-                for (const pii_entity& e : detector_->detect(u.text, u.ctx))
+                for (const pii_entity& e : to_write(u.text, detector_->detect(u.text, u.ctx)))
                 {
                     if (p_.keeps_in_clear(e.type)) continue;
                     report_.count(e.type);
@@ -1819,7 +1893,7 @@ namespace dlib
                         std::size_t pb = b, pe = cut;
                         while (pb < pe && u.text[pb] == ' ') ++pb;
                         while (pe > pb && u.text[pe - 1] == ' ') --pe;
-                        if (pe > pb) edits.push_back(span{ pb, pe, p_.tag(e.type, u.text.substr(pb, pe - pb)) });
+                        if (pe > pb) edits.push_back(span{ pb, pe, text_value(e.type, u.text.substr(pb, pe - pb)) });
                         b = cut;
                         if (cut >= e.end) break;
                     }
@@ -1964,16 +2038,16 @@ namespace dlib
                         if (restoring_)
                         {
                             pseudonymizer::restore_report rr;
-                            value = p_.restore(inner, &rr);
+                            value = with_text_substitutes(p_.restore(inner, &rr));
                             report_.tags_restored += rr.restored;
                             report_.tags_rejected += rr.rejected;
                         }
                         else
                         {
                             std::vector<pii_entity> found;
-                            for (const pii_entity& e : detector_->detect(inner))
+                            for (const pii_entity& e : to_write(inner, detector_->detect(inner)))
                                 if (!p_.keeps_in_clear(e.type)) { found.push_back(e); report_.count(e.type); }
-                            value = p_.apply(inner, found);
+                            value = text_values(inner, found);
                         }
                     }
                     out.push_back(c);
@@ -2165,7 +2239,10 @@ namespace dlib
                                 for (const pii_entity& e : ents)
                                 {
                                     out += value.substr(pos, e.begin - pos);
-                                    out += percent_encode_tag(p_.tag(e.type, value.substr(e.begin, e.end - e.begin)));
+                                    const std::string written =
+                                        text_value(e.type, value.substr(e.begin, e.end - e.begin));
+                                    out += untagged_text_ ? percent_encode_substitute(written)
+                                                          : percent_encode_tag(written);
                                     pos = e.end;
                                     report_.count(e.type);
                                 }
@@ -2177,7 +2254,7 @@ namespace dlib
                     else if (external)
                     {
                         pseudonymizer::restore_report rr;
-                        const std::string back = p_.restore(value, &rr);
+                        const std::string back = with_text_substitutes(p_.restore(value, &rr));
                         if (back != value)
                             edits.replace(target->value_begin, target->value_end, xml_escape_attribute(back));
                         report_.tags_restored += rr.restored;
@@ -2356,6 +2433,8 @@ namespace dlib
         zip_limits limits_;
         bool untagged_properties_ = false;
         pseudonymizer::substitute_resolver resolve_;
+        bool untagged_text_ = false;
+        pseudonymizer::substitute_resolver text_resolve_;
         document_picture_text_finder pictures_;
         const ooxml_package* pkg_ = nullptr;
         std::map<std::string, std::string> described_;     // image part -> text of the describer

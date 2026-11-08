@@ -128,6 +128,12 @@ namespace pseudalis
             s["total"] = report["total"];
             s["dropped"] = static_cast<unsigned long long>(report["dropped"].size());
             s["tags_restored"] = report["tags_restored"];
+            // A protection: whether its values keep their tags, and whether anything can give them back.
+            if (report["tags"].is_bool()) s["tags"] = report["tags"];
+            if (report["restorable"].is_bool()) s["restorable"] = report["restorable"];
+            // A restoration: the substitutes of a file protected without tags given back.
+            if (report["substitutes_restored"].as_int(0) > 0)
+                s["substitutes_restored"] = report["substitutes_restored"];
             // A restoration from the tags: the pictures it removed, the day and the reason of a forgetting.
             if (report["pictures_removed"].as_int(0) > 0) s["pictures_removed"] = report["pictures_removed"];
             if (report["original_forgotten"].is_object()) s["original_forgotten"] = report["original_forgotten"];
@@ -176,6 +182,8 @@ namespace pseudalis
             j["output_sha256"] = r.output_sha256;
             j["object_id"] = r.object_id;
             j["path"] = r.path;
+            // Whether its protected file holds tags: without them, its values come back from this record alone.
+            j["tags"] = r.tags;
             // When its file left the drive, and the day its original goes: none when the originals stay (0).
             j["removed"] = r.removed ? iso_time(r.removed) : std::string();
             j["forgotten"] = r.removed && days > 0 ? iso_time(r.removed + static_cast<int64_t>(days) * 86400)
@@ -337,9 +345,12 @@ namespace pseudalis
             const std::string name = clean_name(given.empty() ? filename : given, "document");
             const std::string source = req.get_param_value("source");
             const bool record = req.get_param_value("record") != "false";
+            // Tags unless the request or, without its word, the settings say otherwise.
+            const std::string asked = req.get_param_value("tags");
+            const bool tags = asked == "true" || (asked != "false" && s->settings().get().tags);
             protect_result r;
             user_error e;
-            if (!s->protect(body, name, source == "web" || source == "shell" ? source : "api", record, r, e))
+            if (!s->protect(body, name, source == "web" || source == "shell" ? source : "api", record, tags, r, e))
             {
                 send_error(res, e.code == "file_too_large" ? 413 : 422, e);
                 return;
@@ -366,9 +377,10 @@ namespace pseudalis
             user_error e;
             if (!s->restore(body, name, lower(req.get_param_value("object_id")), r, e))
             {
-                // The picture of a text file, forgotten, is gone for good: 410, not 404.
+                /* The picture of a text file, forgotten, is gone for good, as the values of a file
+                   protected without tags whose original was forgotten: 410, not 404. */
                 send_error(res, e.code == "not_protected" || e.code == "picture_missing" ? 404 :
-                                e.code == "picture_forgotten" ? 410 : 422, e);
+                                e.code == "picture_forgotten" || e.code == "tagless_forgotten" ? 410 : 422, e);
                 return;
             }
             json meta = json::object();
@@ -430,8 +442,15 @@ namespace pseudalis
                 if (!busy_refused(slot, res)) return;
                 json body, out;
                 if (!parse_body(req, res, body)) return;
+                // Tags unless the body or, without "tags", the settings say otherwise.
+                const bool tags = body["tags"].as_bool(s->settings().get().tags);
+                if (body.contains("substitutions") && !body["substitutions"].is_array())
+                {
+                    send_error(res, 400, "substitutions must be a list of {substitute, tag}", "bad_request");
+                    return;
+                }
                 user_error e;
-                if (!s->text(operation, body["text"].str(), out, e))
+                if (!s->text(operation, body["text"].str(), out, e, tags, body["substitutions"]))
                 {
                     send_error(res, 422, e);
                     return;
@@ -601,7 +620,7 @@ namespace pseudalis
                     return;
                 }
             }
-            for (const char* flag : { "check_updates", "trust_authority" })
+            for (const char* flag : { "tags", "check_updates", "trust_authority" })
                 if (body.contains(flag) && !body[flag].is_bool())
                 {
                     user_error e;

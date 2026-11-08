@@ -38,6 +38,7 @@ namespace pseudalis
         j["max_file_mb"] = max_file_mb;
         j["removed_days"] = removed_days;
         j["history_mb"] = history_mb;
+        j["tags"] = tags;
         j["check_updates"] = check_updates;
         j["trust_authority"] = trust_authority;
         // The place of the publication appears only when it differs from the one of the build.
@@ -76,6 +77,7 @@ namespace pseudalis
         s.history_mb = space >= 1 && space <= max_history_mb ? static_cast<int>(space) : max_history_mb;
         // The space holds the largest file at least.
         if (s.history_mb < s.max_file_mb) s.history_mb = s.max_file_mb;
+        s.tags = j["tags"].as_bool(d.tags);
         s.check_updates = j["check_updates"].as_bool(d.check_updates);
         s.trust_authority = j["trust_authority"].as_bool(d.trust_authority);
         s.feed_url = j["feed_url"].str(d.feed_url);

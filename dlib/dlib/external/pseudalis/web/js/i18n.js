@@ -13,7 +13,7 @@ window.PSEUDALIS_TEXTS = {
     restore_title: 'Restore files',
     restore_hint: 'A protected file, or any copy of it, gives back its original; a protected file edited since, a ' +
       'file whose original was forgotten and a file written elsewhere from protected values get their values back ' +
-      'from their tags, without their pictures.',
+      'from their tags, without their pictures. A file protected without tags comes back while its original is kept.',
     drop: 'Drop files or folders here, or click to choose files',
     choose_folder: 'Choose a folder',
     folder_too_big: 'The folder holds too many files, or too many bytes, for one archive.',
@@ -57,7 +57,7 @@ window.PSEUDALIS_TEXTS = {
     records_title: 'Originals kept',
     records_hint: 'The originals of the files protected on this computer, encrypted in its vault. A forgotten ' +
       'original is deleted with its pictures: its protected file is then restored from its tags, which give back ' +
-      'its values but not its pictures.',
+      'its values but not its pictures; protected without tags, it can no longer be restored.',
     records_none: 'No original kept.',
     records_removed: 'left the drive, kept until {d}',
     records_more: 'Show more',
@@ -73,6 +73,23 @@ window.PSEUDALIS_TEXTS = {
     btn_forget: 'Forget',
     confirm_forget: 'Forget the original of {f}? It is deleted from the vault with its pictures, and its protected ' +
       'file will be restored from its tags alone, without its pictures.',
+    confirm_forget_untagged: 'Forget the original of {f}? It is deleted from the vault with its pictures; protected ' +
+      'without tags, its file can no longer be restored.',
+    forget_title: 'Forget an original',
+    btn_cancel: 'Cancel',
+    btn_close: 'Close',
+    dialog_error: 'Operation not done',
+    records_untagged: 'protected without tags',
+    tags_option: 'Write the tags of the values, which give them back from any copy with the key of this computer',
+    no_restore_hint: 'Without tags and without the original kept, the protected files cannot be restored.',
+    protected_untagged: 'without tags',
+    not_restorable: 'it cannot be restored',
+    text_tags: 'Write the tags',
+    text_untagged_hint: 'Without tags, this page alone restores the text, while it stays open.',
+    set_tags: 'Write the tags of the values in the files of the drive, of the web application and of the ' +
+      'interface (without them, a file comes back only while its original is kept)',
+    err_tagless_forgotten: 'This file was protected without tags and its original was forgotten on {date}: its ' +
+      'values cannot come back.',
     key_title: 'Key of this computer',
     key_hint: 'This key restores every file protected here. Export it, protected by a passphrase of 12 characters ' +
       'or more, and keep the export away from this computer: without it, a new installation restores nothing.',
@@ -172,7 +189,8 @@ window.PSEUDALIS_TEXTS = {
     restore_title: 'Restaurer des fichiers',
     restore_hint: 'Un fichier protégé, ou toute copie de celui-ci, rend son original ; un fichier protégé modifié ' +
       'depuis, un fichier dont l’original a été oublié et un fichier écrit ailleurs à partir de valeurs protégées ' +
-      'retrouvent leurs valeurs par leurs balises, sans leurs images.',
+      'retrouvent leurs valeurs par leurs balises, sans leurs images. Un fichier protégé sans balises revient tant ' +
+      'que son original est conservé.',
     drop: 'Déposez des fichiers ou des dossiers ici, ou cliquez pour choisir des fichiers',
     choose_folder: 'Choisir un dossier',
     folder_too_big: 'Le dossier contient trop de fichiers, ou trop d’octets, pour une archive.',
@@ -216,7 +234,7 @@ window.PSEUDALIS_TEXTS = {
     records_title: 'Originaux conservés',
     records_hint: 'Les originaux des fichiers protégés sur cet ordinateur, chiffrés dans son coffre. Un original ' +
       'oublié est supprimé avec ses images : son fichier protégé est alors restauré par ses balises, qui rendent ' +
-      'ses valeurs mais pas ses images.',
+      'ses valeurs mais pas ses images ; protégé sans balises, il ne peut plus être restauré.',
     records_none: 'Aucun original conservé.',
     records_removed: 'retiré du lecteur, conservé jusqu’au {d}',
     records_more: 'Afficher plus',
@@ -232,6 +250,23 @@ window.PSEUDALIS_TEXTS = {
     btn_forget: 'Oublier',
     confirm_forget: 'Oublier l’original de {f} ? Il est supprimé du coffre avec ses images, et son fichier protégé ' +
       'ne sera plus restauré que par ses balises, sans ses images.',
+    confirm_forget_untagged: 'Oublier l’original de {f} ? Il est supprimé du coffre avec ses images ; protégé sans ' +
+      'balises, son fichier ne pourra plus être restauré.',
+    forget_title: 'Oublier un original',
+    btn_cancel: 'Annuler',
+    btn_close: 'Fermer',
+    dialog_error: 'Opération impossible',
+    records_untagged: 'protégé sans balises',
+    tags_option: 'Écrire les balises des valeurs, qui les rendent depuis toute copie avec la clé de cet ordinateur',
+    no_restore_hint: 'Sans balises ni original conservé, les fichiers protégés ne pourront pas être restaurés.',
+    protected_untagged: 'sans balises',
+    not_restorable: 'il ne pourra pas être restauré',
+    text_tags: 'Écrire les balises',
+    text_untagged_hint: 'Sans balises, seule cette page restaure le texte, tant qu’elle reste ouverte.',
+    set_tags: 'Écrire les balises des valeurs dans les fichiers du lecteur, de l’application web et de ' +
+      'l’interface (sans elles, un fichier ne revient que tant que son original est conservé)',
+    err_tagless_forgotten: 'Ce fichier a été protégé sans balises et son original a été oublié le {date} : ses ' +
+      'valeurs ne peuvent plus revenir.',
     key_title: 'Clé de cet ordinateur',
     key_hint: 'Cette clé restaure tous les fichiers protégés ici. Exportez-la, protégée par une phrase secrète de ' +
       "12 caractères ou plus, et conservez l'export hors de cet ordinateur : sans lui, une nouvelle installation " +
@@ -333,7 +368,8 @@ window.PSEUDALIS_TEXTS = {
     restore_title: 'Dateien wiederherstellen',
     restore_hint: 'Eine geschützte Datei oder jede Kopie davon gibt ihr Original zurück; eine seither bearbeitete ' +
       'geschützte Datei, eine Datei, deren Original vergessen wurde, und eine anderswo aus geschützten Werten ' +
-      'geschriebene Datei erhalten ihre Werte über ihre Markierungen zurück, ohne ihre Bilder.',
+      'geschriebene Datei erhalten ihre Werte über ihre Markierungen zurück, ohne ihre Bilder. Eine ohne ' +
+      'Markierungen geschützte Datei kehrt zurück, solange ihr Original aufbewahrt wird.',
     drop: 'Dateien oder Ordner hier ablegen oder klicken, um Dateien auszuwählen',
     choose_folder: 'Ordner auswählen',
     folder_too_big: 'Der Ordner enthält zu viele Dateien oder zu viele Bytes für ein Archiv.',
@@ -377,7 +413,8 @@ window.PSEUDALIS_TEXTS = {
     records_title: 'Aufbewahrte Originale',
     records_hint: 'Die Originale der auf diesem Computer geschützten Dateien, verschlüsselt in seinem Tresor. Ein ' +
       'vergessenes Original wird mit seinen Bildern gelöscht: Seine geschützte Datei wird dann über ihre ' +
-      'Markierungen wiederhergestellt, die ihre Werte zurückgeben, aber nicht ihre Bilder.',
+      'Markierungen wiederhergestellt, die ihre Werte zurückgeben, aber nicht ihre Bilder; ohne Markierungen ' +
+      'geschützt, lässt sie sich nicht mehr wiederherstellen.',
     records_none: 'Kein Original aufbewahrt.',
     records_removed: 'vom Laufwerk entfernt, aufbewahrt bis {d}',
     records_more: 'Mehr anzeigen',
@@ -393,6 +430,25 @@ window.PSEUDALIS_TEXTS = {
     btn_forget: 'Vergessen',
     confirm_forget: 'Das Original von {f} vergessen? Es wird mit seinen Bildern aus dem Tresor gelöscht, und seine ' +
       'geschützte Datei wird nur noch über ihre Markierungen wiederhergestellt, ohne ihre Bilder.',
+    confirm_forget_untagged: 'Das Original von {f} vergessen? Es wird mit seinen Bildern aus dem Tresor gelöscht; ' +
+      'ohne Markierungen geschützt, lässt sich seine Datei nicht mehr wiederherstellen.',
+    forget_title: 'Ein Original vergessen',
+    btn_cancel: 'Abbrechen',
+    btn_close: 'Schließen',
+    dialog_error: 'Vorgang nicht möglich',
+    records_untagged: 'ohne Markierungen geschützt',
+    tags_option: 'Die Markierungen der Werte schreiben, die sie aus jeder Kopie mit dem Schlüssel dieses Computers ' +
+      'zurückgeben',
+    no_restore_hint: 'Ohne Markierungen und ohne aufbewahrtes Original lassen sich die geschützten Dateien nicht ' +
+      'wiederherstellen.',
+    protected_untagged: 'ohne Markierungen',
+    not_restorable: 'sie lässt sich nicht wiederherstellen',
+    text_tags: 'Markierungen schreiben',
+    text_untagged_hint: 'Ohne Markierungen stellt nur diese Seite den Text wieder her, solange sie geöffnet bleibt.',
+    set_tags: 'Die Markierungen der Werte in die Dateien des Laufwerks, der Webanwendung und der Schnittstelle ' +
+      'schreiben (ohne sie kehrt eine Datei nur zurück, solange ihr Original aufbewahrt wird)',
+    err_tagless_forgotten: 'Diese Datei wurde ohne Markierungen geschützt und ihr Original am {date} vergessen: ' +
+      'Ihre Werte können nicht zurückkehren.',
     key_title: 'Schlüssel dieses Computers',
     key_hint: 'Dieser Schlüssel stellt alle hier geschützten Dateien wieder her. Exportieren Sie ihn, geschützt ' +
       'durch eine Passphrase von mindestens 12 Zeichen, und bewahren Sie den Export außerhalb dieses Computers ' +
@@ -497,7 +553,8 @@ window.PSEUDALIS_TEXTS = {
     restore_title: 'Ripristinare file',
     restore_hint: 'Un file protetto, o qualsiasi sua copia, restituisce l’originale; un file protetto modificato ' +
       'in seguito, un file il cui originale è stato dimenticato e un file scritto altrove da valori protetti ' +
-      'ritrovano i loro valori dai loro tag, senza le loro immagini.',
+      'ritrovano i loro valori dai loro tag, senza le loro immagini. Un file protetto senza tag torna finché il ' +
+      'suo originale è conservato.',
     drop: 'Trascina qui file o cartelle, o fai clic per scegliere file',
     choose_folder: 'Scegli una cartella',
     folder_too_big: 'La cartella contiene troppi file, o troppi byte, per un archivio.',
@@ -541,7 +598,8 @@ window.PSEUDALIS_TEXTS = {
     records_title: 'Originali conservati',
     records_hint: 'Gli originali dei file protetti su questo computer, cifrati nella sua cassaforte. Un originale ' +
       'dimenticato viene eliminato con le sue immagini: il suo file protetto viene allora ripristinato dai suoi ' +
-      'tag, che restituiscono i suoi valori ma non le sue immagini.',
+      'tag, che restituiscono i suoi valori ma non le sue immagini; protetto senza tag, non può più essere ' +
+      'ripristinato.',
     records_none: 'Nessun originale conservato.',
     records_removed: 'rimosso dall’unità, conservato fino al {d}',
     records_more: 'Mostra altri',
@@ -557,6 +615,23 @@ window.PSEUDALIS_TEXTS = {
     btn_forget: 'Dimentica',
     confirm_forget: 'Dimenticare l’originale di {f}? Viene eliminato dalla cassaforte con le sue immagini, e il ' +
       'suo file protetto sarà ripristinato solo dai suoi tag, senza le sue immagini.',
+    confirm_forget_untagged: 'Dimenticare l’originale di {f}? Viene eliminato dalla cassaforte con le sue immagini; ' +
+      'protetto senza tag, il suo file non potrà più essere ripristinato.',
+    forget_title: 'Dimenticare un originale',
+    btn_cancel: 'Annulla',
+    btn_close: 'Chiudi',
+    dialog_error: 'Operazione non riuscita',
+    records_untagged: 'protetto senza tag',
+    tags_option: 'Scrivere i tag dei valori, che li restituiscono da qualsiasi copia con la chiave di questo computer',
+    no_restore_hint: 'Senza tag e senza l’originale conservato, i file protetti non potranno essere ripristinati.',
+    protected_untagged: 'senza tag',
+    not_restorable: 'non potrà essere ripristinato',
+    text_tags: 'Scrivere i tag',
+    text_untagged_hint: 'Senza tag, solo questa pagina ripristina il testo, finché resta aperta.',
+    set_tags: 'Scrivere i tag dei valori nei file dell’unità, dell’applicazione web e dell’interfaccia (senza di ' +
+      'essi, un file torna solo finché il suo originale è conservato)',
+    err_tagless_forgotten: 'Questo file è stato protetto senza tag e il suo originale è stato dimenticato il {date}: ' +
+      'i suoi valori non possono più tornare.',
     key_title: 'Chiave di questo computer',
     key_hint: 'Questa chiave ripristina tutti i file protetti qui. Esportatela, protetta da una passphrase di ' +
       "almeno 12 caratteri, e conservate l'esportazione lontano da questo computer: senza di essa, una nuova " +
@@ -660,7 +735,8 @@ window.PSEUDALIS_TEXTS = {
     restore_title: 'Restaurar archivos',
     restore_hint: 'Un archivo protegido, o cualquier copia, devuelve su original; un archivo protegido modificado ' +
       'después, un archivo cuyo original se olvidó y un archivo escrito en otro lugar a partir de valores ' +
-      'protegidos recuperan sus valores por sus etiquetas, sin sus imágenes.',
+      'protegidos recuperan sus valores por sus etiquetas, sin sus imágenes. Un archivo protegido sin etiquetas ' +
+      'vuelve mientras se conserve su original.',
     drop: 'Suelte aquí archivos o carpetas, o haga clic para elegir archivos',
     choose_folder: 'Elegir una carpeta',
     folder_too_big: 'La carpeta contiene demasiados archivos, o demasiados bytes, para un archivo ZIP.',
@@ -704,7 +780,7 @@ window.PSEUDALIS_TEXTS = {
     records_title: 'Originales guardados',
     records_hint: 'Los originales de los archivos protegidos en este equipo, cifrados en su caja fuerte. Un ' +
       'original olvidado se elimina con sus imágenes: su archivo protegido se restaura entonces por sus etiquetas, ' +
-      'que devuelven sus valores pero no sus imágenes.',
+      'que devuelven sus valores pero no sus imágenes; protegido sin etiquetas, ya no puede restaurarse.',
     records_none: 'Ningún original guardado.',
     records_removed: 'retirado de la unidad, guardado hasta el {d}',
     records_more: 'Mostrar más',
@@ -720,6 +796,24 @@ window.PSEUDALIS_TEXTS = {
     btn_forget: 'Olvidar',
     confirm_forget: '¿Olvidar el original de {f}? Se elimina de la caja fuerte con sus imágenes, y su archivo ' +
       'protegido solo se restaurará por sus etiquetas, sin sus imágenes.',
+    confirm_forget_untagged: '¿Olvidar el original de {f}? Se elimina de la caja fuerte con sus imágenes; protegido ' +
+      'sin etiquetas, su archivo ya no podrá restaurarse.',
+    forget_title: 'Olvidar un original',
+    btn_cancel: 'Cancelar',
+    btn_close: 'Cerrar',
+    dialog_error: 'Operación imposible',
+    records_untagged: 'protegido sin etiquetas',
+    tags_option: 'Escribir las etiquetas de los valores, que los devuelven desde cualquier copia con la clave de ' +
+      'este equipo',
+    no_restore_hint: 'Sin etiquetas ni original conservado, los archivos protegidos no podrán restaurarse.',
+    protected_untagged: 'sin etiquetas',
+    not_restorable: 'no podrá restaurarse',
+    text_tags: 'Escribir las etiquetas',
+    text_untagged_hint: 'Sin etiquetas, solo esta página restaura el texto, mientras siga abierta.',
+    set_tags: 'Escribir las etiquetas de los valores en los archivos de la unidad, de la aplicación web y de la ' +
+      'interfaz (sin ellas, un archivo solo vuelve mientras se conserve su original)',
+    err_tagless_forgotten: 'Este archivo se protegió sin etiquetas y su original se olvidó el {date}: sus valores ' +
+      'ya no pueden volver.',
     key_title: 'Clave de este equipo',
     key_hint: 'Esta clave restaura todos los archivos protegidos aquí. Expórtela, protegida por una frase de ' +
       'contraseña de 12 caracteres o más, y guarde la exportación fuera de este equipo: sin ella, una nueva ' +

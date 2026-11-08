@@ -518,6 +518,27 @@ namespace dlib
         return out;
     }
 
+    inline std::string percent_encode_substitute(const std::string& substitute)
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        std::string out;
+        for (unsigned char c : substitute)
+        {
+            if (c <= 0x20 || c >= 0x7F || c == '"' || c == '<' || c == '>' || c == '\\' || c == '^' || c == '`' ||
+                c == '{' || c == '|' || c == '}')
+            {
+                out.push_back('%');
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 15]);
+            }
+            else
+            {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+        return out;
+    }
+
 // ----------------------------------------------------------------------------------------
 
     class pseudonymizer
@@ -723,6 +744,11 @@ namespace dlib
 
         std::string substitute(pii_type type, const std::string& value, std::string* tag_out = nullptr) const
         {
+            // A verified tag of the type, written by a protection before, stands for its value.
+            pii_type was = pii_type::none;
+            std::string original;
+            if (value.compare(0, 2, "[[") == 0 && decode(value, was, original) && was == type)
+                return substitute(type, original, tag_out);
             const std::string t = tag(type, value);
             if (tag_out) *tag_out = t;
             std::string shifted;
@@ -874,6 +900,38 @@ namespace dlib
                 found.push_back(o);
             });
             return found;
+        }
+
+        std::vector<pii_entity> with_tag_entities(const std::string& text, std::vector<pii_entity> entities) const
+        {
+            if (text.find("[[") == std::string::npos) return entities;
+            const std::vector<tag_occurrence> tags = find_tags(text);
+            if (tags.empty()) return entities;
+            std::stable_sort(entities.begin(), entities.end(),
+                             [](const pii_entity& a, const pii_entity& b) { return a.begin < b.begin; });
+            std::vector<pii_entity> out;
+            out.reserve(entities.size() + tags.size());
+            std::size_t i = 0, reach = 0;
+            for (const tag_occurrence& o : tags)
+            {
+                // The entities that begin before the end of the tag come first; one that ends past
+                // its beginning covers part of it, and the tag stays out.
+                for (; i < entities.size() && entities[i].begin < o.end; ++i)
+                {
+                    reach = std::max(reach, entities[i].end);
+                    out.push_back(entities[i]);
+                }
+                if (reach > o.begin) continue;
+                pii_entity e;
+                e.begin = o.begin;
+                e.end = o.end;
+                e.type = o.type;
+                e.confidence = 1;
+                out.push_back(e);
+                reach = o.end;
+            }
+            for (; i < entities.size(); ++i) out.push_back(entities[i]);
+            return out;
         }
 
         bool decode(const std::string& tag_text, pii_type& type, std::string& original) const

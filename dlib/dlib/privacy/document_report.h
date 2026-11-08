@@ -21,6 +21,7 @@ namespace dlib
     {
         std::string substitute;
         std::string tag;
+        bool text = false;
     };
 
 // ----------------------------------------------------------------------------------------

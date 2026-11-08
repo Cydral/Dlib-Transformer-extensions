@@ -52,8 +52,10 @@ END
 */
 
 // English.
-#define VERB_PROTECT "Anonymize"
-#define VERB_PROTECT_COPY "Anonymize as a copy"
+#define VERB_PROTECT_TAGS "Anonymize with tags"
+#define VERB_PROTECT_BARE "Anonymize without tags"
+#define VERB_PROTECT_COPY_TAGS "Anonymize as a copy, with tags"
+#define VERB_PROTECT_COPY_BARE "Anonymize as a copy, without tags"
 #define VERB_RESTORE "Restore the original"
 #define VERB_RESTORE_COPY "Restore as a copy"
 LANGUAGE 0x09, 0x01
@@ -62,14 +64,18 @@ LANGUAGE 0x09, 0x02
 #include "shell_verbs.rc2"
 LANGUAGE 0x09, 0x00
 #include "shell_verbs.rc2"
-#undef VERB_PROTECT
-#undef VERB_PROTECT_COPY
+#undef VERB_PROTECT_TAGS
+#undef VERB_PROTECT_BARE
+#undef VERB_PROTECT_COPY_TAGS
+#undef VERB_PROTECT_COPY_BARE
 #undef VERB_RESTORE
 #undef VERB_RESTORE_COPY
 
 // French.
-#define VERB_PROTECT "Anonymiser"
-#define VERB_PROTECT_COPY "Anonymiser dans une copie"
+#define VERB_PROTECT_TAGS "Anonymiser avec balises"
+#define VERB_PROTECT_BARE "Anonymiser sans balises"
+#define VERB_PROTECT_COPY_TAGS "Anonymiser dans une copie, avec balises"
+#define VERB_PROTECT_COPY_BARE "Anonymiser dans une copie, sans balises"
 #define VERB_RESTORE "Restaurer l'original"
 #define VERB_RESTORE_COPY "Restaurer dans une copie"
 LANGUAGE 0x0c, 0x00
@@ -86,14 +92,18 @@ LANGUAGE 0x0c, 0x05
 #include "shell_verbs.rc2"
 LANGUAGE 0x0c, 0x06
 #include "shell_verbs.rc2"
-#undef VERB_PROTECT
-#undef VERB_PROTECT_COPY
+#undef VERB_PROTECT_TAGS
+#undef VERB_PROTECT_BARE
+#undef VERB_PROTECT_COPY_TAGS
+#undef VERB_PROTECT_COPY_BARE
 #undef VERB_RESTORE
 #undef VERB_RESTORE_COPY
 
 // German.
-#define VERB_PROTECT "Anonymisieren"
-#define VERB_PROTECT_COPY "Als Kopie anonymisieren"
+#define VERB_PROTECT_TAGS "Mit Markierungen anonymisieren"
+#define VERB_PROTECT_BARE "Ohne Markierungen anonymisieren"
+#define VERB_PROTECT_COPY_TAGS "Als Kopie mit Markierungen anonymisieren"
+#define VERB_PROTECT_COPY_BARE "Als Kopie ohne Markierungen anonymisieren"
 #define VERB_RESTORE "Original wiederherstellen"
 #define VERB_RESTORE_COPY "Als Kopie wiederherstellen"
 LANGUAGE 0x07, 0x00
@@ -108,14 +118,18 @@ LANGUAGE 0x07, 0x04
 #include "shell_verbs.rc2"
 LANGUAGE 0x07, 0x05
 #include "shell_verbs.rc2"
-#undef VERB_PROTECT
-#undef VERB_PROTECT_COPY
+#undef VERB_PROTECT_TAGS
+#undef VERB_PROTECT_BARE
+#undef VERB_PROTECT_COPY_TAGS
+#undef VERB_PROTECT_COPY_BARE
 #undef VERB_RESTORE
 #undef VERB_RESTORE_COPY
 
 // Italian.
-#define VERB_PROTECT "Anonimizza"
-#define VERB_PROTECT_COPY "Anonimizza in una copia"
+#define VERB_PROTECT_TAGS "Anonimizza con tag"
+#define VERB_PROTECT_BARE "Anonimizza senza tag"
+#define VERB_PROTECT_COPY_TAGS "Anonimizza in una copia, con tag"
+#define VERB_PROTECT_COPY_BARE "Anonimizza in una copia, senza tag"
 #define VERB_RESTORE "Ripristina l'originale"
 #define VERB_RESTORE_COPY "Ripristina in una copia"
 LANGUAGE 0x10, 0x00
@@ -124,14 +138,18 @@ LANGUAGE 0x10, 0x01
 #include "shell_verbs.rc2"
 LANGUAGE 0x10, 0x02
 #include "shell_verbs.rc2"
-#undef VERB_PROTECT
-#undef VERB_PROTECT_COPY
+#undef VERB_PROTECT_TAGS
+#undef VERB_PROTECT_BARE
+#undef VERB_PROTECT_COPY_TAGS
+#undef VERB_PROTECT_COPY_BARE
 #undef VERB_RESTORE
 #undef VERB_RESTORE_COPY
 
 // Spanish.
-#define VERB_PROTECT "Anonimizar"
-#define VERB_PROTECT_COPY "Anonimizar en una copia"
+#define VERB_PROTECT_TAGS "Anonimizar con etiquetas"
+#define VERB_PROTECT_BARE "Anonimizar sin etiquetas"
+#define VERB_PROTECT_COPY_TAGS "Anonimizar en una copia, con etiquetas"
+#define VERB_PROTECT_COPY_BARE "Anonimizar en una copia, sin etiquetas"
 #define VERB_RESTORE "Restaurar el original"
 #define VERB_RESTORE_COPY "Restaurar en una copia"
 LANGUAGE 0x0a, 0x00
@@ -180,7 +198,9 @@ LANGUAGE 0x0a, 0x15
 #include "shell_verbs.rc2"
 LANGUAGE 0x0a, 0x16
 #include "shell_verbs.rc2"
-#undef VERB_PROTECT
-#undef VERB_PROTECT_COPY
+#undef VERB_PROTECT_TAGS
+#undef VERB_PROTECT_BARE
+#undef VERB_PROTECT_COPY_TAGS
+#undef VERB_PROTECT_COPY_BARE
 #undef VERB_RESTORE
 #undef VERB_RESTORE_COPY

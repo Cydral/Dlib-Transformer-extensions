@@ -39,6 +39,12 @@ namespace dlib
         void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
         void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
 
+        void set_untagged_text(bool untagged) { untagged_text_ = untagged; }
+        void set_text_substitute_resolver(const pseudonymizer::substitute_resolver& resolve)
+        {
+            text_resolve_ = resolve;
+        }
+
         void set_picture_text_finder(const document_picture_text_finder& find) { pictures_ = find; }
 
         std::string anonymize(const std::string& pdf_bytes)
@@ -605,6 +611,17 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
 
+        // The protected form of a value of the text: its tag, or its substitute listed in the report.
+        std::string text_value(pii_type type, const std::string& value)
+        {
+            if (!untagged_text_) return p_.tag(type, value);
+            document_substitution s;
+            s.substitute = p_.substitute(type, value, &s.tag);
+            s.text = true;
+            report_.substitutions.push_back(s);
+            return s.substitute;
+        }
+
         void transform_unit(const unit& u)
         {
             if (u.text.empty()) return;
@@ -633,14 +650,50 @@ namespace dlib
                     if (in_picture(o.begin, o.end)) ++inside;
                     else edits.push_back(span{ o.begin, o.end, o.original });
                 }
-                std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
                 report_.tags_restored += rr.restored - std::min(inside, rr.restored);
                 report_.tags_rejected += rr.rejected;
+                // The substitutes of an untagged text, outside its tags and the texts of its pictures.
+                if (text_resolve_)
+                    for (const auto& o : p_.find_substitutes(u.text, text_resolve_))
+                    {
+                        bool covered = false;
+                        for (const span& s : edits)
+                            if (o.begin < s.e && s.b < o.end) covered = true;
+                        if (covered) continue;
+                        edits.push_back(span{ o.begin, o.end, o.original });
+                        ++report_.substitutes_restored;
+                    }
+                std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
             }
             else
             {
-                for (const pii_entity& e : detector_->detect(u.text, u.ctx))
+                // The substitutes that the text resolver knows, an untagged document protected again, stay.
+                std::vector<pseudonymizer::substitute_occurrence> known;
+                if (text_resolve_) known = p_.find_substitutes(u.text, text_resolve_);
+                std::vector<pii_entity> found = detector_->detect(u.text, u.ctx);
+                if (untagged_text_)
                 {
+                    /* Without tags, the tags of a text protected before with them take substitutes, those
+                       that one piece of the text holds: a tag cut at a line end would become two values. */
+                    std::vector<pii_entity> with = p_.with_tag_entities(u.text, std::move(found));
+                    found.clear();
+                    for (const pii_entity& e : with)
+                    {
+                        pii_type type = pii_type::none;
+                        std::string value;
+                        bool whole = u.text.compare(e.begin, 2, "[[") != 0 ||
+                                     !p_.decode(u.text.substr(e.begin, e.end - e.begin), type, value);
+                        for (const piece& pc : u.pieces)
+                            if (pc.ub <= e.begin && e.end <= pc.ue) whole = true;
+                        if (whole) found.push_back(e);
+                    }
+                }
+                for (const pii_entity& e : found)
+                {
+                    bool written = false;
+                    for (const auto& o : known)
+                        if (e.begin < o.end && o.begin < e.end) written = true;
+                    if (written) continue;
                     if (p_.keeps_in_clear(e.type)) continue;
                     /* A value read across lines is cut at each line end, so that every
                        line keeps its part of it and restoration puts it back in place.
@@ -656,7 +709,7 @@ namespace dlib
                         while (pe > pb && (u.text[pe - 1] == ' ' || u.text[pe - 1] == '\n')) --pe;
                         if (pe > pb)
                         {
-                            edits.push_back(span{ pb, pe, p_.tag(e.type, u.text.substr(pb, pe - pb)) });
+                            edits.push_back(span{ pb, pe, text_value(e.type, u.text.substr(pb, pe - pb)) });
                             report_.count(e.type);
                         }
                         if (end >= e.end) break;
@@ -695,6 +748,8 @@ namespace dlib
         document_image_describer describer_;
         bool untagged_properties_ = false;
         pseudonymizer::substitute_resolver resolve_;
+        bool untagged_text_ = false;
+        pseudonymizer::substitute_resolver text_resolve_;
         document_picture_text_finder pictures_;
         bool restoring_ = false;
         bool layout_mode_ = false;

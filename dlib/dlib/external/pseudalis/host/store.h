@@ -39,6 +39,7 @@ namespace pseudalis
         std::string object_id;          // 32 hexadecimal digits, or empty
         std::string path;               // where the protected file was written, when known
         int64_t removed = 0;            // when its file left the drive (Unix time), else 0
+        bool tags = true;               // whether the protected file holds the tags of its values
     };
 
     struct entry_record
@@ -135,11 +136,32 @@ namespace pseudalis
                   the entries of a protected archive are remembered as forgotten
                   (find_forgotten()), in the same transaction: a copy extracted from the archive
                   is restored from its tags too, unless a record of its own holds it.
+                - The substitutes of the text of the record leave with it (add_text_substitutes()).
         !*/
         bool remove_file(long long id, std::vector<std::string>& blobs, const std::string& reason = std::string());
         // The last original forgotten of a protected file, by its SHA-256 or its object identifier.
         bool find_forgotten(const std::string& sha256, const std::string& object_id, int64_t& time,
-            std::string& reason);
+            std::string& reason, bool* tags = nullptr);
+
+        /*!
+            ensures
+                - Records the substitutes the engine wrote in the text of the protected file of
+                  record, a file protected without tags, each (substitute, tag) once with the
+                  number of places that hold it: they leave with the record (remove_file()),
+                  and with them the means to give its values back.
+        !*/
+        void add_text_substitutes(long long record, const std::vector<std::pair<std::string, std::string>>& made);
+        // The substitutes of the text of record, or those it inherited alone (copy_text_substitutes()).
+        std::vector<std::pair<std::string, std::string>> text_substitutes(long long record,
+            bool inherited_only = false);
+        /*!
+            ensures
+                - Gives record to the substitutes of the text of record from: those of the archive
+                  of an entry extracted from it, or, inherited, those that the original of record to
+                  holds, a file protected without tags and protected again, which its restoration
+                  gives back.
+        !*/
+        void copy_text_substitutes(long long from, long long to, bool inherited = false);
 
         // The entries of the protected archive of record (entry_record).
         void add_entries(long long record, const std::vector<entry_record>& entries);

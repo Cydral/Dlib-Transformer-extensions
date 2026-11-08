@@ -960,6 +960,35 @@ namespace pseudalis
             return archive_kind_of(bytes) == archive_kind::none &&
                    family_of(detect_document_format(bytes, base)) == document_family::text;
         }
+
+        /*
+            What one call asks besides its bytes: tags or substitutes for the values of the text,
+            and the substitutes of the text that a restoration gives back, or that a protection
+            leaves as they are, an untagged file protected again.
+        */
+        struct call_options
+        {
+            bool tags = true;
+            pseudonymizer::substitute_resolver text;
+        };
+
+        // The resolver of a list of substitutes: the tags of a substitute, in the order of the list.
+        pseudonymizer::substitute_resolver resolver_of_list(const std::vector<substitution>& list)
+        {
+            if (list.empty()) return pseudonymizer::substitute_resolver();
+            auto table = std::make_shared<std::map<std::string, std::vector<std::string>>>();
+            for (const substitution& s : list)
+            {
+                if (s.substitute.empty() || s.tag.empty()) continue;
+                std::vector<std::string>& tags = (*table)[s.substitute];
+                if (std::find(tags.begin(), tags.end(), s.tag) == tags.end()) tags.push_back(s.tag);
+            }
+            if (table->empty()) return pseudonymizer::substitute_resolver();
+            return [table](const std::string& candidate) {
+                const auto it = table->find(candidate);
+                return it == table->end() ? std::vector<std::string>() : it->second;
+            };
+        }
     }
 
 // ----------------------------------------------------------------------------------------
@@ -1003,17 +1032,17 @@ namespace pseudalis
             found counts the values.
         */
         std::string protect_description(const std::string& description, const pii_detector* known,
-                                        document_report& found) const
+                                        document_report& found, const call_options& c) const
         {
             std::string line;
             bool bounded = false;
-            for (char c : description)
+            for (char ch : description)
             {
-                if (c == '\r' || c == '\n' || c == '\t') c = ' ';
-                if (c == '[') c = '(';
-                if (c == ']') c = ')';
-                if (c == ' ' && (line.empty() || line.back() == ' ')) continue;
-                line.push_back(c);
+                if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+                if (ch == '[') ch = '(';
+                if (ch == ']') ch = ')';
+                if (ch == ' ' && (line.empty() || line.back() == ' ')) continue;
+                line.push_back(ch);
                 // The answers of Albireo stay far below; past 1000 bytes, nothing is written.
                 if (line.size() >= 16384)
                 {
@@ -1055,6 +1084,34 @@ namespace pseudalis
                 joined.push_back(e);
             }
             for (const pii_entity& e : joined) found.count(e.type);
+            if (!c.tags)
+            {
+                // Without tags, the values take their substitutes, which the caller keeps, all whole.
+                std::vector<pseudonymizer::substitution> made;
+                std::string out = p->apply_substitutes(line, joined, &made);
+                size_t cut = out.size() > 1000 ? 1000 : out.size(), pos = 0;
+                std::size_t kept = 0;
+                for (const pseudonymizer::substitution& s : made)
+                {
+                    const size_t at = out.find(s.substitute, pos);
+                    if (at == std::string::npos || at >= cut) break;
+                    if (at + s.substitute.size() > cut)
+                    {
+                        cut = at;
+                        break;
+                    }
+                    pos = at + s.substitute.size();
+                    ++kept;
+                }
+                for (std::size_t k = 0; k < kept; ++k)
+                    found.substitutions.push_back(document_substitution{ made[k].substitute, made[k].tag, true });
+                if (cut < out.size())
+                {
+                    while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) --cut;
+                    out = out.substr(0, cut) + "...";
+                }
+                return out;
+            }
             std::string out = p->apply(line, joined);
             if (out.size() > 1000)
             {
@@ -1081,7 +1138,7 @@ namespace pseudalis
         */
         std::string marker_of(const std::string& bytes, const std::string& media_type, const std::string& location,
                               const picture_handler& handler, std::vector<std::string>& ids,
-                              const pii_detector* known, document_report& found,
+                              const pii_detector* known, document_report& found, const call_options& c,
                               std::map<std::string, std::string>* written = nullptr) const
         {
             picture_found f;
@@ -1092,7 +1149,7 @@ namespace pseudalis
             f.location = location;
             f.bytes = &bytes;
             if (std::find(ids.begin(), ids.end(), f.id) == ids.end()) ids.push_back(f.id);
-            const std::string description = protect_description(handler(f), known, found);
+            const std::string description = protect_description(handler(f), known, found, c);
             if (written) (*written)[f.sha256] = description;
             return engine::picture_marker(f.id, description);
         }
@@ -1178,10 +1235,11 @@ namespace pseudalis
         */
         engine_result document(const std::string& bytes, const std::string& name, document_format f,
                                const picture_handler& handler, bool restoring, const substitute_lookup& lookup,
-                               uint64_t& budget) const
+                               uint64_t& budget, const call_options& c) const
         {
             pii_detector first(options());
-            if (!handler || restoring) return read_document(bytes, name, f, handler, restoring, lookup, budget, first);
+            if (!handler || restoring)
+                return read_document(bytes, name, f, handler, restoring, lookup, budget, c, first);
             std::map<std::string, std::string> given;
             const picture_handler once = [&](const picture_found& found) {
                 const auto it = given.find(found.sha256);
@@ -1191,13 +1249,13 @@ namespace pseudalis
                 return description;
             };
             std::map<std::string, std::string> written;
-            engine_result out = read_document(bytes, name, f, once, false, lookup, budget, first, nullptr, &written);
+            engine_result out = read_document(bytes, name, f, once, false, lookup, budget, c, first, nullptr, &written);
             bool again = false;
             document_report unused;
             for (const auto& w : written)
             {
                 const auto g = given.find(w.first);
-                if (g != given.end() && protect_description(g->second, &first, unused) != w.second)
+                if (g != given.end() && protect_description(g->second, &first, unused, c) != w.second)
                 {
                     again = true;
                     break;
@@ -1206,7 +1264,7 @@ namespace pseudalis
             if (!again) return out;
             out = engine_result();
             pii_detector second(options());
-            return read_document(bytes, name, f, once, false, lookup, budget, second, &first);
+            return read_document(bytes, name, f, once, false, lookup, budget, c, second, &first);
         }
 
         /*
@@ -1216,7 +1274,8 @@ namespace pseudalis
         */
         engine_result read_document(const std::string& bytes, const std::string& name, document_format f,
                                     const picture_handler& handler, bool restoring, const substitute_lookup& lookup,
-                                    const uint64_t& budget, pii_detector& d, const pii_detector* known = nullptr,
+                                    const uint64_t& budget, const call_options& c, pii_detector& d,
+                                    const pii_detector* known = nullptr,
                                     std::map<std::string, std::string>* written = nullptr) const
         {
             engine_result out;
@@ -1226,6 +1285,9 @@ namespace pseudalis
             // The properties of the document take substitutes, which a window of properties shows as they are.
             a.set_untagged_properties(true);
             a.set_substitute_resolver(resolver_of(lookup));
+            // Without tags, the values of the text take substitutes too, which the caller keeps.
+            a.set_untagged_text(!restoring && !c.tags);
+            a.set_text_substitute_resolver(c.text);
             // A restoration cannot give a picture back into a document: its marker leaves.
             if (restoring) a.set_picture_text_finder(picture_markers);
             /*
@@ -1242,7 +1304,7 @@ namespace pseudalis
             if (handler && !restoring)
                 a.set_image_describer([&](const document_image& img) {
                     return marker_of(img.bytes, img.media_type, base_name(name) + ": " + img.location, handler, ids,
-                                     known ? known : &d, described, written);
+                                     known ? known : &d, described, c, written);
                 });
             document_report report;
             out.bytes = restoring ? a.restore(bytes, f, report, base_name(name))
@@ -1250,6 +1312,7 @@ namespace pseudalis
             // The values of the descriptions count with those of the document.
             for (const auto& e : described.entities) report.entities[e.first] += e.second;
             report.dates_shifted += described.dates_shifted;
+            for (const document_substitution& s : described.substitutions) report.substitutions.push_back(s);
             // The name is read with what the document taught the detector.
             std::vector<substitution> named;
             out.name = folder_of(name) + (restoring ? restore_base(a, report, base_name(name))
@@ -1259,19 +1322,22 @@ namespace pseudalis
             out.pictures = ids;
             // The substitutes of the properties and of the name, as written.
             for (const document_substitution& s : report.substitutions)
-                out.substitutions.push_back(substitution{ s.substitute, s.tag });
+                out.substitutions.push_back(substitution{ s.substitute, s.tag, s.text });
             return out;
         }
 
         engine_result picture(const std::string& bytes, const std::string& name, const picture_handler& handler,
-                              const substitute_lookup& lookup) const
+                              const substitute_lookup& lookup, const call_options& c) const
         {
             engine_result out;
             std::vector<std::string> ids;
             const picture_handler none = [](const picture_found&) { return std::string(); };
             document_report report;
             out.bytes = marker_of(bytes, image_media_type(bytes), base_name(name), handler ? handler : none, ids,
-                                  nullptr, report) + "\r\n";
+                                  nullptr, report, c) + "\r\n";
+            // The substitutes of the description, without tags.
+            for (const document_substitution& s : report.substitutions)
+                out.substitutions.push_back(substitution{ s.substitute, s.tag, s.text });
             out.name = folder_of(name) + protect_alone(base_name(name), lookup, out.substitutions, report) + ".txt";
             out.kind = "image";
             out.report = report_json(report);
@@ -1282,7 +1348,7 @@ namespace pseudalis
         // known: the kind of the file when the caller found it already.
         engine_result any(const std::string& bytes, const std::string& name, const picture_handler& handler,
                           bool restoring, const substitute_lookup& lookup, int depth, uint64_t& budget,
-                          const file_kind* known = nullptr) const
+                          const call_options& c, const file_kind* known = nullptr) const
         {
             const std::string base = base_name(name);
             text_verdict verdict = text_verdict::other;
@@ -1291,7 +1357,7 @@ namespace pseudalis
             if (k == file_kind::unsupported && restoring && text_content(bytes, base)) k = file_kind::document;
             if (k == file_kind::picture)
             {
-                if (!restoring) return picture(bytes, name, handler, lookup);
+                if (!restoring) return picture(bytes, name, handler, lookup, c);
                 engine_result out;
                 document_report report;
                 out.bytes = bytes;
@@ -1300,10 +1366,10 @@ namespace pseudalis
                 out.report = report_json(report);
                 return out;
             }
-            if (k == file_kind::archive) return archive(bytes, name, handler, restoring, lookup, depth, budget);
+            if (k == file_kind::archive) return archive(bytes, name, handler, restoring, lookup, depth, budget, c);
             if (k == file_kind::document)
                 return document(bytes, name, detect_document_format(bytes, base_name(name)), handler, restoring,
-                                lookup, budget);
+                                lookup, budget, c);
             if (supported_name(base))
                 throw std::runtime_error(base + ": the content of this file does not match its name");
             if (known) verdict = through_and_through(bytes, base);
@@ -1379,7 +1445,8 @@ namespace pseudalis
         }
 
         engine_result archive(const std::string& bytes, const std::string& name, const picture_handler& handler,
-                              bool restoring, const substitute_lookup& lookup, int depth, uint64_t& budget) const
+                              bool restoring, const substitute_lookup& lookup, int depth, uint64_t& budget,
+                              const call_options& c) const
         {
             if (depth > 3) throw std::runtime_error(base_name(name) + ": archives nested too deep");
             archive_kind ak = archive_kind_of(bytes);
@@ -1440,7 +1507,7 @@ namespace pseudalis
                 }
                 try
                 {
-                    engine_result r = any(e.data, e.name, handler, restoring, lookup, depth + 1, budget,
+                    engine_result r = any(e.data, e.name, handler, restoring, lookup, depth + 1, budget, c,
                                           restoring ? nullptr : &kind);
                     const std::string read_as = e.name;
                     const std::string renamed =
@@ -1587,17 +1654,23 @@ namespace pseudalis
     }
 
     engine_result engine::anonymize(const std::string& bytes, const std::string& name,
-                                    const picture_handler& pictures, const substitute_lookup& lookup) const
+                                    const picture_handler& pictures, const substitute_lookup& lookup, bool tags,
+                                    const std::vector<substitution>& known) const
     {
         uint64_t budget = decompression_budget(bytes.size());
-        return p_->any(bytes, name, pictures, false, lookup, 0, budget);
+        call_options c;
+        c.tags = tags;
+        c.text = resolver_of_list(known);
+        return p_->any(bytes, name, pictures, false, lookup, 0, budget, c);
     }
 
     engine_result engine::restore(const std::string& bytes, const std::string& name,
-                                  const substitute_lookup& lookup) const
+                                  const substitute_lookup& lookup, const std::vector<substitution>& text) const
     {
         uint64_t budget = decompression_budget(bytes.size());
-        return p_->any(bytes, name, picture_handler(), true, lookup, 0, budget);
+        call_options c;
+        c.text = resolver_of_list(text);
+        return p_->any(bytes, name, picture_handler(), true, lookup, 0, budget, c);
     }
 
     std::string engine::anonymize_name(const std::string& name, const substitute_lookup& lookup,
@@ -1617,21 +1690,28 @@ namespace pseudalis
         return out;
     }
 
-    std::string engine::anonymize_text(const std::string& text, json& report) const
+    std::string engine::anonymize_text(const std::string& text, json& report, bool tags,
+                                       std::vector<substitution>* made) const
     {
         pii_detector d(p_->options());
         p_->attach(d);
         document_anonymizer a(*p_->p, d);
+        a.set_untagged_text(!tags);
         document_report r;
         const std::string out = a.anonymize_text(text, r);
         report = report_json(r);
+        if (made)
+            for (const document_substitution& s : r.substitutions)
+                made->push_back(substitution{ s.substitute, s.tag, s.text });
         return out;
     }
 
-    std::string engine::restore_text(const std::string& text, json& report) const
+    std::string engine::restore_text(const std::string& text, json& report,
+                                     const std::vector<substitution>& substitutes) const
     {
         pii_detector d(p_->options());
         document_anonymizer a(*p_->p, d);
+        a.set_text_substitute_resolver(resolver_of_list(substitutes));
         document_report r;
         const std::string out = a.restore(text, document_format::text, r);
         report = report_json(r);
@@ -1645,11 +1725,46 @@ namespace pseudalis
         const std::size_t max_spans = 100000;
     }
 
-    json engine::tag_spans(const std::string& text) const
+    namespace
+    {
+        // A value of a protected text: its byte range, its type and its original.
+        struct protected_value
+        {
+            std::size_t begin, end;
+            pii_type type;
+            std::string original;
+        };
+
+        /* The tags of a text, then the substitutes that resolve knows outside them, in their order:
+           the protected values as restore_text() puts them back. */
+        std::vector<protected_value> protected_values(const pseudonymizer& p, const std::string& text,
+                                                      const pseudonymizer::substitute_resolver& resolve)
+        {
+            std::vector<protected_value> out;
+            for (const pseudonymizer::tag_occurrence& o : p.find_tags(text))
+                out.push_back(protected_value{ o.begin, o.end, o.type, o.original });
+            if (resolve)
+            {
+                const std::size_t tags = out.size();
+                for (const pseudonymizer::substitute_occurrence& o : p.find_substitutes(text, resolve))
+                {
+                    bool inside = false;
+                    for (std::size_t k = 0; k < tags; ++k)
+                        if (o.begin < out[k].end && out[k].begin < o.end) inside = true;
+                    if (!inside) out.push_back(protected_value{ o.begin, o.end, o.type, o.original });
+                }
+                std::sort(out.begin(), out.end(),
+                          [](const protected_value& a, const protected_value& b) { return a.begin < b.begin; });
+            }
+            return out;
+        }
+    }
+
+    json engine::tag_spans(const std::string& text, const std::vector<substitution>& substitutes) const
     {
         json spans = json::array();
         if (!privacy_impl::utf8_valid(text)) return spans;
-        for (const pseudonymizer::tag_occurrence& o : p_->p->find_tags(text))
+        for (const protected_value& o : protected_values(*p_->p, text, resolver_of_list(substitutes)))
         {
             if (spans.size() == max_spans) return json::array();
             json s = json::object();
@@ -1661,13 +1776,14 @@ namespace pseudalis
         return spans;
     }
 
-    json engine::restored_spans(const std::string& tagged, const std::string& restored) const
+    json engine::restored_spans(const std::string& tagged, const std::string& restored,
+                                const std::vector<substitution>& substitutes) const
     {
         json spans = json::array();
         if (!privacy_impl::utf8_valid(restored)) return spans;
         std::string rebuilt;
         std::size_t pos = 0;
-        for (const pseudonymizer::tag_occurrence& o : p_->p->find_tags(tagged))
+        for (const protected_value& o : protected_values(*p_->p, tagged, resolver_of_list(substitutes)))
         {
             if (o.begin < pos || spans.size() == max_spans) return json::array();
             rebuilt.append(tagged, pos, o.begin - pos);

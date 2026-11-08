@@ -42,8 +42,9 @@ namespace pseudalis
 
     struct substitution
     {
-        std::string substitute;             // as written in a name or a property
+        std::string substitute;             // as written in a name, a property or a text without tags
         std::string tag;                    // the tag it stands for
+        bool text = false;                  // written in the text of a document protected without tags
     };
 
     struct engine_options
@@ -109,6 +110,11 @@ namespace pseudalis
                 with its tag, which the caller records: restore() asks the lookup for
                 them.
 
+                Without tags (anonymize() and anonymize_text() with tags false), each value of
+                the text takes its substitute too: the file holds no tag, and its values come
+                back only from the substitutes that the caller keeps (engine_result::
+                substitutions, text true) and gives back to restore().
+
             THREAD SAFETY
                 The methods may be called from several threads at once.
         !*/
@@ -142,20 +148,27 @@ namespace pseudalis
         /*
             Throws std::runtime_error for a file of no supported kind, or that cannot be read.  The
             substitutes that lookup knows, in a name or a property protected before, are not
-            replaced again.
+            replaced again.  Without tags, each value of the text takes its substitute, as the names
+            and the properties do, the descriptions of the pictures included, and
+            engine_result::substitutions lists it with text true, once for each place it is
+            written in: its value comes back only from the substitutes the caller keeps.  The
+            substitutes of known, those of a file protected without tags before, stay as they are.
         */
         engine_result anonymize(const std::string& bytes, const std::string& name,
-            const picture_handler& pictures, const substitute_lookup& lookup = substitute_lookup()) const;
+            const picture_handler& pictures, const substitute_lookup& lookup = substitute_lookup(),
+            bool tags = true, const std::vector<substitution>& known = std::vector<substitution>()) const;
         /*
-            Puts back the values of the tags, and those of the substitutes that lookup knows in
-            the names and the properties.  A picture cannot come back into a document: its
-            marker leaves with the tags of its description (from a run of Word, with the gray
-            text box of a slide, from over the gray box of a PDF, which stays), and so does the
-            text file of a picture from an archive, report["pictures_removed"] counting them; the
-            service gives back the picture of a text file alone from its vault.
+            Puts back the values of the tags, those of the substitutes that lookup knows in the
+            names and the properties, and those of the substitutes of text in the text, a file
+            protected without tags.  A picture cannot come back into a document: its marker leaves
+            with the tags of its description (from a run of Word, with the gray text box of a
+            slide, from over the gray box of a PDF, which stays), and so does the text file of a
+            picture from an archive, report["pictures_removed"] counting them; the service gives
+            back the picture of a text file alone from its vault.
         */
         engine_result restore(const std::string& bytes, const std::string& name,
-            const substitute_lookup& lookup = substitute_lookup()) const;
+            const substitute_lookup& lookup = substitute_lookup(),
+            const std::vector<substitution>& text = std::vector<substitution>()) const;
         /*
             The bytes of the entry at path in the archive bytes named name, read as anonymize()
             reads it: path is entry_written::original, the archives inside joined by '!'.  Throws
@@ -168,18 +181,23 @@ namespace pseudalis
             std::vector<substitution>& made, json& report) const;
         std::string restore_name(const std::string& name, const substitute_lookup& lookup, json& report) const;
 
-        std::string anonymize_text(const std::string& text, json& report) const;
-        // A text keeps the picture markers it holds, which its reader sees.
-        std::string restore_text(const std::string& text, json& report) const;
+        // Without tags, the values take their substitutes, which made receives.
+        std::string anonymize_text(const std::string& text, json& report, bool tags = true,
+            std::vector<substitution>* made = nullptr) const;
+        // A text keeps the picture markers it holds, which its reader sees; substitutes come back too.
+        std::string restore_text(const std::string& text, json& report,
+            const std::vector<substitution>& substitutes = std::vector<substitution>()) const;
         /*
-            [{"begin", "end", "type"}] of the tags of a protected text that this key restores, and
-            of the values that restore_text() wrote in restored in place of the tags of tagged:
-            byte offsets of the text, for the colouring of the web application. The values are
-            given when the tags alone account for the restoration (a tag written in a link, which
-            the restoration also reads, gives none).
+            [{"begin", "end", "type"}] of the tags of a protected text that this key restores and of
+            the substitutes of the list, and of the values that restore_text() wrote in restored in
+            their place in tagged: byte offsets of the text, for the colouring of the web
+            application. The values are given when the tags and the substitutes alone account for
+            the restoration (a tag written in a link, which the restoration also reads, gives none).
         */
-        json tag_spans(const std::string& text) const;
-        json restored_spans(const std::string& tagged, const std::string& restored) const;
+        json tag_spans(const std::string& text,
+            const std::vector<substitution>& substitutes = std::vector<substitution>()) const;
+        json restored_spans(const std::string& tagged, const std::string& restored,
+            const std::vector<substitution>& substitutes = std::vector<substitution>()) const;
         // [{"begin", "end", "type", "confidence", "text"}] of the values of a text.
         json detect(const std::string& text) const;
 

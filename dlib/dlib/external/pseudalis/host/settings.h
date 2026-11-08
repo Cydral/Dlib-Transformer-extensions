@@ -39,6 +39,12 @@ namespace pseudalis
         static const int max_removed_days = 3650;
         int history_mb = 10240;                 // the space the originals kept may take, in MB, max_file_mb at least
         static const int max_history_mb = 1048576;
+        /*
+            Whether the values of the files take their tags, which give them back from any copy with the
+            key; false writes their substitutes alone, which only the record of the file gives back while
+            it lasts: the drive, the web application and the interface take it unless a request says.
+        */
+        bool tags = true;
         bool check_updates = true;              // a check every day
         bool trust_authority = true;            // the local authority in the trusted roots (the installer)
         std::string feed_url = default_feed_url;

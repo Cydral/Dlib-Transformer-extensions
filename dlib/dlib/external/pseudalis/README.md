@@ -33,6 +33,35 @@ character that Windows refuses in a name. The database records each substitute w
 its value in clear; a restoration gives back the original name and the original properties, those of a
 copy edited since included, as long as the substitutes stay in place.
 
+### Without tags
+
+The values can also be written without their tags, their substitutes alone, as the names already are:
+the file then reads as an ordinary document, for a prompt sent to an assistant, test or training data,
+or a file sent outside, but nothing in it tells a value from its substitute any more, and its record
+alone gives its values back. The setting `tags` (on by default) decides for the drive, the web
+application and the interface; the commands of the Explorer offer both, and a request says it with
+`tags=false`.
+
+- The record of a file protected without tags keeps its original, as any record, and the substitutes of
+  its text with the tags they stand for, never its values in clear: its copies give back the original,
+  and a copy edited since, known by its NTFS object identifier, its values from those substitutes,
+  without its pictures. The list of the originals kept says which files were protected without tags.
+- Once its original is forgotten, at the request of a user, at the end of its time or to make room, its
+  values cannot come back: Restore refuses the file (HTTP 410, code `tagless_forgotten`) and tells the
+  date of the forgetting, and Forget says so before it forgets. A file protected without tags and
+  without record (Keep the originals unchecked) never comes back, which its report says
+  (`"restorable": false`).
+- A text protected without tags in the web application keeps the list of its substitutes in the page,
+  which gives back the text, or the answer of an assistant that quotes them, while the page stays open;
+  the interface gives that list in `substitutions`, which `/v1/text/restore` takes back.
+- A protected file protected again, by a newer version that finds more values in it for instance, keeps
+  the values protected before: with tags, as they are, the substitutes that its record keeps included,
+  which its new record inherits; without tags, its tags give way to the substitutes of their values,
+  which its new record keeps. A file of the drive protected without tags and edited there is protected
+  again the same way. Its restoration gives back the values of both protections, with or without tags:
+  the original of each record of the chain that still keeps it, the values of the tags and of the
+  inherited substitutes of the others, without any warning.
+
 ### The kinds of files
 
 A file is processed when its extension names one of the kinds of Pseudalis and its content is of that
@@ -94,8 +123,8 @@ difference: a file is anonymized once its writer closed it and it rested two sec
 included. The anonymized file takes its place, the original goes to the encrypted vault, and the file
 written is deleted.
 
-- A document keeps its kind and its layout, its values replaced by tags in its content and by
-  substitutes in its name and its properties.
+- A document keeps its kind and its layout, its values replaced by tags in its content, or by their
+  substitutes alone when the setting `tags` is off, and by substitutes in its name and its properties.
 - A picture becomes `<name>.txt`, its marker `[Image@<id> : <description>]`, or `[Image@<id>]` when no
   description is available, and the picture goes to the vault.
 - A ZIP, TAR or TAR.GZ archive keeps its kind, the values of its name replaced; its documents are
@@ -144,16 +173,21 @@ web application and the interface, from any copy of the anonymized file.
 ### The commands of the Explorer
 
 A right click on a file of one of the extensions above, or on a folder, shows, under Show more options
-on Windows 11, a menu Pseudalis with four commands, which `pseudalis.exe` carries out through the
+on Windows 11, a menu Pseudalis with six commands, which `pseudalis.exe` carries out through the
 service; a text of another extension goes through the commands of its folder, the drive, the web
 application or the interface, the menu staying off the programs, sounds and videos:
 
 | Command | On a file | On a folder |
 |---|---|---|
-| Anonymize | the file is replaced by its anonymized version; a picture by its text file | each file, then each folder under its anonymized name |
-| Anonymize as a copy | `name (anonymized).ext` is written beside the file | `name (anonymized)` receives the tree anonymized |
+| Anonymize with tags, Anonymize without tags | the file is replaced by its anonymized version; a picture by its text file | each file, then each folder under its anonymized name |
+| Anonymize as a copy, with tags or without tags | `name (anonymized).ext` is written beside the file | `name (anonymized)` receives the tree anonymized |
 | Restore the original | the original takes the place of the file, under its original name | each file and each folder takes back its original |
 | Restore as a copy | `<original name> (restored).ext` is written beside the file | `<original name> (restored)` receives the tree restored |
+
+The commands without tags write the values as their substitutes alone (see Without tags above). A
+selection of up to 100 files or folders takes the commands, which the Explorer starts once for each:
+they take their turn, two at a time, and the icon notifies together the results that come within a
+second and a half.
 
 The suffixes follow the language of the installation, and ` (2)` is added to a name already taken. In a
 folder, a file of another kind stays as it is in its place, out of an anonymized copy, and as it is in a
@@ -176,7 +210,7 @@ gives back its picture while the vault keeps it, and is refused once it was forg
 program while a command processes it stays as it is, and the command says so. A file of the drive is
 anonymized already: Restore asks where to save its original, outside the drive, which would anonymize it
 again, and the folder where the originals of a folder of the drive go. The same program runs from a
-prompt, `pseudalis protect [--copy] <file or folder>...` and
+prompt, `pseudalis protect [--copy] [--no-tags] <file or folder>...` and
 `pseudalis restore [--copy] <file or folder>...`, its results printed there (`start /wait pseudalis ...`
 waits for them).
 
@@ -187,7 +221,9 @@ anonymized or restored and downloaded back, a folder dropped or chosen there as 
 tree, texts are anonymized or restored in place, their tags highlighted and their values restored
 underlined in the color of their kind, or analyzed, the values found listed below them, and, opened from
 the icon, it lists the originals kept
-(download, forget), exports and imports the key, and changes the settings and the imposed terms. The
+(download, forget), exports and imports the key, and changes the settings and the imposed terms. Its
+files and its texts take their tags or not as their option says, which the setting `tags` sets, and it
+asks and tells in a window of its own, over the page, Escape or a click beside it cancelling. The
 interface it uses is
 described with Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu of the
 icon), without account: the operations of administration take the token of the data folder in the header
@@ -197,11 +233,11 @@ by themselves.
 | Route | Purpose |
 |---|---|
 | `GET /v1/health`, `GET /v1/info` | the state of the service, of its engine, of the drive and of Albireo |
-| `POST /v1/anonymize?name=&record=&format=` | anonymizes the file of the body; the answer is the file, or JSON with `format=json` |
+| `POST /v1/anonymize?name=&record=&tags=&format=` | anonymizes the file of the body, without tags with `tags=false`; the answer is the file, or JSON with `format=json` |
 | `POST /v1/restore?name=&object_id=&format=` | restores the file of the body: its original, its picture or its tags |
 | `GET /v1/lookup?sha256=&object_id=` | whether a file is an anonymized file of this computer |
 | `POST /v1/records/{id}/location` | records where an anonymized file was written (token) |
-| `POST /v1/text/anonymize`, `/restore`, `/detect` | the same protection on a text, `{"text": ...}`; the places of the tags written (`tags`) or of the values restored (`restored`) come back with it |
+| `POST /v1/text/anonymize`, `/restore`, `/detect` | the same protection on a text, `{"text": ...}`, `"tags": false` without tags, whose `substitutions` `/restore` takes back; the places of the tags written (`tags`) or of the values restored (`restored`) come back with it |
 | `POST /v1/names/anonymize`, `/restore` | a name alone, the one of a folder, `{"name": ...}`, its substitutes recorded |
 | `GET /v1/drive`, `GET /v1/events?since=` | the drive, the files it protected or refused (token for the events) |
 | `GET /v1/albireo` | whether Albireo describes the pictures |
@@ -372,6 +408,11 @@ processed, `refused\`.
   name or a property edited since as long as it keeps its form, a run of up to twelve words; one of four
   characters or fewer, a year for instance, is too common to be read back there, and comes back only
   with the original kept in the vault.
+- The record of a file protected without tags keeps the substitutes of its text with their tags rather
+  than their places in the file: the places of an Office document or of a PDF lie in its compressed
+  parts, which give back nothing more than the original that its exact copies receive, while the
+  substitutes, each a distinct code with its length, are found again in a copy edited since, and in the
+  original of a file protected again, whose new record inherits them.
 - A picture becomes a text file of the same name with `.txt` added, which the Explorer and the prompt
   show as text; its picture comes back through Restore, the web application and the interface.
 - A file of another kind is never written in an anonymized place, since its content would come out

@@ -49,6 +49,12 @@ namespace pseudalis
                their tags, with the tags they stand for: tags, never values in clear. */
             "CREATE TABLE IF NOT EXISTS substitutes(substitute TEXT NOT NULL, tag TEXT NOT NULL,"
             " created INTEGER NOT NULL, PRIMARY KEY(substitute, tag)) WITHOUT ROWID;"
+            /* The substitutes written in the text of a file protected without tags, with the tags
+               they stand for and the number of places that hold each, and those of its original that a
+               protection without tags wrote before (inherited): they leave with the record. */
+            "CREATE TABLE IF NOT EXISTS text_substitutes(record INTEGER NOT NULL REFERENCES files(id)"
+            " ON DELETE CASCADE, substitute TEXT NOT NULL, tag TEXT NOT NULL, places INTEGER NOT NULL,"
+            " inherited INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(record, substitute, tag)) WITHOUT ROWID;"
             // The files of the folder of the drive as the service left them.
             "CREATE TABLE IF NOT EXISTS folder_files(folder TEXT NOT NULL, path TEXT NOT NULL COLLATE NOCASE,"
             " size INTEGER NOT NULL, written INTEGER NOT NULL, sha256 TEXT NOT NULL, record INTEGER NOT NULL,"
@@ -104,7 +110,7 @@ namespace pseudalis
 
         const char* const file_columns = "id, created, source, original_name, output_name, original_sha256,"
                                          " output_sha256, original_blob, original_size, output_size, kind,"
-                                         " object_id, path, removed";
+                                         " object_id, path, removed, tags";
 
         file_record read_file_row(statement& s)
         {
@@ -123,6 +129,7 @@ namespace pseudalis
             r.object_id = s.text(11);
             r.path = s.text(12);
             r.removed = s.integer(13);
+            r.tags = s.integer(14) != 0;
             return r;
         }
     }
@@ -168,6 +175,36 @@ namespace pseudalis
                     throw;
                 }
             }
+            /*
+                3: whether the protected file of a record, or of an original forgotten, holds the tags
+                of its values, false for a file protected without tags; every file of the versions
+                before held them.
+            */
+            if (version < 3)
+            {
+                // A column already there, a database a later version wrote and then marked older, stays.
+                auto has_column = [this](const char* table, const char* column) {
+                    statement c(db_, (std::string("PRAGMA table_info(") + table + ")").c_str());
+                    while (c.step())
+                        if (c.text(1) == column) return true;
+                    return false;
+                };
+                exec("BEGIN IMMEDIATE");
+                try
+                {
+                    if (!has_column("files", "tags"))
+                        exec("ALTER TABLE files ADD COLUMN tags INTEGER NOT NULL DEFAULT 1;");
+                    if (!has_column("forgotten", "tags"))
+                        exec("ALTER TABLE forgotten ADD COLUMN tags INTEGER NOT NULL DEFAULT 1;");
+                    exec("PRAGMA user_version = 3;"
+                         "COMMIT;");
+                }
+                catch (...)
+                {
+                    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+                    throw;
+                }
+            }
         }
         catch (...)
         {
@@ -199,11 +236,12 @@ namespace pseudalis
         std::lock_guard<std::mutex> lock(m_);
         statement s(db_,
             "INSERT INTO files(created, source, original_name, output_name, original_sha256, output_sha256,"
-                         " original_blob, original_size, output_size, kind, object_id, path)"
-                         " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)");
+                         " original_blob, original_size, output_size, kind, object_id, path, tags)"
+                         " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)");
         s.bind(1, static_cast<long long>(r.created ? r.created : now_unix())).bind(2, r.source).bind(3, r.original_name)
             .bind(4, r.output_name).bind(5, r.original_sha256).bind(6, r.output_sha256).bind(7, r.original_blob)
-            .bind(8, r.original_size).bind(9, r.output_size).bind(10, r.kind).bind(11, r.object_id).bind(12, r.path);
+            .bind(8, r.original_size).bind(9, r.output_size).bind(10, r.kind).bind(11, r.object_id).bind(12, r.path)
+            .bind(13, static_cast<long long>(r.tags ? 1 : 0));
         s.step();
         return sqlite3_last_insert_rowid(db_);
     }
@@ -344,18 +382,22 @@ namespace pseudalis
         {
             if (!reason.empty())
             {
-                statement f(db_, "INSERT INTO forgotten(time, reason, output_sha256, object_id)"
-                                 " SELECT ?2, ?3, output_sha256, object_id FROM files WHERE id = ?1");
+                statement f(db_, "INSERT INTO forgotten(time, reason, output_sha256, object_id, tags)"
+                                 " SELECT ?2, ?3, output_sha256, object_id, tags FROM files WHERE id = ?1");
                 f.bind(1, id).bind(2, static_cast<long long>(now_unix())).bind(3, reason);
                 f.step();
-                statement fe(db_, "INSERT INTO forgotten(time, reason, output_sha256, object_id)"
-                                  " SELECT DISTINCT ?2, ?3, sha256, '' FROM entries WHERE record = ?1");
+                statement fe(db_, "INSERT INTO forgotten(time, reason, output_sha256, object_id, tags)"
+                                  " SELECT DISTINCT ?2, ?3, e.sha256, '', f.tags FROM entries e, files f"
+                                  " WHERE e.record = ?1 AND f.id = ?1");
                 fe.bind(1, id).bind(2, static_cast<long long>(now_unix())).bind(3, reason);
                 fe.step();
             }
             statement de(db_, "DELETE FROM entries WHERE record = ?1");
             de.bind(1, id);
             de.step();
+            statement dt(db_, "DELETE FROM text_substitutes WHERE record = ?1");
+            dt.bind(1, id);
+            dt.step();
             statement d(db_, "DELETE FROM files WHERE id = ?1");
             d.bind(1, id);
             d.step();
@@ -390,16 +432,62 @@ namespace pseudalis
     }
 
     bool store::find_forgotten(const std::string& sha256, const std::string& object_id, int64_t& time,
-                               std::string& reason)
+                               std::string& reason, bool* tags)
     {
         std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, "SELECT time, reason FROM forgotten WHERE output_sha256 = ?1 OR (?2 != '' AND object_id = ?2)"
-                         " ORDER BY id DESC LIMIT 1");
+        statement s(db_, "SELECT time, reason, tags FROM forgotten WHERE output_sha256 = ?1"
+                         " OR (?2 != '' AND object_id = ?2) ORDER BY id DESC LIMIT 1");
         s.bind(1, sha256).bind(2, object_id);
         if (!s.step()) return false;
         time = s.integer(0);
         reason = s.text(1);
+        if (tags) *tags = s.integer(2) != 0;
         return true;
+    }
+
+    void store::add_text_substitutes(long long record, const std::vector<std::pair<std::string, std::string>>& made)
+    {
+        if (made.empty()) return;
+        std::lock_guard<std::mutex> lock(m_);
+        exec("BEGIN IMMEDIATE");
+        try
+        {
+            statement s(db_, "INSERT INTO text_substitutes(record, substitute, tag, places) VALUES(?1, ?2, ?3, 1)"
+                             " ON CONFLICT(record, substitute, tag) DO UPDATE SET places = places + 1,"
+                             " inherited = 0");
+            for (const auto& m : made)
+            {
+                s.reset();
+                s.bind(1, record).bind(2, m.first).bind(3, m.second);
+                s.step();
+            }
+            exec("COMMIT");
+        }
+        catch (...)
+        {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw;
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> store::text_substitutes(long long record, bool inherited_only)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT substitute, tag FROM text_substitutes WHERE record = ?1"
+                         " AND (?2 = 0 OR inherited = 1)");
+        s.bind(1, record).bind(2, static_cast<long long>(inherited_only ? 1 : 0));
+        std::vector<std::pair<std::string, std::string>> out;
+        while (s.step()) out.push_back(std::make_pair(s.text(0), s.text(1)));
+        return out;
+    }
+
+    void store::copy_text_substitutes(long long from, long long to, bool inherited)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT OR IGNORE INTO text_substitutes(record, substitute, tag, places, inherited)"
+                         " SELECT ?2, substitute, tag, places, ?3 FROM text_substitutes WHERE record = ?1");
+        s.bind(1, from).bind(2, to).bind(3, static_cast<long long>(inherited ? 1 : 0));
+        s.step();
     }
 
     void store::add_entries(long long record, const std::vector<entry_record>& entries)
