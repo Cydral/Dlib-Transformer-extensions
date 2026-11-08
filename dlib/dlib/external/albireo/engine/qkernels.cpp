@@ -168,10 +168,10 @@ namespace albireo
             scales[b] = stored;
 #if ALBIREO_QK_AVX2
             const __m256 vi = _mm256_set1_ps(inv);
-            const int mode = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
             const __m256 hi = _mm256_set1_ps(127.0f), lo = _mm256_set1_ps(-127.0f);
+            // The mode of the rounding is written out: a compiler may require a literal constant there.
             auto level = [&](__m256 x) {
-                const __m256 r = _mm256_round_ps(_mm256_mul_ps(x, vi), mode);
+                const __m256 r = _mm256_round_ps(_mm256_mul_ps(x, vi), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
                 return _mm256_cvtps_epi32(_mm256_max_ps(lo, _mm256_min_ps(hi, r)));
             };
             __m256i i0 = level(x0);
