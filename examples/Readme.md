@@ -426,12 +426,16 @@ The two modules take the reference structure of `hrm_transformer_config`, select
 The model sees one input grid and no worked example of the same task. What tells it which transformation to apply is the identifier at the first position, which `puzzle_embeddings` looks up in a table of its own, one row per puzzle, zero at first and trained by sparse sign descent on the rows a batch names, as the reference trains its puzzle embedding. An identifier never trained on keeps its zero row, so a puzzle can only be asked about by name if it was named during training. `--blank-puzzle-id` withholds it, which is the harder setting.
 
 ### The batch
-The defaults are the published settings at a batch of 768. Another `--batch-size` carries them over by the square-root rule for adaptive optimizers (Malladi et al., 2022). The rates and the decoupled decays are multiplied by the square root of the batch ratio, each moment decay keeps its horizon in examples, and the warmup is divided by the ratio. A setting given on the command line is kept as given, and `--no-batch-scaling` turns the rule off.
+The defaults are the published settings at a batch of 768. Another `--batch-size` carries them over by the square-root rule for adaptive optimizers (Malladi et al., 2022). The rates and the decoupled decays are multiplied by the square root of the batch ratio, each moment decay and the decay of the weight average keep their horizon in examples, and the warmup is divided by the ratio. A setting given on the command line is kept as given, and `--no-batch-scaling` turns the rule off.
+
+### The average of the weights
+Every measurement, the best model and the final model read an exponential moving average of the weights, which `parameter_average` keeps at a decay of 0.999 per step at a batch of 768, as the tiny recursive model averages them, while the training goes on from the weights as trained, for the reason the Sudoku section below gives. The identifier table, which moves by its own sign descent, stays out of the average. `--ema 0` measures the weights as trained, and `--patience N` stops the training after N measurements without a better held-out rate.
 
 ### Main ideas demonstrated
 - the reference structure of `hrm_transformer_config`, one template argument away from the library's pre-norm structure,
 - an identifier table trained by sparse sign descent beside a token table trained by the solver, in `puzzle_embeddings`,
 - a recurrent layer whose state is carried across forward passes and restarted sample by sample,
+- the measured weights averaged by `parameter_average` over every tensor `visit_learnable_parameters` reaches, the modules of the hierarchical layer included,
 - the network type selected at compile time by whether the adaptive layer is present.
 
 ### Preparing the data
@@ -458,13 +462,17 @@ A batch is a set of slots, each holding one puzzle and the recurrent state the n
 The output projection is one channel wider than the vocabulary, and that channel, read at the first position, is a halting logit. `loss_halting_cross_entropy_per_token` scores the cells and trains the halting logit towards whether the whole answer came out exact. The loss is where this belongs, since only the loss sees the labels and exactness is a question about them. A slot halts when the logit is positive or when it reaches the maximum number of passes, and one time in ten it is held to a random minimum first, so that the head also sees the passes it would have skipped. The published work also trains a "continue" logit from one more pass of the network; this program trains the halting logit alone, as the tiny recursive model that followed it does, which removes that pass.
 
 ### The batch
-The settings are the published ones at a batch of 768, the one behind the reported result. The default batch of 128 receives them by the square-root rule for adaptive optimizers, as in the ARC example, and the program prints the settings it derived; `--batch-size 768` runs the published setting as it is. The published single-GPU recipe, a batch of 384 at a rate of 7e-5, applies the same rule to the rate alone.
+The settings are the published ones at a batch of 768, the one behind the reported result. The default batch of 128 receives them by the square-root rule for adaptive optimizers, as in the ARC example, the decay of the weight average included, and the program prints the settings it derived; `--batch-size 768` runs the published setting as it is. The published single-GPU recipe, a batch of 384 at a rate of 7e-5, applies the same rule to the rate alone.
+
+### The average of the weights
+Trained on a thousand puzzles, the network overfits late in the run. The rate on the test sample peaks while the training answers are still far from exact and falls as they become exact, and the training then turns unstable, as the release of the reference warns. The tiny recursive model that followed it averages the weights exponentially and reports that the average prevents the collapse. This program keeps such an average in `parameter_average`, at a decay of 0.999 per step at a batch of 768, and every measurement, the best model and the final model read it, while the training goes on from the weights as trained. `--ema 0` measures the weights as trained, and `--patience N` stops the training after N measurements without a better held-out rate.
 
 ### Main ideas demonstrated
 - the reference structure of `hrm_transformer_config`, with the parameter-free `unit_rms_norm`,
 - a halting head trained jointly with the network, through a loss layer that splits the token logits from the halting logit,
 - a recurrent state restarted sample by sample, so that halted sequences are replaced one at a time,
 - stablemax cross-entropy and the Adam-atan2 solver, both as the published configuration uses them,
+- the measured weights averaged by `parameter_average` over every tensor `visit_learnable_parameters` reaches, the modules of the hierarchical layer included,
 - the solver's algorithm and settings handed to the modules the hierarchical layer updates itself, through `network_context`.
 
 ### Preparing the data

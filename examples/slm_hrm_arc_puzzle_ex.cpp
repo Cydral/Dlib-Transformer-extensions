@@ -88,12 +88,25 @@
     split, each answering all the test inputs of its task, so a task votes with the
     variants read. The published measure reads them all, which --eval-samples 0 does.
 
+    THE AVERAGE OF THE WEIGHTS
+
+    The weights a measurement reads are averaged exponentially, as the tiny recursive model
+    averages them, at a decay of 0.999 per step at a batch of 768, unless --ema 0 is given.
+    The Sudoku example shows why. Trained on a small set, the reference overfits late in
+    the run and its training turns unstable, and the average keeps that from deciding what
+    is measured. Every measurement, the best model and the final model read the average,
+    while the training goes on from the weights as trained. The identifier table, which
+    moves by its own sign descent, stays out of the average, as it does in that work.
+    --patience N stops the training after N measurements that do not improve on the best
+    one.
+
     WHAT DIFFERS FROM THE REFERENCE
 
     The halting head trains the halting logit alone, as described above. One linear layer
     carries the cell logits and the halting logit, so the cell logits have a bias where
     the reference's output layer has none. The computation is in single precision, where
-    the reference runs its forward pass in bfloat16.
+    the reference runs its forward pass in bfloat16. The weights a measurement reads are
+    averaged, as described above, where the reference measures them as trained.
 
     Prepare the data first, with the tasks of ConceptARC beside those of ARC-AGI-1, as the
     reference trains:
@@ -109,10 +122,11 @@
     set for. A run with another --batch-size gets the settings the square-root rule of
     Malladi et al. (2022) derives for adaptive optimizers, as in the Sudoku example. With
     kappa the ratio of the two batches, the rates are multiplied by sqrt(kappa), each
-    moment decay becomes 1 - kappa * (1 - beta), the decoupled decays are multiplied by
-    sqrt(kappa), and the warmup is divided by kappa. The number of steps follows from
-    --epochs, so the amount of data seen stays the same. A setting given on the command
-    line is taken as it is, and --no-batch-scaling turns the rule off.
+    moment decay becomes 1 - kappa * (1 - beta), as does the decay of the weight average,
+    the decoupled decays are multiplied by sqrt(kappa), and the warmup is divided by
+    kappa. The number of steps follows from --epochs, so the amount of data seen stays the
+    same. A setting given on the command line is taken as it is, and --no-batch-scaling
+    turns the rule off.
 
     A slot here holds eleven times the positions of a Sudoku slot, and the attention of
     every block grows with the square of that number. The memory extension, on unless
@@ -249,6 +263,8 @@ struct run_options
     double        ponder_cost         = 0.01;
     bool          softmax             = false;
     bool          blank_id            = false;
+    double        ema                 = 0.999;   // 0 measures the weights as trained
+    long          patience            = 0;       // 0 trains to the end
     long          report_every        = 100;
     unsigned long seed                = 0;
     bool          verbose             = false;
@@ -272,6 +288,7 @@ void transpose_to_batch (run_options& o, const command_line_parser& parser)
     if (!parser.option("beta1"))               o.beta1 = moment(o.beta1);
     if (!parser.option("beta2"))               o.beta2 = moment(o.beta2);
     if (!parser.option("warmup-steps"))        o.warmup_steps = std::lround(o.warmup_steps / kappa);
+    if (!parser.option("ema") && o.ema > 0)    o.ema = moment(o.ema);
     o.transposed = true;
 }
 
@@ -600,11 +617,12 @@ double rate_at (const run_options& o, long step, long total)
 }
 
 /*
-    A checkpoint holds the network, the identifier table with it, the solvers, the step,
-    the best held-out rate measured so far and the batch. The rate lets a resumed run keep
-    the best model it already saved, since its first measurement then replaces that model
-    only by doing better. The slots are not kept, so a resumed run starts every slot on a
-    new example, which costs the examples in flight and nothing else.
+    A checkpoint holds the network, the identifier table with it, the solvers, the average
+    of the weights, the step, the best held-out rate measured so far, the measurements
+    taken since and the batch. The rate lets a resumed run keep the best model it already
+    saved, since its first measurement then replaces that model only by doing better. The
+    slots are not kept, so a resumed run starts every slot on a new example, which costs
+    the examples in flight and nothing else.
 
     The solvers keep the moment decays and the weight decay they were built with, and a
     step means a batch of examples, so a run resumes at the batch it was written with.
@@ -613,9 +631,17 @@ double rate_at (const run_options& o, long step, long total)
     otherwise. The next step allocates them again, and the recurrent state the slots carry
     is kept, as cleaning leaves it alone.
 */
+struct run_progress
+{
+    long   step       = 0;
+    double best       = -1;    // the best held-out rate, -1 before the first measurement
+    long   since_best = 0;     // measurements since that rate was reached
+    long   batch      = 0;
+};
+
 template <typename network>
-void save_checkpoint (const std::string& file, network& net,
-                      const std::vector<adam_atan2>& solvers, long step, double best, long batch)
+void save_checkpoint (const std::string& file, network& net, const std::vector<adam_atan2>& solvers,
+                      const parameter_average& average, const run_progress& at)
 {
     net.clean();
     const std::string tmp = file + "_";
@@ -623,9 +649,11 @@ void save_checkpoint (const std::string& file, network& net,
         std::ofstream out(tmp, std::ios::binary);
         serialize(net, out);
         serialize(solvers, out);
-        serialize(step, out);
-        serialize(best, out);
-        serialize(batch, out);
+        serialize(average, out);
+        serialize(at.step, out);
+        serialize(at.best, out);
+        serialize(at.since_best, out);
+        serialize(at.batch, out);
         if (!out)
             throw std::runtime_error("unable to write " + tmp);
     }
@@ -633,17 +661,19 @@ void save_checkpoint (const std::string& file, network& net,
 }
 
 template <typename network>
-bool load_checkpoint (const std::string& file, network& net,
-                      std::vector<adam_atan2>& solvers, long& step, double& best, long& batch)
+bool load_checkpoint (const std::string& file, network& net, std::vector<adam_atan2>& solvers,
+                      parameter_average& average, run_progress& at)
 {
     if (!file_exists(file))
         return false;
     std::ifstream in(file, std::ios::binary);
     deserialize(net, in);
     deserialize(solvers, in);
-    deserialize(step, in);
-    deserialize(best, in);
-    deserialize(batch, in);
+    deserialize(average, in);
+    deserialize(at.step, in);
+    deserialize(at.best, in);
+    deserialize(at.since_best, in);
+    deserialize(at.batch, in);
     return true;
 }
 
@@ -668,7 +698,8 @@ void explain_mismatch (const std::string& file, const run_options& o, const std:
     cout << "\n" << file << " does not fit this network. The adaptive layer of --halting "
             "internal and both makes\nthe modules a different type, so a file written under "
             "one arrangement reads under the\nsame one only, and this run uses --halting "
-         << describe(o.halting) << ".\nRemove the file, or point --model-file elsewhere.\n\n  "
+         << describe(o.halting) << ". A file written by an earlier\nversion of this program "
+            "does not read either.\nRemove the file, or point --model-file elsewhere.\n\n  "
          << e.what() << "\n";
 }
 
@@ -689,13 +720,14 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
 
     std::vector<adam_atan2> solvers(network::num_computational_layers,
                                     adam_atan2(o.weight_decay, o.beta1, o.beta2));
-    long step = 0, written_batch = o.batch_size;
-    double best_exact = -1;
+    parameter_average average;
+    run_progress at;
+    at.batch = o.batch_size;
     const std::string checkpoint = "chkpt-" + o.model_file;
     bool resumed = false;
     try
     {
-        resumed = load_checkpoint(checkpoint, net, solvers, step, best_exact, written_batch);
+        resumed = load_checkpoint(checkpoint, net, solvers, average, at);
     }
     catch (const std::exception& e)
     {
@@ -704,18 +736,28 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
     }
     if (resumed)
     {
-        if (written_batch != o.batch_size)
+        if (at.batch != o.batch_size)
         {
-            cout << checkpoint << " was written by a run of batch " << written_batch
+            cout << checkpoint << " was written by a run of batch " << at.batch
                  << ", and this one asks for " << o.batch_size << ".\nResume with --batch-size "
-                 << written_batch << ", or remove the file to start afresh.\n";
+                 << at.batch << ", or remove the file to start afresh.\n";
             return 1;
         }
-        cout << "Resuming from " << checkpoint << " at step " << step;
-        if (best_exact >= 0)
-            cout << ", best held-out rate so far " << 100.0 * best_exact << " %";
+        cout << "Resuming from " << checkpoint << " at step " << at.step;
+        if (at.best >= 0)
+            cout << ", best held-out rate so far " << 100.0 * at.best << " %";
         cout << "\n";
     }
+    long& step = at.step;
+    double& best_exact = at.best;
+
+    /* The run's own setting decides whether the weights are averaged. A run that averages
+       and resumes from a checkpoint written without the average starts it there. */
+    const bool averaging = o.ema > 0;
+    if (averaging)
+        average.set_decay(o.ema);
+    else
+        average.clear();
 
     // Set after loading, so that a resumed run takes the options it was given.
     auto& loss = net.loss_details();
@@ -779,6 +821,9 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
         initialize_halting_head(net);
         core.reset_state();
     }
+    // The average starts at the weights the run starts from.
+    if (averaging && average.empty())
+        average.update(net);
     cout << "Parameters: " << count_parameters(net).total << ", and an identifier table of "
          << table.get_num_puzzles() << " rows of " << EMBED_DIM << " beside them ("
          << (table.get_num_puzzles() * EMBED_DIM * sizeof(float) >> 20) << " MiB)\n";
@@ -793,7 +838,8 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
     cout << "\nTraining for " << total_steps << " steps of " << B << " slots, measuring every "
          << eval_every << " steps\n";
 
-    while (step < total_steps && !signal_handler::is_triggered())
+    bool out_of_patience = false;
+    while (step < total_steps && !out_of_patience && !signal_handler::is_triggered())
     {
         ++step;
         const double lr = rate_at(o, step, total_steps);
@@ -815,6 +861,8 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
 
         net.compute_parameter_gradients(x, ys.begin());
         net.update_parameters(solvers, lr);
+        if (averaging)
+            average.update(net);
 
         token_loss += loss.get_token_loss();
         halting_loss += loss.get_halting_loss();
@@ -880,22 +928,33 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
 
         if (std::chrono::steady_clock::now() - last_save > std::chrono::minutes(15))
         {
-            save_checkpoint(checkpoint, net, solvers, step, best_exact, B);
+            save_checkpoint(checkpoint, net, solvers, average, at);
             last_save = std::chrono::steady_clock::now();
         }
 
         if (test.num_examples() > 0 && (step % eval_every == 0 || step == total_steps))
         {
             const auto measured_at = std::chrono::steady_clock::now();
+            // The measurement reads the average, put in place of the weights for its time.
+            if (averaging)
+                average.swap(net);
             const measurement m = evaluate(net, test, o, o.eval_samples);
             report(m, "held out");
             const double rate = m.examples ? (double)m.exact / m.examples : 0;
             if (rate > best_exact)
             {
                 best_exact = rate;
+                at.since_best = 0;
                 save_model(o.model_file + ".best", net);
                 cout << "  best so far, saved to " << o.model_file << ".best\n";
             }
+            else if (++at.since_best >= o.patience && o.patience > 0)
+            {
+                cout << "  no better rate in " << at.since_best << " measurements, training stops\n";
+                out_of_patience = true;
+            }
+            if (averaging)
+                average.swap(net);
             // The measurement replaced the carried state, so every slot starts a new example.
             std::fill(slot_restart.begin(), slot_restart.end(), true);
             // Its time is left out of the training pace the next line reports.
@@ -914,11 +973,15 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
         cout << "\n";
     }
 
-    save_checkpoint(checkpoint, net, solvers, step, best_exact, B);
+    save_checkpoint(checkpoint, net, solvers, average, at);
     core.set_carry_state(false);
     core.reset_state();
+    if (averaging)
+        average.swap(net);
     save_model(o.model_file, net);
-    cout << "Model saved to " << o.model_file << "\n";
+    if (averaging)
+        average.swap(net);
+    cout << "Model saved to " << o.model_file << (averaging ? ", the average of the weights" : "") << "\n";
     network_context::reset();
     return 0;
 }
@@ -1017,6 +1080,11 @@ int main(int argc, char** argv)
         parser.add_option("softmax", "Score the cells under softmax, where the reference uses stablemax");
         parser.add_option("blank-puzzle-id", "Withhold the identifier, so that the model is asked "
                                              "to work without being told the rule");
+        parser.add_option("ema", "Decay per step of the average of the weights that measurements and "
+                                 "saved models read, 0 to read the weights as trained (default: "
+                                 "0.999 at a batch of 768)", 1);
+        parser.add_option("patience", "Stop training after N measurements without a better held-out "
+                                      "rate, 0 to train to the end (default: 0)", 1);
         parser.add_option("report-every", "Print a line every N steps, and at least every five "
                                           "minutes (default: 100)", 1);
         parser.add_option("seed", "Seed of the draws (default: 0)", 1);
@@ -1080,6 +1148,8 @@ int main(int argc, char** argv)
         o.ponder_cost         = get_option(parser, "ponder-cost", o.ponder_cost);
         o.softmax             = parser.option("softmax");
         o.blank_id            = parser.option("blank-puzzle-id");
+        o.ema                 = get_option(parser, "ema", o.ema);
+        o.patience            = get_option(parser, "patience", o.patience);
         o.report_every        = get_option(parser, "report-every", o.report_every);
         o.seed                = get_option(parser, "seed", o.seed);
         o.verbose             = parser.option("verbose");
@@ -1104,6 +1174,11 @@ int main(int argc, char** argv)
         {
             cout << "--learning-rate must be positive, --puzzle-rate and --puzzle-weight-decay "
                     "at least 0\n";
+            return 1;
+        }
+        if (!(o.ema >= 0 && o.ema < 1) || o.patience < 0)
+        {
+            cout << "--ema must lie in [0, 1) and --patience be at least 0\n";
             return 1;
         }
         transpose_to_batch(o, parser);
@@ -1190,6 +1265,14 @@ int main(int argc, char** argv)
              << (uses_head(o.halting) ? ", halting when the head says so" : ", all of them") << "\n";
         if (uses_act(o.halting))
             cout << "  ponder cost   : " << o.ponder_cost << " per adaptive step\n";
+        if (o.ema > 0)
+            cout << "  weights       : averaged at a decay of " << o.ema << " per step, which "
+                    "measurements and saved models read\n";
+        else
+            cout << "  weights       : measured as trained\n";
+        if (o.patience > 0)
+            cout << "  patience      : training stops after " << o.patience
+                 << " measurements without a better rate\n";
         cout << "\n";
 
         /* The adaptive layer changes the type of the modules, so each arrangement

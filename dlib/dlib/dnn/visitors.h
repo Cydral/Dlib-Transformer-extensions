@@ -10,6 +10,9 @@
 #include "loss.h"
 #include <iomanip>
 #include <sstream>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace dlib
 {
@@ -262,6 +265,246 @@ namespace dlib
         ensure_network_initialized(net, seq_len);
         return count_parameters(net);
     }
+
+// ----------------------------------------------------------------------------------------
+// Every learnable tensor of a network, nested networks included
+// ----------------------------------------------------------------------------------------
+
+    namespace impl
+    {
+        template <typename net_type, typename visitor>
+        void visit_all_parameters (net_type& net, visitor& v);
+
+        /* The layers that hold networks of their own, found by the accessors they offer: the
+           recurrent layer of hierarchical reasoning and its two modules, the adaptive layer
+           and its transition network, the mixture of experts and its gate and experts, and
+           modality fusion and its encoder. */
+        template <typename layer_type, typename visitor>
+        auto visit_modules (layer_type& l, visitor& v, int)
+            -> decltype(l.get_h_net(), l.get_l_net(), void())
+        {
+            impl::visit_all_parameters(l.get_h_net(), v);
+            impl::visit_all_parameters(l.get_l_net(), v);
+        }
+        template <typename layer_type, typename visitor>
+        void visit_modules (layer_type&, visitor&, long) {}
+
+        template <typename layer_type, typename visitor>
+        auto visit_transition_net (layer_type& l, visitor& v, int)
+            -> decltype(l.get_transition_net(), void())
+        {
+            impl::visit_all_parameters(l.get_transition_net(), v);
+        }
+        template <typename layer_type, typename visitor>
+        void visit_transition_net (layer_type&, visitor&, long) {}
+
+        template <typename layer_type, typename visitor>
+        auto visit_experts (layer_type& l, visitor& v, int)
+            -> decltype(l.get_gate(), l.get_experts(), void())
+        {
+            impl::visit_all_parameters(l.get_gate(), v);
+            for (auto& expert : l.get_experts())
+                impl::visit_all_parameters(expert, v);
+        }
+        template <typename layer_type, typename visitor>
+        void visit_experts (layer_type&, visitor&, long) {}
+
+        template <typename layer_type, typename visitor>
+        auto visit_encoder (layer_type& l, visitor& v, int)
+            -> decltype(l.get_encoder(), void())
+        {
+            impl::visit_all_parameters(l.get_encoder(), v);
+        }
+        template <typename layer_type, typename visitor>
+        void visit_encoder (layer_type&, visitor&, long) {}
+
+        template <typename T, typename = void>
+        struct holds_modules : std::false_type {};
+        template <typename T>
+        struct holds_modules<T, decltype((void)std::declval<T&>().get_h_net())> : std::true_type {};
+
+        template <typename T, typename = void>
+        struct holds_transition_net : std::false_type {};
+        template <typename T>
+        struct holds_transition_net<T, decltype((void)std::declval<T&>().get_transition_net())> : std::true_type {};
+
+        template <typename T, typename = void>
+        struct holds_experts : std::false_type {};
+        template <typename T>
+        struct holds_experts<T, decltype((void)std::declval<T&>().get_experts())> : std::true_type {};
+
+        template <typename T, typename = void>
+        struct holds_encoder : std::false_type {};
+        template <typename T>
+        struct holds_encoder<T, decltype((void)std::declval<T&>().get_encoder())> : std::true_type {};
+
+        template <typename T, typename = void>
+        struct reports_internal_parameters : std::false_type {};
+        template <typename T>
+        struct reports_internal_parameters<T, decltype((void)std::declval<const T&>().internal_parameters())>
+            : std::true_type {};
+
+        template <typename net_type, typename visitor>
+        void visit_all_parameters (net_type& net, visitor& v)
+        {
+            visit_computational_layers(net, [&v](auto& l) {
+                using layer_type = typename std::remove_reference<decltype(l)>::type;
+                /* A layer that counts parameters of its own beyond its parameter tensor keeps
+                   them in networks it holds, and a layer reached by none of the accessors
+                   above would have them skipped without a word. */
+                static_assert(!reports_internal_parameters<layer_type>::value ||
+                              holds_modules<layer_type>::value || holds_transition_net<layer_type>::value ||
+                              holds_experts<layer_type>::value || holds_encoder<layer_type>::value,
+                              "This layer holds parameters in networks that visit_learnable_parameters() "
+                              "does not know how to reach");
+                v(l.get_layer_params());
+                visit_modules(l, v, 0);
+                visit_transition_net(l, v, 0);
+                visit_experts(l, v, 0);
+                visit_encoder(l, v, 0);
+            });
+        }
+    }
+
+    template <typename net_type, typename visitor>
+    void visit_learnable_parameters (
+        net_type& net,
+        visitor v
+    )
+    {
+        impl::visit_all_parameters(net, v);
+    }
+
+// ----------------------------------------------------------------------------------------
+// An exponential moving average of the learnable parameters
+// ----------------------------------------------------------------------------------------
+
+    class parameter_average
+    {
+    public:
+        parameter_average () = default;
+
+        explicit parameter_average (
+            double decay
+        )
+        {
+            set_decay(decay);
+        }
+
+        double get_decay () const { return decay_; }
+
+        void set_decay (double decay)
+        {
+            DLIB_CASSERT(0 <= decay && decay < 1,
+                "parameter_average: the decay " << decay << " lies outside [0, 1)");
+            decay_ = decay;
+        }
+
+        bool empty () const { return averages_.empty(); }
+        void clear () { averages_.clear(); }
+
+        template <typename net_type>
+        void update (
+            net_type& net
+        )
+        {
+            const std::vector<tensor*> live = gather(net);
+            if (averages_.empty())
+            {
+                averages_.resize(live.size());
+                for (size_t i = 0; i < live.size(); ++i)
+                    start(averages_[i], *live[i]);
+                return;
+            }
+            check_layout(live);
+            const float keep = static_cast<float>(decay_);
+            const float take = static_cast<float>(1 - decay_);
+            for (size_t i = 0; i < live.size(); ++i)
+            {
+                tensor& p = *live[i];
+                if (p.size() == 0)
+                    continue;
+                // A tensor allocated after the average started, an expert's first route.
+                if (averages_[i].size() == 0)
+                {
+                    start(averages_[i], p);
+                    continue;
+                }
+                tt::affine_transform(averages_[i], averages_[i], p, keep, take);
+            }
+        }
+
+        template <typename net_type>
+        void swap (
+            net_type& net
+        )
+        {
+            const std::vector<tensor*> live = gather(net);
+            check_layout(live);
+            for (size_t i = 0; i < live.size(); ++i)
+            {
+                tensor& p = *live[i];
+                if (p.size() == 0 || averages_[i].size() == 0)
+                    continue;
+                scratch_.copy_size(p);
+                memcpy(scratch_, p);
+                memcpy(p, averages_[i]);
+                memcpy(averages_[i], scratch_);
+            }
+        }
+
+        friend void serialize (const parameter_average& item, std::ostream& out)
+        {
+            serialize("parameter_average", out);
+            serialize(item.decay_, out);
+            serialize(item.averages_, out);
+        }
+
+        friend void deserialize (parameter_average& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "parameter_average")
+                throw serialization_error("Unexpected version '" + version +
+                                          "' found while deserializing dlib::parameter_average.");
+            deserialize(item.decay_, in);
+            deserialize(item.averages_, in);
+        }
+
+    private:
+        template <typename net_type>
+        static std::vector<tensor*> gather (net_type& net)
+        {
+            std::vector<tensor*> live;
+            visit_learnable_parameters(net, [&live](tensor& t) { live.push_back(&t); });
+            return live;
+        }
+
+        static void start (resizable_tensor& average, const tensor& p)
+        {
+            average.copy_size(p);
+            if (p.size() != 0)
+                memcpy(average, p);
+        }
+
+        void check_layout (const std::vector<tensor*>& live) const
+        {
+            if (live.size() != averages_.size())
+                throw error("parameter_average: the network holds " + std::to_string(live.size()) +
+                            " parameter tensors where the average holds " +
+                            std::to_string(averages_.size()) + ". It was started on another network.");
+            for (size_t i = 0; i < live.size(); ++i)
+                if (live[i]->size() != 0 && averages_[i].size() != 0 &&
+                    live[i]->size() != averages_[i].size())
+                    throw error("parameter_average: parameter tensor " + std::to_string(i) + " holds " +
+                                std::to_string(live[i]->size()) + " values where the average holds " +
+                                std::to_string(averages_[i].size()) + ". It was started on another network.");
+        }
+
+        double decay_ = 0.999;
+        std::vector<resizable_tensor> averages_;
+        resizable_tensor scratch_;
+    };
 
 // ----------------------------------------------------------------------------------------
 // Low-rank adaptation across a network

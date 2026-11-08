@@ -1671,6 +1671,14 @@ namespace dlib
                 - Returns reference to the internal gate network
         !*/
 
+        std::vector<EXPERT_NET>& get_experts();
+        const std::vector<EXPERT_NET>& get_experts() const;
+        /*!
+            ensures
+                - Returns the expert networks. The vector is empty until the layer is set up,
+                  and holds num_experts() networks afterwards.
+        !*/
+
         long num_experts() const;
         /*!
             ensures

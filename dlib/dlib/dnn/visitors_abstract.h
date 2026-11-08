@@ -218,6 +218,141 @@ namespace dlib
     !*/
 
 // ----------------------------------------------------------------------------------------
+
+    template <typename net_type, typename visitor>
+    void visit_learnable_parameters (
+        net_type& net,
+        visitor v
+    );
+    /*!
+        requires
+            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
+              add_tag_layer.
+            - v is a function object with a signature equivalent to void(tensor& params).
+        ensures
+            - Calls v on the parameter tensor of every computational layer of net, as
+              visit_layer_parameters() does, and also on every parameter tensor of the
+              networks a layer holds: the two modules of hrm_, the transition network of
+              adaptive_computation_time_, the gate and the experts of moe_ and the encoder of
+              modality fusion, at any depth.
+            - The order is the same for every network of a given type, so two such networks
+              visited one after the other yield matching tensors at matching positions.
+            - Tensors that are empty, a layer not set up yet or an expert never routed, are
+              visited as well, which keeps the positions fixed.
+            - A layer that reports internal_parameters() without offering any of the
+              accessors above fails to compile, since its parameters would be skipped.
+            - A table a layer trains by its own sparse updates outside its parameter tensor,
+              the puzzle table of puzzle_embeddings_ for instance, is not visited.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    class parameter_average
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                An exponential moving average of the learnable parameters of a network, the
+                tensors visit_learnable_parameters() reaches. After each update the average
+                becomes decay times itself plus (1 - decay) times the current parameters,
+                which averages them over about 1/(1 - decay) updates.
+
+                A network trained on a small set can overfit and turn unstable late in
+                training. Measuring the average of its recent parameters smooths what is
+                measured and kept, and the tiny recursive model reports that a decay of 0.999
+                prevents the sharp collapse its reference showed on such sets.
+
+                The averaged values live in this object and are exchanged with the network's
+                own for the time of a measurement, so the network keeps a single set of
+                parameters and its solvers stay untouched.
+        !*/
+
+    public:
+
+        parameter_average (
+        );
+        /*!
+            ensures
+                - #get_decay() == 0.999
+                - #empty() == true
+        !*/
+
+        explicit parameter_average (
+            double decay
+        );
+        /*!
+            requires
+                - 0 <= decay < 1
+            ensures
+                - #get_decay() == decay
+                - #empty() == true
+        !*/
+
+        double get_decay (
+        ) const;
+
+        void set_decay (
+            double decay
+        );
+        /*!
+            requires
+                - 0 <= decay < 1
+            ensures
+                - #get_decay() == decay
+        !*/
+
+        bool empty (
+        ) const;
+        /*!
+            ensures
+                - returns true if no network has been recorded yet.
+        !*/
+
+        void clear (
+        );
+        /*!
+            ensures
+                - #empty() == true
+        !*/
+
+        template <typename net_type>
+        void update (
+            net_type& net
+        );
+        /*!
+            ensures
+                - if empty(), the average starts at the current parameters of net.
+                - otherwise every averaged tensor becomes get_decay() times itself plus
+                  (1 - get_decay()) times the matching parameters of net. A parameter tensor
+                  that was empty when the average started and is allocated now starts at its
+                  current values.
+                - net is not modified.
+            throws
+                - dlib::error if the average was started on a network with other parameter
+                  tensors.
+        !*/
+
+        template <typename net_type>
+        void swap (
+            net_type& net
+        );
+        /*!
+            ensures
+                - exchanges the averaged values with the parameters of net, so that net holds
+                  the average and this object the parameters net held. Calling it a second
+                  time restores both.
+            throws
+                - dlib::error if the average was started on a network with other parameter
+                  tensors.
+        !*/
+    };
+
+    void serialize(const parameter_average& item, std::ostream& out);
+    void deserialize(parameter_average& item, std::istream& in);
+    /*!
+        provides serialization support, the decay and the averaged tensors included.
+    !*/
+
+// ----------------------------------------------------------------------------------------
 // Low-rank adaptation across a network
 // ----------------------------------------------------------------------------------------
 

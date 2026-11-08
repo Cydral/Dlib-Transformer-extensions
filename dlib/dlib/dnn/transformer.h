@@ -2880,6 +2880,10 @@ namespace dlib
         GATE_NET& get_gate() { return gate_net; }
         const GATE_NET& get_gate() const { return gate_net; }
 
+        // The expert networks, created when the layer is set up.
+        std::vector<EXPERT_NET>& get_experts() { return experts; }
+        const std::vector<EXPERT_NET>& get_experts() const { return experts; }
+
         long num_experts() const { return n_experts; }
         long num_active_experts() const { return top_k; }
         bool is_training_mode() const

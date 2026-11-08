@@ -112,6 +112,7 @@ add_executable(${target_name} main.cpp tester.cpp
    global_optimization.cpp
    opt_qp_solver.cpp
    parallel_for.cpp
+   parameter_average.cpp
    parse.cpp
    pipe.cpp
    pixel.cpp
