@@ -5,6 +5,8 @@
 
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace dlib
 {
@@ -31,6 +33,19 @@ namespace dlib
             document, a description for instance, or an empty string to leave the picture
             out without text.  The anonymizers write the text as it is returned: a
             function whose text may hold personal data protects it first.
+    !*/
+
+    typedef std::function<std::vector<std::pair<std::size_t, std::size_t>>(const std::string& text)>
+        document_picture_text_finder;
+    /*!
+        WHAT THIS OBJECT REPRESENTS
+            A function that finds, in a text of a document being restored, the texts that a
+            document_image_describer wrote in the place of pictures: it returns their byte
+            ranges [begin, end), in order and without overlap.  The restoration removes
+            them, since it cannot give the pictures back: the picture texts of a Word
+            document leave their runs, the gray text boxes of the pictures of a PowerPoint
+            slide leave the slide, and those written over the gray boxes of a PDF leave the
+            page, whose gray boxes stay.
     !*/
 
 // ----------------------------------------------------------------------------------------

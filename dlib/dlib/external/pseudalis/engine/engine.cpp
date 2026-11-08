@@ -168,6 +168,7 @@ namespace pseudalis
             j["dates_shifted"] = static_cast<unsigned long long>(r.dates_shifted);
             j["substitutes"] = static_cast<unsigned long long>(r.substitutions.size());
             j["substitutes_restored"] = static_cast<unsigned long long>(r.substitutes_restored);
+            j["pictures_removed"] = static_cast<unsigned long long>(r.pictures_removed);
             j["dropped"] = json::array();
             return j;
         }
@@ -179,11 +180,95 @@ namespace pseudalis
                 whole["values"][kv.first] =
                     static_cast<unsigned long long>(whole["values"][kv.first].as_int(0) + kv.second.as_int(0));
             for (const char* key : { "total", "tags_restored", "tags_rejected", "dates_shifted", "substitutes",
-                                     "substitutes_restored" })
+                                     "substitutes_restored", "pictures_removed" })
                 whole[key] = static_cast<unsigned long long>(whole[key].as_int(0) + part[key].as_int(0));
             for (const char* key : { "removed", "notes", "dropped" })
                 for (const json& v : part[key].elements())
                     whole[key].push_back(entry.empty() ? v.str() : entry + ": " + v.str());
+        }
+
+        /*
+            The picture markers of a text, as byte ranges: "[Image@<16 digits>]" and "[Image@<16
+            digits> : <description>]", whose description may hold tags, and a marker that a PDF
+            wrote short over its gray box, ending with "..." at the end of the text.  A space on
+            each side of a marker leaves with it once, so that "voir [Image@...] ci-dessous" gives
+            "voir ci-dessous".
+        */
+        std::vector<std::pair<std::size_t, std::size_t>> picture_markers(const std::string& text)
+        {
+            std::vector<std::pair<std::size_t, std::size_t>> out;
+            std::size_t p = 0;
+            while ((p = text.find("[Image@", p)) != std::string::npos)
+            {
+                std::size_t q = p + 7, digits = 0;
+                while (q < text.size() && digits < 16 &&
+                       ((text[q] >= '0' && text[q] <= '9') || (text[q] >= 'a' && text[q] <= 'f')))
+                {
+                    ++q;
+                    ++digits;
+                }
+                std::size_t end = std::string::npos;
+                if (digits == 16 && q < text.size() && text[q] == ']')
+                {
+                    end = q + 1;
+                }
+                else if (digits == 16 && text.compare(q, 3, " : ") == 0)
+                {
+                    // The description, up to the bracket that closes the marker, its tags read whole.
+                    for (q += 3; q < text.size() && q - p < 8192;)
+                    {
+                        if (text.compare(q, 2, "[[") == 0)
+                        {
+                            const std::size_t close = text.find("]]", q + 2);
+                            if (close == std::string::npos || close - q > 1024) break;
+                            q = close + 2;
+                            continue;
+                        }
+                        if (text[q] == ']') { end = q + 1; break; }
+                        if (text[q] == '[') break;
+                        ++q;
+                    }
+                    // Written short over the gray box of a PDF: "...", then the end of the text.
+                    if (end == std::string::npos)
+                    {
+                        std::size_t last = text.size();
+                        while (last > p && (text[last - 1] == ' ' || text[last - 1] == '\n' || text[last - 1] == '\r'))
+                            --last;
+                        if (last - p < 8192 && last >= p + 3 && text.compare(last - 3, 3, "...") == 0 &&
+                            text.find('[', p + 1) == std::string::npos)
+                            end = last;
+                    }
+                }
+                if (end == std::string::npos)
+                {
+                    p += 7;
+                    continue;
+                }
+                // One space leaves with the marker: the one after it, or the one before it at the end of a line.
+                std::size_t b = p;
+                const bool space_before = b > 0 && text[b - 1] == ' ';
+                const bool line_before = b == 0 || text[b - 1] == '\n' || text[b - 1] == '\r';
+                const bool space_after = end < text.size() && text[end] == ' ';
+                const bool line_after = end == text.size() || text[end] == '\n' || text[end] == '\r';
+                if (space_after && (space_before || line_before)) ++end;
+                else if (space_before && line_after) --b;
+                out.push_back(std::make_pair(b, end));
+                p = end;
+            }
+            return out;
+        }
+
+        // Whether a text is a picture marker alone, the text file of a picture.
+        bool marker_alone(const std::string& text)
+        {
+            std::size_t b = 0, e = text.size();
+            if (e >= 3 && text.compare(0, 3, "\xEF\xBB\xBF") == 0) b = 3;
+            while (b < e && (text[b] == ' ' || text[b] == '\r' || text[b] == '\n' || text[b] == '\t')) ++b;
+            while (e > b && (text[e - 1] == ' ' || text[e - 1] == '\r' || text[e - 1] == '\n' || text[e - 1] == '\t'))
+                --e;
+            if (e - b < 24 || e - b > 65536) return false;
+            const std::vector<std::pair<std::size_t, std::size_t>> found = picture_markers(text.substr(b, e - b));
+            return found.size() == 1 && found[0].first == 0 && found[0].second == e - b;
         }
 
         /*
@@ -1141,6 +1226,8 @@ namespace pseudalis
             // The properties of the document take substitutes, which a window of properties shows as they are.
             a.set_untagged_properties(true);
             a.set_substitute_resolver(resolver_of(lookup));
+            // A restoration cannot give a picture back into a document: its marker leaves.
+            if (restoring) a.set_picture_text_finder(picture_markers);
             /*
                 A part of an Office document takes about 26 bytes of memory for each of its bytes
                 while it is read: each part stays within 32 times the document, from 32 MB.
@@ -1340,6 +1427,14 @@ namespace pseudalis
                 if (!e.regular || (!restoring && kind == file_kind::unsupported))
                 {
                     out.report["dropped"].push_back(e.name);
+                    std::string().swap(e.data);
+                    continue;
+                }
+                // The text file of a picture, whose picture a restoration cannot give back, leaves.
+                if (restoring && e.data.size() <= 65536 + 3 && marker_alone(e.data))
+                {
+                    out.report["pictures_removed"] =
+                        static_cast<unsigned long long>(out.report["pictures_removed"].as_int(0) + 1);
                     std::string().swap(e.data);
                     continue;
                 }

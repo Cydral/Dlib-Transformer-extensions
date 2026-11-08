@@ -627,12 +627,14 @@ namespace pseudalis
         out.how = "original";
         out.record = r.id;
         out.report = json::object();
-        /* The original of a protected file edited on the drive is that file with its edits:
-           the tags it kept are restored too, with the substitutes of its properties.  The
-           parts of an Office document, of a PDF or of an archive are compressed: only a
-           text shows its tags to a search. */
+        /* The original of a protected file edited on the drive, or of a file written elsewhere
+           from protected values, is that file: the tags it kept are restored too, with the
+           substitutes of its properties, and the markers of its pictures leave it, as from any
+           restoration without the original.  The parts of an Office document, of a PDF or of an
+           archive are compressed: only a text shows its tags to a search. */
         const bool text = r.kind == "txt" || r.kind == "csv" || r.kind == "xml" || r.kind == "text";
-        if (engine_ && r.kind != "image" && (!text || out.bytes.find("[[") != std::string::npos))
+        if (engine_ && r.kind != "image" &&
+            (!text || out.bytes.find("[[") != std::string::npos || out.bytes.find("[Image@") != std::string::npos))
         {
             json request = json::object(), result;
             request["operation"] = "restore";
@@ -641,7 +643,8 @@ namespace pseudalis
             const bool done =
                 engine_->process(request, out.bytes, result, restored, nullptr, e, substitute_lookup());
             const long long put_back = done ? result["report"]["tags_restored"].as_int(0) +
-                                              result["report"]["substitutes_restored"].as_int(0) : 0;
+                                              result["report"]["substitutes_restored"].as_int(0) +
+                                              result["report"]["pictures_removed"].as_int(0) : 0;
             if (put_back > 0)
             {
                 out.bytes = restored;
@@ -745,26 +748,16 @@ namespace pseudalis
         file_record r;
         const std::string sha = sha256_hex(bytes);
         if (db_->find_by_output(sha, r, name)) return recorded_original(r, out, error);
-        /* The original was forgotten: the file is not restored, from its tags either.  Its object
-           identifier tells it only while no live record holds it since. */
+        /* The original was forgotten, at the request of a user, at the end of its time or to make
+           room: the file is restored from its tags, which the key still opens, as a file written
+           elsewhere from protected values is; what its protection removed, its pictures first,
+           does not come back.  Its object identifier tells it only while no live record holds it
+           since. */
         int64_t when = 0;
         std::string reason;
         const bool tracked = db_->find_by_object(object_id, r);
-        if (db_->find_forgotten(sha, tracked ? std::string() : object_id, when, reason))
-        {
-            const std::string day = iso_time(when).substr(0, 10);
-            if (reason == "expired")
-                error.set("the original of this file was kept until " + day +
-                          " after its file left the drive, and can no longer be restored", "original_expired");
-            else if (reason == "space")
-                error.set("the original of this file was forgotten on " + day + " to make room for newer "
-                          "originals, and can no longer be restored", "original_space");
-            else
-                error.set("the original of this file was forgotten on " + day + " and can no longer be restored",
-                          "original_forgotten");
-            error.arg("date", day);
-            return false;
-        }
+        const bool forgotten = db_->find_forgotten(sha, tracked ? std::string() : object_id, when, reason);
+        const std::string day = forgotten ? iso_time(when).substr(0, 10) : std::string();
         // A file extracted from a protected archive: the entry of the original archive.
         entry_record entry;
         if (db_->find_entry(sha, entry))
@@ -801,6 +794,16 @@ namespace pseudalis
             out.report = json::object();
             return true;
         }
+        // The text file of a picture that the vault no longer holds: its tags give nothing back.
+        if (!id.empty())
+        {
+            if (forgotten)
+                error.set("the picture of this file was forgotten on " + day + " and cannot be given back",
+                          "picture_forgotten").arg("date", day);
+            else
+                error.set("the picture of this file is not in the vault of this computer", "picture_missing");
+            return false;
+        }
         if (!engine_)
         {
             error.set("the engine is not ready", "engine");
@@ -817,10 +820,19 @@ namespace pseudalis
             return false;
         }
         out.report = result["report"];
-        if (out.report["tags_restored"].as_int(0) == 0 && out.report["substitutes_restored"].as_int(0) == 0)
+        if (!forgotten && out.report["tags_restored"].as_int(0) == 0 &&
+            out.report["substitutes_restored"].as_int(0) == 0 && out.report["pictures_removed"].as_int(0) == 0)
         {
             error.set("this file holds no value that Pseudalis protected with this key", "not_protected");
             return false;
+        }
+        // The day and the reason of the forgetting, which the clients tell with the restoration.
+        if (forgotten)
+        {
+            json f = json::object();
+            f["date"] = day;
+            f["reason"] = reason;
+            out.report["original_forgotten"] = f;
         }
         // The name with its substitutes given back.
         out.name = result["name"].str(name);

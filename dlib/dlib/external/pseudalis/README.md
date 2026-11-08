@@ -131,10 +131,12 @@ written is deleted.
   restored and forgotten alone. A file extracted elsewhere is restored from the original of the archive
   while the service keeps it.
 - An anonymized file whose original was forgotten, or left the vault once its time was over, stays as it
-  is when it comes back to the drive, unrecorded: it is not anonymized again, which would keep a new
-  original whose tags restore it, and its restoration stays refused, as for the files extracted from
-  such an archive. A document edited on the drive and anonymized again keeps its name in clear in the
-  list of the originals, and its original comes back with the values of its tags.
+  is when it comes back to the drive, unrecorded: it is not anonymized again, which would keep the
+  anonymized file itself as a new original. Its restoration puts back the values of its tags, as for
+  the files extracted from such an archive. A document edited on the drive and anonymized again, or
+  written elsewhere from anonymized values and copied to the drive, keeps its name in clear in the list
+  of the originals, and its original comes back with the values of its tags, without the markers of
+  its pictures.
 
 The drive never gives back an original: the originals come back through Restore in the Explorer, the
 web application and the interface, from any copy of the anonymized file.
@@ -162,10 +164,15 @@ One notification tells the files processed, those anonymized already, those of a
 the first failure. The original of an anonymized file is found by the SHA-256 of its content, and by the
 NTFS object identifier of the file, which the command records with its place; a file edited since its
 anonymization gets its values back from its tags, and its name and its properties from the substitutes
-the database recorded. A file whose original was forgotten, from the web application or at the end of
-its time once its file left the drive, or to make room for newer originals, is no longer restored at
-all, from its tags either: Restore says so, with the date (HTTP 410, codes `original_forgotten`,
-`original_expired` and `original_space`). A file saved by another
+the database recorded. A file whose original was forgotten, from the web application, at the end of
+its time once its file left the drive or to make room for newer originals, and a file written elsewhere
+from anonymized values, a document that a language model wrote from an anonymized prompt for instance,
+are restored from their tags the same way, as long as the key stays: Restore tells the date of the
+forgetting. Such a restoration cannot give a picture back: the marker of a picture leaves the document,
+its runs in Word, its gray text box on a slide, its text over the gray box of a PDF, which stays, and
+the text file of a picture leaves an archive; Restore counts them. The text file of a picture alone
+gives back its picture while the vault keeps it, and is refused once it was forgotten (HTTP 410, code
+`picture_forgotten`). A file saved by another
 program while a command processes it stays as it is, and the command says so. A file of the drive is
 anonymized already: Restore asks where to save its original, outside the drive, which would anonymize it
 again, and the folder where the originals of a folder of the drive go. The same program runs from a
@@ -357,8 +364,9 @@ processed, `refused\`.
   Gone with its file, it would leave the copy restorable from its tags alone, without its pictures and
   the parts the protection removed. The space of the originals is bounded all the same, `history_mb`
   and the free space of the disk: when it is full, the oldest originals go first, whatever their time.
-  Once an original is forgotten, its protected file is refused by Restore: the database keeps its
-  SHA-256 and its object identifier, never its content.
+  Once an original is forgotten, Restore gives its protected file back from its tags alone and tells the
+  date of the forgetting: the database keeps the SHA-256 and the object identifier of the file, never
+  its content.
 - The names and the properties take substitutes rather than tags, which a name cannot hold and a window
   of properties would show as they are; the database keeps their tags. A substitute is found again in a
   name or a property edited since as long as it keeps its form, a run of up to twelve words; one of four

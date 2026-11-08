@@ -11,8 +11,9 @@ window.PSEUDALIS_TEXTS = {
       'archives, and whole folders, which come back as a ZIP archive. Each personal value is replaced by a tag that ' +
       'only this computer can restore.',
     restore_title: 'Restore files',
-    restore_hint: 'A protected file, or any copy of it, gives back its original; a protected file edited since ' +
-      'gets its values back.',
+    restore_hint: 'A protected file, or any copy of it, gives back its original; a protected file edited since, a ' +
+      'file whose original was forgotten and a file written elsewhere from protected values get their values back ' +
+      'from their tags, without their pictures.',
     drop: 'Drop files or folders here, or click to choose files',
     choose_folder: 'Choose a folder',
     folder_too_big: 'The folder holds too many files, or too many bytes, for one archive.',
@@ -40,6 +41,9 @@ window.PSEUDALIS_TEXTS = {
     restored_picture: 'picture restored',
     restored_tags: '{n} values restored',
     restored_tags_one: '{n} value restored',
+    restored_forgotten: 'its original forgotten on {date}',
+    pictures_removed: '{n} pictures removed',
+    pictures_removed_one: '{n} picture removed',
     none_found: 'No personal value found.',
     written_by: 'Written by',
     s_version: 'Version',
@@ -52,7 +56,8 @@ window.PSEUDALIS_TEXTS = {
     s_offline: 'The service does not answer.',
     records_title: 'Originals kept',
     records_hint: 'The originals of the files protected on this computer, encrypted in its vault. A forgotten ' +
-      'original is deleted: its protected file can no longer be restored.',
+      'original is deleted with its pictures: its protected file is then restored from its tags, which give back ' +
+      'its values but not its pictures.',
     records_none: 'No original kept.',
     records_removed: 'left the drive, kept until {d}',
     records_more: 'Show more',
@@ -66,8 +71,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interface',
     btn_original: 'Original',
     btn_forget: 'Forget',
-    confirm_forget: 'Forget the original of {f}? It is deleted from the vault, and its protected file can no ' +
-      'longer be restored.',
+    confirm_forget: 'Forget the original of {f}? It is deleted from the vault with its pictures, and its protected ' +
+      'file will be restored from its tags alone, without its pictures.',
     key_title: 'Key of this computer',
     key_hint: 'This key restores every file protected here. Export it, protected by a passphrase of 12 characters ' +
       'or more, and keep the export away from this computer: without it, a new installation restores nothing.',
@@ -104,9 +109,8 @@ window.PSEUDALIS_TEXTS = {
       'cannot read: it is not processed.',
     err_not_protected: 'This file holds no value that Pseudalis protected with the key of this computer.',
     err_original_missing: 'The original of this file can no longer be read in the vault.',
-    err_original_forgotten: 'The original of this file was forgotten on {date}: it can no longer be restored.',
-    err_original_expired: 'The original of this file was kept until {date} after the file left the drive: it ' +
-      'can no longer be restored.',
+    err_picture_forgotten: 'The picture of this file was forgotten on {date}: it cannot be given back.',
+    err_picture_missing: 'The picture of this file is not in the vault of this computer.',
     err_vault: 'The original cannot be kept in the vault.',
     err_database: 'The database of Pseudalis cannot be written: {e}',
     err_authentication: 'The administration token is missing or wrong: open Pseudalis again from its icon.',
@@ -123,8 +127,6 @@ window.PSEUDALIS_TEXTS = {
     err_settings_drive: 'The letter of the drive must be A, B or D to Z.',
     err_settings_value: 'The setting "{field}" has a value the service does not take',
     range: ' ({min} to {max}).',
-    err_original_space: 'The original of this file was forgotten on {date} to make room for newer originals: it ' +
-      'can no longer be restored.',
     s_history: 'Space of the originals',
     records_removed_always: 'left the drive, kept without limit of time',
     set_dates: 'Order of the numeric dates',
@@ -168,8 +170,9 @@ window.PSEUDALIS_TEXTS = {
       'TAR.GZ, et des dossiers entiers, rendus en archive ZIP. Chaque donnée personnelle est remplacée par une ' +
       'balise que seul cet ordinateur peut restaurer.',
     restore_title: 'Restaurer des fichiers',
-    restore_hint: "Un fichier protégé, ou toute copie de celui-ci, rend son original ; un fichier protégé modifié " +
-      'depuis retrouve ses valeurs.',
+    restore_hint: 'Un fichier protégé, ou toute copie de celui-ci, rend son original ; un fichier protégé modifié ' +
+      'depuis, un fichier dont l’original a été oublié et un fichier écrit ailleurs à partir de valeurs protégées ' +
+      'retrouvent leurs valeurs par leurs balises, sans leurs images.',
     drop: 'Déposez des fichiers ou des dossiers ici, ou cliquez pour choisir des fichiers',
     choose_folder: 'Choisir un dossier',
     folder_too_big: 'Le dossier contient trop de fichiers, ou trop d’octets, pour une archive.',
@@ -197,6 +200,9 @@ window.PSEUDALIS_TEXTS = {
     restored_picture: 'image restaurée',
     restored_tags: '{n} valeurs restaurées',
     restored_tags_one: '{n} valeur restaurée',
+    restored_forgotten: 'son original oublié le {date}',
+    pictures_removed: '{n} images retirées',
+    pictures_removed_one: '{n} image retirée',
     none_found: 'Aucune donnée personnelle trouvée.',
     written_by: 'Écrit par',
     s_version: 'Version',
@@ -209,7 +215,8 @@ window.PSEUDALIS_TEXTS = {
     s_offline: 'Le service ne répond pas.',
     records_title: 'Originaux conservés',
     records_hint: 'Les originaux des fichiers protégés sur cet ordinateur, chiffrés dans son coffre. Un original ' +
-      'oublié est supprimé : son fichier protégé ne peut plus être restauré.',
+      'oublié est supprimé avec ses images : son fichier protégé est alors restauré par ses balises, qui rendent ' +
+      'ses valeurs mais pas ses images.',
     records_none: 'Aucun original conservé.',
     records_removed: 'retiré du lecteur, conservé jusqu’au {d}',
     records_more: 'Afficher plus',
@@ -223,8 +230,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interface',
     btn_original: 'Original',
     btn_forget: 'Oublier',
-    confirm_forget: "Oublier l'original de {f} ? Il est supprimé du coffre, et son fichier protégé ne pourra " +
-      'plus être restauré.',
+    confirm_forget: 'Oublier l’original de {f} ? Il est supprimé du coffre avec ses images, et son fichier protégé ' +
+      'ne sera plus restauré que par ses balises, sans ses images.',
     key_title: 'Clé de cet ordinateur',
     key_hint: 'Cette clé restaure tous les fichiers protégés ici. Exportez-la, protégée par une phrase secrète de ' +
       "12 caractères ou plus, et conservez l'export hors de cet ordinateur : sans lui, une nouvelle installation " +
@@ -262,9 +269,8 @@ window.PSEUDALIS_TEXTS = {
       'Pseudalis ne sait pas lire : il n’est pas traité.',
     err_not_protected: 'Ce fichier ne contient aucune valeur protégée par Pseudalis avec la clé de cet ordinateur.',
     err_original_missing: "L'original de ce fichier ne peut plus être lu dans le coffre.",
-    err_original_forgotten: "L'original de ce fichier a été oublié le {date} : il ne peut plus être restauré.",
-    err_original_expired: "L'original de ce fichier a été conservé jusqu'au {date} après la sortie du fichier " +
-      'du lecteur : il ne peut plus être restauré.',
+    err_picture_forgotten: 'L’image de ce fichier, oubliée le {date}, ne peut plus être rendue.',
+    err_picture_missing: 'Le coffre de cet ordinateur ne contient pas l’image de ce fichier.',
     err_vault: "L'original ne peut pas être conservé dans le coffre.",
     err_database: 'La base de données de Pseudalis ne peut pas être écrite : {e}',
     err_authentication: "Le jeton d'administration manque ou est incorrect : rouvrez Pseudalis depuis son icône.",
@@ -281,8 +287,6 @@ window.PSEUDALIS_TEXTS = {
     err_settings_drive: 'La lettre du lecteur doit être A, B ou de D à Z.',
     err_settings_value: 'Le réglage « {field} » a une valeur que le service n’accepte pas',
     range: ' (de {min} à {max}).',
-    err_original_space: 'L’original de ce fichier a été oublié le {date} pour faire place à des originaux plus ' +
-      'récents : il ne peut plus être restauré.',
     s_history: 'Espace des originaux',
     records_removed_always: 'retiré du lecteur, conservé sans limite de durée',
     set_dates: 'Ordre des dates numériques',
@@ -328,7 +332,8 @@ window.PSEUDALIS_TEXTS = {
       'Markierung ersetzt, die nur dieser Computer wiederherstellt.',
     restore_title: 'Dateien wiederherstellen',
     restore_hint: 'Eine geschützte Datei oder jede Kopie davon gibt ihr Original zurück; eine seither bearbeitete ' +
-      'geschützte Datei erhält ihre Werte zurück.',
+      'geschützte Datei, eine Datei, deren Original vergessen wurde, und eine anderswo aus geschützten Werten ' +
+      'geschriebene Datei erhalten ihre Werte über ihre Markierungen zurück, ohne ihre Bilder.',
     drop: 'Dateien oder Ordner hier ablegen oder klicken, um Dateien auszuwählen',
     choose_folder: 'Ordner auswählen',
     folder_too_big: 'Der Ordner enthält zu viele Dateien oder zu viele Bytes für ein Archiv.',
@@ -356,6 +361,9 @@ window.PSEUDALIS_TEXTS = {
     restored_picture: 'Bild wiederhergestellt',
     restored_tags: '{n} Werte wiederhergestellt',
     restored_tags_one: '{n} Wert wiederhergestellt',
+    restored_forgotten: 'sein Original am {date} vergessen',
+    pictures_removed: '{n} Bilder entfernt',
+    pictures_removed_one: '{n} Bild entfernt',
     none_found: 'Kein personenbezogener Wert gefunden.',
     written_by: 'Geschrieben von',
     s_version: 'Version',
@@ -368,7 +376,8 @@ window.PSEUDALIS_TEXTS = {
     s_offline: 'Der Dienst antwortet nicht.',
     records_title: 'Aufbewahrte Originale',
     records_hint: 'Die Originale der auf diesem Computer geschützten Dateien, verschlüsselt in seinem Tresor. Ein ' +
-      'vergessenes Original wird gelöscht: Seine geschützte Datei kann nicht mehr wiederhergestellt werden.',
+      'vergessenes Original wird mit seinen Bildern gelöscht: Seine geschützte Datei wird dann über ihre ' +
+      'Markierungen wiederhergestellt, die ihre Werte zurückgeben, aber nicht ihre Bilder.',
     records_none: 'Kein Original aufbewahrt.',
     records_removed: 'vom Laufwerk entfernt, aufbewahrt bis {d}',
     records_more: 'Mehr anzeigen',
@@ -382,8 +391,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'Schnittstelle',
     btn_original: 'Original',
     btn_forget: 'Vergessen',
-    confirm_forget: 'Das Original von {f} vergessen? Es wird aus dem Tresor gelöscht, und seine geschützte Datei ' +
-      'kann nicht mehr wiederhergestellt werden.',
+    confirm_forget: 'Das Original von {f} vergessen? Es wird mit seinen Bildern aus dem Tresor gelöscht, und seine ' +
+      'geschützte Datei wird nur noch über ihre Markierungen wiederhergestellt, ohne ihre Bilder.',
     key_title: 'Schlüssel dieses Computers',
     key_hint: 'Dieser Schlüssel stellt alle hier geschützten Dateien wieder her. Exportieren Sie ihn, geschützt ' +
       'durch eine Passphrase von mindestens 12 Zeichen, und bewahren Sie den Export außerhalb dieses Computers ' +
@@ -422,10 +431,8 @@ window.PSEUDALIS_TEXTS = {
     err_not_protected: 'Diese Datei enthält keinen Wert, den Pseudalis mit dem Schlüssel dieses Computers ' +
       'geschützt hat.',
     err_original_missing: 'Das Original dieser Datei kann im Tresor nicht mehr gelesen werden.',
-    err_original_forgotten: 'Das Original dieser Datei wurde am {date} vergessen: Es kann nicht mehr ' +
-      'wiederhergestellt werden.',
-    err_original_expired: 'Das Original dieser Datei wurde bis zum {date} aufbewahrt, nachdem die Datei das ' +
-      'Laufwerk verlassen hatte: Es kann nicht mehr wiederhergestellt werden.',
+    err_picture_forgotten: 'Das Bild dieser Datei wurde am {date} vergessen: Es kann nicht zurückgegeben werden.',
+    err_picture_missing: 'Das Bild dieser Datei ist nicht im Tresor dieses Computers.',
     err_vault: 'Das Original kann nicht im Tresor aufbewahrt werden.',
     err_database: 'Die Datenbank von Pseudalis kann nicht geschrieben werden: {e}',
     err_authentication: 'Das Verwaltungstoken fehlt oder ist falsch: Öffnen Sie Pseudalis erneut über sein ' +
@@ -443,8 +450,6 @@ window.PSEUDALIS_TEXTS = {
     err_settings_drive: 'Der Buchstabe des Laufwerks muss A, B oder D bis Z sein.',
     err_settings_value: 'Die Einstellung „{field}“ hat einen Wert, den der Dienst nicht annimmt',
     range: ' ({min} bis {max}).',
-    err_original_space: 'Das Original dieser Datei wurde am {date} vergessen, um Platz für neuere Originale zu ' +
-      'schaffen: Es kann nicht mehr wiederhergestellt werden.',
     s_history: 'Platz der Originale',
     records_removed_always: 'vom Laufwerk entfernt, ohne zeitliche Grenze aufbewahrt',
     set_dates: 'Reihenfolge der numerischen Datumsangaben',
@@ -490,8 +495,9 @@ window.PSEUDALIS_TEXTS = {
       'TAR o TAR.GZ e cartelle intere, restituite come archivio ZIP. Ogni dato personale è sostituito da un tag che ' +
       'solo questo computer può ripristinare.',
     restore_title: 'Ripristinare file',
-    restore_hint: "Un file protetto, o qualsiasi sua copia, restituisce l'originale; un file protetto modificato " +
-      'in seguito ritrova i suoi valori.',
+    restore_hint: 'Un file protetto, o qualsiasi sua copia, restituisce l’originale; un file protetto modificato ' +
+      'in seguito, un file il cui originale è stato dimenticato e un file scritto altrove da valori protetti ' +
+      'ritrovano i loro valori dai loro tag, senza le loro immagini.',
     drop: 'Trascina qui file o cartelle, o fai clic per scegliere file',
     choose_folder: 'Scegli una cartella',
     folder_too_big: 'La cartella contiene troppi file, o troppi byte, per un archivio.',
@@ -519,6 +525,9 @@ window.PSEUDALIS_TEXTS = {
     restored_picture: 'immagine ripristinata',
     restored_tags: '{n} valori ripristinati',
     restored_tags_one: '{n} valore ripristinato',
+    restored_forgotten: 'il suo originale dimenticato il {date}',
+    pictures_removed: '{n} immagini rimosse',
+    pictures_removed_one: '{n} immagine rimossa',
     none_found: 'Nessun dato personale trovato.',
     written_by: 'Scritto da',
     s_version: 'Versione',
@@ -531,7 +540,8 @@ window.PSEUDALIS_TEXTS = {
     s_offline: 'Il servizio non risponde.',
     records_title: 'Originali conservati',
     records_hint: 'Gli originali dei file protetti su questo computer, cifrati nella sua cassaforte. Un originale ' +
-      'dimenticato viene eliminato: il suo file protetto non può più essere ripristinato.',
+      'dimenticato viene eliminato con le sue immagini: il suo file protetto viene allora ripristinato dai suoi ' +
+      'tag, che restituiscono i suoi valori ma non le sue immagini.',
     records_none: 'Nessun originale conservato.',
     records_removed: 'rimosso dall’unità, conservato fino al {d}',
     records_more: 'Mostra altri',
@@ -545,8 +555,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interfaccia',
     btn_original: 'Originale',
     btn_forget: 'Dimentica',
-    confirm_forget: "Dimenticare l'originale di {f}? Viene eliminato dalla cassaforte, e il suo file protetto " +
-      'non potrà più essere ripristinato.',
+    confirm_forget: 'Dimenticare l’originale di {f}? Viene eliminato dalla cassaforte con le sue immagini, e il ' +
+      'suo file protetto sarà ripristinato solo dai suoi tag, senza le sue immagini.',
     key_title: 'Chiave di questo computer',
     key_hint: 'Questa chiave ripristina tutti i file protetti qui. Esportatela, protetta da una passphrase di ' +
       "almeno 12 caratteri, e conservate l'esportazione lontano da questo computer: senza di essa, una nuova " +
@@ -586,10 +596,8 @@ window.PSEUDALIS_TEXTS = {
     err_not_protected: 'Questo file non contiene alcun valore protetto da Pseudalis con la chiave di questo ' +
       'computer.',
     err_original_missing: "L'originale di questo file non può più essere letto nella cassaforte.",
-    err_original_forgotten: "L'originale di questo file è stato dimenticato il {date}: non può più essere " +
-      'ripristinato.',
-    err_original_expired: "L'originale di questo file è stato conservato fino al {date} dopo l'uscita del " +
-      "file dall'unità: non può più essere ripristinato.",
+    err_picture_forgotten: 'L’immagine di questo file è stata dimenticata il {date}: non può essere restituita.',
+    err_picture_missing: 'L’immagine di questo file non è nella cassaforte di questo computer.',
     err_vault: "L'originale non può essere conservato nella cassaforte.",
     err_database: 'Il database di Pseudalis non può essere scritto: {e}',
     err_authentication: 'Il token di amministrazione manca o è errato: riaprite Pseudalis dalla sua icona.',
@@ -606,8 +614,6 @@ window.PSEUDALIS_TEXTS = {
     err_settings_drive: "La lettera dell'unità deve essere A, B o da D a Z.",
     err_settings_value: 'L’impostazione «{field}» ha un valore che il servizio non accetta',
     range: ' (da {min} a {max}).',
-    err_original_space: 'L’originale di questo file è stato dimenticato il {date} per fare spazio a originali più ' +
-      'recenti: non può più essere ripristinato.',
     s_history: 'Spazio degli originali',
     records_removed_always: 'rimosso dall’unità, conservato senza limite di tempo',
     set_dates: 'Ordine delle date numeriche',
@@ -653,7 +659,8 @@ window.PSEUDALIS_TEXTS = {
       'solo este equipo puede restaurar.',
     restore_title: 'Restaurar archivos',
     restore_hint: 'Un archivo protegido, o cualquier copia, devuelve su original; un archivo protegido modificado ' +
-      'después recupera sus valores.',
+      'después, un archivo cuyo original se olvidó y un archivo escrito en otro lugar a partir de valores ' +
+      'protegidos recuperan sus valores por sus etiquetas, sin sus imágenes.',
     drop: 'Suelte aquí archivos o carpetas, o haga clic para elegir archivos',
     choose_folder: 'Elegir una carpeta',
     folder_too_big: 'La carpeta contiene demasiados archivos, o demasiados bytes, para un archivo ZIP.',
@@ -681,6 +688,9 @@ window.PSEUDALIS_TEXTS = {
     restored_picture: 'imagen restaurada',
     restored_tags: '{n} valores restaurados',
     restored_tags_one: '{n} valor restaurado',
+    restored_forgotten: 'su original olvidado el {date}',
+    pictures_removed: '{n} imágenes retiradas',
+    pictures_removed_one: '{n} imagen retirada',
     none_found: 'No se encontró ningún dato personal.',
     written_by: 'Escrito por',
     s_version: 'Versión',
@@ -693,7 +703,8 @@ window.PSEUDALIS_TEXTS = {
     s_offline: 'El servicio no responde.',
     records_title: 'Originales guardados',
     records_hint: 'Los originales de los archivos protegidos en este equipo, cifrados en su caja fuerte. Un ' +
-      'original olvidado se elimina: su archivo protegido ya no se puede restaurar.',
+      'original olvidado se elimina con sus imágenes: su archivo protegido se restaura entonces por sus etiquetas, ' +
+      'que devuelven sus valores pero no sus imágenes.',
     records_none: 'Ningún original guardado.',
     records_removed: 'retirado de la unidad, guardado hasta el {d}',
     records_more: 'Mostrar más',
@@ -707,8 +718,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interfaz',
     btn_original: 'Original',
     btn_forget: 'Olvidar',
-    confirm_forget: '¿Olvidar el original de {f}? Se elimina de la caja fuerte, y su archivo protegido ya no se ' +
-      'podrá restaurar.',
+    confirm_forget: '¿Olvidar el original de {f}? Se elimina de la caja fuerte con sus imágenes, y su archivo ' +
+      'protegido solo se restaurará por sus etiquetas, sin sus imágenes.',
     key_title: 'Clave de este equipo',
     key_hint: 'Esta clave restaura todos los archivos protegidos aquí. Expórtela, protegida por una frase de ' +
       'contraseña de 12 caracteres o más, y guarde la exportación fuera de este equipo: sin ella, una nueva ' +
@@ -747,9 +758,8 @@ window.PSEUDALIS_TEXTS = {
     err_not_protected: 'Este archivo no contiene ningún valor protegido por Pseudalis con la clave de este ' +
       'equipo.',
     err_original_missing: 'El original de este archivo ya no se puede leer en la caja fuerte.',
-    err_original_forgotten: 'El original de este archivo se olvidó el {date}: ya no se puede restaurar.',
-    err_original_expired: 'El original de este archivo se conservó hasta el {date} después de que el archivo ' +
-      'saliera de la unidad: ya no se puede restaurar.',
+    err_picture_forgotten: 'La imagen de este archivo se olvidó el {date}: no se puede devolver.',
+    err_picture_missing: 'La imagen de este archivo no está en la caja fuerte de este equipo.',
     err_vault: 'El original no se puede guardar en la caja fuerte.',
     err_database: 'La base de datos de Pseudalis no se puede escribir: {e}',
     err_authentication: 'El token de administración falta o es incorrecto: vuelva a abrir Pseudalis desde su ' +
@@ -767,8 +777,6 @@ window.PSEUDALIS_TEXTS = {
     err_settings_drive: 'La letra de la unidad debe ser A, B o de D a Z.',
     err_settings_value: 'El ajuste «{field}» tiene un valor que el servicio no acepta',
     range: ' (de {min} a {max}).',
-    err_original_space: 'El original de este archivo se olvidó el {date} para dejar sitio a originales más ' +
-      'recientes: ya no se puede restaurar.',
     s_history: 'Espacio de los originales',
     records_removed_always: 'retirado de la unidad, guardado sin límite de tiempo',
     set_dates: 'Orden de las fechas numéricas',

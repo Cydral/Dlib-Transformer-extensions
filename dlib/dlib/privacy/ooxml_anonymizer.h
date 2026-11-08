@@ -315,6 +315,7 @@ namespace dlib
 
         void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
         void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
+        void set_picture_text_finder(const document_picture_text_finder& find) { pictures_ = find; }
 
         std::string anonymize(const std::string& package_bytes)
         {
@@ -673,6 +674,40 @@ namespace dlib
                    ap + "p></" + pp + "txBody></" + pp + "sp>";
         }
 
+        /* Whether the shape between tokens from and to is the gray text box that pml_text_box()
+           wrote in the place of a picture: a text box filled with E6E6E6 whose whole text is a
+           picture text. */
+        bool picture_text_box(const part_state& st, std::size_t from, std::size_t to) const
+        {
+            bool box = false, gray = false, in_text = false;
+            std::string text;
+            for (std::size_t k = from; k <= to && k < st.tokens.size(); ++k)
+            {
+                const xml_token& t = st.tokens[k];
+                const std::string l = xml_local_name(t.name);
+                if (t.kind == xml_token::start_tag || t.kind == xml_token::empty_tag)
+                {
+                    for (const xml_attribute& a : t.attributes)
+                    {
+                        const std::string v = st.xml.substr(a.value_begin, a.value_end - a.value_begin);
+                        if (l == "cNvSpPr" && a.name == "txBox" && v == "1") box = true;
+                        if (l == "srgbClr" && a.name == "val" && v == "E6E6E6") gray = true;
+                    }
+                    if (l == "t" && t.kind == xml_token::start_tag) in_text = true;
+                }
+                else if (t.kind == xml_token::end_tag && l == "t")
+                    in_text = false;
+                else if (t.kind == xml_token::text && in_text)
+                    text += xml_unescape(st.xml.substr(t.begin, t.end - t.begin));
+            }
+            if (!box || !gray || text.empty()) return false;
+            const std::vector<std::pair<std::size_t, std::size_t>> found = pictures_(text);
+            std::size_t b = 0, e = text.size();
+            while (b < e && text[b] == ' ') ++b;
+            while (e > b && text[e - 1] == ' ') --e;
+            return found.size() == 1 && found[0].first <= b && found[0].second >= e;
+        }
+
         void analyze_part(part_state& st)
         {
             const std::vector<std::size_t> match = match_ends(st.tokens);
@@ -953,6 +988,18 @@ namespace dlib
                     const std::string e_ns = nst.resolve(t.name);
                     const std::string local = xml_local_name(t.name);
 
+                    // The gray text box that took the place of a picture leaves the slide.
+                    if (restoring_ && pictures_ && st.role == "pml" && local == "sp" &&
+                        t.kind == xml_token::start_tag && match[i] != std::string::npos &&
+                        picture_text_box(st, i, match[i]))
+                    {
+                        st.edits.replace(t.begin, st.tokens[match[i]].end, "");
+                        st.removed.push_back(std::make_pair(t.begin, st.tokens[match[i]].end));
+                        ++report_.pictures_removed;
+                        nst.leave();
+                        i = match[i];
+                        continue;
+                    }
                     if (!restoring_ && removal_target(st, e_ns, local))
                     {
                         const std::size_t end_tok = match[i];
@@ -1696,10 +1743,29 @@ namespace dlib
                 untagged_properties_ && (st.role == "core" || st.role == "app" || st.role == "custom");
             if (restoring_)
             {
+                // The texts written in the place of pictures leave, with the tags they hold.
+                std::vector<std::pair<std::size_t, std::size_t>> pictures;
+                if (pictures_ && !property) pictures = pictures_(u.text);
+                auto in_picture = [&](std::size_t b, std::size_t e) {
+                    for (const auto& r : pictures)
+                        if (b < r.second && r.first < e) return true;
+                    return false;
+                };
+                for (const auto& r : pictures)
+                    if (r.first < r.second && r.second <= u.text.size())
+                    {
+                        edits.push_back(span{ r.first, r.second, std::string() });
+                        ++report_.pictures_removed;
+                    }
                 pseudonymizer::restore_report rr;
+                std::size_t inside = 0;
                 for (const auto& o : p_.find_tags(u.text, &rr))
-                    edits.push_back(span{ o.begin, o.end, o.original });
-                report_.tags_restored += rr.restored;
+                {
+                    if (in_picture(o.begin, o.end)) ++inside;
+                    else edits.push_back(span{ o.begin, o.end, o.original });
+                }
+                std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
+                report_.tags_restored += rr.restored - std::min(inside, rr.restored);
                 report_.tags_rejected += rr.rejected;
                 if (property)
                 {
@@ -2290,6 +2356,7 @@ namespace dlib
         zip_limits limits_;
         bool untagged_properties_ = false;
         pseudonymizer::substitute_resolver resolve_;
+        document_picture_text_finder pictures_;
         const ooxml_package* pkg_ = nullptr;
         std::map<std::string, std::string> described_;     // image part -> text of the describer
         bool dates_marked_ = false;

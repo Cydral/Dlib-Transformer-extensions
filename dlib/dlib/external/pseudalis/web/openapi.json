@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -205,7 +205,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten), kept for its time after the file left the drive (code original_expired) or forgotten to make room for newer originals (code original_space), its date in args.date: such a file is not restored from its tags either. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding the marker of a picture the vault keeps (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. A protected file whose original was forgotten, at the request of a user, at the end of its time after the file left the drive or to make room for newer originals, and a file written elsewhere from protected values, an answer of a language model for instance, are restored from their tags; the report then gives \"original_forgotten\": {\"date\", \"reason\"} for the first, the reason \"forgotten\", \"expired\" or \"space\". A restoration from the tags cannot give a picture back: the markers of the pictures leave the document (its runs, the gray text boxes of its slides, the texts over the gray boxes of a PDF, which stay), the text files of pictures leave an archive, and \"pictures_removed\" counts them. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected (code not_protected), or when it is the text file of a picture the vault does not keep (code picture_missing); 410 when that picture was forgotten (code picture_forgotten), its date in args.date. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -332,7 +332,7 @@
     ],
     "responses": {
      "200": {
-      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}; for a file not known whose original was forgotten, \"forgotten\": {\"time\", \"reason\"}, the reason \"forgotten\" (a user asked for it), \"expired\" (its time after the file left the drive was over) or \"space\" (it made room for newer originals)",
+      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}; for a file not known whose original was forgotten, \"forgotten\": {\"time\", \"reason\"}, the reason \"forgotten\" (a user asked for it), \"expired\" (its time after the file left the drive was over) or \"space\" (it made room for newer originals): its restoration puts back the values of its tags",
       "content": {
        "application/json": {
         "schema": {

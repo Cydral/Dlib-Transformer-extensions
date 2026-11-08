@@ -106,9 +106,10 @@ namespace pseudalis
                 the next files that show it), and with record, the original is kept in the
                 vault and recorded with the SHA-256 of the protected file, so that
                 restore() gives back the original itself, from any copy of the protected
-                file.  restore() of a file the database does not know puts back the values
-                of its tags, and a text file holding the marker of a known picture gives
-                that picture back.
+                file.  restore() of a file the database does not know, written elsewhere from
+                protected values or protected here before its original was forgotten, puts
+                back the values of its tags, its picture markers removed; a text file holding
+                the marker of a known picture gives that picture back.
         !*/
     public:
         service();
@@ -143,7 +144,8 @@ namespace pseudalis
         /*!
             The original of a protected file: the original of its record, that of an entry of
             a protected archive when it was extracted from one, a picture from its marker, else
-            the file with the values of its tags put back.
+            the file with the values of its tags put back and its picture markers removed, the
+            day and the reason of a forgetting in out.report["original_forgotten"].
         !*/
         bool restore(const std::string& bytes, const std::string& name, const std::string& object_id,
             restore_result& out, user_error& error);
@@ -168,7 +170,8 @@ namespace pseudalis
             Deletes a record, its original and the pictures no other record shows.  With a
             reason, "forgotten" when a user asked for it, "expired" when its time is over or
             "space" when the oldest originals make room (make_room()), the protected file of
-            the record is remembered, and its restoration refused from then on.
+            the record is remembered: its restoration puts back the values of its tags from
+            then on, and tells the day and the reason.
         !*/
         bool forget(long long record, const std::string& reason = std::string());
         // Marks a record whose file left the drive, deleted or replaced.  A move out of the drive

@@ -311,16 +311,44 @@ namespace dlib
                    of the public catalogues of vulnerabilities ("CVE-2014-0160") name
                    nothing either.
 
+                   Technical documents name programs, versions, ports and hosts. The
+                   dotted numbers of a date with a year of two digits are the version of a
+                   program after a product, a word of versions, a word of comparison and
+                   its preposition, a sign ("<", "@"), another version of a list or the
+                   table cell of a product ("Tomcat 6.1.24", "versions publiées 6.1.25",
+                   "antérieure à 6.1.25", "6.1.24, 6.2.19 et 6.3.11",
+                   "| Tomcat | 7.1.24 |"), and wherever the document writes them alone once
+                   one of them was read so; a preposition of dates keeps a date ("Fassung
+                   vom 01.02.24"). The maker before its product ("Google" in "autour de
+                   Google Chrome"), a port after its protocol or its server ("LDAPS 636"), a
+                   code of one or two capitals and digits ("W8"), a word repeated with
+                   numbers read as
+                   an address ("Échelon 3 Échelon 2 Échelon 1"), a number that the acronym of a
+                   code labels, read as a place, the scheme of an identifier ("pkg:"), a
+                   piece of a reference in capitals and digits or of a compound in lower
+                   case joined by hyphens ("kel" in "kel-billing-api") name nothing; a
+                   department of two generic words at least joined by "pour", "for", "per"
+                   or "para" to the organisation it serves, which a capital opens, of two
+                   words at least or known by its own name, leaves that organisation alone
+                   ("Direction Juridique et Technique pour Électricité de France"), while
+                   "Fondation pour la Recherche", "Centre for London" and the public bodies
+                   stay whole.
+
                 3. Document-level propagation. Detection runs in two passes over a
                    document: learn() records the names established with strong evidence,
                    the places and organisations found in context, the acronym that an
                    organisation defines between parentheses after its name, its initials
                    matching ("ministère de la Pêche et des Eaux intérieures (MPEI)", the
-                   name taking the words in lower case before the parenthesis), and the
-                   name fragments of e-mail addresses; detect() then also flags bare
-                   occurrences of those names ("Dupont a signé", "le MPEI" in capitals),
-                   so that every mention of a person is replaced, bare
-                   surnames included. Generic words are never learned.
+                   name taking the words in lower case before the parenthesis), the name
+                   of an organisation after its descriptor ("la société Novexa"), the name
+                   fragments and the domains of e-mail addresses, webmail services left
+                   out, and the versions of programs; detect() then also flags bare
+                   occurrences of those names ("Dupont a signé", "le MPEI" in capitals,
+                   "Novexa"), so that every mention of a person is replaced, bare
+                   surnames included, reports as web addresses the host names and the web
+                   sites written on those domains ("intranet.acme-conseil.fr" after
+                   "j.martin@acme-conseil.fr") and leaves the versions undated. Generic
+                   words are never learned.
 
                 4. User knowledge. Regular expressions added with add_pattern() and
                    terms added with add_term() describe what is specific to an

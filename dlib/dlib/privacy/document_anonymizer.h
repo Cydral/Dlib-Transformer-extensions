@@ -424,6 +424,8 @@ namespace dlib
 
         void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
 
+        void set_picture_text_finder(const document_picture_text_finder& find) { pictures_ = find; }
+
         std::string anonymize_name(const std::string& name, document_report& report)
         {
             if (name.empty()) return name;
@@ -511,6 +513,7 @@ namespace dlib
                     a.set_package_limits(package_limits_);
                     a.set_untagged_properties(untagged_properties_);
                     a.set_substitute_resolver(resolve_);
+                    a.set_picture_text_finder(pictures_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::pdf:
@@ -519,6 +522,7 @@ namespace dlib
                     a.set_image_describer(describer_);
                     a.set_untagged_properties(untagged_properties_);
                     a.set_substitute_resolver(resolve_);
+                    a.set_picture_text_finder(pictures_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::text:
@@ -587,12 +591,31 @@ namespace dlib
             return out;
         }
 
+        // The text without the picture texts that the finder gives, which leave with the tags they hold.
+        std::string without_pictures(const std::string& text, document_report& report) const
+        {
+            if (!pictures_) return text;
+            const std::vector<std::pair<std::size_t, std::size_t>> found = pictures_(text);
+            if (found.empty()) return text;
+            std::string out;
+            std::size_t pos = 0;
+            for (const auto& r : found)
+            {
+                if (r.first < pos || r.second > text.size() || r.second <= r.first) continue;
+                out.append(text, pos, r.first - pos);
+                pos = r.second;
+                ++report.pictures_removed;
+            }
+            out.append(text, pos, std::string::npos);
+            return out;
+        }
+
         std::string plain_text(const std::string& text, document_report& report, bool restoring)
         {
             if (restoring)
             {
                 pseudonymizer::restore_report rr;
-                const std::string out = p_.restore(text, &rr);
+                const std::string out = p_.restore(without_pictures(text, report), &rr);
                 report.tags_restored += rr.restored;
                 report.tags_rejected += rr.rejected;
                 report.text_units += 1;
@@ -713,7 +736,7 @@ namespace dlib
             {
                 pseudonymizer::restore_report rr;
                 for (std::size_t k = 0; k < cells.size(); ++k)
-                    values[k] = p_.restore(cells[k].value, &rr);
+                    values[k] = p_.restore(without_pictures(cells[k].value, report), &rr);
                 report.tags_restored += rr.restored;
                 report.tags_rejected += rr.rejected;
             }
@@ -1010,10 +1033,27 @@ namespace dlib
             std::vector<edit> edits;
             if (restoring)
             {
+                // The texts written in the place of pictures leave, with the tags they hold.
+                std::vector<std::pair<std::size_t, std::size_t>> pictures;
+                if (pictures_) pictures = pictures_(text);
+                for (const auto& r : pictures)
+                    if (r.first < r.second && r.second <= text.size())
+                    {
+                        edits.push_back(edit{ r.first, r.second, std::string() });
+                        ++report.pictures_removed;
+                    }
                 pseudonymizer::restore_report rr;
+                std::size_t inside = 0;
                 for (const auto& o : p_.find_tags(text, &rr))
-                    edits.push_back(edit{ o.begin, o.end, o.original });
-                report.tags_restored += rr.restored;
+                {
+                    bool covered = false;
+                    for (const auto& r : pictures)
+                        if (o.begin < r.second && r.first < o.end) covered = true;
+                    if (covered) ++inside;
+                    else edits.push_back(edit{ o.begin, o.end, o.original });
+                }
+                std::sort(edits.begin(), edits.end(), [](const edit& a, const edit& b) { return a.b < b.b; });
+                report.tags_restored += rr.restored - std::min(inside, rr.restored);
                 report.tags_rejected += rr.rejected;
             }
             else
@@ -1155,7 +1195,7 @@ namespace dlib
                 if (restoring)
                 {
                     pseudonymizer::restore_report rr;
-                    value = p_.restore(a.value, &rr);
+                    value = p_.restore(without_pictures(a.value, report), &rr);
                     report.tags_restored += rr.restored;
                     report.tags_rejected += rr.rejected;
                 }
@@ -1284,6 +1324,7 @@ namespace dlib
         zip_limits package_limits_;
         bool untagged_properties_ = false;
         pseudonymizer::substitute_resolver resolve_;
+        document_picture_text_finder pictures_;
     };
 
 // ----------------------------------------------------------------------------------------

@@ -100,6 +100,16 @@ namespace dlib
                   leaves the gray boxes empty. restore() never uses it.
         !*/
 
+        void set_picture_text_finder(
+            const document_picture_text_finder& find
+        );
+        /*!
+            ensures
+                - restore() removes from the text of the pages the ranges that find gives,
+                  the texts written over the gray boxes of the pictures, with the tags they
+                  hold (document_anonymizer::set_picture_text_finder()); the gray boxes stay.
+        !*/
+
         void set_untagged_properties(
             bool untagged
         );

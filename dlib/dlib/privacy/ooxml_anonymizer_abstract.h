@@ -161,6 +161,17 @@ namespace dlib
                   (pseudonymizer::find_substitutes()) when the properties are untagged.
         !*/
 
+        void set_picture_text_finder(
+            const document_picture_text_finder& find
+        );
+        /*!
+            ensures
+                - restore() removes the ranges that find gives, the texts written in the
+                  place of pictures, from the runs and the cells that hold them, with the
+                  tags they hold, and the gray text box of a slide whose whole text is one
+                  of them (document_anonymizer::set_picture_text_finder()).
+        !*/
+
         std::string anonymize(const std::string& package_bytes);
         /*!
             ensures

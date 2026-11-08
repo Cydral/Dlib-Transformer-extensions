@@ -7,8 +7,8 @@
 // installer over an installation.
 #define PSEUDALIS_VERSION_MAJOR 1
 #define PSEUDALIS_VERSION_MINOR 0
-#define PSEUDALIS_VERSION_PATCH 3
-#define PSEUDALIS_VERSION "1.0.3"
+#define PSEUDALIS_VERSION_PATCH 4
+#define PSEUDALIS_VERSION "1.0.4"
 
 #define PSEUDALIS_PRODUCT_NAME "Pseudalis"
 /*

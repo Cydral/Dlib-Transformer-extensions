@@ -2124,6 +2124,29 @@ namespace dlib
             return f;
         }
 
+        /* The ligatures of the alphabetic presentation forms (U+FB00 to U+FB06) written as their
+           letters: a glyph "fi" whose ToUnicode entry gives U+FB01 reads "fi", so that the words
+           and the names that hold one stay whole ("officiel", "souffle", "Raffaella"). */
+        inline void expand_ligatures(std::string& text)
+        {
+            if (text.find('\xEF') == std::string::npos) return;
+            static const char* const letters[] = { "ff", "fi", "fl", "ffi", "ffl", "st", "st" };
+            std::string out;
+            for (std::size_t i = 0; i < text.size(); ++i)
+            {
+                if (i + 2 < text.size() && static_cast<unsigned char>(text[i]) == 0xEF &&
+                    static_cast<unsigned char>(text[i + 1]) == 0xAC &&
+                    static_cast<unsigned char>(text[i + 2]) >= 0x80 && static_cast<unsigned char>(text[i + 2]) <= 0x86)
+                {
+                    out += letters[static_cast<unsigned char>(text[i + 2]) - 0x80];
+                    i += 2;
+                    continue;
+                }
+                out.push_back(text[i]);
+            }
+            text.swap(out);
+        }
+
         inline std::vector<glyph> decode_string(const font& f, const std::string& s, std::size_t& unknown)
         {
             std::vector<glyph> out;
@@ -2171,6 +2194,7 @@ namespace dlib
                         if (f.ucs2) g.text = utf16be_to_utf8(s.substr(i, static_cast<std::size_t>(len)));
                         else { g.known = false; ++unknown; }
                     }
+                    expand_ligatures(g.text);
                     g.width = f.cid_width(f.cid_of(g.code)) * 0.001;
                     out.push_back(g);
                     i += static_cast<std::size_t>(len);
@@ -2189,6 +2213,7 @@ namespace dlib
                     else if (c >= 0x20 && c < 0x7F && !f.differs[c]) g.text = std::string(1, static_cast<char>(c));
                     else { g.known = false; ++unknown; }
                 }
+                expand_ligatures(g.text);
                 double w;
                 if (f.has_width[c]) w = f.widths[c];
                 else if (f.missing > 0) w = f.missing;

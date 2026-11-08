@@ -81,8 +81,10 @@ namespace dlib
               or embedded CMaps. A glyph whose code has no known character, such as a
               code renamed by Differences to a private glyph name, is counted in
               undecodable_glyphs and read as U+FFFD; so is text drawn with a font
-              missing from the resources. Form XObjects are followed; images are
-              counted and skipped.
+              missing from the resources. A glyph of a ligature that its font maps to
+              U+FB00 to U+FB06 reads as its letters ("ff", "fi", "fl", "ffi", "ffl",
+              "st"), so that the words that hold one stay whole. Form XObjects are
+              followed; images are counted and skipped.
             - The appearances of form fields, free text annotations and stamps are read
               as page text (the visible value of a filled form is kept); a text field
               without appearance contributes its value. Other annotations, such as

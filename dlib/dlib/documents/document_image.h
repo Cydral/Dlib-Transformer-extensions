@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 #include "../crc32.h"
 #include "../zip/deflate.h"
 
@@ -24,6 +26,9 @@ namespace dlib
     };
 
     typedef std::function<std::string(const document_image& image)> document_image_describer;
+
+    typedef std::function<std::vector<std::pair<std::size_t, std::size_t>>(const std::string& text)>
+        document_picture_text_finder;
 
 // ----------------------------------------------------------------------------------------
 

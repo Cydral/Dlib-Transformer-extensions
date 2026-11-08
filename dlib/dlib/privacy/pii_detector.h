@@ -379,6 +379,8 @@ namespace dlib
             doc_term_set_.clear();
             doc_term_index_.clear();
             doc_acronyms_.clear();
+            doc_versions_.clear();
+            email_domains_.clear();
             std::lock_guard<std::mutex> lock(cache_->m);
             cache_->spans.clear();
         }
@@ -432,6 +434,17 @@ namespace dlib
             std::vector<privacy_impl::pii_candidate> found;
             const privacy_impl::utf8_text t(text, true);
             analyze(text, t, context, found);
+            // The versions of programs, which the same numbers repeat alone in a table cell.
+            if (enabled(pii_type::date))
+                for (const date_match& m : find_dates(text, options_.date_order))
+                {
+                    const std::size_t b =
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), m.begin) - t.offsets.begin();
+                    const std::size_t e =
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), m.end) - t.offsets.begin();
+                    if (software_version(text, t, b, e, m.format) && doc_versions_.size() < 4096)
+                        doc_versions_.insert(privacy_impl::cp_substr(t, text, b, e));
+                }
             for (const privacy_impl::pii_candidate& c : found)
             {
                 const std::string value = privacy_impl::cp_substr(t, text, c.b, c.e);
@@ -458,9 +471,21 @@ namespace dlib
                     }
                     add_doc_term(keys, c.type);
                     add_doc_term(term_keys(value), c.type);
+                    // "la société Novexa": "Novexa" alone too, a word of its own after the descriptor.
+                    static const std::unordered_set<std::string> descriptors = privacy_impl::make_word_set(
+                        "societe ste entreprise company firme firma ditta azienda unternehmen gesellschaft empresa "
+                        "sociedad societa");
+                    if (c.type == pii_type::organization && keys.size() == 2 && descriptors.count(keys.front()) &&
+                        !generic_key(keys.back(), true))
+                        add_doc_term(std::vector<std::string>(1, keys.back()), c.type);
                 }
                 else if (c.type == pii_type::email)
                 {
+                    // The domain of the address, which the host names of the document repeat (scan_hosts()).
+                    const std::string domain = privacy_impl::lowercase(value.substr(value.find('@') + 1));
+                    if (!webmail_domain(domain) && domain.find('.') != std::string::npos &&
+                        email_domains_.size() < 256)
+                        email_domains_.insert(domain);
                     const std::string local = value.substr(0, value.find('@'));
                     std::string frag;
                     for (std::size_t k = 0; k <= local.size(); ++k)
@@ -703,6 +728,7 @@ namespace dlib
             scan_emails(t, c);
             // Web addresses that are not personal data are protected too: a date in their path stays.
             scan_urls(text, t, c, masked);
+            scan_hosts(text, t, c);
             std::sort(masked.begin(), masked.end());
             scan_ip(t, c);
             scan_mac(t, c);
@@ -731,6 +757,11 @@ namespace dlib
                     // "1-29-17 Gion, Tokyo": the numbers of a Japanese address before its district.
                     if (m.format.layout <= 1 && m.format.separator == 1 && m.format.two_digit_year &&
                         t.at(e) == ' ' && privacy_impl::is_upper(t.at(e + 1)))
+                        continue;
+                    // The version of a program, here or anywhere else in the document: "Tomcat 6.1.24".
+                    if (software_version(text, t, b, e, m.format) ||
+                        (!doc_versions_.empty() && m.format.separator == 2 && m.format.two_digit_year &&
+                         doc_versions_.count(privacy_impl::cp_substr(t, text, b, e))))
                         continue;
                     add(c, b, e, pii_type::date, m.format.has_day() ? 0.95 : 0.9);
                 }
@@ -804,6 +835,10 @@ namespace dlib
                     continue;
                 // Words that name nothing, whatever reads them, unless the user, a label or the place says so.
                 if (!x.kept && !x.exact && generic_span(text, t, x.b, x.e, x.type))
+                    continue;
+                // A piece of a reference in capitals and digits names no person and no place.
+                if (!x.kept && !x.exact && (x.type == pii_type::person || x.type == pii_type::location) &&
+                    inside_reference(t, x.b, x.e))
                     continue;
                 // An organisation opened by generic words starts at its head noun: "Politique de sauvegarde
                 // du ministère de la Pêche".
@@ -2910,6 +2945,11 @@ namespace dlib
                 }
                 const auto e = std::lower_bound(emails.begin(), emails.end(), i);
                 if (e != emails.end() && *e < j) flag = true;
+                // A host of the domain of an e-mail address of the document: "intranet.acme-conseil.fr".
+                for (const std::string& d : email_domains_)
+                    if (host == d || (host.size() > d.size() && host[host.size() - d.size() - 1] == '.' &&
+                                      host.compare(host.size() - d.size(), d.size(), d) == 0))
+                        flag = true;
                 if (!flag)
                 {
                     std::string frag;
@@ -2929,6 +2969,75 @@ namespace dlib
                 else if (!flag)
                     protect.push_back(std::make_pair(i, j));
                 i = j;
+            }
+        }
+
+        // The domains of the webmail services, which name no organisation of the document.
+        static bool webmail_domain(const std::string& domain)
+        {
+            static const std::unordered_set<std::string> s = privacy_impl::make_word_set(
+                "gmail.com googlemail.com outlook.com outlook.fr hotmail.com hotmail.fr hotmail.it hotmail.es "
+                "hotmail.de hotmail.co.uk live.com live.fr live.it live.de msn.com yahoo.com yahoo.fr yahoo.it "
+                "yahoo.es yahoo.de yahoo.co.uk ymail.com icloud.com me.com mac.com aol.com aol.fr gmx.com gmx.de "
+                "gmx.fr gmx.net gmx.at gmx.ch web.de t-online.de freenet.de orange.fr wanadoo.fr free.fr sfr.fr "
+                "neuf.fr laposte.net bbox.fr numericable.fr club-internet.fr libero.it virgilio.it tiscali.it "
+                "alice.it tin.it email.it fastwebnet.it telefonica.net movistar.es terra.es protonmail.com "
+                "protonmail.ch proton.me pm.me tutanota.com tuta.io zoho.com mail.com yandex.com yandex.ru mail.ru "
+                "btinternet.com sky.com virginmedia.com bluewin.ch skynet.be telenet.be");
+            return s.count(domain) != 0;
+        }
+
+        /* The host names written without a scheme on the domain of an e-mail address of the
+           document, with their path: "intranet.acme-conseil.fr", "acme-conseil.fr/contact" after
+           "j.martin@acme-conseil.fr". The addresses of the webmail services are left out
+           (webmail_domain()). */
+        void scan_hosts(const std::string& text, const utf8_text& t, std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            if (email_domains_.empty() || !enabled(pii_type::url)) return;
+            std::string lower = text;
+            for (char& ch : lower)
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch | 0x20);
+            auto host_char = [](char ch) {
+                return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+            };
+            for (const std::string& d : email_domains_)
+            {
+                std::size_t p = 0;
+                while ((p = lower.find(d, p)) != std::string::npos)
+                {
+                    const std::size_t at = p;
+                    std::size_t end = p + d.size();
+                    p = end;
+                    // The whole domain, on the boundaries of its labels.
+                    if (end < lower.size() && host_char(lower[end]) &&
+                        !(lower[end] == '.' && !(end + 1 < lower.size() && host_char(lower[end + 1]))))
+                        continue;
+                    if (at > 0 && host_char(lower[at - 1]) && lower[at - 1] != '.') continue;
+                    std::size_t start = at;
+                    while (start > 0 && host_char(lower[start - 1])) --start;
+                    while (start < at && (lower[start] == '.' || lower[start] == '-')) ++start;
+                    // An e-mail address, or a web address that scan_urls() reads.
+                    if (start > 0 && (lower[start - 1] == '@' || lower[start - 1] == '/' || lower[start - 1] == ':'))
+                        continue;
+                    if (end < lower.size() && lower[end] == '@') continue;
+                    // A path after the host.
+                    if (end < lower.size() && lower[end] == '/')
+                    {
+                        while (end < lower.size() && !(lower[end] == ' ' || lower[end] == '\t' || lower[end] == '\n' ||
+                                                       lower[end] == '\r' || lower[end] == '"' || lower[end] == '<' ||
+                                                       lower[end] == '>' || lower[end] == ')' || lower[end] == ']'))
+                            ++end;
+                        while (end > at + d.size() && (lower[end - 1] == '.' || lower[end - 1] == ',' ||
+                                                       lower[end - 1] == ';' || lower[end - 1] == ':'))
+                            --end;
+                    }
+                    const std::size_t b =
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), start) - t.offsets.begin();
+                    const std::size_t e =
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), end) - t.offsets.begin();
+                    if (b < e && e <= t.size()) add(out, b, e, pii_type::url, 0.9);
+                }
             }
         }
 
@@ -4940,6 +5049,124 @@ namespace dlib
             return q - 1 - r > 2 && !person_titles().count(word) && !civility_words().count(word);
         }
 
+        /* Whether the dotted numbers [b, e), read as a date with a year of two digits ("6.1.24"),
+           are the version of a program: after a sign ("< 5.4.18", "tomcat@6.1.24", "v6.1.24"), a
+           product ("Tomcat 6.1.24", "IIS 7.5.19"), a word of versions ("version", "release",
+           "branche"), possibly with a qualifier between ("versions publiées 6.1.25", "Tomcat détecté
+           6.1.24"), a word of comparison and its preposition ("antérieure à 6.1.25", "prior to
+           6.1.25"); in a list after such a version ("6.1.24, 6.2.19 et 6.3.11", "4.0.17-3, 4.1.18");
+           and at the start of a table cell after a cell that ends with such a word ("| Tomcat |
+           7.1.24", "| OpenSearch (moteur) | 1.1.19"). A preposition of dates keeps a date ("version
+           du 08.03.30", "Fassung vom 01.02.24"), and so do the words that date a document or its
+           issue ("Stand", "rilascio"). */
+        static bool software_version(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
+                                     const date_format& f, int depth = 0)
+        {
+            using namespace privacy_impl;
+            if (f.separator != 2 || !f.two_digit_year || f.layout > 1 || depth > 16 || e <= b) return false;
+            static const std::unordered_set<std::string> versions = make_word_set(
+                "version versions release releases build branche branches branch patch correctif "
+                "versione versioni versiones versionen");
+            static const std::unordered_set<std::string> comparisons = make_word_set(
+                "anterieur anterieure anterieurs anterieures posterieur posterieure superieur superieure "
+                "inferieur inferieure prior earlier older later newer below above precedente successiva "
+                "anterior posterior inferior superior");
+            static const std::unordered_set<std::string> links = make_word_set("a to than que di del de als");
+            static const std::unordered_set<std::string> list_links = make_word_set("et ou and or e o y oder und");
+            static const std::unordered_set<std::string> date_links = make_word_set(
+                "vom von am bis ab seit zum zur dal dall al alla dalla desde hasta depuis jusqu since until till");
+            std::size_t q = b;
+            while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0)) --q;
+            if (q == 0) return false;
+            const char32_t c = t.cps[q - 1];
+            if (c == '<' || c == '>' || c == '=' || c == '@' || c == '~' || c == 0x2264 || c == 0x2265) return true;
+            if (q == b && (c == 'v' || c == 'V') && (q < 2 || !is_letter(t.cps[q - 2]))) return true;
+            // The word before q on its line, and its start.
+            auto word_at = [&](std::size_t end, std::size_t& start) {
+                std::size_t r = end;
+                while (r > 0 && (is_letter(t.cps[r - 1]) || is_ascii_digit(t.cps[r - 1]) || t.cps[r - 1] == '-'))
+                    --r;
+                start = r;
+                return cp_substr(t, text, r, end);
+            };
+            std::size_t start = 0;
+            const std::string raw = word_at(q, start);
+            const std::string key = fold_key(raw);
+            if (!key.empty())
+            {
+                if (product_names().count(key) || versions.count(key)) return true;
+                // One word back: a qualifier after a word of versions, a preposition after a comparison.
+                std::size_t p = start;
+                while (p > 0 && (t.cps[p - 1] == ' ' || t.cps[p - 1] == 0xA0)) --p;
+                std::size_t start2 = 0;
+                const std::string key2 = p < start ? fold_key(word_at(p, start2)) : std::string();
+                if (!key2.empty() && links.count(key) && comparisons.count(key2)) return true;
+                if (!key2.empty() && (versions.count(key2) || product_names().count(key2)) &&
+                    !function_words().count(key) && !date_links.count(key))
+                    return true;
+                if (comparisons.count(key)) return true;
+            }
+            // A cell after a cell that ends with a product or a word of versions, its comment between
+            // parentheses passed.
+            if (c == '|' || c == '\t')
+            {
+                std::size_t r = q - 1;
+                while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+                if (r > 0 && t.cps[r - 1] == ')')
+                {
+                    std::size_t open = r - 1;
+                    while (open > 0 && t.cps[open] != '(' && t.cps[open] != '|' && t.cps[open] != '\n') --open;
+                    if (t.cps[open] != '(') return false;
+                    r = open;
+                    while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+                }
+                std::size_t cell = 0;
+                const std::string last = fold_key(word_at(r, cell));
+                return !last.empty() && (product_names().count(last) || versions.count(last));
+            }
+            // A list: the item before, a version, across a comma, a semicolon, a slash or a conjunction.
+            std::size_t r = q;
+            if (c == ',' || c == ';' || c == '/') --r;
+            else if (list_links.count(key)) r = start;
+            else return false;
+            while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+            // The revision of a package after its version: "5.0.11-6".
+            {
+                std::size_t d = r;
+                while (d > 0 && is_ascii_digit(t.cps[d - 1])) --d;
+                if (d < r && d > 1 && t.cps[d - 1] == '-' && is_ascii_digit(t.cps[d - 2])) r = d - 1;
+            }
+            std::size_t s0 = r;
+            while (s0 > 0 && (is_ascii_digit(t.cps[s0 - 1]) || t.cps[s0 - 1] == '.')) --s0;
+            if (s0 == r || (s0 > 0 && is_word_char(t.cps[s0 - 1]))) return false;
+            const std::string item = cp_substr(t, text, s0, r);
+            int groups = 1;
+            for (char ch : item) groups += ch == '.';
+            if (groups != 3 || item.front() == '.' || item.back() == '.') return false;
+            return software_version(text, t, s0, r, f, depth + 1);
+        }
+
+        /* Whether [b, e) is a piece of a reference written in capitals, digits and hyphens, a digit
+           among them: "DOC-ARC" in "NRV-DOC-ARC-2025-031". */
+        static bool inside_reference(const utf8_text& t, std::size_t b, std::size_t e)
+        {
+            using namespace privacy_impl;
+            const std::size_t n = t.size();
+            std::size_t tb = b, te = e;
+            while (tb > 0 && (is_word_char(t.cps[tb - 1]) || t.cps[tb - 1] == '-')) --tb;
+            while (te < n && (is_word_char(t.cps[te]) || t.cps[te] == '-')) ++te;
+            if (tb == b && te == e) return false;
+            bool digits = false, hyphen = false;
+            for (std::size_t q = tb; q < te; ++q)
+            {
+                const char32_t c = t.cps[q];
+                if (!(is_upper(c) || is_ascii_digit(c) || c == '-')) return false;
+                digits = digits || is_ascii_digit(c);
+                hyphen = hyphen || c == '-';
+            }
+            return digits && hyphen;
+        }
+
         /* A common word, or a compound of common words joined by hyphens ("médecin-conseil"); key
            is folded with privacy_impl::fold_key(). */
         static bool common_word_or_compound(const std::string& key)
@@ -5445,6 +5672,10 @@ namespace dlib
                 while (r < t.size() && is_letter(t.cps[r])) ++r;
                 next = fold_key(cp_substr(t, text, q, r));
             }
+            // The maker of the product written after the value: "Google" in "autour de Google Chrome".
+            if (!product && product_names().count(next) &&
+                known_organizations().count(fold_key(cp_substr(t, text, b, e))))
+                return true;
             if (type == pii_type::organization)
             {
                 // A known name, alone or opening the value: "Crédit Mutuel de Bretagne"; the maker of a
@@ -5498,6 +5729,18 @@ namespace dlib
             // A street type, numbers and function words make an address ("99 The Avenue"); a word of a
             // trade beside them makes none ("allée du SIEM").
             if (type == pii_type::address && street && !trade) return false;
+            /* A word of three letters at least repeated, each time before a number, is a series of
+               labels: "Échelon 3 Échelon 2 Échelon 1"; "Carretera de Nuestra Señora de los Dolores, 37"
+               and "Calle de Sevilla, n.º 174, 3.º 1.ª" stay addresses. */
+            if (type == pii_type::address && !street)
+            {
+                std::unordered_set<std::string> seen;
+                for (std::size_t k = 0; k + 1 < keys.size(); ++k)
+                    if (keys[k].size() >= 3 && keys[k].find_first_not_of("0123456789") != std::string::npos &&
+                        keys[k + 1].find_first_not_of("0123456789") == std::string::npos &&
+                        !function_words().count(keys[k]) && !seen.insert(keys[k]).second)
+                        return true;
+            }
             for (std::size_t k = 0; k < keys.size(); ++k)
             {
                 const std::string& key = keys[k];
@@ -5537,10 +5780,16 @@ namespace dlib
                 bool generic = generic_key(key, commons) ||
                                (place && is_lower(name_letter(t, words[k])) && generic_key(key, true) &&
                                 !towns.count(key));
-                // A number of four digits at least is a postal code: "93721", "4870".
+                /* A number of four digits at least is a postal code ("93721", "4870"), unless the acronym
+                   of a code labels it ("RFC 9110"). */
                 if (generic && type == pii_type::location && key.size() >= 4 &&
                     key.find_first_not_of("0123456789") == std::string::npos)
-                    generic = false;
+                {
+                    bool labelled = keys.size() >= 2;
+                    for (std::size_t q = 0; q < keys.size() && labelled; ++q)
+                        if (q != k && !acronym_words().count(keys[q])) labelled = false;
+                    if (!labelled) generic = false;
+                }
                 // Beside a street type, a common word names the street ("rue des Lilas", "18 Mill Street");
                 // a word of a trade does not ("allée du SIEM").
                 if (generic && street && !(key.find_first_not_of("0123456789") == std::string::npos ||
@@ -5615,6 +5864,27 @@ namespace dlib
         {
             using namespace privacy_impl;
             const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
+            /* A department of two generic words at least, "pour" and the organisation it serves,
+               which a capital opens, of two words at least or known by its own name: "Direction
+               Juridique et Technique pour Électricité de France" starts at "Électricité"; "Fondation
+               pour la Mémoire", "Agenzia per l'Italia Digitale", "Centre for Policy Studies" and
+               "Centre for London" stay whole, as the public bodies and the organisations known by
+               their own name; German, which capitalizes its nouns, keeps "für" inside its names
+               ("Bayerisches Landesamt für Statistik"). */
+            static const std::unordered_set<std::string> serving = make_word_set("pour for per para");
+            for (std::size_t k = 2; k + 1 < words.size(); ++k)
+            {
+                if (!serving.count(fold_key(cp_substr(t, text, words[k].first, words[k].second)))) continue;
+                const std::string whole = fold_key(cp_substr(t, text, b, e));
+                if (is_upper(name_letter(t, words[k + 1])) &&
+                    (k + 2 < words.size() ||
+                     known_organizations().count(fold_key(cp_substr(t, text, words[k + 1].first, e)))) &&
+                    !known_organizations().count(whole) && !public_body_names().count(whole) &&
+                    generic_span(text, t, b, words[k - 1].second, pii_type::organization) &&
+                    !generic_span(text, t, words[k + 1].first, e, pii_type::organization))
+                    return words[k + 1].first;
+                break;
+            }
             for (std::size_t k = 0; k < words.size(); ++k)
             {
                 const std::string key = fold_key(cp_substr(t, text, words[k].first, words[k].second));
@@ -5651,6 +5921,8 @@ namespace dlib
             {
                 if (b > 0 && (is_word_char(t.cps[b - 1]) || t.cps[b - 1] == '_')) return true;
                 if (e == b + 1) return true;
+                // The scheme or the namespace of an identifier: "pkg" in "pkg:maven/org.acme/tool@2.1".
+                if (e + 1 < n && t.cps[e] == ':' && (is_letter(t.cps[e + 1]) || t.cps[e + 1] == '/')) return true;
                 const std::string key = fold_key(cp_substr(t, text, b, e));
                 // A file name, its extension numbered or not: "journal.log2", "rapport.docx".
                 const std::size_t dot = key.rfind('.');
@@ -5739,6 +6011,46 @@ namespace dlib
             if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
                 return false;
             if (type == pii_type::location && standard_number(text, t, b, e)) return true;
+            /* A code of one or two capitals and up to three digits read as a person or a place ("W8",
+               "M14", "H12"), and a piece of a token of capitals, digits and hyphens: "DOC-ARC" in
+               "NRV-DOC-ARC-2025-031". A name damaged by a scanner ("Mi1let") and a postal code of
+               Argentina ("C1425") stay what they are. */
+            if (type != pii_type::organization)
+            {
+                std::size_t q = b;
+                while (q < e && is_upper(t.cps[q])) ++q;
+                std::size_t r = q;
+                while (r < e && is_ascii_digit(t.cps[r])) ++r;
+                if (r == e && q > b && q - b <= 2 && r > q && r - q <= 3) return true;
+                if (inside_reference(t, b, e)) return true;
+            }
+            /* A piece in lower case of a compound joined by hyphens: "kel" in "kel-billing-api", the
+               name of a host, a package or a program. */
+            {
+                bool lower = true;
+                for (std::size_t q = b; q < e && lower; ++q) lower = !is_upper(t.cps[q]);
+                if (lower && ((e + 1 < n && is_hyphen(t.cps[e]) && is_lower(t.cps[e + 1])) ||
+                              (b >= 2 && is_hyphen(t.cps[b - 1]) && is_lower(t.cps[b - 2]))))
+                    return true;
+            }
+            // A port after its protocol or its server: "LDAPS 636", "SMTP 25", "port 9443".
+            if (type == pii_type::location)
+            {
+                bool digits = true;
+                for (std::size_t q = b; q < e && digits; ++q) digits = is_ascii_digit(t.cps[q]);
+                if (digits)
+                {
+                    static const std::unordered_set<std::string> carriers = make_word_set(
+                        "http https tcp udp ssh sftp ftp ftps smtp smtps imap imaps pop3 ldap ldaps rdp snmp dns "
+                        "ntp tls ssl port ports porta porte puerto puertos postgresql postgres mysql mariadb redis "
+                        "mongodb mssql oracle kafka amqp mqtt vnc winrm smb nfs");
+                    std::size_t q = b;
+                    while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0 || t.cps[q - 1] == ':')) --q;
+                    std::size_t r = q;
+                    while (r > 0 && is_letter(t.cps[r - 1])) --r;
+                    if (r < q && carriers.count(fold_key(cp_substr(t, text, r, q)))) return true;
+                }
+            }
             /* A piece of a code joined by underscores, its parts of three capitals or digits at most:
                "REQ" in "REQ_SEC_B2"; a name in a file name stays one ("Zhang" in "CV_Zhang_Wei.pdf"). */
             {
@@ -9327,6 +9639,8 @@ namespace dlib
         std::unordered_set<std::string> doc_term_set_;
         std::unordered_map<std::string, std::vector<std::size_t>> doc_term_index_;   // first key to doc_terms_
         std::unordered_set<std::string> doc_acronyms_;   // acronyms of organisations defined in the document
+        std::unordered_set<std::string> doc_versions_;   // versions of programs written in the document ("6.1.24")
+        std::unordered_set<std::string> email_domains_;  // domains of the e-mail addresses, webmail left out
         std::vector<std::pair<std::vector<std::string>, pii_type>> terms_;
         std::unordered_map<std::string, std::vector<std::size_t>> term_index_;       // first key to terms_
         std::unordered_set<std::string> allowed_;

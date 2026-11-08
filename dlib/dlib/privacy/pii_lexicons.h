@@ -2059,7 +2059,51 @@ namespace dlib
                     "condanniamo accoglie rigetta rigettiamo respinge respingiamo ordina assolve deboute rejette "
                     "verurteilt",
                     // Adjectives that name streets too ("Central Avenue"): common words, no words of a trade.
-                    "central centrale centraux centrales"
+                    "central centrale centraux centrales",
+                    /* The words of security bulletins, architecture files, inventories and the reports of
+                       scans and code analyses, which their tables and headings capitalize. */
+                    "source sources branche branches nomenclature nomenclatures composant composants gravite "
+                    "severite criticite correctif correctifs remediation divulgation vulnerabilite vulnerabilites "
+                    "detection detections statut statuts cible cibles modele modeles classement hote hotes "
+                    "destination destinations exposition expositions surface surfaces affectee affectees affecte "
+                    "affectes corrigee corrigees corrige corriges anterieure anterieures anterieur anterieurs "
+                    "posterieure posterieur inferieure deployee deploye deployees serveurs interface "
+                    "interfaces moteur moteurs module modules extension extensions dependance dependances "
+                    "bibliotheque bibliotheques paquet paquets journalisation configurations parametres valeurs "
+                    "comptes exploitant exploitants recette recettes environnement environnements plateforme "
+                    "plateformes passerelle passerelles bastion bastions console consoles balayage scans analyses "
+                    "verification verifications resultat resultats correction corrections indice indices "
+                    "compromission mesure mesures reduction attente limite limites etat "
+                    "etats lecture classification redacteur redactrice validation validations contexte perimetre "
+                    "architectures protocoles ports terminaison acheminement metadonnees echange echanges "
+                    "depot depots retrait requete requetes reponse reponses envoi envois formulaire formulaires "
+                    "multipartite telechargement televersement progression erreur erreurs affichage memoire "
+                    "processus interpreteur commandes utilitaire utilitaires branch severity criticality rating "
+                    "ratings vulnerability vulnerabilities hotspot hotspots remediation disclosure exposure "
+                    "mitigation workaround patch patches patched unpatched affected fixed advisory advisories "
+                    "exploit exploits payload payloads runtime runtimes scanning scanner scanners verbose "
+                    "insecure deprecated enabled disabled hardening misconfiguration settings defect defects "
+                    "safety reliability maintainability coverage duplication smell smells rules column columns "
+                    "category categories priorities component components dependency dependencies library "
+                    "libraries package packages engines gateway gateways endpoint endpoints upload uploads "
+                    "download downloads responses header headers cookie cookies queries injection traversal "
+                    "deserialisation deserialization authentication authorization encryption certificate "
+                    "certificates protocol protocols hosts target targets scopes detections statuses totals "
+                    "profiles reviewed baseline baselines inventory inventories asset assets environments "
+                    "staging releases builds pipeline pipelines repository repositories common weakness "
+                    "enumeration severita criticita correzione correzioni vulnerabilita rilevamento "
+                    "rilevamenti bersaglio componente componenti moduli motore motori pacchetto "
+                    "pacchetti dipendenza dipendenze configurazione parametri valori piattaforma "
+                    "interfaccia interfacce scansione scansioni esposizione mitigazione aggiornamento aggiornamenti "
+                    "versioni gravedad severidad criticidad correccion correcciones vulnerabilidad "
+                    "vulnerabilidades deteccion detecciones objetivo componentes modulo modulos motores "
+                    "paquete paquetes dependencia dependencias configuracion parametro parametros "
+                    "entorno entornos plataforma interfaz escaneo escaneos exposicion mitigacion actualizacion "
+                    "actualizaciones versiones parche parches quelle quellen schweregrad kritikalitat behebung "
+                    "schwachstelle schwachstellen erkennung komponente komponenten modul laufzeit "
+                    "paket pakete abhangigkeit abhangigkeiten konfiguration umgebung umgebungen "
+                    "plattform schnittstelle schnittstellen befund befunde minderung aktualisierung "
+                    "aktualisierungen versionen sicherheitslucke sicherheitslucken"
                 };
                 for (const char* part : frequent)
                 {
@@ -2853,6 +2897,8 @@ namespace dlib
                 "iam mdm byod rpa etl ocr llm gpu cpu ssd hdd usb hdmi bios uefi tpm hsm mwst rrhh hr "
                 // The acronyms of information security, services and public procurement.
                 "ssi smsi pssie cert csirt cti igc pca pra mco mcs iga mdr soar sirp dfir fir ioc iocs ttp ttps "
+                // The schemes of package identifiers, the codes of scanners and the names of hosts.
+                "purl pkg cpe qid sbom cgi voc vmdr sast dast iast rasp fqdn "
                 "kev epss cwe misp osint tlpt raci retex mooc uo moe amoa pv poc pov cctp ccap ccp cgv bpu dpgf "
                 "dqe etp hno jno pacs pdis pris passi siiv oiv lpm aipd dpia dicp dict dmia pdma rto rpo mtd nids "
                 "hids ngfw utm casb cnapp cspm cwpp sase ztna sdwan wan mpls ot dcs gpo rdp smb ntlm adfs laps "
@@ -2883,7 +2929,21 @@ namespace dlib
                 "heartbleed eternalblue printnightmare zerologon proxylogon proxyshell jtagulator kerberos ldaps "
                 "ipsec wireguard openvpn osstmm ptes mitre teamviewer teamviewerqs rsat dxdiag eventvwr regedit "
                 "prefetch amcache shimcache servicenow edge chrome firefox safari excel word powerpoint visio "
-                "teams copilot greenbone zap blueprism trustway zoom system32");
+                "teams copilot greenbone zap blueprism trustway zoom system32 "
+                // The servers, runtimes, databases and package managers of applications.
+                "php-fpm fpm php php-cgi litespeed openlitespeed frankenphp apache httpd nginx tomcat jboss wildfly "
+                "weblogic websphere iis caddy haproxy varnish squid traefik envoy postgresql postgres mysql mariadb "
+                "mongodb redis memcached elasticsearch opensearch couchdb sqlite oracledb mssql kafka "
+                "rabbitmq activemq zookeeper keycloak openldap openssh openssl libressl gnutls bind9 unbound postfix "
+                "dovecot exim sendmail samba nfs vsftpd proftpd rsync cron systemd docker podman containerd helm "
+                "rancher gitea gitlab-ce bitbucket artifactory nexus sonarqube sonarcloud sonarlint checkmarx "
+                "fortify veracode snyk trivy grype syft dependabot renovate cyclonedx spdx owasp-zap zaproxy "
+                "qualys vmdr tenable rapid7 nexpose insightvm splunk grafana prometheus zabbix nagios "
+                "centreon icinga elastic logrhythm crowdstrike falcon mde xdr edr glpi ocsinventory "
+                "symfony laravel drupal wordpress joomla magento prestashop typo3 composer npm yarn pip maven "
+                "gradle nuget monolog guzzle twig doctrine struts django flask rails nodejs node.js "
+                "react angular vue jquery bootstrap python java javascript typescript golang rustc dotnet "
+                "openjdk openapi swagger graphql grpc fastcgi");
             return s;
         }
 

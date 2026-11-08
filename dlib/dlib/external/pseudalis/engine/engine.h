@@ -148,7 +148,11 @@ namespace pseudalis
             const picture_handler& pictures, const substitute_lookup& lookup = substitute_lookup()) const;
         /*
             Puts back the values of the tags, and those of the substitutes that lookup knows in
-            the names and the properties; a picture marker stays (the service keeps the pictures).
+            the names and the properties.  A picture cannot come back into a document: its
+            marker leaves with the tags of its description (from a run of Word, with the gray
+            text box of a slide, from over the gray box of a PDF, which stays), and so does the
+            text file of a picture from an archive, report["pictures_removed"] counting them; the
+            service gives back the picture of a text file alone from its vault.
         */
         engine_result restore(const std::string& bytes, const std::string& name,
             const substitute_lookup& lookup = substitute_lookup()) const;
@@ -165,6 +169,7 @@ namespace pseudalis
         std::string restore_name(const std::string& name, const substitute_lookup& lookup, json& report) const;
 
         std::string anonymize_text(const std::string& text, json& report) const;
+        // A text keeps the picture markers it holds, which its reader sees.
         std::string restore_text(const std::string& text, json& report) const;
         /*
             [{"begin", "end", "type"}] of the tags of a protected text that this key restores, and

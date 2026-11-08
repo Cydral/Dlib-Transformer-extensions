@@ -761,10 +761,24 @@ namespace pseudalis
                 }
                 const std::string shown = narrow(file_of(target));
                 outcome o = how == "tags"
-                    ? success(tr_count("shell_restored_tags", values, { { "f", shown } }), shown)
+                    ? success(tags_message(report, values, shown), shown)
                     : success(tr(moved ? "shell_restored" : "shell_restored_copy", { { "f", shown } }), shown);
                 o.values = values;
                 return o;
+            }
+
+            /* A restoration from the tags: why the original did not come back, the day its original was
+               forgotten or the file written elsewhere, and the pictures that left it. */
+            static std::wstring tags_message(const json& report, long long values, const std::string& shown)
+            {
+                const json& forgotten = report["original_forgotten"];
+                std::wstring text = forgotten.is_object()
+                    ? tr_count("shell_restored_forgotten", values,
+                               { { "f", shown }, { "date", forgotten["date"].as_string() } })
+                    : tr_count("shell_restored_tags", values, { { "f", shown } });
+                const long long pictures = report["pictures_removed"].as_int(0);
+                if (pictures > 0) text += L" " + tr_count("shell_pictures_removed", pictures);
+                return text;
             }
 
             // The name of a folder anonymized, or restored, by the service; why tells a failure.

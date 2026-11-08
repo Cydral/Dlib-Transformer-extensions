@@ -128,6 +128,9 @@ namespace pseudalis
             s["total"] = report["total"];
             s["dropped"] = static_cast<unsigned long long>(report["dropped"].size());
             s["tags_restored"] = report["tags_restored"];
+            // A restoration from the tags: the pictures it removed, the day and the reason of a forgetting.
+            if (report["pictures_removed"].as_int(0) > 0) s["pictures_removed"] = report["pictures_removed"];
+            if (report["original_forgotten"].is_object()) s["original_forgotten"] = report["original_forgotten"];
             return s;
         }
 
@@ -363,10 +366,9 @@ namespace pseudalis
             user_error e;
             if (!s->restore(body, name, lower(req.get_param_value("object_id")), r, e))
             {
-                // A file whose original was forgotten is gone for good: 410, not 404.
-                const bool gone = e.code == "original_forgotten" || e.code == "original_expired" ||
-                                  e.code == "original_space";
-                send_error(res, e.code == "not_protected" ? 404 : gone ? 410 : 422, e);
+                // The picture of a text file, forgotten, is gone for good: 410, not 404.
+                send_error(res, e.code == "not_protected" || e.code == "picture_missing" ? 404 :
+                                e.code == "picture_forgotten" ? 410 : 422, e);
                 return;
             }
             json meta = json::object();
@@ -389,7 +391,7 @@ namespace pseudalis
             }
             else
             {
-                // A protected file whose original was forgotten: its restoration is refused.
+                // A protected file whose original was forgotten: its restoration puts back its tags.
                 int64_t when = 0;
                 std::string reason;
                 if (s->db().find_forgotten(lower(req.get_param_value("sha256")),

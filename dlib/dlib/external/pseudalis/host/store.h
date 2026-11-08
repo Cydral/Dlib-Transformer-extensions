@@ -134,7 +134,7 @@ namespace pseudalis
                 - With a reason ("forgotten", "expired"), the protected file of the record and
                   the entries of a protected archive are remembered as forgotten
                   (find_forgotten()), in the same transaction: a copy extracted from the archive
-                  is not restored either, unless a record of its own holds it.
+                  is restored from its tags too, unless a record of its own holds it.
         !*/
         bool remove_file(long long id, std::vector<std::string>& blobs, const std::string& reason = std::string());
         // The last original forgotten of a protected file, by its SHA-256 or its object identifier.

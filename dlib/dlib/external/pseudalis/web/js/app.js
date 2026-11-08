@@ -338,10 +338,20 @@
     return s;
   }
 
+  /* A restoration from the tags tells the day the original was forgotten, when it was, and the pictures
+     removed, which only their originals could give back. */
   function restoreDetail(body) {
     if (body.restored === 'original') return t('restored_original');
     if (body.restored === 'picture') return t('restored_picture');
-    return tn('restored_tags', (body.report && body.report.tags_restored) || 0);
+    const report = body.report || {};
+    let s = tn('restored_tags', report.tags_restored || 0);
+    const forgotten = report.original_forgotten;
+    if (forgotten && /^\d{4}-\d{2}-\d{2}$/.test(forgotten.date || '')) {
+      const p = forgotten.date.split('-').map(Number);
+      s += ', ' + t('restored_forgotten', { date: new Date(p[0], p[1] - 1, p[2]).toLocaleDateString(language) });
+    }
+    if (report.pictures_removed) s += ', ' + tn('pictures_removed', report.pictures_removed);
+    return s;
   }
 
   function wire(dropId, inputId, folderId, run) {

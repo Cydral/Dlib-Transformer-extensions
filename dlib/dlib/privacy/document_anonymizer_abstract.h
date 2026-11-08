@@ -285,6 +285,21 @@ namespace dlib
                   in report.substitutes_restored.
         !*/
 
+        void set_picture_text_finder(
+            const document_picture_text_finder& find
+        );
+        /*!
+            ensures
+                - restore() then removes from every text the ranges that find gives, the texts
+                  that a describer wrote in the place of pictures, with the tags they hold,
+                  and counts them in report.pictures_removed: in the text formats, the cells
+                  and the markup; in Word documents, from their runs; on slides, the gray
+                  text box of the picture with its text; in PDF documents, the text written
+                  over the gray box, the box staying. A restoration made without the
+                  original thus leaves no trace of a picture it cannot give back.
+                - An empty function, the default, removes nothing.
+        !*/
+
         void set_image_describer(
             const document_image_describer& describer
         );

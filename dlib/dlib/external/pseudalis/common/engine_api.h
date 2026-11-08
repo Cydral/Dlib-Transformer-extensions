@@ -25,7 +25,9 @@
     "photo.png.txt" for a picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx",
     "pdf", "image", "zip", "tar", "tar.gz" or "text"), "report" ({"values": {type: count},
     "removed": [...], "notes": [...], "dropped": [entries of an archive left out],
-    "tags_restored", "tags_rejected", "substitutes", "substitutes_restored"}), "pictures"
+    "tags_restored", "tags_rejected", "substitutes", "substitutes_restored", "pictures_removed"
+    (the picture markers that "restore" removed, which no restoration gives back into a
+    document)}), "pictures"
     (the identifiers of the pictures found) and, for "anonymize" and "anonymize_name",
     "substitutions" ([{"substitute", "tag"}]: the values written without their tags in the
     names and the properties, which the caller records for "restore"); "spans" for

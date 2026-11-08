@@ -39,6 +39,8 @@ namespace dlib
         void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
         void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
 
+        void set_picture_text_finder(const document_picture_text_finder& find) { pictures_ = find; }
+
         std::string anonymize(const std::string& pdf_bytes)
         {
             if (!detector_)
@@ -610,10 +612,29 @@ namespace dlib
             std::vector<span> edits;
             if (restoring_)
             {
+                // The texts written in the place of pictures leave, with the tags they hold.
+                std::vector<std::pair<std::size_t, std::size_t>> pictures;
+                if (pictures_) pictures = pictures_(u.text);
+                auto in_picture = [&](std::size_t b, std::size_t e) {
+                    for (const auto& r : pictures)
+                        if (b < r.second && r.first < e) return true;
+                    return false;
+                };
+                for (const auto& r : pictures)
+                    if (r.first < r.second && r.second <= u.text.size())
+                    {
+                        edits.push_back(span{ r.first, r.second, std::string() });
+                        ++report_.pictures_removed;
+                    }
                 pseudonymizer::restore_report rr;
+                std::size_t inside = 0;
                 for (const auto& o : p_.find_tags(u.text, &rr))
-                    edits.push_back(span{ o.begin, o.end, o.original });
-                report_.tags_restored += rr.restored;
+                {
+                    if (in_picture(o.begin, o.end)) ++inside;
+                    else edits.push_back(span{ o.begin, o.end, o.original });
+                }
+                std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
+                report_.tags_restored += rr.restored - std::min(inside, rr.restored);
                 report_.tags_rejected += rr.rejected;
             }
             else
@@ -674,6 +695,7 @@ namespace dlib
         document_image_describer describer_;
         bool untagged_properties_ = false;
         pseudonymizer::substitute_resolver resolve_;
+        document_picture_text_finder pictures_;
         bool restoring_ = false;
         bool layout_mode_ = false;
         std::vector<pdf_text_replacement> replacements_;

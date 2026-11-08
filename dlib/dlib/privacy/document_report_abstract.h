@@ -57,6 +57,8 @@ namespace dlib
                                   substitute written (pseudonymizer::substitute()) with the
                                   tag it stands for, which the caller keeps to restore it
                 substitutes_restored - restoration: the number of substitutes put back
+                pictures_removed - restoration: the number of picture texts removed
+                                  (document_anonymizer::set_picture_text_finder())
         !*/
         std::string format;
         std::string operation;
@@ -70,6 +72,7 @@ namespace dlib
         std::vector<std::string> notes;
         std::vector<document_substitution> substitutions;
         std::size_t substitutes_restored = 0;
+        std::size_t pictures_removed = 0;
 
         void count(pii_type t);
         /*!

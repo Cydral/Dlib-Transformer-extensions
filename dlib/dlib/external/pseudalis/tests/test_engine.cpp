@@ -240,6 +240,28 @@ int main()
         const std::string xml2 = again.contains("word/document.xml") ? again.read("word/document.xml") : "";
         CHECK(seen_pictures.size() == 1 && xml2.find("in her garden") != std::string::npos &&
               xml2.find("Marchand") == std::string::npos && xml2.find("[Image@" + id + " : ") != std::string::npos);
+        // Restored from its tags, its original forgotten: the marker leaves the document, the values come back.
+        std::string restored_docx;
+        CHECK(process(e, "restore", "lettre.docx", out, res, restored_docx));
+        const dlib::zip_archive_reader rz(restored_docx);
+        const std::string rxml = rz.contains("word/document.xml") ? rz.read("word/document.xml") : std::string();
+        CHECK(rxml.find("[Image@") == std::string::npos && rxml.find("in her garden") == std::string::npos &&
+              rxml.find("Marie Curie") != std::string::npos && rxml.find("Jeanne Marchand") != std::string::npos);
+        CHECK(res["report"]["pictures_removed"].as_int() == 1);
+    }
+    // A text written elsewhere from protected values: its tags come back, the marker of a picture leaves.
+    {
+        std::string tagged, answered;
+        CHECK(process(e, "anonymize", "note.txt", "Photo de Jean Dupont.\n", res, tagged));
+        tagged.erase(tagged.find_last_not_of("\r\n") + 1);
+        const std::string answer = "Voir [Image@0123456789abcdef : " + tagged + "] puis " + tagged + "\n";
+        CHECK(process(e, "restore", "reponse.txt", answer, res, answered));
+        CHECK(answered == "Voir puis Photo de Jean Dupont.\n" && res["report"]["pictures_removed"].as_int() == 1 &&
+              res["report"]["tags_restored"].as_int() >= 1);
+        // At the end and at the start of a line, the space beside the marker leaves with it.
+        const std::string edges = "Voir " + tagged + " [Image@0123456789abcdef]\n[Image@0123456789abcdef] Fin\n";
+        CHECK(process(e, "restore", "reponse.txt", edges, res, answered));
+        CHECK(answered == "Voir Photo de Jean Dupont.\nFin\n" && res["report"]["pictures_removed"].as_int() == 2);
     }
     // Without description.
     CHECK(process(e, "anonymize", "photo.png", png, res, out, false));
@@ -304,6 +326,10 @@ int main()
     {
         const dlib::zip_archive_reader z(back);
         CHECK(z.read("dossier/lettre.txt") == letter);
+        // The text file of the picture, which no restoration gives back, leaves the archive.
+        CHECK(res["report"]["pictures_removed"].as_int() == 1 && z.read("dossier/photo.png.txt") == "already there");
+        for (const pseudalis::archive_entry& x : pseudalis::read_archive(pseudalis::archive_kind::zip, back))
+            CHECK(x.data.find("[Image@") == std::string::npos);
         const std::vector<pseudalis::archive_entry> t =
             pseudalis::read_archive(pseudalis::archive_kind::tar_gz, z.read("archive.tar.gz"));
         CHECK(t.size() == 1 && t[0].data == inner[0].data);

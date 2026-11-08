@@ -37,7 +37,7 @@ namespace pseudalis
             " name TEXT NOT NULL, original TEXT NOT NULL, sha256 TEXT NOT NULL, kind TEXT NOT NULL,"
             " PRIMARY KEY(record, name));"
             "CREATE INDEX IF NOT EXISTS entries_sha ON entries(sha256);"
-            // The originals forgotten, by the protected files that showed them: their restoration is refused.
+            // The originals forgotten, by the protected files that showed them: restored from their tags since.
             "CREATE TABLE IF NOT EXISTS forgotten(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL,"
             " reason TEXT NOT NULL, output_sha256 TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '');"
             "CREATE INDEX IF NOT EXISTS forgotten_output ON forgotten(output_sha256);"
