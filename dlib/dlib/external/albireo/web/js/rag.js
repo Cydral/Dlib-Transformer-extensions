@@ -14,7 +14,11 @@
     A question is answered by the passages closest to it in meaning, by their vectors, and
     in words, by the BM25 score of its terms, the two rankings fused, then chosen so that
     they do not repeat each other (maximal marginal relevance) within a budget of
-    characters.  The consecutive passages of a document merge into one excerpt.
+    characters.  A passage far from the best ones in meaning, or whose words weigh little
+    beside the best ones, is left out, so that a question unrelated to the documents
+    receives no excerpt.  The passage that follows each of the best ones comes with it
+    when the budget allows, the consecutive passages of a document merge into one excerpt,
+    and the documents come in the order of their best excerpt.
 
     Without an embedding model, the search works on the words alone.
 */
@@ -25,6 +29,16 @@ import { terms } from './documents.js';
 export const passageChars = 1200;
 export const overlapChars = 240;
 const embedBatch = 16;
+/*
+    The floors of the search: the cosine of a passage and a question below which they are unrelated, measured
+    with Qwen3-Embedding (0.2 to 0.3 for a question and passages that do not answer it, 0.6 and more for the passage
+    that answers it); the distance to the best cosine beyond which a passage is left out; the share of the best
+    score in words below which a passage is left out; and the best passages that the next one follows.
+*/
+const minMeaning = 0.35;
+const meaningSpread = 0.2;
+const wordsShare = 0.3;
+const followed = 3;
 
 // The embedding model of the service: {id, dimensions}, or null.
 let model = null;
@@ -109,7 +123,7 @@ export function chunk(text) {
     let tail = '';
     if (keepTail && buffer.length > overlapChars) {
       tail = buffer.slice(-overlapChars);
-      const cut = tail.search(/[\n.!?;]\s/);
+      const cut = tail.search(/\n|[.!?;]\s/);
       if (cut >= 0 && cut < tail.length - 40) tail = tail.slice(cut + 1).trimStart();
     }
     buffer = tail;
@@ -139,9 +153,10 @@ export function chunk(text) {
       bufferWhere = where();
       continue;
     }
-    const heading = line.match(/^#{1,6} (.+)$/);
+    // A section starts a passage of its own, without the overlap of the previous one, once that one is long enough.
+    const heading = line.trimEnd().match(/^#{1,6} (.+)$/);
     if (heading) {
-      if (buffer.length > passageChars / 3) emit(true);
+      if (buffer.length > passageChars / 3) emit(false);
       section = heading[1].trim().slice(0, 80);
       if (!buffer.trim()) bufferWhere = where();
     }
@@ -149,6 +164,11 @@ export function chunk(text) {
     let rest = line;
     while (rest.length) {
       const room = passageChars - buffer.length;
+      // A short line that does not fit, such as a row of a sheet, starts the next passage whole.
+      if (rest.length > room && rest === line && line.length <= passageChars / 4 && buffer.trim()) {
+        emit(true);
+        continue;
+      }
       if (rest.length <= room) {
         add(rest);
         pos += rest.length;
@@ -288,12 +308,13 @@ export async function status(owner) {
     Indexes a document {id, name, text} for an owner: its passages, and their vectors when
     the service has an embedding model.  A document already indexed with the current model
     is left as it is.  onProgress(done, total) follows the vectors computed; signal stops the
-    vectors, and the passages are then searched by their words.  A document removed
+    vectors, as does deadline (a time of Date.now()), and the passages without a vector are
+    then searched by their words until an indexing completes them.  A document removed
     (removeDocument, removeOwner, removeAll) once the indexing started keeps no passage.
     Returns {passages, vectors}.
 */
 export async function indexDocument(owner, doc, options = {}) {
-  const { persistent = true, onProgress = null, signal = null } = options;
+  const { persistent = true, onProgress = null, signal = null, deadline = 0 } = options;
   const stamp = removalStamp(owner, doc.id);
   const removed = () => removalStamp(owner, doc.id) !== stamp;
   const pieces = chunk(doc.text || '');
@@ -308,9 +329,25 @@ export async function indexDocument(owner, doc, options = {}) {
   }));
   let vectors = 0;
   if (current) {
-    for (let i = 0; i < records.length; i += embedBatch) {
-      if ((signal && signal.aborted) || removed()) break;
-      const batch = records.slice(i, i + embedBatch);
+    // The passages already computed with the current model keep their vectors: an indexing that stopped goes on.
+    const known = new Map();
+    for (const r of existing) {
+      if (r.vector && r.model === current) known.set(r.where + '\n' + r.text, r.vector);
+    }
+    const missing = [];
+    for (const r of records) {
+      const v = known.get(r.where + '\n' + r.text);
+      if (v) {
+        r.vector = v instanceof Float32Array ? v : new Float32Array(v);
+        r.model = current;
+        ++vectors;
+      } else {
+        missing.push(r);
+      }
+    }
+    for (let i = 0; i < missing.length; i += embedBatch) {
+      if ((signal && signal.aborted) || removed() || (deadline && Date.now() > deadline)) break;
+      const batch = missing.slice(i, i + embedBatch);
       try {
         const vs = await embed(batch.map((r) => passageText(r.name, r.where, r.text)), signal);
         batch.forEach((r, k) => {
@@ -323,7 +360,7 @@ export async function indexDocument(owner, doc, options = {}) {
         // The service lost its model, or stopped: the passages are searched by their words.
         break;
       }
-      if (onProgress) onProgress(Math.min(i + embedBatch, records.length), records.length);
+      if (onProgress) onProgress(vectors, records.length);
     }
   }
   // The removals are checked right before the write, and after it for a removal that came
@@ -379,24 +416,31 @@ function overlap(a, b) {
 
 /*
     The excerpts of the documents of owners closest to a question:
-    [{doc, name, where, text, score}], in the order of the documents, within budget
-    characters, limit passages at most.  skip, a Set of documents, leaves them out of the
-    search, such as the documents of a project the model reads whole.
+    [{doc, name, where, text, score, passages}], the documents in the order of their best
+    excerpt, the excerpts of a document in its order, within budget characters, limit
+    passages at most, passages naming the identifiers of the passages of each excerpt.  skip,
+    a Set of documents, leaves them out of the search, such as the documents of a project the
+    model reads whole; exclude, a Set of passage identifiers, leaves out the passages the
+    context already holds.
 */
 export async function search(owners, question, options = {}) {
-  const { limit = 12, budget = 12000, signal = null, skip = null } = options;
+  const { limit = 12, budget = 12000, signal = null, skip = null, exclude = null } = options;
   const all = [];
   const sparse = [];
+  // The index of each passage among all, for the passage that follows a chosen one.
+  const at = new Map();
   for (const o of owners) {
     const entry = await load(o);
     const entrySparse = sparseOf(entry);
     for (let i = 0; i < entry.records.length; ++i) {
       if (skip && skip.has(entry.records[i].doc)) continue;
+      at.set(entry.records[i].id, all.length);
       all.push(entry.records[i]);
       sparse.push(entrySparse[i]);
     }
   }
   if (!all.length || !String(question).trim()) return [];
+  const excluded = (i) => !!(exclude && exclude.has(all[i].id));
 
   // By words: BM25 over the passages of the owners.
   const q = Array.from(new Set(terms(question)));
@@ -440,14 +484,25 @@ export async function search(owners, question, options = {}) {
     }
   }
 
-  // Reciprocal rank fusion of the two rankings.
+  /*
+      Reciprocal rank fusion of the two rankings, each over the passages near its best one: in meaning, a cosine
+      of minMeaning at least and within meaningSpread of the best; in words, a score of wordsShare of the best at
+      least.  A question that matches no passage in either way receives none.
+  */
   const fused = new Float64Array(all.length);
   const rank = (scores, floor) => {
-    const order = Array.from(scores.keys()).filter((i) => scores[i] > floor).sort((a, b) => scores[b] - scores[a]);
+    const order = Array.from(scores.keys()).filter((i) => scores[i] > floor && !excluded(i))
+      .sort((a, b) => scores[b] - scores[a]);
     order.slice(0, 60).forEach((i, r) => { fused[i] += 1 / (60 + r); });
   };
-  rank(words, 0);
-  if (questionVector) rank(meaning, -1);
+  let bestWords = 0;
+  for (let i = 0; i < all.length; ++i) bestWords = Math.max(bestWords, words[i]);
+  if (bestWords > 0) rank(words, Math.max(0, wordsShare * bestWords));
+  if (questionVector) {
+    let bestMeaning = -1;
+    for (let i = 0; i < all.length; ++i) bestMeaning = Math.max(bestMeaning, meaning[i]);
+    if (bestMeaning >= minMeaning) rank(meaning, Math.max(minMeaning, bestMeaning - meaningSpread) - 1e-9);
+  }
   const candidates = Array.from(fused.keys()).filter((i) => fused[i] > 0).sort((a, b) => fused[b] - fused[a]).slice(0, 60);
   if (!candidates.length) return [];
 
@@ -484,20 +539,45 @@ export async function search(owners, question, options = {}) {
     used += all[i].text.length;
   }
 
-  // The excerpts in the order of the documents, the consecutive passages merged.
+  // The passage that follows each of the best ones continues it, within the budget and the limit.
+  const taken = new Set(chosen);
+  for (const i of chosen.slice(0, followed)) {
+    const next = at.get(all[i].doc + ':' + (all[i].ordinal + 1));
+    if (next == null || taken.has(next) || excluded(next) || chosen.length >= limit) continue;
+    if (used + all[next].text.length > budget) continue;
+    chosen.push(next);
+    taken.add(next);
+    used += all[next].text.length;
+    fused[next] = Math.max(fused[next], fused[i] * 0.5);
+  }
+
+  // The excerpts of each document in its order, the consecutive passages merged.
   chosen.sort((a, b) => (all[a].doc < all[b].doc ? -1 : all[a].doc > all[b].doc ? 1 : all[a].ordinal - all[b].ordinal));
+  const firstLine = (text) => text.slice(0, Math.max(0, text.indexOf('\n')));
   const out = [];
   for (const i of chosen) {
     const r = all[i];
     const last = out[out.length - 1];
     if (last && last.doc === r.doc && last.lastOrdinal + 1 === r.ordinal) {
-      const k = overlap(last.text, r.text);
-      last.text += (k ? '' : '\n') + r.text.slice(k);
+      // The passages of a sheet start with the names of its columns, which the excerpt holds once.
+      let text = r.text;
+      const head = firstLine(last.text);
+      if (head && /^Sheet: /.test(r.where || '') && firstLine(text) === head) text = text.slice(head.length + 1);
+      const k = overlap(last.text, text);
+      last.text += (k ? '' : '\n') + text.slice(k);
       last.lastOrdinal = r.ordinal;
       last.score = Math.max(last.score, fused[i]);
+      last.passages.push(r.id);
       continue;
     }
-    out.push({ doc: r.doc, name: r.name, where: r.where, text: r.text, score: fused[i], lastOrdinal: r.ordinal });
+    out.push({ doc: r.doc, name: r.name, where: r.where, text: r.text, score: fused[i], lastOrdinal: r.ordinal,
+      passages: [r.id] });
   }
-  return out.map(({ doc, name, where, text, score }) => ({ doc, name, where, text, score }));
+  // The documents in the order of their best excerpt.
+  const bestOf = new Map();
+  for (const x of out) bestOf.set(x.doc, Math.max(bestOf.get(x.doc) || 0, x.score));
+  const order = Array.from(bestOf.keys()).sort((a, b) => bestOf.get(b) - bestOf.get(a));
+  const rankOf = new Map(order.map((d, k) => [d, k]));
+  out.sort((a, b) => rankOf.get(a.doc) - rankOf.get(b.doc) || a.lastOrdinal - b.lastOrdinal);
+  return out.map(({ doc, name, where, text, score, passages }) => ({ doc, name, where, text, score, passages }));
 }

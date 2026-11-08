@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -299,12 +300,20 @@ namespace albireo
         long context = 0;
         long max_sequences = 8;
         long batch_tokens = 512;
+        kv_format kv_type = kv_format::f16;
         std::vector<int> stops;
         std::vector<cache_entry> idle;
         std::vector<std::shared_ptr<request_state>> active;
         std::deque<std::shared_ptr<request_state>> waiting;
         std::atomic<bool> unloading{false};
         uint64_t stamp = 0;
+        /*
+            The speeds measured on the answers of the model, in tokens per second: its reading of
+            the prompts that computed 64 tokens or more, and its writing of the answers of 8
+            tokens or more, each an exponential average of the latest answers (model_info).
+        */
+        std::atomic<double> prompt_rate{0.0};
+        std::atomic<double> generation_rate{0.0};
         // When the model last computed, and whether the memory of its free blocks went back
         // to the system since (engine::trim_idle).
         clock_type::time_point last_step;
@@ -1188,9 +1197,10 @@ namespace albireo
         };
         long ctx = embedding && !options.contains("context") ? 0
             : static_cast<long>(setting("context", 0, 0, 1 << 26));
+        const bool chosen_context = ctx > 0;
         /*
-            By default, the context the model was trained for, which the memory given to its keys
-            and values may reduce below; an embedding model reads inputs of 8192 tokens at most.
+            By default, the context the model was trained for, which the memory of the system
+            may reduce below; an embedding model reads inputs of 8192 tokens at most.
         */
         if (ctx <= 0 && m->cfg.ctx_train > 0)
             ctx = embedding ? std::min<long>(m->cfg.ctx_train, 8192) : m->cfg.ctx_train;
@@ -1202,44 +1212,84 @@ namespace albireo
         m->batch_tokens = embedding && !options.contains("batch_tokens") ? 256
             : std::max<long>(16, static_cast<long>(setting("batch_tokens", 512, 0, 65536)));
 
-        const size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * m->cfg.kv_dim() * sizeof(uint16_t);
+        /*
+            The storage of the keys and values (kv_format): auto takes the 8-bit integers for a
+            language model whose heads hold whole groups of them, and half precision for an
+            embedding model, whose vectors then keep the values of its reference implementation.
+        */
+        const json none;
+        const json& kv_type_value = options.contains("kv_type") ? options["kv_type"]
+            : embedding ? none : settings_["kv_type"];
+        const std::string kv_type = kv_type_value.is_string() ? kv_type_value.as_string() : "auto";
+        if ((!kv_type_value.is_null() && !kv_type_value.is_string())
+            || (kv_type != "auto" && kv_type != "q8" && kv_type != "f16"))
+            throw std::invalid_argument("the setting kv_type must be auto, q8 or f16");
+        const bool whole_groups = m->cfg.head_dim % kv_q8_group == 0;
+        m->kv_type = whole_groups && (kv_type == "q8" || (kv_type == "auto" && !embedding)) ? kv_format::q8
+            : kv_format::f16;
+        if (kv_type == "q8" && !whole_groups)
+            log(ALBIREO_LOG_WARNING, "model '" + id + "': heads of " + std::to_string(m->cfg.head_dim) + " values "
+                "hold no whole groups of 8-bit keys and values, which stay in half precision");
+
+        const size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * static_cast<size_t>(m->cfg.n_kv_heads)
+            * kv_row_bytes(m->kv_type, m->cfg.head_dim);
+        const memory_info mem = read_memory_info();
+        /*
+            The memory the keys and values leave to the system and to the other programs, and to the
+            weights of the model, which a generation reads at every token and which have to stay
+            in the physical memory.
+        */
+        const uint64_t weights = static_cast<uint64_t>(m->file->size())
+            + (m->projector && m->projector != m->file ? static_cast<uint64_t>(m->projector->size()) : 0);
+        const uint64_t reserve = std::max<uint64_t>(uint64_t(1) << 30, mem.total / 8) + weights;
+        // The memory the keys and values can take, when the system tells it.
+        const bool known = mem.commit_total > 0;
+        const uint64_t room_bytes = mem.commit_total > reserve ? mem.commit_total - reserve : 0;
+        // The bytes of the keys and values of positions, in whole blocks.
+        const long block_positions = embedding ? 64 : 256;
+        auto bytes_for = [&](long positions) {
+            const long blocks = (positions + block_positions - 1) / block_positions;
+            return per_token * static_cast<size_t>(blocks * block_positions);
+        };
         size_t kv = (embedding && !options.contains("kv_mb") ? size_t(0)
             : static_cast<size_t>(setting("kv_mb", 0, 0, 1 << 24))) << 20;
         if (kv == 0 && embedding)
         {
             // One input of the whole context.
-            kv = per_token * static_cast<size_t>(m->context);
+            kv = bytes_for(m->context);
         }
         else if (kv == 0)
         {
             /*
-                Two full contexts, within a third of the memory available once the other
-                models have grown to their own budgets: the blocks are allocated as the
-                sequences grow, so the memory free now still has to hold that growth.  The
-                context of a model trained on a long one then comes down to what this
-                memory holds.
+                Two full contexts, within the memory the system can commit, its physical memory
+                and its paging file or swap together, less the reserve.  The blocks are
+                allocated as the sequences grow, and the guard below refuses a new block when
+                the memory the system has left comes down to the reserve: this budget is a
+                bound that only sequences of that length reach, the paging file or the swap
+                then holding what the physical memory does not.  The context of the model comes
+                down to what this memory can hold, unless a setting chose it.
             */
-            const memory_info mem = read_memory_info();
-            size_t growth = 0;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                for (const auto& o : models_)
-                {
-                    if (o.first == id) continue;
-                    const size_t budget = o.second->runtime->kv_bytes_budget();
-                    const size_t used = o.second->runtime->kv_bytes_used();
-                    if (budget > used) growth += budget - used;
-                }
-            }
-            kv = per_token * static_cast<size_t>(m->context) * 2;
-            if (mem.available > 0)
-            {
-                const size_t available = static_cast<size_t>(mem.available);
-                kv = std::min<size_t>(kv, (available > growth ? available - growth : 0) / 3);
-            }
-            kv = std::max<size_t>(kv, per_token * static_cast<size_t>(std::min<long>(m->context, 4096)));
+            kv = 2 * bytes_for(m->context);
+            if (known) kv = std::min<size_t>(kv, static_cast<size_t>(room_bytes));
+            if (chosen_context) kv = std::max<size_t>(kv, bytes_for(m->context));
+            kv = std::max<size_t>(kv, bytes_for(std::min<long>(m->context, 4096)));
+            if (chosen_context && known && bytes_for(m->context) > room_bytes)
+                log(ALBIREO_LOG_WARNING, "model '" + id + "': the keys and values of a context of "
+                    + std::to_string(m->context) + " tokens take " + std::to_string(bytes_for(m->context) >> 20)
+                    + " MB, beyond the " + std::to_string(room_bytes >> 20) + " MB the system can commit for them");
         }
-        std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, embedding ? 64 : 256));
+        std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, block_positions,
+            m->kv_type));
+        /*
+            A new block of keys and values leaves the reserve to the system, beyond the blocks of
+            the first 4096 positions, which the model always has.
+        */
+        const size_t floor_bytes = bytes_for(std::min<long>(m->context, 4096));
+        runtime->set_kv_guard([reserve, floor_bytes](size_t bytes, size_t allocated) {
+            if (allocated + bytes <= floor_bytes) return true;
+            const memory_info now = read_memory_info();
+            return now.commit_available == 0 || now.commit_available >= bytes + reserve;
+        });
 #ifdef ALBIREO_TENSOR_BACKEND
         runtime->set_offload(device_->make_offload(id));
 #endif
@@ -1283,7 +1333,8 @@ namespace albireo
             : std::string("chat format ") + m->format->name();
         if (m->vision) log(ALBIREO_LOG_INFO, "model '" + id + "': images read by " + m->vision->description());
         log(ALBIREO_LOG_INFO, "model '" + id + "': " + m->runtime->description() + ", " + use
-            + ", context " + std::to_string(m->context) + ", keys and values up to "
+            + ", context " + std::to_string(m->context) + ", keys and values in "
+            + (m->kv_type == kv_format::q8 ? "8 bits" : "half precision") + " up to "
             + std::to_string(m->runtime->kv_bytes_budget() >> 20) + " MB"
             + (m->tok.exact_pretokenizer() ? "" : ", pre-tokenizer '" + m->tok.pretokenizer() + "' approximated"));
 
@@ -1320,6 +1371,10 @@ namespace albireo
         j["quantization"] = m.quantization;
         j["bytes"] = static_cast<unsigned long long>(m.bytes);
         j["kv_bytes_per_token"] = static_cast<unsigned long long>(m.runtime->kv_bytes_per_token());
+        j["kv_type"] = m.kv_type == kv_format::q8 ? "q8" : "f16";
+        // The measured speeds, 0 until the model answered (loaded_model::prompt_rate).
+        j["prompt_tokens_per_second"] = std::round(10.0 * m.prompt_rate.load(std::memory_order_relaxed)) / 10.0;
+        j["generation_tokens_per_second"] = std::round(10.0 * m.generation_rate.load(std::memory_order_relaxed)) / 10.0;
         j["experts"] = m.cfg.n_experts;
         j["embedding"] = m.cfg.is_embedding();
         if (m.cfg.is_embedding()) j["dimensions"] = m.cfg.d_model;
@@ -2699,6 +2754,12 @@ namespace albireo
             timings["generation_ms"] = 1000.0 * gt;
             timings["prompt_per_second"] = pt > 0 ? computed / pt : 0.0;
             timings["generation_per_second"] = gt > 0 && r.generated > 1 ? (r.generated - 1) / gt : 0.0;
+            auto average = [](std::atomic<double>& rate, double sample) {
+                const double old = rate.load(std::memory_order_relaxed);
+                rate.store(old > 0 ? 0.7 * old + 0.3 * sample : sample, std::memory_order_relaxed);
+            };
+            if (computed >= 64 && pt > 0) average(m.prompt_rate, computed / pt);
+            if (r.generated >= 8 && gt > 0) average(m.generation_rate, (r.generated - 1) / gt);
         }
         done["timings"] = timings;
         r.sink(ALBIREO_EVENT_DONE, done.dump());

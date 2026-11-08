@@ -154,7 +154,8 @@ Intel Xeon of Cascade Lake and Ice Lake, AMD Zen 4) runs `cpu-avx2`; an update r
 installation the libraries of the engines of AVX-512 that earlier versions installed.
 
 The half precision conversions of F16C belong to `cpu-avx2`: every processor with AVX2 has them,
-and the keys and values of the attention, kept in half precision, go through them. The variants
+and the scales of the keys and values of the attention, and these keys and values themselves when
+the settings keep them in half precision, go through them. The variants
 differ in their quantized kernels only ([`engine/qkernels.cpp`](engine/qkernels.cpp)), compiled for
 the instructions of each variant (`/arch:AVX2` and the macro `ALBIREO_AVX_VNNI` with Visual Studio;
 `-mavxvnni` with GCC and Clang) while the rest of the library stays at AVX2: the description of a
@@ -186,16 +187,45 @@ vector kernel of their own, bit for bit with dlib; the work buffers lie on lines
 These paths keep each result within the tolerances of the tests, and the numbers of a pass
 depend on its size: at temperature 0, the first answer to a prompt, whose last token is read
 within the whole prompt, may differ from the next ones, which take the prompt from the cache.
-The keys and values live in half precision in pages of 256 positions, one sequence per request;
-the conversations that start with the same text share the full pages of that text, and a sequence
-copies a shared page before writing in it.
+The keys and values live in pages of 256 positions, one sequence per request, in 8 bits by default
+(`kv_type`): groups of 32 values that share a scale in half precision, 34 bytes against 64 in half
+precision ([`engine/kv_cache.h`](engine/kv_cache.h)). The keys are rotated before their rounding,
+the signs of a fixed pattern then the normalized Walsh-Hadamard transform, and the queries alike,
+which keeps their products: a few channels of the keys of Qwen3 hold values ten times larger than
+the others, which the groups would round with a coarse step, and the rotation spreads them over the
+row. Against half precision, the 8-bit keys and values gave the same next token on the 210
+positions of a text with Qwen3-VL 4B, with a mean divergence of 6.5e-5 (KL), twenty-five times
+below the differences of the integer products of the generation; without the rotation, the keys
+alone gave 1.1e-2 with Qwen3 0.6B, and 7e-4 with it. The conversations that start with the same
+text share the full pages of that text, and a sequence copies a shared page before writing in it.
 The attention runs on the processor in every variant, by tiles: up to 64 rows of queries, the
 heads that share one key/value head for consecutive tokens of a prompt, read the pages one after
 the other with a running maximum and sum, as FlashAttention does, so that each key and value
 taken from memory serves the whole tile instead of a single row. On two cores, the 2,900 tokens
 of a question that a project adds to a discussion of 3,200 tokens took 80 s instead of 228 s with
-Qwen3 0.6B. While a single answer is generated, each head makes a task of its own, so that every
-thread takes part. The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from
+Qwen3 0.6B. While a single answer is generated, the positions of each tile are split into ranges
+of 256 positions at least, each read by one task for all the heads of its group, and the partial
+sums of the ranges are merged (the split of FlashDecoding): every thread takes part, and the keys
+and values of a long context are read once per token instead of once per head. On two cores, a
+step of Qwen3 0.6B after 8,192 positions took 102 ms with the 8-bit keys and values, against
+116 ms in half precision. The sums of the ranges come in another order than in a single task, so
+that the logits of a step differ by the rounding of the floats from one number of threads to
+another.
+
+The context of a model is the one it was trained for, which the engine brings down only when the
+keys and values of a full context exceed the memory the system can commit, its physical memory and
+its paging file or swap together, less a reserve left to the system (an eighth of the physical
+memory, 1 GB at least) and the weights of the model, which a generation reads at every token; the
+setting `context` chooses another one. The pages are allocated as the sequences grow, within a
+budget of two full contexts in that memory, and beyond the pages of the first 4,096 positions a
+guard refuses a new page once the memory the system can still commit comes down to that reserve,
+the request then waiting or ending as when the budget runs out. The memory of the keys and values follows the text actually
+held: the 262,144 positions of Qwen3-VL 4B take 20.5 GB in 8 bits (38.6 GB in half precision), which
+only a conversation of that length reaches, the paging file or the swap holding what the physical
+memory does not. The keys and values stay in the memory of the computer with every engine: the
+graphics engines keep the attention on the processor, and V²RAM extends the memory of the card for
+the weights. The web application sizes its own choices within that context (see the prompt of a
+question below). The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from
 the next token of every request being generated and a slice of the prompts being read, and draws
 the next tokens of the pass in parallel. When the pages run out, a prompt being read gives its
 pages back to the answers being written and is read again once there is room; the context of a
@@ -517,10 +547,23 @@ The search ([`web/js/rag.js`](web/js/rag.js)) cuts the documents into passages o
 characters overlapping by 240, named after their document and their part. The embedding model of
 the service computes the vector of each passage once, through `/v1/embeddings`, and the passages
 are kept with their vectors in the database of the browser (IndexedDB), or in memory for an
-incognito discussion. A question is compared with the passages by meaning (cosine of the vectors)
-and by words (BM25); the two rankings are fused (reciprocal rank fusion), the passages chosen so
-that they do not repeat each other (maximal marginal relevance), and the consecutive passages of
-a document merged into one excerpt. The engine computes the vectors of every client in the same
+incognito discussion. A heading starts a passage of its own, without the overlap of the previous
+one, and names the section of the passages that follow; a short line that does not fit, such as a
+row of a sheet, starts the next passage whole. A question is compared with the passages by meaning
+(cosine of the vectors) and by words (BM25), each ranking over the passages near its best one: a
+cosine of 0.35 at least and within 0.2 of the best, measured with Qwen3-Embedding (0.2 to 0.3
+for passages that do not answer, 0.6 and more for the one that does), and a score in words of 30%
+of the best at least, so that "Thanks, that is perfect!" receives no excerpt. The two rankings are
+fused (reciprocal rank fusion), the passages chosen so that they do not repeat each other
+(maximal marginal relevance), the passage that follows each of the three best ones added within
+the budget, the consecutive passages of a document merged into one excerpt that gives the names
+of the columns of a sheet once, and the documents given in the order of their best excerpt. The
+passages that the questions of the context already brought are not given again, and a question of
+fewer than six words is searched with the beginning of the previous one ("and in 2025?"). A
+document attached to a question is indexed before its answer for 15 seconds at most: the passages
+whose vectors are not computed yet are searched by their words while the queue computes them, and
+an indexing that stopped (an answer stopped, a service busy, a new embedding model) goes on later
+from the vectors already computed. The engine computes the vectors of every client in the same
 passes and keeps these passes short while a conversation is answered, so that indexing documents
 never delays an answer. The page of a project lists each document with its format, the estimate of
 its tokens and the number of its passages ("MD · ≈ 265 tokens · 3 passages", "(by words)" while
@@ -534,34 +577,56 @@ The prompt of a question is built for the cache of the engine, which keeps the k
 each conversation and computes again only the tokens that differ from what it already read
 ([`web/js/app.js`](web/js/app.js)):
 
-| Part of the prompt | Content | Share of the context |
-|---|---|---|
-| System message | the day the discussion started, instructions, memory, documents of the project read whole | 30% at most, else the project is searched |
-| Memory | short sentences on the user, as they were when the discussion started | 4% at most, 200 words |
-| Summary | the exchanges that left the context, compressed by the model | 15% at most |
-| Attached document | read whole | 25% at most, else indexed and searched |
-| Excerpts of a question | the passages found for it, kept with the message once sent | 20% at most |
-| Exchanges | the conversation, a question asked on a later day with its date | the rest; the oldest leave in one step, down to 30% of the room left by the system message and the tools |
+The application sizes its choices from the working context of the model: its context, as the
+engine gives it, within what the computer reads in four minutes at the speed the engine measured
+on the answers of the model (`prompt_tokens_per_second` of the loaded models, rounded down to a
+power of two, 128 tokens per second for the processor engines until the model answered), 16,384
+tokens at least, rounded to a power of two, so that a new measure changes the choices only when
+the speed doubles or halves: 32,768 tokens at 128 tokens per second, 65,536 at 256, and the
+262,144 of Qwen3-VL 4B from 1,024. The engine keeps the keys and values of the discussions read,
+so that a discussion reads its whole context again only when they left the memory; the documents
+read whole and the excerpts have times of reading of their own, since a question waits for them.
+A document can still be longer than these shares: the context of the model stays the limit of
+what a question holds.
 
-The system message keeps the day the discussion started, in English, and a question asked on a
-later day carries its own date, so that a discussion continued the next day keeps the beginning
-of its prompt. The beginning of the prompt therefore stays the same from one question to the
-next: each question costs its own tokens only (the engine reads the previous answer, as the
-template renders it in the history, while the user reads it), the conversations of a project
-share the reading of its documents (the engine shares the pages of the cached prefix between the
-sequences), and
+| Part of the prompt | Content | Share of the working context |
+|---|---|---|
+| System message | documents of the project read whole, the day the discussion started, instructions, memory | 30% and 60 s of reading at most, else the project is searched |
+| Memory | short sentences on the user, as they were when the discussion started | 4% at most, 400 words |
+| Summary | the exchanges that left the context, compressed by the background model | 15% and 60 s of writing at most |
+| Attached document | read whole | 25% and 40 s of reading at most, else indexed and searched |
+| Excerpts of a question | the passages found for it, kept with the message once sent | 20% and 20 s of reading, 2,000 to 12,000 tokens, 4 to 24 passages |
+| Exchanges | the conversation, a question asked on a later day with its date | the rest; the oldest leave in one step, down to 30% of the room left by the system message and the tools |
+| Answer | the room kept for it | the longest answer of the settings, else 8,192 tokens with the deep reasoning and 2,048 without, a quarter of the context at most |
+
+The tokens of a document are estimated from its characters: 3.6 characters a token in the
+alphabets of Latin, three tokens for four characters of the ideographs, the kana and the hangul,
+and 2.2 characters a token for the other scripts. A question that does not fit beside
+the documents of its project read whole has them searched, in its discussion from then on.
+
+The system message starts with the project and its documents, then keeps the day the discussion
+started, in English, and a question asked on a later day carries its own date, so that a
+discussion continued the next day keeps the beginning of its prompt. The beginning of the prompt
+therefore stays the same from one question to the next: each question costs its own tokens only
+(the engine reads the previous answer, as the template renders it in the history, while the user
+reads it), the discussions of a project share the reading of its documents whatever their day and
+their memory (the engine shares the pages of the cached prefix between the sequences), the images
+of a project found for a question stay with it at the next questions, and
 the compression of the oldest exchanges happens once every several questions. On the tests, the
 second question of a discussion found 954 tokens in the cache and read its context in 0.5 s,
 against 6.4 s for the first question. The service serves several sessions at once,
 each with its own context: the requests of every session are computed together, one forward pass
 serving the next token of each.
 
-A discussion has no length limit. Once its exchanges take half of the room left by the system
-message and the tools, as the service counts them after each answer and when the discussion is
-opened, the oldest exchanges are compressed in the background, down to 30% of that room: the
-background model rewrites the summary of the discussion with them, in parts that fit its context,
-oldest first, keeping the facts, figures, names, decisions, requests and open questions, and the
-discussion then starts with the summary, given with its first remaining question. A question that
+A discussion has no length limit. Once its exchanges take half of the room that the system
+message and the tools leave in the working context, as the service counts them after each answer
+and when the discussion is opened, the oldest exchanges are compressed in the background, down to
+30% of that room, the last question staying with its answer: the background model rewrites the
+summary of the discussion with them, in parts that fit its working context, oldest first, keeping
+the facts, figures, names, decisions, requests and open questions, and the discussion then starts
+with the summary, given with its first remaining question. The documents read whole of the
+questions that left the context are indexed, so that the excerpts of the next questions can come
+from them, and an answer written in another tab keeps the beginning of its prompt. A question that
 comes before the summary waits for it only when it does not fit without it, and a summary written
 while an answer is being written in the discussion applies once that answer ends; a summary that
 cannot be written lets the exchanges leave without it. One tab compresses a discussion at a time.
@@ -594,26 +659,40 @@ quotes of the memory take up the words of the discussion, and a summary that rep
 each of them once.
 
 The memory of the discussions holds short sentences on the user, one after the other in one
-paragraph (profession, projects, preferences, the way to answer), the lasting facts the user
-states about themselves, without the requests and the topics of the discussions; the notes that
-an earlier version wrote as a list become sentences at the next opening. It reads the questions
-it has not read yet, each discussion from its mark, in
-one pass once they are enough (three questions or 1,200 characters) and the user has been quiet
-for 20 seconds, at the opening of the application included: the background model writes the new
-facts only, in the language of the interface whatever the language of the discussions, which join
-the memory unless it holds them already in other words, and the memory is rewritten as a whole
-only when it outgrows its size (200 words), or else loses its oldest sentences. The facts written in
-another language are rewritten first in the language of the interface, and a change of that
-language plans an update. A new fact joins only when it comes with the words of the user it
-rests on, which the application finds in the questions read, in a sentence that asks nothing and
-in a clause that does not start with a request ("Write…", "Crée…", "Explique-moi…"), three words
-or 12 characters at least, each quote serving one fact: on the questions of the
-tests, the facts invented by the model that comes with Albireo went from 7 of 16 to none of 9.
+paragraph, the lasting facts the user states about themselves that help in other discussions:
+role, profession and field, organization, projects and their goals, languages, tools, frameworks,
+systems and computers, level of expertise, habits of work, the way to answer (language, length,
+format, style) and the standing instructions ("always…", "never…"), without the requests and the
+topics of the discussions; the notes that an earlier version wrote as a list become sentences at
+the next opening. It reads the questions it has not read yet, each discussion from its mark, the
+discussions changed least recently first, in one pass once they are enough (three questions or
+1,200 characters) and the user has been quiet for 20 seconds, at the opening of the application
+included, what the background model reads in 30 seconds at most, the next questions waiting for
+the next pass: the background model writes the new facts only, in the language of the interface
+whatever the language of the discussions, which join the memory unless it holds them already in
+other words. The memory comes to the model numbered, and a new fact that changes one of it (a new
+role, another preference) names its number and takes its place; a fact said again moves to the
+end, so that the facts the questions no longer bring leave first when the memory outgrows its size
+(400 words), after a rewriting as a whole that fails. The sentences the user adds or changes in the
+settings stay, unless the words of the user in a discussion change one of them, and the facts the
+model learns keep half of the memory at least beside them. The facts written in
+another language are rewritten first in the language of the interface, sentence by sentence and
+numbered, a sentence the model left out staying as it was, and a change of that language plans an
+update. A new fact joins only when it comes with the words of the user it rests on, which the
+application finds in the questions read, accents aside and the pieces of a quote shortened with an
+ellipsis in their order, in a sentence that asks nothing, or in a clause of a question that starts
+by saying what the user is or does ("As a C++ developer, how do I…?", "Je suis enseignant,
+comment…?"), and in a clause that does not
+start with a request ("Write…", "Crée…", "Explique-moi…") unless it holds a standing instruction
+("Please always answer in French"), three words or 12 characters at least, each quote serving one
+fact: on the questions of the tests, the facts invented by the model that comes with Albireo went
+from 7 of 16 to none of 9.
 A notification, which disappears by itself, says how many facts joined, and a new question stops
 an update in progress, which comes back once the user is quiet again. One tab updates the memory
 at a time, by a lease of three minutes in the database of the browser: a tab closed in the middle
 of an update holds nothing, the service stops the request within two seconds, and the next update
-reads the same questions again, since the marks move only once the memory is saved. The tabs tell
+reads the same questions again, since the marks move only once the memory is saved; the lease is
+renewed before each request of the background model. The tabs tell
 each other the changes of the settings; an update reads the memory again before saving it and
 drops its result when another tab edited, reset or turned off the memory meanwhile. The notes
 leave out sensitive information (health, finances, opinions, identifiers, other people) unless
@@ -1025,9 +1104,10 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; a size lets the copies of the weights go beyond the card into it; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
 | `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
 | `threads`       | 0       | threads of the engine, 0 for the physical cores                           |
-| `context`       | 0       | context of the models, 0 for the trained one, within `kv_mb`              |
+| `context`       | 0       | context of the models, 0 for the trained one, brought down when the memory the system can commit cannot hold its keys and values |
 | `max_sequences` | 4       | requests computed together per model                                      |
-| `kv_mb`         | 0       | memory of the keys and values, 0 for two contexts within a third of the available memory |
+| `kv_mb`         | 0       | memory of the keys and values, 0 for two contexts within the memory the system can commit, a reserve left |
+| `kv_type`       | `auto`  | keys and values: `q8` (8 bits, the keys rotated), `f16` (half precision), `auto` (`q8` for the language models whose heads hold whole groups of 32 values) |
 | `check_updates` | true    | checks the feed at each start and every six hours                          |
 | `default_model` | true    | downloads the default language model of the catalog at the first start    |
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |

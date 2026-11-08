@@ -519,6 +519,121 @@ namespace
         std::printf("  attention by tiles\n");
     }
 
+    void test_attention_q8(std::mt19937& rng)
+    {
+        // The rows of 8-bit keys and values: groups of 32 values with a scale in half precision.
+        std::uniform_real_distribution<float> value(-3.0f, 3.0f);
+        for (long n : { 32L, 64L, 128L, 256L })
+        {
+            std::vector<float> x(static_cast<size_t>(n));
+            for (long i = 0; i < n; ++i)
+            {
+                // Groups of different magnitudes, a group of zeros, and a group with one large value.
+                const long g = i / 32;
+                const float f = g % 4 == 1 ? 0.0f : g % 4 == 2 ? 1e-3f : 1.0f;
+                x[static_cast<size_t>(i)] = value(rng) * f;
+            }
+            if (n >= 128) x[100] = 50.0f;
+            // A group of tiny values, whose scale is a subnormal half.
+            if (n >= 256)
+                for (long i = 192; i < 224; ++i) x[static_cast<size_t>(i)] = 1e-6f * static_cast<float>(i - 207);
+            std::vector<int8_t> q(static_cast<size_t>(n));
+            std::vector<uint16_t> scales(static_cast<size_t>(n / 32));
+            qk_float_to_q8_row(x.data(), q.data(), scales.data(), n);
+            std::vector<float> back(static_cast<size_t>(n));
+            qk_q8_to_float_row(q.data(), scales.data(), back.data(), n);
+            for (long g = 0; g < n / 32; ++g)
+            {
+                float amax = 0.0f;
+                for (long i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[static_cast<size_t>(g * 32 + i)]));
+                uint16_t stored = qk_float_to_half(amax / 127.0f);
+                if (qk_half_to_float(stored) * 127.5f < amax) ++stored;
+                check(scales[static_cast<size_t>(g)] == stored, "q8 scale", scales[static_cast<size_t>(g)], stored);
+                const float d = qk_half_to_float(stored);
+                const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+                for (long i = 0; i < 32; ++i)
+                {
+                    const size_t k = static_cast<size_t>(g * 32 + i);
+                    const float r = std::max(-127.0f, std::min(127.0f, std::nearbyint(x[k] * inv)));
+                    check(q[k] == static_cast<int8_t>(r), "q8 value", q[k], r);
+                    check(back[k] == d * static_cast<float>(q[k]), "q8 dequantized value", back[k], d * q[k]);
+                    check(std::fabs(back[k] - x[k]) <= 0.5f * d * 1.01f + 1e-30f, "q8 rounding", back[k], x[k]);
+                }
+            }
+        }
+
+        // The attention kernels over 8-bit rows against the products of the dequantized rows.
+        const long cases[][3] = { { 1, 1, 64 }, { 2, 5, 128 }, { 3, 37, 32 }, { 64, 256, 128 }, { 5, 100, 256 },
+            { 7, 70, 64 }, { 1, 256, 128 }, { 4, 9, 96 } };
+        std::uniform_real_distribution<float> unit(-2.0f, 2.0f);
+        for (const auto& c : cases)
+        {
+            const long rows = c[0], m = c[1], hd = c[2];
+            const long lds = m + 3;
+            const long per_row = hd / 32;
+            std::vector<float> Q(static_cast<size_t>(rows * hd)), O(static_cast<size_t>(rows * hd));
+            std::vector<float> P(static_cast<size_t>(rows * lds));
+            std::vector<float> Kf(static_cast<size_t>(m * hd)), Vf(static_cast<size_t>(m * hd));
+            for (auto& e : Q) e = unit(rng);
+            for (auto& e : O) e = unit(rng);
+            for (auto& e : P) e = unit(rng) * 0.25f + 0.5f;
+            for (auto& e : Kf) e = unit(rng);
+            for (auto& e : Vf) e = unit(rng);
+            std::vector<int8_t> K(static_cast<size_t>(m * hd)), V(static_cast<size_t>(m * hd));
+            std::vector<uint16_t> Ks(static_cast<size_t>(m * per_row)), Vs(static_cast<size_t>(m * per_row));
+            std::vector<float> Kd(Kf.size()), Vd(Vf.size());
+            for (long j = 0; j < m; ++j)
+            {
+                qk_float_to_q8_row(Kf.data() + j * hd, K.data() + j * hd, Ks.data() + j * per_row, hd);
+                qk_float_to_q8_row(Vf.data() + j * hd, V.data() + j * hd, Vs.data() + j * per_row, hd);
+                qk_q8_to_float_row(K.data() + j * hd, Ks.data() + j * per_row, Kd.data() + j * hd, hd);
+                qk_q8_to_float_row(V.data() + j * hd, Vs.data() + j * per_row, Vd.data() + j * hd, hd);
+            }
+            std::vector<float> scratch(static_cast<size_t>(qk_attention_scratch(hd)));
+
+            std::vector<float> S(static_cast<size_t>(rows * lds), 1234.0f);
+            qk_attention_scores_q8(Q.data(), rows, K.data(), Ks.data(), m, hd, S.data(), lds, scratch.data());
+            double worst = 0;
+            for (long r = 0; r < rows; ++r)
+            {
+                for (long j = 0; j < m; ++j)
+                {
+                    double ref = 0, mag = 0;
+                    for (long i = 0; i < hd; ++i)
+                    {
+                        const double t = static_cast<double>(Q[static_cast<size_t>(r * hd + i)])
+                            * Kd[static_cast<size_t>(j * hd + i)];
+                        ref += t;
+                        mag += std::fabs(t);
+                    }
+                    worst = std::max(worst, std::fabs(S[static_cast<size_t>(r * lds + j)] - ref) / (mag + 1));
+                }
+                for (long j = m; j < lds; ++j)
+                    check(S[static_cast<size_t>(r * lds + j)] == 1234.0f, "q8 attention scores stay in their rows");
+            }
+            check(worst <= 1e-6, "q8 attention scores", worst, static_cast<double>(rows * 1000000 + m * 1000 + hd));
+
+            std::vector<float> got = O;
+            qk_attention_values_q8(P.data(), lds, rows, V.data(), Vs.data(), m, hd, got.data(), scratch.data());
+            worst = 0;
+            for (long r = 0; r < rows; ++r)
+                for (long i = 0; i < hd; ++i)
+                {
+                    double ref = O[static_cast<size_t>(r * hd + i)], mag = std::fabs(ref);
+                    for (long j = 0; j < m; ++j)
+                    {
+                        const double t = static_cast<double>(P[static_cast<size_t>(r * lds + j)])
+                            * Vd[static_cast<size_t>(j * hd + i)];
+                        ref += t;
+                        mag += std::fabs(t);
+                    }
+                    worst = std::max(worst, std::fabs(got[static_cast<size_t>(r * hd + i)] - ref) / (mag + 1));
+                }
+            check(worst <= 1e-6, "q8 attention values", worst, static_cast<double>(rows * 1000000 + m * 1000 + hd));
+        }
+        std::printf("  8-bit keys and values\n");
+    }
+
     void test_pool(thread_pool& pool)
     {
         // Many small sections in a row, the pattern of a generation step.
@@ -598,6 +713,7 @@ int main()
     test_matmul(rng, pool);
     test_helpers(rng);
     test_attention_tiles(rng);
+    test_attention_q8(rng);
     test_pool(pool);
     test_new_pools();
     if (failures)

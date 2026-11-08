@@ -91,7 +91,13 @@ namespace albireo
     struct memory_info
     {
         uint64_t total = 0;       // physical memory, bytes
-        uint64_t available = 0;   // available to a new allocation, bytes
+        uint64_t available = 0;   // physical memory available to a new allocation, bytes
+        /*
+            The memory the system can commit, physical memory and paging file (Windows) or
+            swap (Linux) together: the limit, and what new allocations can still take of it.
+        */
+        uint64_t commit_total = 0;
+        uint64_t commit_available = 0;
     };
 
     memory_info read_memory_info();

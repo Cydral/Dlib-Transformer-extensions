@@ -92,6 +92,14 @@ foreach ($family in @("", "_avxvnni")) {
 # The loading of damaged model files and of a model file of more than 2 GiB, mapped and streamed.
 Invoke-Check "model files" "all checks passed" (Join-Path $main "tests\test_model_file.exe") @($logs) | Out-Null
 
+# The attention of the steps split among the threads, against one task per key/value head, with keys and values
+# in half precision and in 8 bits, on a tiny model written in the folder of the logs.
+$runtimeTest = Join-Path $main "tests\test_runtime.exe"
+if (Test-Path $runtimeTest) {
+    Invoke-Check "attention" "all checks passed" $runtimeTest @("synthetic", $logs) | Out-Null
+}
+else { Add-Result "attention" "SKIP" "no $runtimeTest (build_windows.ps1 -Tests)" 0 }
+
 # The engine steps run with the PATH of a service, System32 and the Windows folder only: the
 # libraries an engine loads by name must come from the folders of Albireo, not from the PATH of
 # this computer.

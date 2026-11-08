@@ -83,6 +83,15 @@ namespace albireo
             bool warned = false;
             // The web application opens once the service answers.
             bool open_pending = false;
+            /*
+                Whether the shell took the version 4 of the notification icons, which reports a
+                click of the left button as NIN_SELECT and one of the right button as
+                WM_CONTEXTMENU besides the messages of the mouse; whether the menu is shown; and
+                when the web application was last opened (GetTickCount64).
+            */
+            bool version4 = false;
+            bool menu_shown = false;
+            ULONGLONG opened_at = 0;
             bool polling = false;
             int icon_state = -1;
             std::string notified_update;
@@ -200,7 +209,7 @@ namespace albireo
             wcscpy(tray.nid.szTip, L"Albireo");
             Shell_NotifyIconW(NIM_ADD, &tray.nid);
             tray.nid.uVersion = NOTIFYICON_VERSION_4;
-            Shell_NotifyIconW(NIM_SETVERSION, &tray.nid);
+            tray.version4 = Shell_NotifyIconW(NIM_SETVERSION, &tray.nid) != FALSE;
             tray.icon_state = 2;
         }
 
@@ -555,8 +564,12 @@ namespace albireo
             }
         }
 
+        // Opens the web application once for a click the shell reports twice.
         void open_app()
         {
+            const ULONGLONG now = GetTickCount64();
+            if (tray.opened_at != 0 && now - tray.opened_at < 1500) return;
+            tray.opened_at = now;
             ui::open_url(widen(tray.client.base_url()));
         }
 
@@ -643,6 +656,9 @@ namespace albireo
 
         void show_menu()
         {
+            // A second message of the same click finds the menu shown and leaves it alone.
+            if (tray.menu_shown) return;
+            tray.menu_shown = true;
             HMENU m = CreatePopupMenu();
             const bool on = tray.online;
             AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_OPEN, tr("tray_open").c_str());
@@ -684,6 +700,7 @@ namespace albireo
             const UINT cmd = TrackPopupMenuEx(m, flags, p.x, p.y, tray.hwnd, nullptr);
             PostMessageW(tray.hwnd, WM_NULL, 0, 0);
             DestroyMenu(m);
+            tray.menu_shown = false;
             if (cmd) SendMessageW(tray.hwnd, WM_COMMAND, cmd, 0);
         }
 
@@ -740,21 +757,28 @@ namespace albireo
             switch (msg)
             {
             case WM_TRAY:
-                switch (LOWORD(lp))
+            {
+                /*
+                    With the version 4 of the notification icons, the shell reports a click of
+                    the left button as NIN_SELECT and a click of the right button as
+                    WM_CONTEXTMENU, besides the messages of the mouse, which a shell without that
+                    version sends alone; the icon acts on one message of each click.
+                */
+                const UINT event = LOWORD(lp);
+                const bool select = event == NIN_SELECT || event == NIN_KEYSELECT
+                    || (event == WM_LBUTTONUP && !tray.version4);
+                const bool menu = event == WM_CONTEXTMENU || (event == WM_RBUTTONUP && !tray.version4);
+                if (select)
                 {
-                case WM_LBUTTONUP:
-                case NIN_SELECT:
-                case NIN_KEYSELECT:
                     if (tray.online) open_app();
                     else show_menu();
-                    return 0;
-                case WM_CONTEXTMENU:
-                case WM_RBUTTONUP:
-                    show_menu();
-                    return 0;
-                default:
-                    return 0;
                 }
+                else if (menu)
+                {
+                    show_menu();
+                }
+                return 0;
+            }
             case WM_TIMER:
                 if (wp == TIMER_POLL) poll();
                 return 0;

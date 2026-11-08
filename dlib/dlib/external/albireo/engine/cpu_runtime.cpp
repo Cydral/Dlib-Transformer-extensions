@@ -38,9 +38,9 @@ namespace albireo
     }
 
     cpu_runtime::cpu_runtime(std::shared_ptr<model_file> file, const model_config& config, thread_pool& pool,
-        size_t kv_budget_bytes, long kv_block_positions)
+        size_t kv_budget_bytes, long kv_block_positions, kv_format kv_type)
         : file_(std::move(file)), cfg_(config), pool_(pool),
-          kv_(config.n_layers, config.n_kv_heads, config.head_dim, kv_block_positions, kv_budget_bytes)
+          kv_(config.n_layers, config.n_kv_heads, config.head_dim, kv_block_positions, kv_budget_bytes, kv_type)
     {
         const model_file& f = *file_;
         const long d = cfg_.d_model;
@@ -447,6 +447,52 @@ namespace albireo
 
     // Attention
 
+    void cpu_runtime::store_keys_values(long li, const forward_batch& batch)
+    {
+        const long T = static_cast<long>(batch.tokens.size());
+        const long KVH = cfg_.n_kv_heads;
+        const long hd = cfg_.head_dim;
+        const long kvd = cfg_.kv_dim();
+        const long B = kv_.block_positions();
+        const bool q8 = kv_.format() == kv_format::q8;
+        const long scales_per_row = hd / kv_q8_group;
+        token_sequences_.resize(static_cast<size_t>(T));
+        for (const auto& s : batch.segments)
+            for (long j = 0; j < s.count; ++j) token_sequences_[static_cast<size_t>(s.start + j)] = s.sequence;
+        auto one = [&](long t, int thread) {
+            const kv_sequence& seq = *sequences_[static_cast<size_t>(token_sequences_[static_cast<size_t>(t)])];
+            const long pos = positions_[static_cast<size_t>(t)];
+            const int block = seq.blocks[static_cast<size_t>(pos / B)];
+            const long row = pos % B;
+            float* rotated = attention_work_[static_cast<size_t>(thread)].scratch.data();
+            for (long h = 0; h < KVH; ++h)
+            {
+                const float* k = k_.data() + t * kvd + h * hd;
+                const float* v = v_.data() + t * kvd + h * hd;
+                if (q8)
+                {
+                    // The keys are stored rotated (qk_rotate_row), the queries being rotated alike.
+                    std::copy(k, k + hd, rotated);
+                    qk_rotate_row(rotated, hd);
+                    qk_float_to_q8_row(rotated, reinterpret_cast<int8_t*>(kv_.keys(block, li, h)) + row * hd,
+                        kv_.key_scales(block, li, h) + row * scales_per_row, hd);
+                    qk_float_to_q8_row(v, reinterpret_cast<int8_t*>(kv_.values(block, li, h)) + row * hd,
+                        kv_.value_scales(block, li, h) + row * scales_per_row, hd);
+                }
+                else
+                {
+                    qk_float_to_half_row(k, reinterpret_cast<uint16_t*>(kv_.keys(block, li, h)) + row * hd, hd);
+                    qk_float_to_half_row(v, reinterpret_cast<uint16_t*>(kv_.values(block, li, h)) + row * hd, hd);
+                }
+            }
+        };
+        // Each token writes rows of its own.
+        if (T >= 32)
+            pool_.parallel_for(T, [&](long t, int thread) { one(t, thread); });
+        else
+            for (long t = 0; t < T; ++t) one(t, 0);
+    }
+
     void cpu_runtime::attention(long layer_index, const forward_batch& batch, const std::vector<long>& positions)
     {
         const long T = static_cast<long>(batch.tokens.size());
@@ -455,6 +501,8 @@ namespace albireo
         const long qd = cfg_.q_dim();
         const long rep = cfg_.n_heads / KVH;
         const long B = kv_.block_positions();
+        const bool q8 = kv_.format() == kv_format::q8;
+        const long scales_per_row = hd / kv_q8_group;
         const float scale = cfg_.attention_scale > 0.0
             ? static_cast<float>(cfg_.attention_scale)
             : 1.0f / std::sqrt(static_cast<float>(hd));
@@ -462,49 +510,78 @@ namespace albireo
         // The tiles: consecutive tokens of one segment, whose positions are consecutive too.
         const long per_tile = std::max<long>(1, tile_rows / rep);
         tiles_.clear();
+        long span = 0;
         for (const auto& s : batch.segments)
             for (long j = 0; j < s.count; j += per_tile)
-                tiles_.push_back({ s.sequence, s.start + j, std::min(per_tile, s.count - j) });
-        // The heads of a task: the whole group of a key/value head, or a single head when
-        // the tiles are too few to keep the threads busy.
-        const long nh = static_cast<long>(tiles_.size()) * KVH < pool_.size() ? 1 : rep;
-        const long groups = rep / nh;
+            {
+                const long count = std::min(per_tile, s.count - j);
+                tiles_.push_back({ s.sequence, s.start + j, count });
+                span = std::max(span, positions[static_cast<size_t>(s.start + j + count - 1)] + 1);
+            }
+        /*
+            The parts of a tile: when the tiles and their key/value heads are fewer than the
+            threads, as in the generation of a single answer, the positions of each tile are
+            split into ranges of part_positions at least, each range read by one task for all
+            the heads of the group, and the partial sums of the ranges are merged afterwards
+            (the split of FlashDecoding).  The keys and values are then read once for all the
+            heads that share them.
+        */
+        const long units = static_cast<long>(tiles_.size()) * KVH;
+        long parts = 1;
+        if (units < pool_.size())
+            parts = std::max<long>(1, std::min<long>((2 * pool_.size() + units - 1) / units, span / part_positions));
+        const long rows_cap = per_tile * rep;
+        if (parts > 1) partial_.resize(static_cast<size_t>(units * parts * rows_cap * (hd + 2)));
 
         ctx_.resize(static_cast<size_t>(T * qd));
-        pool_.parallel_for(static_cast<long>(tiles_.size()) * KVH * groups, [&](long item, int thread) {
-            const attention_tile& tile = tiles_[static_cast<size_t>(item / (KVH * groups))];
-            const long kvh = item / groups % KVH;
-            const long h0 = kvh * rep + item % groups * nh;
+        pool_.parallel_for(units * parts, [&](long item, int thread) {
+            const attention_tile& tile = tiles_[static_cast<size_t>(item / (KVH * parts))];
+            const long kvh = item / parts % KVH;
+            const long part = item % parts;
+            const long h0 = kvh * rep;
             const kv_sequence& seq = *sequences_[static_cast<size_t>(tile.sequence)];
             attention_work& w = attention_work_[static_cast<size_t>(thread)];
-            const long rows = tile.count * nh;
+            const long rows = tile.count * rep;
             const long last = positions[static_cast<size_t>(tile.start + tile.count - 1)];
+            const long length = (last + parts) / parts;
+            const long begin = part * length;
+            const long end = std::min(last + 1, begin + length);
 
-            // Row a * nh + i holds token tile.start + a and head h0 + i, scaled.
+            // Row a * rep + i holds token tile.start + a and head h0 + i, scaled, and rotated as the 8-bit keys.
             for (long a = 0; a < tile.count; ++a)
             {
                 const float* src = q_.data() + (tile.start + a) * qd + h0 * hd;
-                float* dst = w.q.data() + a * nh * hd;
-                for (long e = 0; e < nh * hd; ++e) dst[e] = src[e] * scale;
+                float* dst = w.q.data() + a * rep * hd;
+                for (long e = 0; e < rep * hd; ++e) dst[e] = src[e] * scale;
+                if (q8)
+                    for (long i = 0; i < rep; ++i) qk_rotate_row(dst + i * hd, hd);
             }
             std::fill(w.o.begin(), w.o.begin() + rows * hd, 0.0f);
             std::fill(w.max.begin(), w.max.begin() + rows, -INFINITY);
             std::fill(w.sum.begin(), w.sum.begin() + rows, 0.0f);
 
-            for (long p = 0; p <= last; p += B)
+            for (long p = begin; p < end;)
             {
                 const int block = seq.blocks[static_cast<size_t>(p / B)];
-                const long m = std::min(B, last + 1 - p);
-                qk_attention_scores(w.q.data(), rows, kv_.keys(block, layer_index, kvh), m, hd, w.s.data(), B,
-                    w.scratch.data());
+                const long first = p % B;
+                const long m = std::min(B - first, end - p);
+                if (q8)
+                    qk_attention_scores_q8(w.q.data(), rows,
+                        reinterpret_cast<const int8_t*>(kv_.keys(block, layer_index, kvh)) + first * hd,
+                        kv_.key_scales(block, layer_index, kvh) + first * scales_per_row, m, hd, w.s.data(), B,
+                        w.scratch.data());
+                else
+                    qk_attention_scores(w.q.data(), rows,
+                        reinterpret_cast<const uint16_t*>(kv_.keys(block, layer_index, kvh)) + first * hd, m, hd,
+                        w.s.data(), B, w.scratch.data());
                 for (long a = 0; a < tile.count; ++a)
                 {
                     // Each token sees the positions up to its own.
                     const long own = positions[static_cast<size_t>(tile.start + a)];
                     const long seen = std::max<long>(0, std::min(m, own + 1 - p));
-                    for (long i = 0; i < nh; ++i)
+                    for (long i = 0; i < rep; ++i)
                     {
-                        const long r = a * nh + i;
+                        const long r = a * rep + i;
                         float* sr = w.s.data() + r * B;
                         std::fill(sr + seen, sr + m, 0.0f);
                         if (seen == 0) continue;
@@ -522,18 +599,66 @@ namespace albireo
                         w.sum[static_cast<size_t>(r)] += added;
                     }
                 }
-                qk_attention_values(w.s.data(), B, rows, kv_.values(block, layer_index, kvh), m, hd, w.o.data(),
-                    w.scratch.data());
+                if (q8)
+                    qk_attention_values_q8(w.s.data(), B, rows,
+                        reinterpret_cast<const int8_t*>(kv_.values(block, layer_index, kvh)) + first * hd,
+                        kv_.value_scales(block, layer_index, kvh) + first * scales_per_row, m, hd, w.o.data(),
+                        w.scratch.data());
+                else
+                    qk_attention_values(w.s.data(), B, rows,
+                        reinterpret_cast<const uint16_t*>(kv_.values(block, layer_index, kvh)) + first * hd, m, hd,
+                        w.o.data(), w.scratch.data());
+                p += m;
             }
 
+            if (parts > 1)
+            {
+                // The sums of the range, unnormalized, with the maximum and the sum of each row.
+                float* out = partial_.data() + item * rows_cap * (hd + 2);
+                std::copy(w.o.begin(), w.o.begin() + rows * hd, out);
+                std::copy(w.max.begin(), w.max.begin() + rows, out + rows_cap * hd);
+                std::copy(w.sum.begin(), w.sum.begin() + rows, out + rows_cap * (hd + 1));
+                return;
+            }
             for (long a = 0; a < tile.count; ++a)
-                for (long i = 0; i < nh; ++i)
+                for (long i = 0; i < rep; ++i)
                 {
-                    const long r = a * nh + i;
+                    const long r = a * rep + i;
                     const float inv = 1.0f / w.sum[static_cast<size_t>(r)];
                     const float* src = w.o.data() + r * hd;
                     float* dst = ctx_.data() + (tile.start + a) * qd + (h0 + i) * hd;
                     for (long e = 0; e < hd; ++e) dst[e] = src[e] * inv;
+                }
+        });
+        if (parts == 1) return;
+
+        // Each row takes the ranges of its tile with the largest maximum of them as reference.
+        pool_.parallel_for(units, [&](long unit, int) {
+            const attention_tile& tile = tiles_[static_cast<size_t>(unit / KVH)];
+            const long h0 = unit % KVH * rep;
+            const float* first = partial_.data() + unit * parts * rows_cap * (hd + 2);
+            const long stride = rows_cap * (hd + 2);
+            for (long a = 0; a < tile.count; ++a)
+                for (long i = 0; i < rep; ++i)
+                {
+                    const long r = a * rep + i;
+                    float mx = -INFINITY;
+                    for (long q = 0; q < parts; ++q) mx = std::max(mx, first[q * stride + rows_cap * hd + r]);
+                    float* dst = ctx_.data() + (tile.start + a) * qd + (h0 + i) * hd;
+                    std::fill(dst, dst + hd, 0.0f);
+                    float sum = 0.0f;
+                    for (long q = 0; q < parts; ++q)
+                    {
+                        const float* range = first + q * stride;
+                        const float s = range[rows_cap * (hd + 1) + r];
+                        if (s <= 0.0f) continue;
+                        const float f = std::exp(range[rows_cap * hd + r] - mx);
+                        sum += s * f;
+                        const float* o = range + r * hd;
+                        for (long e = 0; e < hd; ++e) dst[e] += f * o[e];
+                    }
+                    const float inv = 1.0f / sum;
+                    for (long e = 0; e < hd; ++e) dst[e] *= inv;
                 }
         });
     }
@@ -863,22 +988,7 @@ namespace albireo
 
             // Keys and values of the batch go into the sequences before attention reads
             // them, so that each token sees the earlier tokens of its own chunk.
-            for (const auto& s : batch.segments)
-            {
-                kv_sequence& seq = *sequences_[static_cast<size_t>(s.sequence)];
-                for (long j = 0; j < s.count; ++j)
-                {
-                    const long t = s.start + j;
-                    const long pos = positions_[static_cast<size_t>(t)];
-                    const int block = seq.blocks[static_cast<size_t>(pos / B)];
-                    const long row = pos % B;
-                    for (long h = 0; h < KVH; ++h)
-                    {
-                        qk_float_to_half_row(k_.data() + t * kvd + h * hd, kv_.keys(block, li, h) + row * hd, hd);
-                        qk_float_to_half_row(v_.data() + t * kvd + h * hd, kv_.values(block, li, h) + row * hd, hd);
-                    }
-                }
-            }
+            store_keys_values(li, batch);
 
             attention(li, batch, positions_);
             if (on_device)

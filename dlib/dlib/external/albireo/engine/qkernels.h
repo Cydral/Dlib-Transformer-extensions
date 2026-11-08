@@ -196,6 +196,36 @@ namespace albireo
     void qk_half_to_float_row(const uint16_t* src, float* dst, long n);
     void qk_float_to_half_row(const float* src, uint16_t* dst, long n);
 
+    /*!
+        The 8-bit keys and values of the cache: rows of n values, n a multiple of 32, each
+        group of 32 values stored as 8-bit integers with one scale in half precision, the
+        largest magnitude of the group over 127.
+
+        qk_float_to_q8_row() ensures:
+            - dst[i] == round(src[i] / d), within [-127, 127], for i < n, d being the scale of
+              the group of i as stored in scales[i / 32]: the largest magnitude of the group
+              over 127 in half precision, raised to the next half when the rounding of a
+              subnormal half would bring the largest value beyond 127.5 steps.
+        qk_q8_to_float_row() ensures:
+            - dst[i] == half_to_float(scales[i / 32]) * src[i] for i < n.
+    !*/
+    void qk_float_to_q8_row(const float* src, int8_t* dst, uint16_t* scales, long n);
+    void qk_q8_to_float_row(const int8_t* src, const uint16_t* scales, float* dst, long n);
+
+    /*!
+        requires
+            - n > 0
+        ensures
+            - Rotates the row x of n values: the signs of a fixed pattern, then the normalized
+              Walsh-Hadamard transform on each block of the largest power of two dividing n.
+              The map is orthogonal, so that a key and a query rotated alike keep their dot
+              product.  The keys of the 8-bit cache are stored rotated, with the queries
+              rotated alike before the scores: a few channels of the keys of some models hold
+              values ten times larger than the others, which the rotation spreads over the
+              row, so that the groups of the 8-bit format round them with a finer step.
+    !*/
+    void qk_rotate_row(float* x, long n);
+
     // Vector helpers of the attention and normalization code.
     float qk_dot_f32(const float* a, const float* b, long n);
     float qk_dot_f32_f16(const float* a, const uint16_t* b, long n);
@@ -225,6 +255,11 @@ namespace albireo
         float* scratch);
     void qk_attention_values(const float* P, long lds, long rows, const uint16_t* V, long m, long hd, float* O,
         float* scratch);
+    // The same over 8-bit keys and values (qk_float_to_q8_row), hd a multiple of 32.
+    void qk_attention_scores_q8(const float* Q, long rows, const int8_t* K, const uint16_t* K_scales, long m, long hd,
+        float* S, long lds, float* scratch);
+    void qk_attention_values_q8(const float* P, long lds, long rows, const int8_t* V, const uint16_t* V_scales, long m,
+        long hd, float* O, float* scratch);
 
     /*!
         The vector helpers of the image encoders, whose blocks normalize with a mean and a

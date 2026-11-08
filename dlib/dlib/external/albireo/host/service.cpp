@@ -421,6 +421,7 @@ namespace albireo
         c["context"] = s.context;
         c["max_sequences"] = s.max_sequences;
         c["kv_mb"] = s.kv_mb;
+        c["kv_type"] = s.kv_type;
         c["v2ram"] = s.v2ram;
         c["v2ram_max_mb"] = s.v2ram_max_mb;
         c["offload_mb"] = s.device_mb;
@@ -1402,6 +1403,7 @@ namespace albireo
             if (st.context > 0) options["context"] = st.context;
             options["max_sequences"] = st.max_sequences;
             if (st.kv_mb > 0) options["kv_mb"] = st.kv_mb;
+            options["kv_type"] = st.kv_type;
         }
         // The vision encoder of a model that reads images.
         if (!m.projector.empty())
@@ -1940,6 +1942,8 @@ namespace albireo
         json m = json::object();
         m["total"] = static_cast<unsigned long long>(mem.total);
         m["available"] = static_cast<unsigned long long>(mem.available);
+        m["commit_total"] = static_cast<unsigned long long>(mem.commit_total);
+        m["commit_available"] = static_cast<unsigned long long>(mem.commit_available);
         host["memory"] = m;
         s["host"] = host;
 

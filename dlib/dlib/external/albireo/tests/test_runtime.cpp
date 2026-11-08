@@ -9,24 +9,34 @@
     tests/reference_forward.py.  The program compares them with the logits of the
     runtime, then checks that the runtime gives the same results however the work is
     cut: the whole sequence in one pass, a prompt followed by one token at a time, two
-    sequences sharing a batch, and a sequence truncated and extended again.
+    sequences sharing a batch, and a sequence truncated and extended again; the keys and
+    values in 8 bits then agree with those in half precision.
 
     With "exact", the products run on floats (qk_set_exact_products) and the comparison
     with the reference is tight; otherwise the activations are quantized as in normal
     operation and the comparison bears on the distributions.
+
+        test_runtime synthetic [folder]
+
+    checks the attention on the tiny model of tiny_gguf.h, written in folder: the split of
+    the positions among the threads of a single step against the attention of one task per
+    key/value head, with keys and values in half precision and in 8 bits.
 */
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "../engine/cpu_runtime.h"
+#include "tiny_gguf.h"
 
 using namespace albireo;
 
@@ -112,8 +122,99 @@ namespace
     }
 }
 
+namespace
+{
+    // The logits of the steps of one token that follow a prompt of the first prompt tokens, read in one pass.
+    std::vector<float> run_steps(cpu_runtime& rt, const std::vector<int>& tokens, long prompt)
+    {
+        const long T = static_cast<long>(tokens.size());
+        const long V = rt.config().vocab;
+        const int seq = rt.create_sequence();
+        std::vector<float> got, logits;
+        forward_batch b;
+        expect(rt.reserve_sequence(seq, prompt), "reserve the prompt");
+        b.tokens.assign(tokens.begin(), tokens.begin() + prompt);
+        b.segments.push_back({ seq, 0, prompt });
+        b.logit_rows.push_back(prompt - 1);
+        rt.forward(b, logits);
+        for (long i = prompt; i < T; ++i)
+        {
+            expect(rt.reserve_sequence(seq, i + 1), "reserve a step");
+            b.clear();
+            b.tokens.push_back(tokens[static_cast<size_t>(i)]);
+            b.segments.push_back({ seq, 0, 1 });
+            b.logit_rows.push_back(0);
+            rt.forward(b, logits);
+            got.insert(got.end(), logits.begin(), logits.begin() + V);
+        }
+        rt.release_sequence(seq);
+        return got;
+    }
+
+    int synthetic(const std::string& folder)
+    {
+        const std::string path = folder + "test_runtime_synthetic.gguf";
+        const albireo_test::tiny_gguf model = albireo_test::tiny_gguf_writer().head_dim(32).build();
+        if (!model.save(path, model.bytes))
+        {
+            std::printf("cannot write %s\n", path.c_str());
+            return 2;
+        }
+        {
+            auto file = std::make_shared<model_file>(path);
+            const model_config cfg = read_model_config(*file);
+            std::printf("%s\n", describe(cfg).c_str());
+            std::vector<int> tokens(1100);
+            uint32_t state = 7;
+            for (auto& t : tokens)
+            {
+                state = state * 1664525u + 1013904223u;
+                t = static_cast<int>((state >> 8) % 256);
+            }
+            const long prompt = 1024;
+            const long steps = static_cast<long>(tokens.size()) - prompt;
+            const long V = cfg.vocab;
+
+            /*
+                Two threads take one task per key/value head of a step; twelve split the
+                positions of the step among them (cpu_runtime::attention).  Blocks of 16
+                positions, so that the ranges start inside blocks.
+            */
+            thread_pool narrow(2), wide(12);
+            std::vector<float> results[4];
+            const kv_format formats[2] = { kv_format::f16, kv_format::q8 };
+            for (int f = 0; f < 2; ++f)
+            {
+                cpu_runtime one(file, cfg, narrow, size_t(64) << 20, 16, formats[f]);
+                cpu_runtime split(file, cfg, wide, size_t(64) << 20, 16, formats[f]);
+                const size_t row = formats[f] == kv_format::q8 ? 32 + 2 : 64;
+                expect(one.kv_bytes_per_token() == 2 * 2 * 2 * row, "bytes of the keys and values of a token");
+                results[2 * f] = run_steps(one, tokens, prompt);
+                results[2 * f + 1] = run_steps(split, tokens, prompt);
+                expect(one.kv_bytes_used() == 0 && split.kv_bytes_used() == 0, "every block returned");
+                const stats d = compare(results[2 * f].data(), results[2 * f + 1].data(), steps, V);
+                report(f ? "split attention, 8 bits" : "split attention, half precision", d);
+                expect(d.max_abs <= 1e-4 * std::max(1.0, d.scale), "split attention against one task per head");
+            }
+            const stats q = compare(results[0].data(), results[2].data(), steps, V);
+            report("8 bits against half precision", q);
+            expect(q.mean_kl < 1e-3, "8-bit keys and values against half precision");
+        }
+        std::remove(path.c_str());
+        if (failures)
+        {
+            std::printf("%d checks FAILED\n", failures);
+            return 1;
+        }
+        std::printf("all checks passed\n");
+        return 0;
+    }
+}
+
 int main(int argc, char** argv)
 {
+    if (argc >= 2 && std::string(argv[1]) == "synthetic")
+        return synthetic(argc > 2 ? std::string(argv[2]) + "/" : std::string());
     if (argc < 4)
     {
         std::printf("usage: test_runtime model.gguf reference.bin [exact] id...\n");
@@ -317,6 +418,22 @@ int main(int argc, char** argv)
         rt.release_sequence(a);
         rt.release_sequence(c);
         expect(rt.kv_bytes_used() == 0, "every shared block returned");
+    }
+
+    /*
+        6. The keys and values in 8 bits against those in half precision, over the whole
+           sequence: their differences stay below those of the integer products of the single
+           steps (2), a few thousandths of KL on the models of the catalog.
+    */
+    if (cfg.head_dim % kv_q8_group == 0)
+    {
+        cpu_runtime rt8(file, cfg, pool, size_t(512) << 20, 16, kv_format::q8);
+        const std::vector<float> q8 = run_whole(rt8, tokens);
+        const stats d = compare(whole.data(), q8.data(), T, V);
+        report("8-bit keys and values", d);
+        expect(d.mean_kl < 0.005, "8-bit keys and values as a distribution");
+        expect(d.top1 >= 0.9, "8-bit keys and values, argmax");
+        expect(rt8.kv_bytes_used() == 0, "every 8-bit block returned");
     }
 
     if (failures)

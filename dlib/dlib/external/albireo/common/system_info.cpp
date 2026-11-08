@@ -175,18 +175,28 @@ namespace albireo
         {
             m.total = s.ullTotalPhys;
             m.available = s.ullAvailPhys;
+            m.commit_total = s.ullTotalPageFile;
+            m.commit_available = s.ullAvailPageFile;
         }
 #else
         std::ifstream in("/proc/meminfo");
         std::string key;
         uint64_t value;
         std::string unit;
+        uint64_t swap_total = 0, swap_free = 0;
         while (in >> key >> value >> unit)
         {
             if (key == "MemTotal:") m.total = value * 1024;
             else if (key == "MemAvailable:") m.available = value * 1024;
+            else if (key == "SwapTotal:") swap_total = value * 1024;
+            else if (key == "SwapFree:") swap_free = value * 1024;
         }
+        m.commit_total = m.total + swap_total;
+        m.commit_available = m.available + swap_free;
 #endif
+        // Never below the physical memory, which a system without paging file still commits.
+        m.commit_total = std::max(m.commit_total, m.total);
+        m.commit_available = std::max(m.commit_available, m.available);
         return m;
     }
 

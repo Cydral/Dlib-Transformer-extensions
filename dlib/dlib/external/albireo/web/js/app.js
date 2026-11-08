@@ -37,7 +37,8 @@ import { icon } from './icons.js';
 import * as store from './store.js';
 import { renderMarkdown, attachCodeButtons, escapeHtml } from './markdown.js';
 import * as api from './api.js';
-import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind, pdfPages } from './documents.js';
+import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind, pdfPages, terms }
+  from './documents.js';
 import * as rag from './rag.js';
 import * as tools from './tools.js';
 import * as web from './web.js';
@@ -50,23 +51,44 @@ const projectColors = ['#5b8cff', '#f2b544', '#3fb68b', '#e5534b', '#a371f7', '#
 // The steps of an answer with tools at most: each step is a request of the model, then the calls it asks for.
 const maxAgentSteps = 100;
 
-// Shares of the context of the model: the documents of a project read whole, an attached
-// document read whole, and the excerpts given with a question.  Beyond the first two, the
-// documents are searched.
-const knowledgeShare = 0.3;
-const attachmentShare = 0.25;
-const excerptShare = 0.2;
 /*
-    The room of the exchanges is the room of the context less the system message and the tools.  When the oldest
-    exchanges leave, the exchanges kept, with the summary of those that left, take keptShare of that room, so that
-    they grow again for several questions before the next cut.  Once an answer ends, or a discussion is opened, with
-    the exchanges taking compactShare of their room, their oldest part is compressed in the background: the next
-    questions still fit meanwhile, and find the summary written.
+    The working context of a discussion (workingContext): the context the engine gives the model, which it already
+    brought down to what the memory of the computer holds (its physical memory and its paging file or swap), within
+    what the computer reads in workingSeconds at the speed measured for the model (readRate), minWorkingContext
+    tokens at least, rounded to a power of two, so that a new measure changes the choices that follow only when the
+    speed doubles or halves.  The engine keeps the keys and values of the discussions read, so that a discussion
+    reads its whole context again only in the rare cases where they left the memory.  The automatic choices of a
+    discussion take their shares of it: the documents of a project read whole, an attached document read whole, and
+    the excerpts given with a question, each within a time of reading too, since a question waits for them; beyond
+    the first two, the documents are searched.  The context of the model stays the limit of what a question holds.
+*/
+const workingSeconds = 240;
+const minWorkingContext = 16384;
+const knowledgeShare = 0.3;
+const knowledgeSeconds = 60;
+const attachmentShare = 0.25;
+const attachmentSeconds = 40;
+// The excerpts of a question: excerptShare of the working context, within excerptSeconds of reading, between the
+// least and the most tokens below; one passage per passageTokens.
+const excerptShare = 0.2;
+const excerptSeconds = 20;
+const leastExcerptTokens = 2000;
+const mostExcerptTokens = 12000;
+const passageTokens = 330;
+/*
+    The room of the exchanges is the room of the working context less the system message and the tools.  When the
+    oldest exchanges leave, the exchanges kept, with the summary of those that left, take keptShare of that room, so
+    that they grow again for several questions before the next cut.  Once an answer ends, or a discussion is opened,
+    with the exchanges taking compactShare of their room, their oldest part is compressed in the background: the
+    next questions still fit meanwhile, and find the summary written.  A conversation that outgrows the room of the
+    context of the model loses its oldest exchanges at once (fitContext).
 */
 const keptShare = 0.3;
 const compactShare = 0.5;
-// The summary of the exchanges that left the context takes at most this share of the room.
+// The summary of the exchanges that left the context takes at most this share of the room, within summarySeconds
+// of writing by the background model.
 const summaryShare = 0.15;
+const summarySeconds = 60;
 /*
     The images the context of a discussion holds at most, those of its project that a question receives with their
     descriptions, the most relevant first, and those a project holds.  A request of the service carries 16 images
@@ -83,28 +105,98 @@ const maxProjectItems = 100;
 */
 const closedReasoningTokens = 32;
 
-// The tokens a discussion keeps free for the answer of the model of caps, with or without its reasoning.
+/*
+    The tokens a discussion keeps free for the answer of the model of caps, with or without its reasoning: the
+    longest answer of the settings, else room for a reasoning before the answer, a quarter of the context at most
+    beyond 2048 tokens.
+*/
 function answerReserve(caps, reasoning) {
-  return (state.settings.maxTokens || 2048) + (caps.reasoningAlways && !reasoning ? closedReasoningTokens : 0);
+  const answer = state.settings.maxTokens || (reasoning ? 8192 : 2048);
+  const context = caps.context || 8192;
+  return Math.min(answer, Math.max(2048, Math.floor(context / 4)))
+    + (caps.reasoningAlways && !reasoning ? closedReasoningTokens : 0);
 }
 
-// Tokens of a text, estimated from its characters.
+/*
+    Tokens of a text, estimated from its characters: 3.6 characters a token in the alphabets of Latin, three tokens
+    for four characters of the ideographs, the kana and the hangul, and 2.2 characters a token for the other scripts
+    (Cyrillic, Greek, Arabic, Hebrew, Indic).
+*/
+const tokenEstimates = new Map();
+
 function estimateTokens(text) {
-  return Math.ceil(String(text || '').length / 3.6);
+  const s = String(text || '');
+  // The documents are measured once: their texts do not change.
+  if (s.length > 8192 && tokenEstimates.has(s)) return tokenEstimates.get(s);
+  let latin = 0, wide = 0, other = 0;
+  for (let i = 0; i < s.length; ++i) {
+    const c = s.charCodeAt(i);
+    if (c < 0x370) ++latin;
+    else if ((c >= 0x3040 && c <= 0x30ff) || (c >= 0x3400 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af)
+      || (c >= 0xf900 && c <= 0xfaff)) ++wide;
+    else if (c >= 0xd800 && c <= 0xdfff) ++latin;
+    else ++other;
+  }
+  const tokens = Math.ceil(latin / 3.6 + wide * 0.75 + other / 2.2);
+  if (s.length > 8192) {
+    if (tokenEstimates.size >= 64) tokenEstimates.delete(tokenEstimates.keys().next().value);
+    tokenEstimates.set(s, tokens);
+  }
+  return tokens;
+}
+
+/*
+    The speeds of a model measured by the engine on its answers, in tokens per second: its reading of the prompts,
+    rounded down to a power of two, so that the choices it sizes stay while it varies by less than half, and its
+    writing of the answers.  Until the model answered, the speeds of the engines of its kind.
+*/
+function readRate(id) {
+  const loaded = loadedModel(id);
+  const variant = (state.status && state.status.engine && state.status.engine.variant) || '';
+  const rate = loaded && loaded.prompt_tokens_per_second > 0 ? loaded.prompt_tokens_per_second
+    : /cuda/.test(variant) ? 1024 : /openvino/.test(variant) ? 512 : 128;
+  return Math.pow(2, Math.floor(Math.log2(Math.max(1, rate))));
+}
+
+function writeRate(id) {
+  const loaded = loadedModel(id);
+  if (loaded && loaded.generation_tokens_per_second > 0) return loaded.generation_tokens_per_second;
+  const variant = (state.status && state.status.engine && state.status.engine.variant) || '';
+  return /cuda/.test(variant) ? 30 : 10;
+}
+
+// The working context of a model of context tokens (see workingSeconds).
+function workingContext(id, context) {
+  const wanted = Math.max(minWorkingContext, workingSeconds * readRate(id));
+  return Math.min(context || 8192, Math.pow(2, Math.round(Math.log2(wanted))));
+}
+
+// The tokens of the documents that a model of the capabilities caps reads whole: those of a project, or those of
+// a question.
+function wholeTokens(caps, share, seconds) {
+  return Math.min(share * (caps.working || 8192), seconds * (caps.read || 128));
+}
+
+// The excerpts of a question for a model of the capabilities caps: {budget, limit}, in characters and passages.
+function excerptBudget(caps) {
+  const most = Math.max(leastExcerptTokens, Math.min(mostExcerptTokens, excerptSeconds * (caps.read || 128)));
+  const tokens = Math.max(leastExcerptTokens, Math.min(most, excerptShare * (caps.working || 8192)));
+  return { budget: Math.floor(tokens * 3.6), limit: Math.max(4, Math.min(24, Math.round(tokens / passageTokens))) };
 }
 
 const defaults = {
   theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null, topK: null,
   maxTokens: 0, sendOnEnter: true, systemPrompt: '', sidebar: true,
-  memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', storagePersisted: null
+  memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', memoryPinned: '',
+  storagePersisted: null
 };
 
 /*
     The memory of the discussions: short sentences on the user, one after the other, which the model writes from the
     discussions, private ones excepted, and which each discussion receives at its start.  Its size follows the
-    context of the model: memoryShare of it, memoryWords words at most.
+    working context of the background model: memoryShare of it, memoryWords words at most.
 */
-const memoryWords = 200;
+const memoryWords = 400;
 const memoryShare = 0.04;
 
 function memoryLimitWords(contextTokens) {
@@ -649,18 +741,22 @@ function acceptFor(role, room) {
 
 /*
     The capabilities of the model of a function: reasoning, reasoningAlways for a model trained to reason before
-    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, and its context.
+    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, its context and its working
+    context (workingContext), 0 while it is not loaded, and its speeds of reading and writing (readRate, writeRate).
 */
 function roleCapabilities(role) {
   const id = roleModel(role);
   const loaded = loadedModel(id);
+  const read = readRate(id);
+  const write = writeRate(id);
   if (loaded) {
+    const context = loaded.context || 0;
     return { reasoning: loaded.reasoning !== false, reasoningAlways: loaded.reasoning_always === true,
-      tools: loaded.tools !== false, context: loaded.context || 0 };
+      tools: loaded.tools !== false, context, working: context ? workingContext(id, context) : 0, read, write };
   }
   const m = modelInfo(id);
   return { reasoning: m ? m.reasoning !== false : true, reasoningAlways: !!(m && m.reasoning_always === true),
-    tools: m ? m.tools !== false : true, context: 0 };
+    tools: m ? m.tools !== false : true, context: 0, working: 0, read, write };
 }
 
 /*
@@ -721,10 +817,18 @@ function toolSet(c, caps) {
 */
 const backgroundModel = 'albireo-background';
 
+// The working context of the background model, and its speeds of reading and writing.
 function backgroundContext() {
   const s = state.status;
   const loaded = s && s.background ? loadedModel(s.background) : null;
-  return (loaded && loaded.context) || roleCapabilities('general').context || 8192;
+  if (loaded && loaded.context) return workingContext(loaded.id, loaded.context);
+  return roleCapabilities('general').working || 8192;
+}
+
+function backgroundRates() {
+  const s = state.status;
+  const id = s && s.background && loadedModel(s.background) ? s.background : roleModel('general');
+  return { read: readRate(id), write: writeRate(id) };
 }
 
 // True when the background model reads images, which the descriptions of the images of the projects need.
@@ -1575,7 +1679,9 @@ async function deleteQuestion(c, index) {
   stopReadingOf(c, c.messages.slice(index, end), index);
   // The documents and the images of the question leave, unless another question, a replay, shares them.
   const others = attachmentIds(c.messages.slice(0, index).concat(c.messages.slice(end)));
-  for (const a of (m && m.attachments) || []) if (a.mode === 'search' && !others.has(a.id)) forgetDocument(c.id, a.id);
+  for (const a of (m && m.attachments) || []) {
+    if ((a.mode === 'search' || a.searchable) && !others.has(a.id)) forgetDocument(c.id, a.id);
+  }
   const otherImages = imageIds(c.messages.slice(0, index).concat(c.messages.slice(end)));
   const gone = ((m && m.images) || []).filter((img) => !otherImages.has(img.id)).map((img) => img.id);
   c.messages.splice(index, removed);
@@ -1610,7 +1716,7 @@ async function rewriteSummary(c) {
   c.summary = null;
   if (start === 0 || !roleModel(c.role)) return;
   const caps = roleCapabilities(c.role);
-  const context = caps.context || 8192;
+  const context = caps.working || caps.context || 8192;
   const room = context - Math.min(answerReserve(caps, !!(c.reasoning && caps.reasoning)), Math.floor(context / 2));
   toast(t('compacting'));
   cancelWarmup(c.id);
@@ -1764,19 +1870,37 @@ async function indexAttachments(c) {
   if (!c || !Array.isArray(c.messages)) return;
   const docs = new Map();
   for (const m of c.messages) {
-    if (m && m.role === 'user') for (const a of m.attachments || []) if (a.mode === 'search') docs.set(a.id, a);
+    if (m && m.role === 'user') {
+      for (const a of m.attachments || []) if (a.mode === 'search' || a.searchable) docs.set(a.id, a);
+    }
   }
   if (!docs.size) return;
   const st = await rag.status(c.id);
-  for (const a of docs.values()) if (!st.has(a.id)) queueIndex(c.id, a, !c.incognito);
+  for (const a of docs.values()) if (!complete(st.get(a.id))) queueIndex(c.id, a, !c.incognito);
 }
 
-// How a project gives its documents to the model: whole, searched, or not at all.
-function knowledgeMode(p, contextTokens) {
+/*
+    Whether the passages of a document, as rag.status() gives their state, are all there with their vectors when
+    the service has an embedding model: a document whose vectors stopped (an answer stopped, the service busy, a new
+    embedding model) is indexed again, its passages already computed keeping their vectors.
+*/
+function complete(st) {
+  if (!st) return false;
+  const embedder = rag.embeddingModel();
+  return !embedder || st.vectors >= st.passages;
+}
+
+/*
+    How a project gives its documents to the model of the capabilities caps: whole while they fit in their share of
+    its working context and in their time of reading (wholeTokens), searched beyond, or not at all.  A discussion
+    whose question did not fit with the documents read whole (c.knowledgeSearch) searches them.
+*/
+function knowledgeMode(p, caps, c) {
   const files = (p && p.files) || [];
   if (!files.length) return 'none';
+  if (c && c.knowledgeSearch) return 'search';
   const total = files.reduce((n, f) => n + estimateTokens(f.text), 0);
-  return total <= knowledgeShare * (contextTokens || 8192) ? 'whole' : 'search';
+  return total <= wholeTokens(caps || {}, knowledgeShare, knowledgeSeconds) ? 'whole' : 'search';
 }
 
 /*
@@ -2169,11 +2293,12 @@ function renderProject(p) {
     h('p', { class: 'help' }, t('knowledgeImagesHelp')),
     pictures.length ? h('div', { class: 'list image-list' }, pictures.map((img) => projectImageRow(p, img))) : null);
   // The share of the context the documents take, and how the model reads them.
-  const contextTokens = roleCapabilities('general').context || 0;
+  const general = roleCapabilities('general');
+  const contextTokens = general.context || 0;
   const totalTokens = (p.files || []).reduce((n, f) => n + estimateTokens(f.text), 0);
   const capacity = h('p', { class: 'help' });
   if ((p.files || []).length) {
-    const mode = knowledgeMode(p, contextTokens);
+    const mode = knowledgeMode(p, general);
     const share = contextTokens ? Math.round(100 * totalTokens / contextTokens) : 0;
     capacity.textContent = t(mode === 'whole' ? 'knowledgeWhole' : 'knowledgeSearch',
       { p: share, tokens: tn('tokensCount', totalTokens, { n: formatNumber(totalTokens) }) })
@@ -3382,7 +3507,9 @@ function editMessage(c, m, index, el) {
         for (const a of pictures) keptImages.add(a.id);
         const gone = [];
         for (const x of c.messages.slice(index)) {
-          for (const a of x.attachments || []) if (!kept.has(a.id) && a.mode === 'search') forgetDocument(c.id, a.id);
+          for (const a of x.attachments || []) {
+            if (!kept.has(a.id) && (a.mode === 'search' || a.searchable)) forgetDocument(c.id, a.id);
+          }
           for (const img of x.images || []) if (!keptImages.has(img.id)) gone.push(img.id);
         }
         images.remove(gone).catch(() => {});
@@ -4148,6 +4275,9 @@ async function regenerate(c) {
   // The reading aloud of an answer that leaves ends with it: the new answer is drawn in the place of the old one.
   stopReadingOf(c, removed, c.messages.length);
   if (!c.messages.length) return;
+  // A discussion compressed by an earlier version up to its last answer starts again at its last question.
+  const lastQuestion = c.messages.map((x) => x.role).lastIndexOf('user');
+  if (lastQuestion >= 0 && (c.contextStart || 0) > lastQuestion) c.contextStart = lastQuestion;
   const abort = beginTurn(c);
   const turn = newTurn(c);
   // The new answer takes the place of the old one in the thread, its buttons waiting until it is written.
@@ -4155,12 +4285,15 @@ async function regenerate(c) {
   await runTurn(c, abort, turn);
 }
 
-// How the model reads the documents of a question: whole while they fit in their share of the
-// context, searched beyond.
+// The time the indexing of a document attached to a question may take before its answer, in milliseconds.
+const indexWait = 15000;
+
+// How the model reads the documents of a question: whole while they fit in their share of the working context and
+// in their time of reading, searched beyond.
 function attachmentModes(c, m) {
-  const contextTokens = roleCapabilities(c.role).context || 8192;
+  const limit = wholeTokens(roleCapabilities(c.role), attachmentShare, attachmentSeconds);
   for (const a of m.attachments || []) {
-    if (!a.mode) a.mode = estimateTokens(a.text) <= attachmentShare * contextTokens ? 'whole' : 'search';
+    if (!a.mode) a.mode = estimateTokens(a.text) <= limit ? 'whole' : 'search';
   }
 }
 
@@ -4171,18 +4304,25 @@ function attachmentModes(c, m) {
     stops the vectors of the documents, then searched by their words, and the search.
 */
 async function prepareQuestion(c, m, signal) {
-  const contextTokens = roleCapabilities(c.role).context || 8192;
+  const caps = roleCapabilities(c.role);
   const owners = [];
   attachmentModes(c, m);
   for (const a of m.attachments || []) {
     if (a.mode === 'search') {
-      // Indexed at once, beside the documents of the projects that may be in progress.
+      /*
+          Indexed at once, beside the documents of the projects that may be in progress: the vectors computed within
+          indexWait, the passages searched by their words beyond, until the queue completes their vectors.
+      */
       toast(t('indexingDocument', { name: a.name }));
-      await rag.indexDocument(c.id, a, { persistent: !c.incognito, signal }).catch(() => {});
+      const r = await rag.indexDocument(c.id, a, { persistent: !c.incognito, signal, deadline: Date.now() + indexWait })
+        .catch(() => null);
+      if (r && rag.embeddingModel() && r.vectors < r.passages && !(signal && signal.aborted)) {
+        queueIndex(c.id, a, !c.incognito);
+      }
     }
   }
   for (const x of c.messages) {
-    if (x.role === 'user' && (x.attachments || []).some((a) => a.mode === 'search')) {
+    if (x.role === 'user' && (x.attachments || []).some((a) => a.mode === 'search' || a.searchable)) {
       owners.push(c.id);
       break;
     }
@@ -4191,25 +4331,35 @@ async function prepareQuestion(c, m, signal) {
   // The descriptions of the images of the project are searched, even when its documents are read whole.
   const pictures = new Map(((p && p.images) || []).map((x) => [x.id, x]));
   let skip = null;
-  if (p && knowledgeMode(p, contextTokens) === 'search') owners.unshift(p.id);
+  if (p && knowledgeMode(p, caps, c) === 'search') owners.unshift(p.id);
   else if (p && pictures.size) {
     owners.unshift(p.id);
     skip = new Set((p.files || []).map((f) => f.id));
   }
   m.context = '';
   delete m.projectImages;
+  delete m.passages;
   if (!owners.length) return;
-  // A short question takes the previous one with it: "and in 2025?" is searched with what
-  // it continues.
+  /*
+      A question of few words takes the beginning of the previous one with it: "and in 2025?" is searched with what
+      it continues.
+  */
   let question = m.content || '';
-  if (question.length < 80) {
+  if (terms(question).length < 6) {
     const users = c.messages.filter((x) => x.role === 'user' && x !== m);
-    if (users.length) question = users[users.length - 1].content + '\n' + question;
+    if (users.length) question = keepStart(users[users.length - 1].content || '', 300) + '\n' + question;
   }
   if (!question.trim()) question = (m.attachments || []).map((a) => a.name).join(' ');
+  // The passages that the questions of the context already brought are not given again.
+  const exclude = new Set();
+  for (const x of c.messages.slice(c.contextStart || 0)) {
+    if (x !== m && x.role === 'user') for (const id of x.passages || []) exclude.add(id);
+  }
   try {
-    const hits = await rag.search(owners, question, { budget: Math.floor(excerptShare * contextTokens * 3.6), signal, skip });
+    const { budget, limit } = excerptBudget(caps);
+    const hits = await rag.search(owners, question, { budget, limit, signal, skip, exclude });
     if (hits.length) {
+      m.passages = hits.reduce((list, x) => list.concat(x.passages || []), []);
       m.context = '<excerpts>\n' + hits.map((x) => (pictures.has(x.doc) ? '<excerpt image="' + x.name + '"'
         : '<excerpt document="' + x.name + '"' + (x.where ? ' location="' + x.where + '"' : '')) + '>\n' + x.text
         + '\n</excerpt>').join('\n') + '\n</excerpts>';
@@ -4237,14 +4387,20 @@ async function searchDocumentsOf(c, query, limit) {
   for (const m of c.messages) {
     if (m.role !== 'user') continue;
     for (const a of m.attachments || []) {
-      if (a.mode === 'search') searched = true;
-      else whole.push({ name: a.name, text: a.text });
+      if (a.mode === 'search' || a.searchable) searched = true;
+      if (a.mode !== 'search') whole.push({ name: a.name, text: a.text });
     }
   }
   if (searched) owners.push(c.id);
   const hits = owners.length ? await rag.search(owners, query, { limit, budget: 1500 * limit }) : [];
   const words = whole.length ? searchPassages(whole, query, limit).map((x) => ({ name: x.name, where: '', text: x.text })) : [];
-  return hits.concat(words).slice(0, limit);
+  // The two lists in turn, so that the documents read whole keep their place.
+  const out = [];
+  for (let k = 0; out.length < limit && (k < hits.length || k < words.length); ++k) {
+    if (k < hits.length) out.push(hits[k]);
+    if (k < words.length && out.length < limit) out.push(words[k]);
+  }
+  return out;
 }
 
 // The context the model receives.
@@ -4258,22 +4414,15 @@ function documentsOf(c) {
 }
 
 /*
-    The system message of a discussion; set, from toolSet(), tells which tools come with the question, and their
-    instructions close the message, those of the agent, then those of the web.  It holds what stays the same from one
-    question to the next, so that the engine reads it once: the day the discussion started, in English whatever the
-    language of the interface, and the memory as it was then.
+    The system message of a discussion for a model of the capabilities caps; set, from toolSet(), tells which tools
+    come with the question, and their instructions close the message, those of the agent, then those of the web.  It
+    holds what stays the same from one question to the next, so that the engine reads it once: the project and its
+    documents first, which the discussions of the project share, then the day the discussion started, in English
+    whatever the language of the interface, and the memory as it was then.
 */
-function systemPrompt(c, contextTokens, set) {
+function systemPrompt(c, caps, set) {
   const agent = !!(set && set.agent);
   const parts = [];
-  parts.push('Current date: ' + dayText(c.day || today()) + '.');
-  if (state.settings.userName) parts.push('The user is named ' + state.settings.userName + '.');
-  if (state.settings.systemPrompt) parts.push(state.settings.systemPrompt);
-  // The memory as it was when the discussion started: its prompt keeps the same beginning.
-  if (c.memory && state.settings.memoryEnabled && !c.incognito) {
-    parts.push('What you remember from earlier discussions with the user, to use when it helps, without mentioning it '
-      + 'otherwise:\n' + c.memory);
-  }
   const p = c.projectId ? projectById(c.projectId) : null;
   if (p) {
     parts.push('This discussion belongs to the project "' + p.name + '".' + (p.description ? ' ' + p.description : ''));
@@ -4282,7 +4431,7 @@ function systemPrompt(c, contextTokens, set) {
     // The documents enter whole while they fit in their share of the context; beyond, the
     // excerpts closest to each question come with it.  This message stays the same from one
     // question to the next.
-    if (knowledgeMode(p, contextTokens) === 'whole') {
+    if (knowledgeMode(p, caps, c) === 'whole') {
       parts.push('Documents of the project:\n' + files.map((f) => '<document name="' + f.name + '">\n' + f.text + '\n</document>').join('\n'));
     } else if (files.length) {
       const one = files.length === 1;
@@ -4299,6 +4448,14 @@ function systemPrompt(c, contextTokens, set) {
         + 'comes with the questions it relates to, in <excerpt image="...">, and the image itself with it when you '
         + 'read images.');
     }
+  }
+  parts.push('Current date: ' + dayText(c.day || today()) + '.');
+  if (state.settings.userName) parts.push('The user is named ' + state.settings.userName + '.');
+  if (state.settings.systemPrompt) parts.push(state.settings.systemPrompt);
+  // The memory as it was when the discussion started: its prompt keeps the same beginning.
+  if (c.memory && state.settings.memoryEnabled && !c.incognito) {
+    parts.push('What you remember from earlier discussions with the user, to use when it helps, without mentioning it '
+      + 'otherwise:\n' + c.memory);
   }
   if (agent) parts.push(tools.agentInstructions);
   if (set && set.web) parts.push(web.instructions(set.search));
@@ -4336,10 +4493,18 @@ function imagePart(url, img) {
   return part;
 }
 
-// The images of a list of messages the model receives, "message/position": the newest maxContextImages of them.
+/*
+    The images of a list of messages the model receives, "message/position" for the images of a question and
+    "message/p" and the position for the images of the project found for it: the newest maxContextImages of them.
+*/
 function sentImages(messages) {
   const out = new Set();
   for (let i = messages.length - 1; i >= 0; --i) {
+    const found = (messages[i].projectImages || []).slice(0, maxQuestionProjectImages);
+    for (let k = found.length - 1; k >= 0; --k) {
+      if (out.size >= maxContextImages) return out;
+      out.add(messages[i].id + '/p' + k);
+    }
     const list = messages[i].images || [];
     for (let k = list.length - 1; k >= 0; --k) {
       if (out.size >= maxContextImages) return out;
@@ -4352,9 +4517,10 @@ function sentImages(messages) {
 /*
     The messages of a request.  media gives the images: read, whether the model reads images, and
     url(id), the data URL of an image, null when this browser does not hold it.  The images of a
-    question go before its text, the newest maxContextImages of the discussion, and the images of
-    the project found for the last question come with it; a model that reads text only, a request
-    without media, and the images missing receive their names ("[Image: name]").  cuts (fitContext)
+    question go before its text, the newest maxContextImages of the discussion, the images of the
+    project found for each question among them, so that a question keeps its images when the next
+    one comes; a model that reads text only, a request without media, and the images missing
+    receive their names ("[Image: name]").  cuts (fitContext)
     shortens the oldest texts, a result of a tool keeping its beginning, leaves out the reasoning of
     the steps it gives a length of 0, and leaves out the cuts.steps oldest steps of the answer being
     written, the last message, which a line then names.
@@ -4368,8 +4534,6 @@ function apiMessages(c, system, cuts, media) {
   const messages = c.messages.slice(start);
   const read = !!(media && media.read);
   const sent = read ? sentImages(messages) : null;
-  let last = null;
-  for (const m of messages) if (m.role === 'user') last = m;
   // A summary an earlier version kept with its lines repeated gives each of them once.
   let summary = start > 0 && c.summary && c.summary.text ? distinctLines(c.summary.text) : '';
   if (summary && cuts && cuts.summary != null) summary = keepEnd(summary, cuts.summary);
@@ -4382,11 +4546,11 @@ function apiMessages(c, system, cuts, media) {
         if (url != null) parts.push(imagePart(url, img));
         else named.push('[Image: ' + img.name + ']');
       });
-      if (read && m === last) {
-        for (const img of (m.projectImages || []).slice(0, maxQuestionProjectImages)) {
-          const url = media.url(img.id);
+      if (read) {
+        (m.projectImages || []).slice(0, maxQuestionProjectImages).forEach((img, k) => {
+          const url = sent.has(m.id + '/p' + k) ? media.url(img.id) : null;
           if (url != null) parts.push(imagePart(url, img));
-        }
+        });
       }
       let content = [named.join('\n'), userContent(m, cuts)].filter(Boolean).join('\n\n');
       if (summary) {
@@ -4430,18 +4594,17 @@ function apiMessages(c, system, cuts, media) {
 
 /*
     The images the request of a question of c carries, as data URLs read from their Blobs when it
-    is sent: those of the questions of its context and those of the project found for its last
-    question, for a model of role that reads images.  Returns {read, url(id)}, url giving null for
-    an image this browser does not hold.
+    is sent: those of the questions of its context and those of the project found for them, for a
+    model of role that reads images.  Returns {read, url(id)}, url giving null for an image this
+    browser does not hold.
 */
 async function requestMedia(c, role) {
   const read = readsImages(role);
   const urls = new Map();
   if (read) {
-    const ids = imageIds(c.messages.slice(c.contextStart || 0));
-    const questions = c.messages.filter((x) => x.role === 'user');
-    const last = questions[questions.length - 1];
-    for (const img of (last && last.projectImages) || []) ids.add(img.id);
+    const kept = c.messages.slice(c.contextStart || 0);
+    const ids = imageIds(kept);
+    for (const x of kept) for (const img of x.projectImages || []) ids.add(img.id);
     for (const id of ids) urls.set(id, await images.dataUrl(id).catch(() => null));
   }
   return { read, url: (id) => urls.get(id) || null };
@@ -4650,7 +4813,8 @@ async function summarize(c, previous, transcript, limit, signal) {
     room loses its oldest points.
 */
 async function compact(c, from, to, room, scale, signal) {
-  const limit = Math.max(128, Math.min(1024, Math.floor(summaryShare * room)));
+  const most = Math.max(384, Math.min(1536, Math.floor(summarySeconds * backgroundRates().write)));
+  const limit = Math.max(128, Math.min(most, Math.floor(summaryShare * room)));
   // The parts fit the context of the background model, which writes the summary.
   room = Math.min(room, backgroundContext() - 64);
   let summary = (c.summary && c.summary.text) || '';
@@ -4671,13 +4835,31 @@ async function compact(c, from, to, room, scale, signal) {
     summary = await summarize(c, summary, keepEnd(transcriptOf(c.messages.slice(i, j)), available), limit, signal);
     i = j;
   }
-  return { summary: { text: keepEnd(summary, chars(limit)), upTo: to, updated: Date.now() }, to,
+  // The summary stays as written: its length is bounded by the tokens of its request.
+  return { summary: { text: summary, upTo: to, updated: Date.now() }, to,
     last: c.messages[to - 1] && c.messages[to - 1].id };
 }
 
+// Gives a compression to the discussion c.
 function applyCompaction(c, r) {
   c.summary = r.summary;
   c.contextStart = r.to;
+  indexLeftDocuments(c, r.to);
+}
+
+/*
+    Indexes for the search the documents read whole of the questions before the message to of c, which left the
+    context, so that the excerpts of the following questions can come from them.
+*/
+function indexLeftDocuments(c, to) {
+  for (const m of c.messages.slice(0, to)) {
+    if (!m || m.role !== 'user') continue;
+    for (const a of m.attachments || []) {
+      if (a.mode === 'search' || a.searchable || !a.text) continue;
+      a.searchable = true;
+      queueIndex(c.id, a, !c.incognito);
+    }
+  }
 }
 
 /*
@@ -4859,6 +5041,7 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model,
       } catch (e) {
         if (e.name === 'AbortError') throw e;
         c.contextStart = next;
+        indexLeftDocuments(c, next);
         trimmed = true;
       }
       restart();
@@ -5056,7 +5239,7 @@ async function runTurn(c, abort, turn) {
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
-      const system = systemPrompt(c, caps.context || 8192, set);
+      const system = systemPrompt(c, caps, set);
       // The conversation, with the steps of this answer already done (the agent's).
       const build = (x) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
@@ -5066,6 +5249,23 @@ async function runTurn(c, abort, turn) {
         scheduleRender(c);
       }, 'albireo-' + role, cuts);
       turn.compacting = false;
+      /*
+          A question that does not fit beside the documents of the project read whole has them searched, in this
+          discussion from now on, its excerpts found again, and the step starts over.
+      */
+      const project = c.projectId ? projectById(c.projectId) : null;
+      if (fitted.overflow && !c.knowledgeSearch && knowledgeMode(project, caps, c) === 'whole') {
+        c.knowledgeSearch = true;
+        const asked = c.messages.filter((x) => x.role === 'user');
+        if (asked.length) await prepareQuestion(c, asked[asked.length - 1], signal);
+        // The cuts of the fitting that did not fit leave: the texts are measured again whole.
+        cuts.summary = null;
+        cuts.texts.clear();
+        cuts.steps = 0;
+        turn.steps.pop();
+        --step;
+        continue;
+      }
       if (fitted.trimmed) turn.trimmed = true;
       if (fitted.compacted) turn.compacted = true;
       if (fitted.context) {
@@ -5224,6 +5424,9 @@ const memoryBatchQuestions = 3;
 const memoryBatchChars = 1200;
 const memoryIdle = 20000;
 const memoryLeaseMs = 180000;
+// The questions an update reads at most: what the background model reads in memoryReadSeconds, half of its working
+// context at most; the others wait for the next update.
+const memoryReadSeconds = 30;
 const tabId = store.uid();
 let memoryTimer = null;
 let memoryRunning = false;
@@ -5268,8 +5471,9 @@ const memoryExamples = {
 
 /*
     The new facts the questions teach, which join the memory, each followed by the words of the user
-    that say it, which the update checks in the questions it read (groundedFacts).  The examples show
-    a message with two facts, and a request, which teaches none.
+    that say it, which the update checks in the questions it read (groundedFacts).  The memory comes
+    numbered, and a fact that changes one of it names its number, so that it replaces it.  The
+    examples show a message with two facts, and a request, which teaches none.
 */
 function memoryDeltaInstructions(words, sensitive) {
   const code = memoryExamples[language()] ? language() : 'en';
@@ -5282,17 +5486,23 @@ function memoryDeltaInstructions(words, sensitive) {
   const request = english ? 'Write a Python program that computes the integral of x squared between 0 and 1.'
     : 'Crée un programme Python pour calculer l\'intégrale de x au carré entre 0 et 1.';
   return 'You keep a short memory about the user for the future discussions of an assistant. From the new messages '
-    + 'of the user, write the lasting facts about the user that the memory does not hold yet: profession, projects, '
-    + 'preferences, habits of work, the way they want to be answered. A fact says who the user is, what the user '
-    + 'does, uses or wants over time, as the user says it about themselves. A request of the user (write, create, '
-    + 'explain, translate or compute something) and the topic of a question are not facts about the user: leave '
-    + 'them out, whatever their words. Leave out what serves one discussion only, the content of documents, and '
-    + 'what the memory already holds, even in other words. ' + sensitiveRule(sensitive)
+    + 'of the user, write the lasting facts about the user that the memory does not hold yet, those that will help '
+    + 'in other discussions: the role, the profession and the field of the user, the organization they work for, '
+    + 'their projects and the goals of these projects, the languages, tools, frameworks, systems and computers they '
+    + 'use, their level of expertise, their habits of work, and the way they want to be answered (language, length, '
+    + 'format, style), with their standing instructions ("always...", "never..."). A fact says who the user is, what '
+    + 'the user does, uses or wants over time, as the user says it about themselves, even inside a question ("As a '
+    + 'teacher, how do I..."). A request of the user (write, create, explain, translate or compute something) and the '
+    + 'topic of a question are not facts about the user: leave them out, whatever their words. Leave out what serves '
+    + 'one discussion only, the content of documents, and what the memory already holds, even in other words. '
+    + sensitiveRule(sensitive)
     + 'Write each new fact on a line of its own: "- ", the fact as a short sentence in ' + memoryLanguage()
     + ' about the user, without naming the user, " | ", then the statement of the user that says it, copied '
-    + 'exactly as the user wrote it, in its language, between double quotes; a question or a request of the user '
-    + 'states no fact. A fact the user did not state in so many words is left out. The facts take at most ' + words
-    + ' words in all. For example, for the message "' + message + '":\n'
+    + 'exactly as the user wrote it, in its language, between double quotes; a request of the user states no fact. '
+    + 'The facts of the memory are numbered: a new fact that changes one of them, a new role or another preference, '
+    + 'starts with its number between brackets, "- [3] ", and replaces it. A fact the user did not state in so many '
+    + 'words is left out. The facts take at most ' + words + ' words in all. For example, for the message "'
+    + message + '":\n'
     + '- ' + a + ' | "' + qa + '"\n'
     + '- ' + b + ' | "' + qb + '"\n'
     + 'For the message "' + request + '": NONE\n'
@@ -5360,37 +5570,74 @@ function asksForTask(clause) {
 }
 
 /*
-    Whether the words of a quote, normalized, appear in the questions read, normalized too, with 3
-    words or 12 characters at least within a part of a sentence that asks nothing.  The parts end at
-    the marks that end a sentence, at colons and at semicolons, and a part that ends with a question
-    mark supports no fact, as in "One line: what is RAII?".  A quote whose clause starts with a request
-    ("Write a program that...") supports no fact either (asksForTask).
+    The words of a standing instruction of the user, folded, in the languages of the interface: a request that holds
+    one ("Please always answer in French") says how the user wants to be answered from now on.
+*/
+const standingWords = new RegExp('\\b(always|never|from now on|toujours|jamais|desormais|dorenavant|a l\'avenir|immer|nie'
+  + '|niemals|ab jetzt|kunftig|sempre|mai|d\'ora in poi|siempre|nunca|a partir de ahora|de ahora en adelante)\\b');
+
+/*
+    The openings of a clause in which the user says what they are or do, folded: a role ("as a teacher") or a subject
+    in the first person with a verb of state or of work ("I work", "je suis", "ich arbeite", "sono", "trabajo").  A
+    clause that starts with one of them states a fact about the user even inside a question ("As a teacher, how do
+    I...?"); the other parts of a question support none.
+*/
+const statementOpeners = new RegExp('^(as an? |en tant qu|in qualita di |als |i am |i\'m |i work |i use |i develop '
+  + '|i teach |i study |i manage |i lead |je suis |je travaille |j\'utilise |je developpe |j\'enseigne |j\'etudie '
+  + '|je dirige |ich bin |ich arbeite |ich nutze |ich verwende |ich entwickle |ich unterrichte |ich studiere |sono '
+  + '|lavoro |insegno |studio |soy |trabajo |utilizo |desarrollo |enseno |estudio )');
+
+/*
+    Whether the words of a quote, normalized and folded, appear in the questions read, normalized and
+    folded too, with 3 words or 12 characters at least within a part of a sentence that asks
+    nothing.  The parts end at the marks that end a sentence, at colons and at semicolons, and a
+    part that ends with a question mark supports no fact, as in "One line: what is RAII?", unless
+    the quote starts by saying what the user is or does (statementOpeners: "As a C++ developer, how do I...?").
+    A quote whose clause starts with a request ("Write a program that...") supports no fact either
+    (asksForTask), unless it holds a standing instruction ("Always answer in French").
 */
 function statedIn(quote, where) {
   const at = quote ? where.indexOf(quote) : -1;
   if (at < 0) return false;
   let clause = at;
   while (clause > 0 && !/[.!?:;,\u2026]/.test(where[clause - 1])) --clause;
-  if (asksForTask(where.slice(clause, at + quote.length))) return false;
+  const said = where.slice(clause, at + quote.length);
+  if (asksForTask(said) && !standingWords.test(said)) return false;
+  const personal = statementOpeners.test(quote);
   const end = at + quote.length;
   for (const s of where.matchAll(/[^.!?:;\u2026]+[.!?:;\u2026]*/g)) {
     const from = Math.max(at, s.index);
     const to = Math.min(end, s.index + s[0].length);
-    if (from >= to || /\?\s*$/.test(s[0])) continue;
+    if (from >= to || (/\?\s*$/.test(s[0]) && !personal)) continue;
     const part = where.slice(from, to).replace(/[.!?;:,\u2026]+$/, '').trim();
     if (part.split(' ').filter(Boolean).length >= 3 || part.length >= 12) return true;
   }
   return false;
 }
 
+// The pieces of a quote that the model shortened with an ellipsis, each of them in the questions, in their order.
+function quotePieces(quote, where) {
+  const pieces = quote.split(/\s*(?:\u2026|\.\.\.)\s*/).map((x) => x.trim()).filter(Boolean);
+  let from = 0;
+  for (const piece of pieces) {
+    const at = where.indexOf(piece, from);
+    if (at < 0) return null;
+    from = at + piece.length;
+  }
+  return pieces;
+}
+
 /*
     The new facts of a delta that the questions read by the update support.  Each line holds a fact,
     " | " and the words of the user that say it, which must lie in a statement of the questions read
-    (statedIn).  The words of the user support one fact, and a later fact that cites them again is
-    left out.  The facts keep no quote, and become sentences.  Returns {facts, proposed, discarded}.
+    (statedIn), the pieces of a quote shortened with an ellipsis in their order.  The words of the
+    user support one fact, and a later fact that cites them again is left out.  A fact may start
+    with the number of the fact of the memory it replaces, "[3]".  The facts keep no quote, and
+    become sentences.  Returns {facts: [{text, replaces}], proposed, discarded}, replaces being the
+    number of the replaced fact, 0 for none.
 */
 function groundedFacts(text, read, sensitive) {
-  const where = evidenceText(read);
+  const where = fold(evidenceText(read));
   const cited = new Set();
   const facts = [];
   let proposed = 0;
@@ -5399,14 +5646,17 @@ function groundedFacts(text, read, sensitive) {
     const line = raw.trim();
     if (!/^[-*\u2022]\s*\S/.test(line)) continue;
     ++proposed;
-    const m = /^[-*\u2022]\s*(.+?)\s*\|\s*(.+)$/.exec(line);
-    const quote = m ? evidenceText(m[2]).replace(/[.!?;:,\u2026]+$/, '').trim() : '';
-    if (!m || !m[1].trim() || cited.has(quote) || !statedIn(quote, where)) {
+    const m = /^[-*\u2022]\s*(?:\[(\d+)\]\s*)?(.+?)\s*\|\s*(.+)$/.exec(line);
+    const quote = m ? fold(evidenceText(m[3])).replace(/[.!?;:,\u2026]+$/, '').trim() : '';
+    const pieces = quote ? quotePieces(quote, where) : null;
+    const longest = (pieces || []).reduce((x, y) => (y.length > x.length ? y : x), '');
+    if (!m || !m[2].trim() || !pieces || cited.has(quote) || !statedIn(longest, where)) {
       ++discarded;
       continue;
     }
     cited.add(quote);
-    facts.push(...memorySentences(sentenceOf(m[1]), sensitive));
+    const replaces = m[1] ? Number(m[1]) : 0;
+    for (const x of memorySentences(sentenceOf(m[2]), sensitive)) facts.push({ text: x, replaces });
   }
   return { facts, proposed, discarded };
 }
@@ -5415,18 +5665,38 @@ function groundedFacts(text, read, sensitive) {
 function memoryCompactInstructions(words, sensitive) {
   return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite it in at most '
     + words + ' words, as short sentences one after the other in a single paragraph, without a list, a bullet or a '
-    + 'line break: merge the sentences that say the same thing, keep the most lasting facts about the user, the '
-    + 'newest last, and leave out the requests and the tasks of past discussions. ' + sensitiveRule(sensitive)
+    + 'line break: merge the sentences that say the same thing, keep the most lasting facts about the user, those '
+    + 'that help in any discussion first (role, field, projects, tools, standing preferences), the newest last, and '
+    + 'leave out the requests and the tasks of past discussions. ' + sensitiveRule(sensitive)
     + 'Write every sentence in ' + memoryLanguage() + ', the sentences written in another language included. '
     + 'Answer with the paragraph alone.';
 }
 
-// The memory written again in the language of the interface, each of its facts kept.
+// The memory written again in the language of the interface, sentence by sentence, each with its number.
 function memoryTranslateInstructions() {
-  return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite the memory in '
-    + memoryLanguage() + ': translate the sentences written in another language, keep the sentences already written '
-    + 'in ' + memoryLanguage() + ' as they are, and keep every fact and their order, as short sentences one after '
-    + 'the other in a single paragraph, without a list or a line break. Answer with the paragraph alone.';
+  return 'You keep a short memory about the user for the future discussions of an assistant. Its sentences are '
+    + 'numbered. Rewrite each of them in ' + memoryLanguage() + ', on a line of its own that starts with its number '
+    + 'between brackets, as "[1] ": translate the sentences written in another language, and keep the sentences '
+    + 'already written in ' + memoryLanguage() + ' as they are. Answer with the numbered lines alone.';
+}
+
+/*
+    The sentences of the memory lines once translated: the line of each number in the answer of the model, the
+    sentence as it was for a number the answer lacks.  Returns null when the answer translated none of them.
+*/
+function translatedSentences(lines, answer) {
+  const out = lines.slice();
+  let found = 0;
+  for (const raw of String(answer || '').split('\n')) {
+    const m = /^\s*\[(\d+)\]\s*(.+)$/.exec(raw);
+    const k = m ? Number(m[1]) - 1 : -1;
+    if (k < 0 || k >= lines.length) continue;
+    const sentence = memorySentences(m[2], true).join(' ');
+    if (!sentence) continue;
+    out[k] = sentence;
+    ++found;
+  }
+  return found ? out : null;
 }
 
 // True when a sentence of a memory is written in another language than the one of the interface.
@@ -5473,10 +5743,22 @@ function memorySentences(text, sensitive) {
 
 const wordCount = (lines) => lines.join(' ').split(/\s+/).filter(Boolean).length;
 
-// The memory as it is kept: its sentences one after the other, within words words, the oldest leaving first.
-function memoryParagraph(sentences, words) {
-  let list = sentences.slice();
-  while (list.length > 1 && wordCount(list) > words) list = list.slice(1);
+// The words the facts the model learns may take beside the sentences the user wrote: half of the memory at least.
+function learnedRoom(words, pinned) {
+  return Math.max(words - wordCount(pinned), Math.floor(words / 2));
+}
+
+/*
+    The memory as it is kept: its sentences one after the other, within words words, the oldest leaving first, the
+    sentences the user wrote (pinned, a Set) excepted.
+*/
+function memoryParagraph(sentences, words, pinned) {
+  const list = sentences.slice();
+  while (list.length > 1 && wordCount(list) > words) {
+    const k = list.findIndex((x) => !(pinned && pinned.has(x)));
+    if (k < 0) break;
+    list.splice(k, 1);
+  }
   return list.join(' ');
 }
 
@@ -5502,22 +5784,57 @@ function sameFact(a, b) {
   return shared / (x.size + y.size - shared) >= 0.7;
 }
 
-// The questions the memory has not read yet, each discussion from its mark.
+/*
+    The questions the memory has not read yet, each discussion from its mark, the discussions changed least recently
+    first: [{id, to, asked: [{text, to}]}], to being the mark after the discussion or after the question.
+*/
 function pendingMemory() {
   const items = [];
   let questions = 0;
   let chars = 0;
   const all = state.conversations.slice();
   if (state.current && !state.current.incognito && !all.includes(state.current)) all.push(state.current);
+  all.sort((a, b) => (a.updated || 0) - (b.updated || 0));
   for (const c of all) {
     if (c.incognito || !Array.isArray(c.messages) || c.messages.length <= (c.memoryMark || 0)) continue;
-    const asked = c.messages.slice(c.memoryMark || 0).filter((m) => m.role === 'user' && (m.content || '').trim())
-      .map((m) => m.content);
+    const asked = [];
+    for (let i = c.memoryMark || 0; i < c.messages.length; ++i) {
+      const m = c.messages[i];
+      if (m.role === 'user' && (m.content || '').trim()) asked.push({ text: m.content, to: i + 1 });
+    }
     items.push({ id: c.id, to: c.messages.length, asked });
     questions += asked.length;
-    chars += asked.reduce((n, a) => n + a.length, 0);
+    chars += asked.reduce((n, a) => n + a.text.length, 0);
   }
   return { items, questions, chars };
+}
+
+/*
+    The questions an update reads, oldest first, within chars characters: the text the model reads, and the items to
+    mark read, the last of them up to the last question it took.
+*/
+function memoryReading(items, chars) {
+  const parts = [];
+  const marks = [];
+  let used = 0;
+  for (const item of items) {
+    let taken = 0;
+    for (const a of item.asked) {
+      const part = 'User: ' + keepStart(a.text, 1500);
+      if (parts.length && used + part.length + 2 > chars) break;
+      parts.push(part);
+      used += part.length + 2;
+      ++taken;
+    }
+    // A discussion read whole is marked at its end, one read in part after its last question read.
+    if (taken === item.asked.length) {
+      marks.push({ id: item.id, to: item.to });
+      continue;
+    }
+    if (taken) marks.push({ id: item.id, to: item.asked[taken - 1].to });
+    break;
+  }
+  return { read: parts.join('\n\n'), marks };
 }
 
 // The lease of this tab on the memory: false when another tab holds it and it has not expired.
@@ -5560,7 +5877,8 @@ async function markRead(items) {
 async function storedMemory() {
   const s = Object.assign({}, defaults, await store.getSettings());
   return {
-    enabled: !!s.memoryEnabled, sensitive: !!s.memorySensitive, memory: s.memory || '', language: s.memoryLanguage
+    enabled: !!s.memoryEnabled, sensitive: !!s.memorySensitive, memory: s.memory || '', language: s.memoryLanguage,
+    pinned: s.memoryPinned || ''
   };
 }
 
@@ -5614,6 +5932,11 @@ async function updateMemory(force) {
     const words = memoryLimitWords(context);
     const current = stored.memory;
     const target = language();
+    // The sentences the user wrote in the memory, which stay; the lease, renewed before each request of the model.
+    let pinned = memorySentences(stored.pinned, true);
+    const renew = async () => {
+      if (!(await takeMemoryLease())) throw new DOMException('The memory is updated by another tab.', 'AbortError');
+    };
     // True when the memory was reset, edited or turned off meanwhile, in this tab or in another
     // one, as stored now: the update is then dropped.
     const changed = async () => {
@@ -5629,56 +5952,106 @@ async function updateMemory(force) {
         lost facts is left out, and the next update tries again.
     */
     if (lines.length && (memoryForeign(current) || (!!stored.language && stored.language !== target))) {
+      await renew();
       const r = await backgroundText(memoryTranslateInstructions(),
-        '<memory>\n' + lines.join(' ') + '\n</memory>\n\nRewrite every sentence in ' + memoryLanguage() + '.',
-        Math.ceil(wordCount(lines) * 2.5) + 32, signal).catch((e) => {
+        '<memory>\n' + lines.map((x, k) => '[' + (k + 1) + '] ' + x).join('\n') + '\n</memory>\n\nRewrite every '
+          + 'sentence in ' + memoryLanguage() + '.', Math.ceil(wordCount(lines) * 2.5) + 8 * lines.length + 32,
+        signal).catch((e) => {
         if (e.name === 'AbortError') throw e;
         return null;
       });
       if (await changed()) return;
-      const translated = r ? memorySentences(r.text, true) : [];
-      if (translated.length >= Math.ceil(lines.length * 0.7)) {
+      // A translation keeps every sentence, the sentences the user wrote taking their translations.
+      const translated = r ? translatedSentences(lines, r.text) : null;
+      if (translated) {
+        const kept = new Set(pinned);
+        pinned = translated.filter((x, k) => kept.has(lines[k]));
         lines = translated;
         rewritten = true;
       }
     }
     let added = 0;
+    let moved = 0;
+    let marks = [];
     if (enough && pending.chars >= 40) {
-      // What the user wrote: the memory is about the user, and the answers would fill it with
-      // what the assistant said.
-      const asked = [];
-      for (const item of pending.items) for (const a of item.asked) asked.push('User: ' + keepStart(a, 1500));
-      // The questions as the model reads them, in which the words of each new fact are looked for.
-      const read = keepEnd(asked.join('\n\n'), Math.floor(context * 3.6 * 0.5));
+      // What the user wrote, oldest first, within the reading of the update: the memory is about the user, and the
+      // answers would fill it with what the assistant said.
+      const rates = backgroundRates();
+      const reading = memoryReading(pending.items,
+        Math.floor(Math.min(0.5 * context, Math.max(2048, memoryReadSeconds * rates.read)) * 3.6));
+      const read = reading.read;
+      marks = reading.marks;
+      await renew();
       const r = await backgroundText(memoryDeltaInstructions(words, sensitive),
-        '<memory>\n' + (lines.join(' ') || '(empty)') + '\n</memory>\n\n<messages>\n' + read
+        '<memory>\n' + (lines.map((x, k) => '[' + (k + 1) + '] ' + x).join('\n') || '(empty)')
+          + '\n</memory>\n\n<messages>\n' + read
           + '\n</messages>\n\nWrite the new facts in ' + memoryLanguage() + ', each with the words of the user.',
         Math.ceil(words * 3.2) + 32, signal);
       if (await changed()) return;
       const delta = groundedFacts(r.text, read, sensitive);
       console.info('Albireo: memory: ' + delta.proposed + ' facts proposed, ' + delta.discarded
         + ' left out, unsupported by the words of the user');
+      /*
+          A fact that replaces one of the memory takes its place, a fact said again moves to the end with the new ones,
+          so that the facts the questions no longer bring leave first; the sentences the user wrote stay as written,
+          unless the words of the user change one of them.
+      */
+      const kept = new Set(pinned);
+      const recent = [];
+      const slots = lines.slice();
       for (const fact of delta.facts) {
-        if (lines.some((l) => sameFact(l, fact))) continue;
-        lines.push(fact);
+        const k = fact.replaces - 1;
+        if (k >= 0 && k < slots.length && slots[k] != null) {
+          if (slots[k] !== fact.text) ++added;
+          kept.delete(slots[k]);
+          slots[k] = null;
+          recent.push(fact.text);
+          continue;
+        }
+        const same = slots.findIndex((l) => l != null && sameFact(l, fact.text));
+        if (same >= 0) {
+          if (!kept.has(slots[same])) {
+            recent.push(slots[same]);
+            slots[same] = null;
+            ++moved;
+          }
+          continue;
+        }
+        if (recent.some((l) => sameFact(l, fact.text))) continue;
+        recent.push(fact.text);
         ++added;
       }
-      if (added && wordCount(lines) > words) {
-        const compact = await backgroundText(memoryCompactInstructions(words, sensitive),
-          '<memory>\n' + lines.join(' ') + '\n</memory>', Math.ceil(words * 2.2) + 16, signal).catch(() => null);
+      if (added || moved) {
+        lines = slots.filter((x) => x != null).concat(recent);
+        pinned = pinned.filter((x) => kept.has(x));
+      }
+      if (added && wordCount(lines) > wordCount(pinned) + learnedRoom(words, pinned)) {
+        // The facts the model learned are rewritten within the room the sentences of the user leave them.
+        const learned = lines.filter((x) => !pinned.includes(x));
+        const room = learnedRoom(words, pinned);
+        await renew();
+        const compact = await backgroundText(memoryCompactInstructions(room, sensitive),
+          '<memory>\n' + learned.join(' ') + '\n</memory>', Math.ceil(room * 2.2) + 16, signal).catch(() => null);
         if (signal.aborted) return;
         if (await changed()) return;
         const compacted = compact ? memorySentences(compact.text, sensitive) : [];
-        if (compacted.length && wordCount(compacted) <= words * 1.2) lines = compacted;
+        if (compacted.length && wordCount(compacted) <= room * 1.2) lines = pinned.concat(compacted);
       }
     }
-    // The memory the user wrote may take twice its size, which the facts the model adds bring back to it.
-    if (added || rewritten || listMemory(current)) {
-      await saveSetting('memory', memoryParagraph(lines, added ? words : words * 2));
+    /*
+        The facts the model learned take the room the sentences of the user leave them, half of the memory at least;
+        a memory the user wrote, which may take twice its size, keeps it while no fact joins.
+    */
+    if (added || moved || rewritten || listMemory(current)) {
+      const limit = wordCount(pinned) + learnedRoom(words, pinned);
+      await saveSetting('memory', memoryParagraph(lines, added ? limit : Math.max(limit, words * 2), new Set(pinned)));
+      await saveSetting('memoryPinned', pinned.join(' '));
       await saveSetting('memoryUpdated', Date.now());
       await saveSetting('memoryLanguage', target);
     }
-    if (enough) await markRead(pending.items);
+    // Questions too short to say anything are read all the same.
+    if (enough && pending.chars < 40) marks = pending.items;
+    if (marks.length) await markRead(marks);
     if (added) toast(tn('memoryLearned', added), false, 4500);
     else if (rewritten) toast(t('memoryRewritten'), false, 4500);
   } finally {
@@ -5942,22 +6315,22 @@ async function compactInBackground(c, signal) {
   const caps = roleCapabilities(role);
   const set = toolSet(view, caps);
   const toolDefs = set.definitions;
-  const system = systemPrompt(view, caps.context || 8192, set);
+  const system = systemPrompt(view, caps, set);
   const text = apiMessages(view, system, null, { read: false, url: () => null });
   const [all, base] = await Promise.all([api.count(model, text, toolDefs),
     api.count(model, text.slice(0, 1), toolDefs).catch(() => null)]);
   if (signal.aborted || !all || typeof all.tokens !== 'number' || !all.context) return;
   const reserve = answerReserve(caps, !!(view.reasoning && caps.reasoning));
-  const room = all.context - Math.min(reserve, Math.floor(all.context / 2));
+  // The room of the working context, within that of the context of the model.
+  const context = Math.min(all.context, caps.working || all.context);
+  const room = context - Math.min(reserve, Math.floor(context / 2));
   const estimate = tokenEstimate(text, all.tokens, model);
   const media = estimateMedia(role);
   const build = () => apiMessages(view, system, null, media);
   const fixed = base && typeof base.tokens === 'number' ? base.tokens : estimate.of(text.slice(0, 1));
   if (estimate.of(build()) - fixed < compactShare * Math.max(0, room - fixed)) return;
-  // The questions after the start, the last one included: the next question comes after it.
-  view.messages.push({ id: 'next', role: 'user', content: '' });
+  // The last question stays with its answer, which a new answer may replace (regenerate).
   const next = nextStart(view, build, estimate.of, keptTokens(fixed, room));
-  view.messages.pop();
   if (next <= (view.contextStart || 0)) return;
   cancelWarmup(c.id);
   const r = await compact(view, view.contextStart || 0, next, room, estimate.scale, signal);
@@ -5968,6 +6341,8 @@ async function compactInBackground(c, signal) {
     g.compaction = r;
     return;
   }
+  // An answer written in another tab keeps the beginning of its prompt; the discussion is compressed again later.
+  if (answeredElsewhere(now)) return;
   if (!settleCompaction(now, r)) return;
   await persist(now);
   // The images of the exchanges summarized left the context: their places go to new ones.
@@ -6019,7 +6394,7 @@ async function warmBeginning(c) {
     if (abort.signal.aborted) return;
     const next = Object.assign({}, c, { messages: c.messages.concat([{ id: 'next', role: 'user', content: '.' }]) });
     const body = { model: backgroundModel, reasoning: false, max_tokens: 1, stream: false,
-      messages: apiMessages(next, systemPrompt(c, caps.context || 8192, set), null, media) };
+      messages: apiMessages(next, systemPrompt(c, caps, set), null, media) };
     if (set.definitions) body.tools = set.definitions;
     limit = api.limitedSignal(abort.signal, backgroundTimeout);
     await api.postJSON('/v1/chat/completions', body, limit.signal);
@@ -6175,8 +6550,7 @@ function modelTab(body) {
 
 // The memory of the discussions: its use, its content, which the user may edit, and its reset.
 function memoryTab(body) {
-  const context = roleCapabilities('general').context || 8192;
-  const words = memoryLimitWords(context);
+  const words = memoryLimitWords(backgroundContext());
   const enabled = h('input', { type: 'checkbox', checked: !!state.settings.memoryEnabled });
   const sensitive = h('input', { type: 'checkbox', checked: !!state.settings.memorySensitive });
   const text = h('textarea', { rows: 8, placeholder: t('memoryEmpty') });
@@ -6195,9 +6569,17 @@ function memoryTab(body) {
   sensitive.addEventListener('change', () => saveSetting('memorySensitive', sensitive.checked));
   text.addEventListener('input', showSize);
   text.addEventListener('change', async () => {
-    // What the user writes stays, sensitive or not, within twice the size of the memory, as sentences one after
-    // the other: a line becomes a sentence.
+    /*
+        What the user writes stays, sensitive or not, within twice the size of the memory, as sentences one after
+        the other: a line becomes a sentence.  The sentences the user adds or changes stay when the facts the model
+        learns fill the memory; those the model learned and the user left as they were may leave.
+    */
+    const before = new Set(memorySentences(state.settings.memory, true));
+    const pinnedBefore = new Set(memorySentences(state.settings.memoryPinned, true));
     await saveSetting('memory', memoryParagraph(memorySentences(text.value, true), words * 2));
+    // The sentences the user added or changed, and those the user wrote before, as the saved memory splits them.
+    const saved = memorySentences(state.settings.memory, true);
+    await saveSetting('memoryPinned', saved.filter((x) => pinnedBefore.has(x) || !before.has(x)).join(' '));
     await saveSetting('memoryUpdated', Date.now());
     text.value = state.settings.memory;
     showSize();
@@ -6222,6 +6604,7 @@ function memoryTab(body) {
       onclick: async () => {
         if (!await confirmDialog(t('memoryReset'), t('memoryResetText'))) return;
         await saveSetting('memory', '');
+        await saveSetting('memoryPinned', '');
         await saveSetting('memoryUpdated', 0);
         // The discussions forget the memory they started with, and what they already said
         // stays out of the next updates: the stored discussions change in place, read again

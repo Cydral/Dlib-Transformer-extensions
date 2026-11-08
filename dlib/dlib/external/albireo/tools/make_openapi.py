@@ -311,8 +311,17 @@ schemas = {
         "v2ram_max_mb": {"type": "integer", "description": "Limit of the extended memory, 0 for automatic."},
         "device_mb": {"type": "integer", "description": "Memory of the device for the copies of the weights of "
                       "the models, in megabytes, 0 for automatic."},
-        "threads": {"type": "integer"}, "context": {"type": "integer"},
-        "max_sequences": {"type": "integer", "minimum": 1, "maximum": 64}, "kv_mb": {"type": "integer"},
+        "threads": {"type": "integer"},
+        "context": {"type": "integer", "description": "Context of the language models, 0 for the context each "
+                    "model was trained for, which the memory the system can commit (its physical memory and its "
+                    "paging file or swap) reduces when it cannot hold the keys and values of one full context."},
+        "max_sequences": {"type": "integer", "minimum": 1, "maximum": 64},
+        "kv_mb": {"type": "integer", "description": "Memory of the keys and values of each language model, in "
+                  "megabytes, 0 for two full contexts within the memory the system can commit less a reserve."},
+        "kv_type": {"type": "string", "enum": ["auto", "q8", "f16"], "default": "auto",
+                    "description": "Storage of the keys and values of the language models: q8, 8-bit integers by "
+                                   "groups of 32 values with a scale, the keys rotated; f16, half precision. auto "
+                                   "takes q8 for the models whose heads hold whole groups."},
         "check_updates": {"type": "boolean"},
         "offline": {"type": "boolean", "description": "No access to the network: the catalog, the models and the "
                     "updates come from imports, and the service opens no connection."},
@@ -502,8 +511,11 @@ paths = {
                 "cpu": {"type": "object", "properties": {
                     "name": {"type": "string"}, "cores": {"type": "integer"}, "threads": {"type": "integer"},
                     "features": {"type": "array", "items": {"type": "string"}}}},
-                "memory": {"type": "object", "properties": {"total": {"type": "integer"},
-                                                            "available": {"type": "integer"}}}}},
+                "memory": {"type": "object", "properties": {
+                    "total": {"type": "integer"}, "available": {"type": "integer"},
+                    "commit_total": {"type": "integer", "description": "The memory the system can commit, its "
+                                     "physical memory and its paging file or swap together."},
+                    "commit_available": {"type": "integer"}}}}},
             "usage": {"type": "object", "description": "The requests and the tokens since the service started.",
                       "properties": {"requests": {"type": "integer"}, "prompt_tokens": {"type": "integer"},
                                      "completion_tokens": {"type": "integer"}}},
@@ -519,7 +531,10 @@ paths = {
                            "description": "The model that comes with Albireo and serves albireo-background, which "
                                           "stays loaded; empty without one."},
             "loaded_models": {"type": "array", "items": {"type": "object"},
-                              "description": "The models of the engine, with their context and capabilities."},
+                              "description": "The models of the engine, with their context and capabilities: "
+                                             "context, trained_context, kv_bytes_per_token, kv_type (q8 or f16), "
+                                             "and the speeds measured on their answers, prompt_tokens_per_second "
+                                             "and generation_tokens_per_second, 0 until they answered."},
             "models_state": {"type": "object", "additionalProperties": {"type": "string"},
                              "description": "loading, ready, unloading, removing, or the error of a load."},
             "web": {"type": "object", "description": "The web access of the Web button, which the web application "

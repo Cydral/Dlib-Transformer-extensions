@@ -81,6 +81,13 @@ for family in "" _avxvnni _vnni256; do
   fi
 done
 
+# The attention of the steps split among the threads, against one task per key/value head, with
+# keys and values in half precision and in 8 bits, on a tiny model written in the work folder.
+if [ -x "$BUILD/tests/test_runtime" ]; then
+  step "attention" "all checks passed" "$BUILD/tests/test_runtime" synthetic "$WORK"
+else skip "attention" "no $BUILD/tests/test_runtime"
+fi
+
 # Damaged model files, the chat format of the agents and the C interface of an engine under
 # concurrent requests, on tiny models the tests write in the work folder.
 if [ -x "$BUILD/tests/test_model_file" ]; then

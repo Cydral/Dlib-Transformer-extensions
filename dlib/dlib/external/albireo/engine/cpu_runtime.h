@@ -3,6 +3,7 @@
 #ifndef ALBIREO_ENGINE_CPU_RUNTIME_H_
 #define ALBIREO_ENGINE_CPU_RUNTIME_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -27,8 +28,8 @@ namespace albireo
                 The weights stay in the memory mapping of the GGUF file, in their
                 quantized form, and every product goes through the kernels of
                 qkernels.h.  Activations are single-precision floats; keys and values are
-                stored in half precision in a kv_pool, one paged sequence per request
-                slot.
+                stored in a kv_pool, in half precision or in 8-bit integers by groups of
+                kv_q8_group values (kv_format), one paged sequence per request slot.
 
                 The numerical path follows the reference implementations of the
                 supported families: pre-normalization residual blocks with RMS norms,
@@ -45,7 +46,9 @@ namespace albireo
                 block with a running maximum and sum (the softmax of FlashAttention), so
                 that every key and value read from memory serves all the rows of the tile.
                 When the tiles are fewer than the threads, as in the generation of a single
-                answer, each head of the group makes a task of its own.
+                answer, the positions of each tile are split into ranges that tasks read
+                for all the heads of the group, and the partial sums of the ranges are
+                merged (the split of FlashDecoding).
 
                 With a matmul_offload, the products with the weight matrices go through it,
                 and it decides, product by product, whether a device computes them.  When the
@@ -66,7 +69,7 @@ namespace albireo
         !*/
     public:
         cpu_runtime(std::shared_ptr<model_file> file, const model_config& config, thread_pool& pool,
-            size_t kv_budget_bytes, long kv_block_positions = 256);
+            size_t kv_budget_bytes, long kv_block_positions = 256, kv_format kv_type = kv_format::f16);
 
         const model_config& config() const override { return cfg_; }
 
@@ -83,8 +86,11 @@ namespace albireo
         size_t kv_bytes_budget() const override { return kv_.max_blocks() * kv_.block_bytes(); }
         size_t kv_bytes_per_token() const override
         {
-            return 2 * static_cast<size_t>(cfg_.n_layers) * cfg_.kv_dim() * sizeof(uint16_t);
+            return 2 * static_cast<size_t>(cfg_.n_layers) * cfg_.n_kv_heads * kv_row_bytes(kv_.format(), cfg_.head_dim);
         }
+        kv_format kv_type() const { return kv_.format(); }
+        // The check of the memory of the system before each new block of keys and values (kv_pool::set_guard).
+        void set_kv_guard(std::function<bool(size_t, size_t)> guard) { kv_.set_guard(std::move(guard)); }
         void trim_memory() override { kv_.trim(); }
         void set_busy(bool busy) override
         {
@@ -122,6 +128,9 @@ namespace albireo
         // block of the cache stay within a few tens of kilobytes.
         static const long tile_rows = 64;
 
+        // The positions of a range of the split of the attention, at least (attention()).
+        static const long part_positions = 256;
+
         // The tokens of the passes that compare the layers of the device with the processor.
         static const long probe_tokens = 8;
 
@@ -157,6 +166,8 @@ namespace albireo
         // a DeepStack layer added after it.
         void check_given_embeddings(const forward_batch& batch, long T) const;
         void add_given_embeddings(const forward_batch& batch, long slice);
+        // The keys and values of the tokens of a batch, written in the blocks of their sequences.
+        void store_keys_values(long layer, const forward_batch& batch);
         void attention(long layer, const forward_batch& batch, const std::vector<long>& positions);
         void moe_ffn(const layer& L, long n_tokens);
         void embed(const std::vector<int>& tokens);
@@ -210,6 +221,9 @@ namespace albireo
         std::vector<qk_scratch> scratch_;
         std::vector<attention_work> attention_work_;
         std::vector<attention_tile> tiles_;
+        // The partial sums of the ranges of a split attention, and the sequence of each token of a batch.
+        aligned_floats partial_;
+        std::vector<int> token_sequences_;
         std::vector<long> positions_;
     };
 

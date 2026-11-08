@@ -3,15 +3,18 @@
 /*
     Measures the processor runtime on a model:
 
-        bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel]
+        bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel] [f16|q8]
 
     Reports the prompt throughput, the time of one generation step for a single
-    sequence, and the throughput of steps that advance several sequences together.
+    sequence, and the throughput of steps that advance several sequences together, with
+    the keys and values in half precision (by default) or in 8 bits.
 */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -29,18 +32,24 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel]\n");
+        std::printf("usage: bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel] [f16|q8]\n");
         return 2;
     }
     const int threads = argc > 2 ? std::atoi(argv[2]) : static_cast<int>(std::thread::hardware_concurrency());
     const long prompt = argc > 3 ? std::atol(argv[3]) : 128;
     const long steps = argc > 4 ? std::atol(argv[4]) : 32;
     const long parallel = argc > 5 ? std::atol(argv[5]) : 4;
+    const kv_format format = argc > 6 && std::string(argv[6]) == "q8" ? kv_format::q8 : kv_format::f16;
 
     auto file = std::make_shared<model_file>(argv[1]);
     const model_config cfg = read_model_config(*file);
     thread_pool pool(threads);
-    cpu_runtime rt(file, cfg, pool, size_t(1) << 30);
+    // The keys and values of the prompt and of the steps, and of the parallel sequences.
+    const size_t per_token = 2 * static_cast<size_t>(cfg.n_layers) * static_cast<size_t>(cfg.n_kv_heads)
+        * kv_row_bytes(format, cfg.head_dim);
+    const size_t budget = std::max<size_t>(size_t(1) << 30, per_token * static_cast<size_t>(prompt + 2 * steps + 64
+        + parallel * (64 + steps) + 1024));
+    cpu_runtime rt(file, cfg, pool, budget, 256, format);
     std::printf("%s\n", rt.description().c_str());
     file->warm_up(false);
 

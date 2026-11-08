@@ -134,6 +134,108 @@ namespace albireo
         for (; i < n; ++i) dst[i] = qk_float_to_half(src[i]);
     }
 
+    // 8-bit keys and values
+
+    void qk_float_to_q8_row(const float* src, int8_t* dst, uint16_t* scales, long n)
+    {
+        for (long b = 0; b * 32 < n; ++b)
+        {
+            const float* x = src + b * 32;
+            int8_t* q = dst + b * 32;
+            float amax = 0.0f;
+#if ALBIREO_QK_AVX2
+            const __m256 sign = _mm256_set1_ps(-0.0f);
+            const __m256 x0 = _mm256_loadu_ps(x), x1 = _mm256_loadu_ps(x + 8);
+            const __m256 x2 = _mm256_loadu_ps(x + 16), x3 = _mm256_loadu_ps(x + 24);
+            __m256 m = _mm256_max_ps(_mm256_andnot_ps(sign, x0), _mm256_andnot_ps(sign, x1));
+            m = _mm256_max_ps(m, _mm256_max_ps(_mm256_andnot_ps(sign, x2), _mm256_andnot_ps(sign, x3)));
+            __m128 h = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+            h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+            h = _mm_max_ss(h, _mm_movehdup_ps(h));
+            amax = _mm_cvtss_f32(h);
+#else
+            for (long i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+#endif
+            /*
+                The values are quantized with the scale as stored, in half precision, raised to the next half
+                when its rounding brought it so far below amax / 127 that the largest value would round beyond
+                127 (the subnormal halves of the tiny groups), the values then kept within [-127, 127].
+            */
+            uint16_t stored = qk_float_to_half(amax / 127.0f);
+            if (h2f(stored) * 127.5f < amax) ++stored;
+            const float d = h2f(stored);
+            const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+            scales[b] = stored;
+#if ALBIREO_QK_AVX2
+            const __m256 vi = _mm256_set1_ps(inv);
+            const int mode = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+            const __m256 hi = _mm256_set1_ps(127.0f), lo = _mm256_set1_ps(-127.0f);
+            auto level = [&](__m256 x) {
+                const __m256 r = _mm256_round_ps(_mm256_mul_ps(x, vi), mode);
+                return _mm256_cvtps_epi32(_mm256_max_ps(lo, _mm256_min_ps(hi, r)));
+            };
+            __m256i i0 = level(x0);
+            __m256i i1 = level(x1);
+            __m256i i2 = level(x2);
+            __m256i i3 = level(x3);
+            // The packs work on each half of the registers: the order is restored at the end.
+            i0 = _mm256_packs_epi32(i0, i1);
+            i2 = _mm256_packs_epi32(i2, i3);
+            i0 = _mm256_packs_epi16(i0, i2);
+            i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(q), i0);
+#else
+            for (long i = 0; i < 32; ++i)
+            {
+                const float r = std::nearbyint(x[i] * inv);
+                q[i] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, r)));
+            }
+#endif
+        }
+    }
+
+    void qk_q8_to_float_row(const int8_t* src, const uint16_t* scales, float* dst, long n)
+    {
+        for (long b = 0; b * 32 < n; ++b)
+        {
+            const float d = h2f(scales[b]);
+            const int8_t* q = src + b * 32;
+            float* y = dst + b * 32;
+#if ALBIREO_QK_AVX2
+            const __m256 vd = _mm256_set1_ps(d);
+            const __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
+            const __m128i hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q + 16));
+            // Eight values at a time, each widened to 32 bits, converted and scaled.
+            const __m128i eights[4] = { lo, _mm_srli_si128(lo, 8), hi, _mm_srli_si128(hi, 8) };
+            for (int k = 0; k < 4; ++k)
+                _mm256_storeu_ps(y + 8 * k, _mm256_mul_ps(vd, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(eights[k]))));
+#else
+            for (long i = 0; i < 32; ++i) y[i] = d * static_cast<float>(q[i]);
+#endif
+        }
+    }
+
+    void qk_rotate_row(float* x, long n)
+    {
+        for (long i = 0; i < n; ++i)
+            if ((static_cast<uint32_t>(i) * 2654435761u) >> 31) x[i] = -x[i];
+        const long block = n & -n;
+        const float norm = 1.0f / std::sqrt(static_cast<float>(block));
+        for (long b0 = 0; b0 < n; b0 += block)
+        {
+            float* y = x + b0;
+            for (long len = 1; len < block; len <<= 1)
+                for (long i = 0; i < block; i += 2 * len)
+                    for (long j = i; j < i + len; ++j)
+                    {
+                        const float a = y[j], c = y[j + len];
+                        y[j] = a + c;
+                        y[j + len] = a - c;
+                    }
+            for (long i = 0; i < block; ++i) y[i] *= norm;
+        }
+    }
+
     const char* qk_isa()
     {
 #if ALBIREO_QK_VNNI && ALBIREO_QK_VNNI_FORM_EVEX
@@ -2344,63 +2446,100 @@ namespace albireo
         return attention_group(hd) * hd;
     }
 
+    namespace
+    {
+        // The scores of the rows of queries over m keys, which expand(j0, g, to) gives as floats g at a time.
+        template <typename Expand>
+        void attention_scores(const float* Q, long rows, long m, long hd, float* S, long lds, float* scratch,
+            const Expand& expand)
+        {
+            const long G = attention_group(hd);
+            for (long j0 = 0; j0 < m; j0 += G)
+            {
+                const long g = std::min(G, m - j0);
+                expand(j0, g, scratch);
+                long r = 0;
+                for (; r + 2 <= rows; r += 2)
+                {
+                    const float* q[2] = { Q + r * hd, Q + (r + 1) * hd };
+                    long j = 0;
+                    for (; j + 4 <= g; j += 4)
+                    {
+                        float* s[2] = { S + r * lds + j0 + j, S + (r + 1) * lds + j0 + j };
+                        dot_rows_x4<2>(q, scratch + j * hd, hd, s);
+                    }
+                    for (; j < g; ++j)
+                        for (int e = 0; e < 2; ++e) S[(r + e) * lds + j0 + j] = qk_dot_f32(q[e], scratch + j * hd, hd);
+                }
+                for (; r < rows; ++r)
+                {
+                    const float* q[1] = { Q + r * hd };
+                    long j = 0;
+                    for (; j + 4 <= g; j += 4)
+                    {
+                        float* s[1] = { S + r * lds + j0 + j };
+                        dot_rows_x4<1>(q, scratch + j * hd, hd, s);
+                    }
+                    for (; j < g; ++j) S[r * lds + j0 + j] = qk_dot_f32(q[0], scratch + j * hd, hd);
+                }
+            }
+        }
+
+        // The values of m keys weighted and added to the rows of the output, expand giving them as above.
+        template <typename Expand>
+        void attention_values(const float* P, long lds, long rows, long m, long hd, float* O, float* scratch,
+            const Expand& expand)
+        {
+            const long G = attention_group(hd);
+            for (long j0 = 0; j0 < m; j0 += G)
+            {
+                const long g = std::min(G, m - j0);
+                expand(j0, g, scratch);
+                long r = 0;
+                for (; r + 2 <= rows; r += 2)
+                {
+                    const float* p[2] = { P + r * lds + j0, P + (r + 1) * lds + j0 };
+                    float* o[2] = { O + r * hd, O + (r + 1) * hd };
+                    add_weighted_rows<2>(p, scratch, g, hd, o);
+                }
+                for (; r < rows; ++r)
+                {
+                    const float* p[1] = { P + r * lds + j0 };
+                    float* o[1] = { O + r * hd };
+                    add_weighted_rows<1>(p, scratch, g, hd, o);
+                }
+            }
+        }
+    }
+
     void qk_attention_scores(const float* Q, long rows, const uint16_t* K, long m, long hd, float* S, long lds,
         float* scratch)
     {
-        const long G = attention_group(hd);
-        for (long j0 = 0; j0 < m; j0 += G)
-        {
-            const long g = std::min(G, m - j0);
-            qk_half_to_float_row(K + j0 * hd, scratch, g * hd);
-            long r = 0;
-            for (; r + 2 <= rows; r += 2)
-            {
-                const float* q[2] = { Q + r * hd, Q + (r + 1) * hd };
-                long j = 0;
-                for (; j + 4 <= g; j += 4)
-                {
-                    float* s[2] = { S + r * lds + j0 + j, S + (r + 1) * lds + j0 + j };
-                    dot_rows_x4<2>(q, scratch + j * hd, hd, s);
-                }
-                for (; j < g; ++j)
-                    for (int e = 0; e < 2; ++e) S[(r + e) * lds + j0 + j] = qk_dot_f32(q[e], scratch + j * hd, hd);
-            }
-            for (; r < rows; ++r)
-            {
-                const float* q[1] = { Q + r * hd };
-                long j = 0;
-                for (; j + 4 <= g; j += 4)
-                {
-                    float* s[1] = { S + r * lds + j0 + j };
-                    dot_rows_x4<1>(q, scratch + j * hd, hd, s);
-                }
-                for (; j < g; ++j) S[r * lds + j0 + j] = qk_dot_f32(q[0], scratch + j * hd, hd);
-            }
-        }
+        attention_scores(Q, rows, m, hd, S, lds, scratch,
+            [=](long j0, long g, float* to) { qk_half_to_float_row(K + j0 * hd, to, g * hd); });
     }
 
     void qk_attention_values(const float* P, long lds, long rows, const uint16_t* V, long m, long hd, float* O,
         float* scratch)
     {
-        const long G = attention_group(hd);
-        for (long j0 = 0; j0 < m; j0 += G)
-        {
-            const long g = std::min(G, m - j0);
-            qk_half_to_float_row(V + j0 * hd, scratch, g * hd);
-            long r = 0;
-            for (; r + 2 <= rows; r += 2)
-            {
-                const float* p[2] = { P + r * lds + j0, P + (r + 1) * lds + j0 };
-                float* o[2] = { O + r * hd, O + (r + 1) * hd };
-                add_weighted_rows<2>(p, scratch, g, hd, o);
-            }
-            for (; r < rows; ++r)
-            {
-                const float* p[1] = { P + r * lds + j0 };
-                float* o[1] = { O + r * hd };
-                add_weighted_rows<1>(p, scratch, g, hd, o);
-            }
-        }
+        attention_values(P, lds, rows, m, hd, O, scratch,
+            [=](long j0, long g, float* to) { qk_half_to_float_row(V + j0 * hd, to, g * hd); });
+    }
+
+    void qk_attention_scores_q8(const float* Q, long rows, const int8_t* K, const uint16_t* K_scales, long m, long hd,
+        float* S, long lds, float* scratch)
+    {
+        attention_scores(Q, rows, m, hd, S, lds, scratch, [=](long j0, long g, float* to) {
+            qk_q8_to_float_row(K + j0 * hd, K_scales + j0 * (hd / 32), to, g * hd);
+        });
+    }
+
+    void qk_attention_values_q8(const float* P, long lds, long rows, const int8_t* V, const uint16_t* V_scales, long m,
+        long hd, float* O, float* scratch)
+    {
+        attention_values(P, lds, rows, m, hd, O, scratch, [=](long j0, long g, float* to) {
+            qk_q8_to_float_row(V + j0 * hd, V_scales + j0 * (hd / 32), to, g * hd);
+        });
     }
 
     // Encoders

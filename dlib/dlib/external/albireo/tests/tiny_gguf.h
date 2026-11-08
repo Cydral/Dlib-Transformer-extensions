@@ -68,6 +68,13 @@ namespace albireo_test
     class tiny_gguf_writer
     {
     public:
+        // The width of the heads, 16 by default; 32 gives rows of whole groups of 8-bit keys and values.
+        tiny_gguf_writer& head_dim(long hd)
+        {
+            head_dim_ = hd;
+            return *this;
+        }
+
         // The chat template of a model whose reasoning a request switches.
         static std::string switchable_template()
         {
@@ -86,7 +93,8 @@ namespace albireo_test
         tiny_gguf build(const std::string& chat_template = switchable_template())
         {
             out_ = tiny_gguf();
-            const long d = 64, ff = 128, heads = 4, kv_heads = 2, hd = 16, layers = 2;
+            const long d = 64, ff = 128, heads = 4, kv_heads = 2, layers = 2;
+            const long hd = head_dim_;
             std::vector<std::string> tokens = byte_tokens();
             std::vector<int32_t> types(tokens.size(), 1);
             const char* control[] = { "<|endoftext|>", "<|im_start|>", "<|im_end|>" };
@@ -197,6 +205,8 @@ namespace albireo_test
         }
 
     private:
+        long head_dim_ = 16;
+
         static std::vector<std::string> byte_tokens()
         {
             // The printable bytes stand for themselves; the others take the code points

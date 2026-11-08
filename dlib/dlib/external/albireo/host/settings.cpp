@@ -114,6 +114,7 @@ namespace albireo
         j["context"] = context;
         j["max_sequences"] = max_sequences;
         j["kv_mb"] = kv_mb;
+        j["kv_type"] = kv_type;
         json a = json::object();
         for (const auto& kv : active) a[kv.first] = kv.second;
         j["active"] = a;
@@ -145,6 +146,8 @@ namespace albireo
         max_sequences = static_cast<int>(j["max_sequences"].as_int(d.max_sequences));
         if (max_sequences < 1 || max_sequences > 64) max_sequences = d.max_sequences;
         kv_mb = j["kv_mb"].as_int(d.kv_mb);
+        kv_type = j["kv_type"].str(d.kv_type);
+        if (kv_type != "auto" && kv_type != "q8" && kv_type != "f16") kv_type = d.kv_type;
         active.clear();
         for (const auto& kv : j["active"].items())
         {
