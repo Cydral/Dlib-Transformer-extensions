@@ -329,10 +329,11 @@ namespace pseudalis
         }
 
         /*
-            The files of the versions before 1.0.8: the key of their authority, which is
-            never kept now, and on Windows the key of the server in clear, which moves into
-            its encrypted file.  Returns true when the key of the authority was found: a copy
-            of it may have left the computer, and the authority is replaced at once.
+            The files that the earlier design of these certificates wrote, the design of Albireo
+            before Pseudalis took it over: the key of their authority, which is never kept now,
+            and on Windows the key of the server in clear, which moves into its encrypted file.
+            Returns true when the key of the authority was found: a copy of it may have left
+            the computer, and the authority is replaced at once.
         */
         bool migrate(const certificate_files& f)
         {

@@ -13,8 +13,8 @@ namespace pseudalis
         std::string ca_cert;       // PEM of the local authority
         std::string server_cert;   // PEM of the certificate of the local server
         std::string server_key;    // private key of the server: encrypted on Windows, PEM elsewhere
-        std::string plain_key;     // the key in clear of the versions before 1.0.8, on Windows
-        std::string ca_key;        // the key of the authority of the versions before 1.0.8
+        std::string plain_key;     // the key of the server in clear of the earlier design, on Windows
+        std::string ca_key;        // the key of the authority that the earlier design kept
     };
 
     certificate_files certificate_paths(const std::string& dir);
@@ -32,9 +32,9 @@ namespace pseudalis
               browsers accept the local server without warning.
             - Both certificates are valid for 397 days.  When less than 30 days remain, when
               the key of the server does not read or does not match its certificate, or when
-              dir holds the key of an authority of a version before 1.0.8, which may have
-              been copied, a new authority and a new certificate of the server replace them,
-              and renewed is set to true.
+              dir holds the key of an authority kept by the earlier design of these files,
+              which may have been copied, a new authority and a new certificate of the server
+              replace them, and renewed is set to true.
             - On Windows, the private key of the server is encrypted with DPAPI for the
               account that runs this function, LocalSystem for the service, in a file that
               SYSTEM and the administrators alone may open: a copy of that file serves no

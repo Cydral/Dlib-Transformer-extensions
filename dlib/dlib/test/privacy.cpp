@@ -237,6 +237,23 @@ namespace
         return d;
     }
 
+    // Whether the two last digits of a French social security number are its key, 97 minus its
+    // first 13 digits modulo 97, Corsica's 2A and 2B counting as 19 and 18.
+    bool nir_key_valid(const string& nir)
+    {
+        string a;
+        for (char c : nir) if ((c >= '0' && c <= '9') || c == 'A' || c == 'B') a.push_back(c);
+        if (a.size() != 15) return false;
+        if (a[6] == 'A' || a[6] == 'B')
+        {
+            a[6] = a[6] == 'A' ? '9' : '8';
+            a[5] = '1';
+        }
+        long long r = 0;
+        for (size_t k = 0; k < 13; ++k) r = (r * 10 + (a[k] - '0')) % 97;
+        return 97 - r == (a[13] - '0') * 10 + (a[14] - '0');
+    }
+
     void test_pseudonymizer()
     {
         const pseudonymization_key key = pseudonymization_key::from_bytes(string(32, '\x42'));
@@ -267,9 +284,9 @@ namespace
                                                     "78" },
                                                   { pii_type::iban, "FR76 3000 6000 0112 3456 7890 189" },
                                                   { pii_type::iban, "GB29 NWBK 6016 1331 9268 19" },
-                                                  { pii_type::payment_card, "4970 1012 3456 7899" },
-                                                  { pii_type::nir, "1 85 03 75 123 456 13" },
-                                                  { pii_type::nir, "2 69 05 2A 123 456 09" },
+                                                  { pii_type::payment_card, "4970 1012 3456 7893" },
+                                                  { pii_type::nir, "1 85 03 75 123 456 41" },
+                                                  { pii_type::nir, "2 69 05 2A 123 456 88" },
                                                   { pii_type::siret, "732 829 320 00074" },
                                                   { pii_type::mac_address, "00:1A:2B:3C:4D:5E" },
                                                   { pii_type::license_plate, "AB-123-CD" },
@@ -298,8 +315,22 @@ namespace
         for (char& c : lower_surname) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
         DLIB_TEST(p.tag(pii_type::email, "jean.dupont@acme.fr").find(lower_surname) != string::npos);
 
-        // Checksums still verify on protected numbers.
-        DLIB_TEST(luhn(only_digits(tag_body(p.tag(pii_type::payment_card, "4970 1012 3456 7899")))));
+        // Checksums still verify on protected numbers, which keep their layout: the card its first
+        // six digits, the social security number the department 2A of Corsica.
+        const string card = tag_body(p.tag(pii_type::payment_card, "4970 1012 3456 7893"));
+        DLIB_TEST(card.size() == 19 && card.back() != '!' && card[4] == ' ' && card[9] == ' ' && card[14] == ' ');
+        DLIB_TEST(only_digits(card).substr(0, 6) == "497010" && luhn(only_digits(card)));
+        DLIB_TEST(card != "4970 1012 3456 7893");
+        const string nir = tag_body(p.tag(pii_type::nir, "1 85 03 75 123 456 41"));
+        DLIB_TEST(nir.size() == 21 && nir.back() != '!' && nir_key_valid(nir) && nir != "1 85 03 75 123 456 41");
+        const string corsica = tag_body(p.tag(pii_type::nir, "2 69 05 2A 123 456 88"));
+        DLIB_TEST(corsica.size() == 21 && corsica.substr(8, 2) == "2A" && nir_key_valid(corsica));
+        // A number whose check digits are wrong is no card and no social security number: it
+        // takes an opaque code, which still restores it.
+        DLIB_TEST(tag_body(p.tag(pii_type::payment_card, "4970 1012 3456 7899")).back() == '!');
+        DLIB_TEST(tag_body(p.tag(pii_type::nir, "1 85 03 75 123 456 13")).back() == '!');
+        DLIB_TEST(round_trip(p, pii_type::payment_card, "4970 1012 3456 7899"));
+        DLIB_TEST(round_trip(p, pii_type::nir, "1 85 03 75 123 456 13"));
         const string siret = only_digits(tag_body(p.tag(pii_type::siret, "732 829 320 00074")));
         DLIB_TEST(siret.size() == 14 && luhn(siret) && luhn(siret.substr(0, 9)));
         DLIB_TEST(siret.substr(0, 9) == only_digits(tag_body(p.tag(pii_type::siret, "732 829 320"))));

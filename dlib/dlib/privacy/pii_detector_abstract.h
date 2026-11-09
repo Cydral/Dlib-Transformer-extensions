@@ -143,10 +143,14 @@ namespace dlib
                 Finds personal data in UTF-8 text in French, English, Italian, Spanish and
                 German.
 
-                Five channels contribute candidates. Overlaps are resolved by priority,
-                then length, then position: the validated scanners first, then the user
-                patterns and dictionaries, the confident learned spans, the labelled
-                values and the linguistic rules. Typographic spaces read as spaces and
+                Five channels contribute candidates. Each candidate takes the priority of
+                its type, the types of the validated scanners above names, places and
+                organisations, plus a bonus of its channel; overlaps are resolved by
+                priority, then length, then position. Forced values and the user patterns
+                come first, then the validated scanners; within a type, the user terms and
+                the confident learned spans come before the labelled values and the
+                linguistic rules. The imposed terms of the options (pii_imposed_term)
+                outrank every channel. Typographic spaces read as spaces and
                 invisible marks (soft hyphens, zero width spaces) are skipped, so that
                 they hide no value; offsets always point into the original bytes.
 
@@ -352,9 +356,10 @@ namespace dlib
 
                 4. User knowledge. Regular expressions added with add_pattern() and
                    terms added with add_term() describe what is specific to an
-                   organisation; they take precedence over the scanners and the rules.
-                   Existing pseudonymization tags and forced values keep precedence over
-                   them.
+                   organisation. The patterns take precedence over the validated scanners
+                   and the rules; a term ranks with the values of its type, with the bonus
+                   of the confident learned spans. Existing pseudonymization tags and
+                   forced values keep precedence over them.
 
                 5. Learned recognizers added with add_recognizer(): pii_sequence_tagger,
                    pii_span_model or any function with the same signature. Their spans
@@ -415,8 +420,9 @@ namespace dlib
                   most two characters ("EMP-4521", "Dupont Conseil"). A number is matched
                   as a whole: the term "12345" is not found in "A12345".
                 - Does nothing if type is pii_type::none or term holds no word or number.
-                - The term ranks with the rules of its type; the imposed terms of the
-                  options (pii_imposed_term) outrank every channel.
+                - The term ranks with the values of its type, with the bonus of the
+                  confident learned spans; the imposed terms of the options
+                  (pii_imposed_term) outrank every channel.
         !*/
 
         void add_allowed_term(const std::string& term);

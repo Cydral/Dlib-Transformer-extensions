@@ -188,7 +188,7 @@ configure_file(cmake/feed_public_key.h.in ${CMAKE_BINARY_DIR}/generated/feed_pub
 set(PSEUDALIS_SERVICE_SOURCES common/engine_loader.cpp host/main.cpp host/service.cpp host/server.cpp
    host/settings.cpp host/store.cpp host/vault.cpp host/keys.cpp host/albireo_client.cpp host/updater.cpp
    host/http_fetch.cpp host/crypto.cpp host/certificates.cpp)
-# The drives: two folders of the data folder, watched by the service, with their letters on Windows.
+# The drive: a folder of the data folder, watched by the service, with its letter on Windows.
 list(APPEND PSEUDALIS_SERVICE_SOURCES host/drive_folders.cpp)
 if (WIN32)
    list(APPEND PSEUDALIS_SERVICE_SOURCES resources/service.rc)

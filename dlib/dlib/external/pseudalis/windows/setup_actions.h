@@ -129,7 +129,8 @@ namespace setup
     /*
         Registers the service, with the restarts the service manager makes after a failure.
         With keep_start_type, a service in place keeps the start chosen for it (an update);
-        otherwise it starts with Windows, after a delay.
+        otherwise it starts with Windows, without delay, so that the drive is there when the
+        users sign in.
     */
     bool register_service(const std::string& program_dir, bool keep_start_type, std::string& error);
     /*
@@ -313,12 +314,13 @@ namespace setup
 
     /*
         The commands of the Explorer on the files Pseudalis protects and on the folders (Show
-        more options on Windows 11): a cascade "Pseudalis" with Anonymize, Anonymize as a copy,
-        Restore the original and Restore as a copy, which run pseudalis.exe of program_dir.
+        more options on Windows 11): a cascade "Pseudalis" with six commands, Anonymize with
+        tags, Anonymize without tags, the same two as a copy, Restore the original and Restore
+        as a copy, which run pseudalis.exe of program_dir on a selection of up to 100 items.
         labels gives their texts in the language of the installation: "menu", "protect",
-        "protect_copy", "restore" and "restore_copy".  With each_user, the language of the
-        installation follows the system, and the commands take the texts of pseudalis.exe in
-        the language of each user instead.
+        "protect_bare", "protect_copy", "protect_copy_bare", "restore" and "restore_copy".
+        With each_user, the language of the installation follows the system, and the commands
+        take the texts of pseudalis.exe in the language of each user instead.
     */
     bool context_menu_registered();
     bool register_context_menu(const std::string& program_dir, const std::map<std::string, std::wstring>& labels,
