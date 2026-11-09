@@ -1816,12 +1816,6 @@ namespace pseudalis
         p_->terms.swap(converted);
     }
 
-    std::size_t engine::term_count() const
-    {
-        std::lock_guard<std::mutex> lock(p_->terms_m);
-        return p_->terms.size();
-    }
-
     json engine::detect(const std::string& text) const
     {
         pii_detector d(p_->options());

@@ -207,7 +207,6 @@ namespace pseudalis
             it started with for the detectors it already made.
         */
         void set_terms(const std::vector<imposed_term>& terms);
-        std::size_t term_count() const;
 
         std::string key_fingerprint() const;
         // {"tagger", "span_model", "size"}

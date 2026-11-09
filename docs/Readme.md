@@ -6,7 +6,7 @@ The [examples guide](../examples/Readme.md) explains what each program does. The
 
 Every article is published in two places. The Markdown version here is the reference and travels with the code it describes. A companion version is posted on Medium, which is where most readers will find it.
 
-One item in this directory is not an article. The research report on buffer-level residency is a technical paper with its own measurements and references, kept here in PDF because the format is the point: it is meant to be read, printed and cited as a whole rather than browsed a section at a time.
+Two items in this directory are not articles. The research reports on buffer-level residency and on the technical architecture of Pseudalis are technical papers with their own measurements and references, kept here in PDF because the format is the point: they are meant to be read, printed and cited as a whole rather than browsed a section at a time.
 
 ---
 
@@ -24,6 +24,9 @@ What the project covers, the trade between model size and usefulness, and why th
 
 **[Buffer-Level Residency Management for GPU Memory Extension](buffer-level-residency.pdf)** (PDF)  
 A research report on the extended device memory of this fork: how a model larger than the card is streamed through it without any network being told, why the usual place for such a mechanism is one level higher in the stack, and what it costs measured against keeping everything resident. Written in the format of a conference paper rather than an article, with the prior art it sits beside, the measurements, and the limitations stated as such.
+
+**[Technical application architecture of Pseudalis Community](pseudalis-technical-architecture.pdf)** (PDF)  
+A research report on the Windows application that carries the privacy recognizers of this fork to the desk: the service and its programs, the four devices that detect personal data (structured scanners, internal tables, a structural SVM tagger and a byte-level span model), the tags that encrypt each value with FF1 while keeping its form, the restoration with or without tags, the measures of the recognizers, the standards applied and the coverage of the GDPR. Written in the format of a research report, with its figures and its references.
 
 ---
 

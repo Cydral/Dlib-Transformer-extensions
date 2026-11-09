@@ -34,11 +34,6 @@ namespace pseudalis
                 A check made from the menu of the tray downloads the update in the same
                 way and leaves it for the next restart; "apply" restarts at once.
 
-                A machine without Internet access receives the same files on a removable
-                medium: import_offline() reads the signed feed and the installer it names
-                from a folder, checks them as a download would be checked, and stages the
-                update the same way.
-
                 A staged update is the installer of its version in the updates folder, the
                 signed feed that announced it beside it (feed-<version>.json and its .sig),
                 and staged.json, which names them.  The installer is checked against that
@@ -54,11 +49,11 @@ namespace pseudalis
                 Every error, in the state and in the answers, comes as its English text
                 ("error"), its code ("code") and its values ("args", an object), which the
                 tray gives in the language of the user: update_check {e}, update_record
-                {version}, update_feed_missing {version}, update_feed_missing_folder
-                {folder}, update_signature {file}, update_feed_mismatch {file, version},
-                update_outside {file}, update_installer_mismatch {version},
-                update_feed_invalid, update_download {e}, update_not_ready, update_invalid
-                {version}, update_start {code}, update_package_manager and stopping.
+                {version}, update_feed_missing {version}, update_signature {file},
+                update_feed_mismatch {file, version}, update_outside {file},
+                update_installer_mismatch {version}, update_feed_invalid, update_download
+                {e}, update_not_ready, update_invalid {version}, update_start {code},
+                update_package_manager and stopping.
         !*/
     public:
         updater(const std::string& feed_url, const std::string& updates_dir);
@@ -69,19 +64,6 @@ namespace pseudalis
         // Ends a check in progress and refuses the following ones: the service stops.
         void cancel();
         json status() const;
-
-        /*!
-            ensures
-                - Stages the update found in folder: feed.json, feed.json.sig and the
-                  installer the feed names, by its file name ("file", else the name of its
-                  "url"), each read through no link from base (an empty base: the root of
-                  the drive of folder).
-                - Returns {"state": "ready", "version", "installer"} when the update is
-                  staged, {"state": "up_to_date", "version"} when the folder holds this
-                  version or an older one, {"error", "code", "args"} otherwise; "installer"
-                  names the file of the installer in folder once the feed is read.
-        !*/
-        json import_offline(const std::string& folder, const std::string& base);
 
         // The installer of a downloaded update newer than this program, or empty.
         std::string staged_installer() const;
@@ -99,18 +81,15 @@ namespace pseudalis
         bool launch_staged(user_error& error);
 
     private:
-        enum class stage_result { staged, older, failed };
-
         void check();
         /*!
             ensures
                 - Records the installer of version, checked against the signed feed (its
                   exact bytes and signature), as the update of the next start, with the feed
                   beside it.
-                - Returns older, staging nothing, when a newer version is staged, and failed,
-                  with error, when the files cannot be written.
+                - Returns false, with error, when the files cannot be written.
         !*/
-        stage_result stage(const std::string& version, const std::string& sha, const json& notes,
+        bool stage(const std::string& version, const std::string& sha, const json& notes,
             const std::string& feed, const std::string& signature, user_error& error);
         std::string installer_path(const std::string& version) const;
         // The signed feed of the update of version, kept beside its installer.

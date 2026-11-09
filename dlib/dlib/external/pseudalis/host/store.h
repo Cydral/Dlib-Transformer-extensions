@@ -180,7 +180,6 @@ namespace pseudalis
         // Removes the pictures that no file names, the blobs of which the vault then drops; their count.
         size_t remove_unlinked_pictures();
         void link_picture(long long file, const std::string& picture);
-        std::vector<std::string> pictures_of(long long file);
 
         // The files of the folder of the drive as the service left them; their paths compare without case.
         std::vector<folder_file> folder_files(const std::string& folder);

@@ -14,6 +14,11 @@ Cydral Technology, and distributed under the Boost Software License 1.0
 data folder, which the service watches and Windows shows under its letter. The installer of each version
 lies in [`dist/pseudalis`](../../../../dist/pseudalis), where anyone downloads it.
 
+The architecture of the product, its four detection devices, its format-preserving encryption and the
+measures of its recognizers are described in
+[Technical application architecture of Pseudalis Community](../../../../docs/pseudalis-technical-architecture.pdf),
+a research report kept in [`docs/`](../../../../docs).
+
 ## What it does
 
 Each personal value of a document (names, addresses, telephone numbers, e-mail addresses, identifiers,
@@ -253,15 +258,15 @@ by themselves.
 
 ### The icon
 
-The icon in the notification area follows the service: its tooltip gives the version, the drive and
-the number of originals kept, and it notifies the files the drive anonymized or did not process, the
-results of the commands of the Explorer, the updates and a service that stops answering. It tells the
-Explorer of the drive that comes and goes. Its menu opens Pseudalis (the web application), the drive
-and the folder of the files not processed of its user, checks for updates and installs them, manages the
-service, opens the documentation of the interface and the About window. Service management restarts
-the service, and stops it while it runs or starts it while it is stopped: a service stopped there stays
-stopped, without the warning of the icon, until the computer starts again, its start with the system
-unchanged, or until a user starts it.
+The icon in the notification area follows the service: a click opens the web application, once for a
+double click, its tooltip gives the version, the drive and the number of originals kept, and it notifies
+the files the drive anonymized or did not process, the results of the commands of the Explorer, the
+updates and a service that stops answering. It tells the Explorer of the drive that comes and goes. Its
+menu opens Pseudalis (the web application), the drive and the folder of the files not processed of its
+user, checks for updates and installs them, manages the service, opens the documentation of the interface
+and the About window. Service management restarts the service, and stops it while it runs or starts it
+while it is stopped: a service stopped there stays stopped, without the warning of the icon, until the
+computer starts again, its start with the system unchanged, or until a user starts it.
 
 ### Imposed terms
 
@@ -299,13 +304,13 @@ those kept included.
 ### Languages
 
 The installer, the icon, the commands of the Explorer and the web application speak English, French,
-German, Italian and Spanish, and English for any other language. They follow the language of the
-system: the icon and the commands of each user take the language of that user's Windows, the web
-application the first language of the browser that it speaks (its menu chooses another one, kept by the
-browser), and the installer the language of Windows, which its first page changes. The setting
-`language`, `auto` by default, sets one language for every user instead; a language chosen in the
-installer other than the one of Windows becomes that setting. The errors of the service reach the web
-application and the windows as codes, written in their language.
+German, Italian and Spanish, and English for any other language. They follow the language of the system:
+the icon and the commands of each user take the language of that user's Windows, the web application, at
+each opening, the first language of the browser that it speaks (its menu shows another one until the page
+closes), and the installer the language of Windows, which its first page changes. The documentation of
+the interface stays in English. The setting `language`, `auto` by default, sets one language for every
+user instead; a language chosen in the installer other than the one of Windows becomes that setting. The
+errors of the service reach the web application and the windows as codes, written in their language.
 
 ## Programs and data
 

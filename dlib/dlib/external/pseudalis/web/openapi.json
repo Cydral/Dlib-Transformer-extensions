@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",

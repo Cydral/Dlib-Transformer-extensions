@@ -69,10 +69,13 @@ namespace pseudalis
             out.erase("args");
         }
 
+#if defined(_WIN32)
+        // A check of the installer that the service ends as it stops.
         user_error stopping_error()
         {
             return user_error().set("the service stops", "stopping");
         }
+#endif
     }
 
     updater::updater(const std::string& feed_url, const std::string& updates_dir)
@@ -156,7 +159,7 @@ namespace pseudalis
         return join_path(dir_, "feed-" + version + ".json");
     }
 
-    updater::stage_result updater::stage(const std::string& version, const std::string& sha, const json& notes,
+    bool updater::stage(const std::string& version, const std::string& sha, const json& notes,
         const std::string& feed, const std::string& signature, user_error& error)
     {
         const std::string file = installer_path(version);
@@ -166,10 +169,6 @@ namespace pseudalis
         staged["sha256"] = sha;
         staged["notes"] = notes;
         std::lock_guard<std::mutex> lock(m_);
-        // Of a check and an import that end at once, the newer version stays staged.
-        const json& current = staged_;
-        if (current.is_object() && compare_versions(version, current["version"].as_string()) < 0)
-            return stage_result::older;
         // The signed feed first, then staged.json, which names it.
         make_dirs(dir_);
         const std::string copy = feed_path(version);
@@ -178,7 +177,7 @@ namespace pseudalis
         {
             error.set("the update of version " + version + " cannot be recorded in " + dir_, "update_record")
                 .arg("version", version);
-            return stage_result::failed;
+            return false;
         }
         staged_ = staged;
         status_["latest"] = version;
@@ -186,7 +185,7 @@ namespace pseudalis
         status_["file"] = file;
         status_["state"] = "ready";
         clear_error(status_);
-        return stage_result::staged;
+        return true;
     }
 
     bool updater::staged_feed(const std::string& version, uint64_t& size, std::string& sha, user_error& error) const
@@ -264,7 +263,7 @@ namespace pseudalis
             status_[key] = v;
         };
         // A check ended by the service, which stops or goes offline, leaves no error, and
-        // an update staged earlier, from a medium say, stays ready whatever the check finds.
+        // an update staged earlier stays ready whatever the check finds.
         auto ended = [&]() { return cancelled_ || http_cancelled(); };
         auto settle = [&](const std::string& state, const user_error& error) {
             std::lock_guard<std::mutex> lock(m_);
@@ -404,129 +403,15 @@ namespace pseudalis
             }
         }
         user_error staging;
-        switch (stage(latest, sha, notes, body, sig, staging))
+        if (stage(latest, sha, notes, body, sig, staging))
         {
-        case stage_result::staged:
             log_info("updates: version " + latest + " downloaded, applied at the next restart");
-            break;
-        case stage_result::older:
-            // A newer version, imported from a medium meanwhile, stays the one installed.
-            settle("up_to_date", user_error());
-            break;
-        case stage_result::failed:
+        }
+        else
+        {
             fail(staging);
             log_error("updates: " + staging.text);
-            break;
         }
-    }
-
-    json updater::import_offline(const std::string& folder, const std::string& base)
-    {
-        json r = json::object();
-        std::string body, sig;
-        if (!read_file_link_free(join_path(folder, "feed.json"), base, body, 1u << 20)
-            || !read_file_link_free(join_path(folder, "feed.json.sig"), base, sig, 4096))
-        {
-            put_error(r, user_error().set("no signed update feed (feed.json and feed.json.sig) in " + folder,
-                "update_feed_missing_folder").arg("folder", folder));
-            return r;
-        }
-        if (!verify_signature(body, sig, feed_public_key_pem))
-        {
-            const std::string file = join_path(folder, "feed.json");
-            put_error(r, user_error().set("the signature of " + file + " is not valid", "update_signature")
-                .arg("file", file));
-            log_error("updates: " + r["error"].as_string());
-            return r;
-        }
-        const json stable = json::parse_or_null(body)["channels"]["stable"];
-        const std::string latest = stable["version"].as_string();
-        r["version"] = latest;
-        if (!plain_version(latest))
-        {
-            put_error(r, user_error().set("the update feed names no version", "update_feed_invalid"));
-            return r;
-        }
-        std::string staged_version;
-        {
-            std::lock_guard<std::mutex> lock(m_);
-            const json& staged = staged_;
-            staged_version = staged["version"].as_string();
-        }
-        if (compare_versions(latest, PSEUDALIS_VERSION) <= 0)
-        {
-            r["state"] = "up_to_date";
-            return r;
-        }
-        // An older medium never replaces the update staged from a newer one, which stays
-        // the one installed at the next start.
-        if (!staged_version.empty() && compare_versions(latest, staged_version) <= 0)
-        {
-            r["state"] = "ready";
-            r["version"] = staged_version;
-            return r;
-        }
-        const json& inst = stable["installer"];
-        const std::string sha = inst["sha256"].as_string();
-        const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        // The name of the installer beside the feed, else the one of its address.
-        const std::string name = inst["file"].is_string() ? inst["file"].as_string()
-            : file_name(inst["url"].as_string());
-        const std::string source = join_path(folder, name);
-        r["installer"] = name;
-        if (sha.size() != 64 || size == 0 || !plain_name(name))
-        {
-            put_error(r, user_error().set("the update feed is incomplete", "update_feed_invalid"));
-            return r;
-        }
-        // Each pass over the installer ends at once when the service stops.
-        const std::string file = installer_path(latest);
-        if (!(file_exists(file) && sha256_file(file, nullptr, &cancelled_) == sha))
-        {
-            // The installer, read through no link, with its size, then its hash, then copied as it was read.
-            link_free_file installer;
-            std::string why;
-            const bool found = installer.open(source, base, why) && installer.size() == size && installer.links() == 1;
-            if (!found || sha256_open_file(installer, &cancelled_) != sha)
-            {
-                if (cancelled_) put_error(r, stopping_error());
-                else
-                    put_error(r, user_error().set("the installer " + source + " is missing or does not match the feed",
-                        "update_installer_mismatch").arg("version", latest));
-                return r;
-            }
-            make_dirs(dir_);
-            const std::string tmp = file + ".import";
-            remove_file(tmp);
-            if (copy_open_file(installer, tmp, sha, &cancelled_).empty() || !rename_file(tmp, file))
-            {
-                remove_file(tmp);
-                if (cancelled_) put_error(r, stopping_error());
-                else
-                    put_error(r, user_error().set("the installer cannot be copied into " + dir_, "update_record")
-                        .arg("version", latest));
-                return r;
-            }
-        }
-        user_error staging;
-        const stage_result staged = stage(latest, sha, stable["notes"], body, sig, staging);
-        if (staged == stage_result::failed)
-        {
-            log_error("updates: " + staging.text);
-            put_error(r, staging);
-            return r;
-        }
-        r["state"] = "ready";
-        if (staged == stage_result::older)
-        {
-            // A newer version, downloaded meanwhile, stays the one installed.
-            std::lock_guard<std::mutex> lock(m_);
-            const json& current = staged_;
-            r["version"] = current["version"];
-            return r;
-        }
-        log_info("updates: version " + latest + " imported from " + folder + ", applied at the next restart");
-        return r;
     }
 
     std::string updater::staged_installer() const

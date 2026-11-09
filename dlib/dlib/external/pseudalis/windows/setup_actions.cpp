@@ -1291,7 +1291,7 @@ namespace setup
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "pseudalis-setup.exe")) + L"\"";
         str(L"DisplayName", widen(PSEUDALIS_FULL_NAME));
         str(L"DisplayVersion", widen(PSEUDALIS_VERSION));
-        str(L"Publisher", widen(PSEUDALIS_PUBLISHER));
+        str(L"Publisher", widen(PSEUDALIS_AUTHOR_NAME));
         str(L"DisplayIcon", widen(join_path(program_dir, "pseudalis-tray.exe")) + L",0");
         str(L"InstallLocation", dir);
         str(L"UninstallString", setup + L" /uninstall");

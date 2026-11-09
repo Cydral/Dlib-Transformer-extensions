@@ -603,16 +603,6 @@ namespace pseudalis
         s.step();
     }
 
-    std::vector<std::string> store::pictures_of(long long file)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, "SELECT picture FROM file_pictures WHERE file = ?1");
-        s.bind(1, file);
-        std::vector<std::string> out;
-        while (s.step()) out.push_back(s.text(0));
-        return out;
-    }
-
     void store::drive_usage(long long& files, long long& bytes)
     {
         std::lock_guard<std::mutex> lock(m_);

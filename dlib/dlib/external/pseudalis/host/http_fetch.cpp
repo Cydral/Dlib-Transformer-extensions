@@ -428,39 +428,6 @@ namespace pseudalis
 #endif
         }
 
-        // The text of an IPv4 or IPv6 address of a resolution, empty for another family.
-        std::string numeric_address(const sockaddr* a)
-        {
-            char text[INET6_ADDRSTRLEN] = {};
-            const void* bytes = nullptr;
-            if (a && a->sa_family == AF_INET) bytes = &reinterpret_cast<const sockaddr_in*>(a)->sin_addr;
-            else if (a && a->sa_family == AF_INET6) bytes = &reinterpret_cast<const sockaddr_in6*>(a)->sin6_addr;
-            if (!bytes || !inet_ntop(a->sa_family, bytes, text, sizeof(text))) return std::string();
-            return text;
-        }
-
-        // Resolves host with getaddrinfo(), which answers in the time of the resolver of the system.
-        bool resolve_unbounded(const std::string& host, std::vector<std::string>& addresses, std::string& error)
-        {
-            addrinfo hints = {};
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-            addrinfo* list = nullptr;
-            const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &list);
-            if (rc != 0)
-            {
-                error = "the name of the server cannot be resolved (error " + std::to_string(rc) + ")";
-                return false;
-            }
-            for (const addrinfo* a = list; a; a = a->ai_next)
-            {
-                const std::string text = numeric_address(a->ai_addr);
-                if (!text.empty()) addresses.push_back(text);
-            }
-            freeaddrinfo(list);
-            return true;
-        }
-
         // The port of an origin, "https://host:port".
         int port_of(const std::string& origin)
         {
@@ -560,59 +527,6 @@ namespace pseudalis
     {
         std::lock_guard<std::mutex> lock(active_m);
         active.erase(c_);
-    }
-
-    bool http_proxy_for(const std::string& origin, std::string& host, int& port, std::string& user,
-        std::string& password)
-    {
-        proxy_address p;
-        const std::string proxy = proxy_for(origin);
-        const bool via_proxy = !proxy.empty() && parse_proxy(proxy, p);
-        host = via_proxy ? p.host : std::string();
-        port = via_proxy ? p.port : 0;
-        user = via_proxy ? p.user : std::string();
-        password = via_proxy ? p.password : std::string();
-        return via_proxy;
-    }
-
-    bool http_resolve(const std::string& host, std::vector<std::string>& addresses, std::string& error)
-    {
-        addresses.clear();
-        if (cancelled)
-        {
-            error = cancelled_error();
-            return false;
-        }
-#if defined(_WIN32)
-        std::unique_ptr<lookup> l = lookup_bounded(host, error);
-        if (l)
-        {
-            for (const ADDRINFOEXW* a = l->result; a; a = a->ai_next)
-            {
-                const std::string text = numeric_address(a->ai_addr);
-                if (!text.empty()) addresses.push_back(text);
-            }
-            free_lookup(l);
-        }
-        // Without the functions of a bounded resolution, the resolver of the system answers in its own time.
-        else if (!error.empty() || !resolve_unbounded(host, addresses, error))
-        {
-            return false;
-        }
-#else
-        if (!resolve_unbounded(host, addresses, error)) return false;
-#endif
-        if (cancelled)
-        {
-            error = cancelled_error();
-            return false;
-        }
-        if (addresses.empty())
-        {
-            error = "the name of the server has no address";
-            return false;
-        }
-        return true;
     }
 
     bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes, int timeout_seconds)

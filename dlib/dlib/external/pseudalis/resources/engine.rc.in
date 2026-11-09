@@ -18,7 +18,7 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", PSEUDALIS_PUBLISHER
+            VALUE "CompanyName", PSEUDALIS_AUTHOR_NAME
             VALUE "FileDescription", "@PSEUDALIS_RC_DESCRIPTION@"
             VALUE "FileVersion", PSEUDALIS_VERSION
             VALUE "InternalName", "@PSEUDALIS_RC_FILE@"

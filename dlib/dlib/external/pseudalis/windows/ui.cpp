@@ -128,8 +128,8 @@ namespace ui
 
     void init()
     {
-        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS |
-            ICC_TAB_CLASSES | ICC_LINK_CLASS | ICC_BAR_CLASSES };
+        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_TAB_CLASSES |
+            ICC_LINK_CLASS | ICC_BAR_CLASSES };
         InitCommonControlsEx(&icc);
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
@@ -169,7 +169,6 @@ namespace ui
 
     COLORREF color_background() { return RGB(250, 251, 254); }
     COLORREF color_text() { return RGB(23, 26, 43); }
-    COLORREF color_faint() { return RGB(110, 116, 140); }
     COLORREF color_accent() { return RGB(61, 107, 255); }
 
     HBRUSH background_brush()
@@ -288,15 +287,6 @@ namespace ui
     {
         HWND c = create(parent, PROGRESS_CLASSW, L"", PBS_SMOOTH, id);
         SendMessageW(c, PBM_SETRANGE32, 0, 1000);
-        return c;
-    }
-
-    HWND listview(HWND parent, int id, DWORD style)
-    {
-        const DWORD list_style = WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | style;
-        HWND c = create(parent, WC_LISTVIEWW, L"", list_style, id, WS_EX_CLIENTEDGE);
-        ListView_SetExtendedListViewStyle(c, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        set_font(c, parent);
         return c;
     }
 

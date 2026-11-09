@@ -7,8 +7,8 @@
 // installer over an installation.
 #define PSEUDALIS_VERSION_MAJOR 1
 #define PSEUDALIS_VERSION_MINOR 0
-#define PSEUDALIS_VERSION_PATCH 5
-#define PSEUDALIS_VERSION "1.0.5"
+#define PSEUDALIS_VERSION_PATCH 6
+#define PSEUDALIS_VERSION "1.0.6"
 
 #define PSEUDALIS_PRODUCT_NAME "Pseudalis"
 /*
@@ -24,7 +24,6 @@
 #ifndef PSEUDALIS_FULL_NAME
 #define PSEUDALIS_FULL_NAME "Pseudalis Community"
 #endif
-#define PSEUDALIS_PUBLISHER "Cydral Technology"
 #define PSEUDALIS_AUTHOR_NAME "Aldric Pierrain"
 #define PSEUDALIS_AUTHOR_EMAIL "cydraltechnology@gmail.com"
 #define PSEUDALIS_COPYRIGHT "Copyright (C) 2026 Cydral Technology"

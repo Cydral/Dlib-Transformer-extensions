@@ -28,7 +28,6 @@ namespace pseudalis
         int port = 0;
         std::string ca;
         std::chrono::steady_clock::time_point used;
-        unsigned long long opened = 0;
     };
 
     namespace
@@ -92,12 +91,6 @@ namespace pseudalis
         kept_ = std::make_shared<kept_connection>();
     }
 
-    unsigned long long service_client::poll_connections() const
-    {
-        std::lock_guard<std::mutex> lock(kept_->m);
-        return kept_->opened;
-    }
-
     bool service_client::poll(const std::string& path, json& out, std::string& error, int timeout_seconds) const
     {
         kept_connection& k = *kept_;
@@ -119,7 +112,6 @@ namespace pseudalis
             k.client->set_read_timeout(timeout_seconds);
             k.client->set_write_timeout(timeout_seconds);
             const bool reused = k.client->is_socket_open() != 0;
-            if (!reused) ++k.opened;
             r = k.client->Get(path, h);
             k.used = std::chrono::steady_clock::now();
             if (r) break;

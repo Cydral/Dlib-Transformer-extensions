@@ -45,7 +45,6 @@ namespace ui
     // Colors of the windows.
     COLORREF color_background();
     COLORREF color_text();
-    COLORREF color_faint();
     COLORREF color_accent();
     HBRUSH background_brush();
 
@@ -66,7 +65,6 @@ namespace ui
     HWND edit(HWND parent, const std::wstring& text, int id, DWORD style = 0);
     HWND combo(HWND parent, int id);
     HWND progress(HWND parent, int id);
-    HWND listview(HWND parent, int id, DWORD style = 0);
 
     void place(HWND control, int x, int y, int w, int h);
     // Width of a button for its text and font, at least min_width pixels.

@@ -10,13 +10,17 @@
   // The text card is ready: its marks follow the language (renderMarks()).
   let textReady = false;
 
-  /* The language of the page: the one chosen in its menu, else the first language of the
-     browser, which follows the system unless its user chose otherwise, that the application
-     knows, else English. */
+  /* The language of the page: the one chosen in its menu while the page stays open, else the
+     first language of the browser, which follows the system unless its user chose otherwise,
+     that the application knows, else English.  A choice kept in the browser by an earlier
+     version goes, so that each opening of the application takes the language of the browser. */
   function pick() {
-    let saved = null;
-    try { saved = localStorage.getItem('pseudalis.language'); } catch (e) { /* storage unavailable */ }
-    if (saved && texts[saved]) return saved;
+    let chosen = null;
+    try {
+      chosen = sessionStorage.getItem('pseudalis.language');
+      localStorage.removeItem('pseudalis.language');
+    } catch (e) { /* storage unavailable */ }
+    if (chosen && texts[chosen]) return chosen;
     const wanted = navigator.languages && navigator.languages.length ? navigator.languages
       : [navigator.language || 'en'];
     for (let i = 0; i < wanted.length; ++i) {
@@ -1003,7 +1007,7 @@
   select.value = language;
   select.addEventListener('change', function () {
     language = select.value;
-    try { localStorage.setItem('pseudalis.language', language); } catch (e) { /* storage unavailable */ }
+    try { sessionStorage.setItem('pseudalis.language', language); } catch (e) { /* storage unavailable */ }
     translate();
   });
   translate();

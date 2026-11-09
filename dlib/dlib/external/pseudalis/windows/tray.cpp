@@ -101,6 +101,8 @@ namespace pseudalis
             bool stopped_by_user = false;
             // The web application opens once the service answers.
             bool open_pending = false;
+            // The last selection of the icon (GetTickCount64), by a click or by the keyboard.
+            ULONGLONG last_selection = 0;
             bool polling = false;
             int icon_state = -1;
             std::string notified_update;
@@ -237,6 +239,18 @@ namespace pseudalis
                 size, size, LR_DEFAULTCOLOR));
         }
 
+        /*
+            Changes the icon with flags and gives its tooltip again: with NOTIFYICON_VERSION_4,
+            the shell keeps the standard tooltip only for a change that names NIF_SHOWTIP, and
+            the icon would otherwise show an empty bubble.  An empty text names no NIF_SHOWTIP,
+            so that the icon shows no tooltip at all.
+        */
+        void modify_icon(NOTIFYICONDATAW& n, UINT flags)
+        {
+            n.uFlags = flags | NIF_TIP | (n.szTip[0] ? NIF_SHOWTIP : 0);
+            Shell_NotifyIconW(NIM_MODIFY, &n);
+        }
+
         // 0: the service answers, 1: it does not, 2: an update is ready.
         void set_icon(int state)
         {
@@ -245,8 +259,7 @@ namespace pseudalis
             static const int ids[] = { IDI_TRAY, IDI_TRAY_OFF, IDI_TRAY_UPDATE };
             HICON old = tray.nid.hIcon;
             tray.nid.hIcon = load_icon(ids[state], GetSystemMetrics(SM_CXSMICON));
-            tray.nid.uFlags = NIF_ICON;
-            Shell_NotifyIconW(NIM_MODIFY, &tray.nid);
+            modify_icon(tray.nid, NIF_ICON);
             if (old) DestroyIcon(old);
         }
 
@@ -256,20 +269,30 @@ namespace pseudalis
             if (t == tray.nid.szTip) return;
             wcsncpy(tray.nid.szTip, t.c_str(), 127);
             tray.nid.szTip[127] = 0;
-            tray.nid.uFlags = NIF_TIP | NIF_SHOWTIP;
-            Shell_NotifyIconW(NIM_MODIFY, &tray.nid);
+            modify_icon(tray.nid, 0);
         }
 
         void notify(const std::wstring& title, const std::wstring& text, bool warning = false)
         {
             NOTIFYICONDATAW n = tray.nid;
-            n.uFlags = NIF_INFO;
             wcsncpy(n.szInfoTitle, title.substr(0, 63).c_str(), 63);
             n.szInfoTitle[63] = 0;
             wcsncpy(n.szInfo, text.substr(0, 255).c_str(), 255);
             n.szInfo[255] = 0;
             n.dwInfoFlags = (warning ? NIIF_WARNING : NIIF_INFO) | NIIF_RESPECT_QUIET_TIME;
-            Shell_NotifyIconW(NIM_MODIFY, &n);
+            modify_icon(n, NIF_INFO);
+        }
+
+        /*
+            Whether a selection of the icon comes later than the time of a double click after
+            the one before: a double click, or a key held, opens the application once.
+        */
+        bool first_selection()
+        {
+            const ULONGLONG now = GetTickCount64();
+            const bool first = now - tray.last_selection > GetDoubleClickTime();
+            tray.last_selection = now;
+            return first;
         }
 
         void add_icon()
@@ -995,16 +1018,20 @@ namespace pseudalis
             switch (msg)
             {
             case WM_TRAY:
+                /*
+                    With NOTIFYICON_VERSION_4, a click comes as NIN_SELECT besides its mouse
+                    messages, the keyboard as NIN_KEYSELECT, and the menu as WM_CONTEXTMENU,
+                    besides the messages of the right button: each action answers one message.
+                */
                 switch (LOWORD(lp))
                 {
-                case WM_LBUTTONUP:
                 case NIN_SELECT:
                 case NIN_KEYSELECT:
+                    if (!first_selection()) return 0;
                     if (tray.online) open_app();
                     else show_menu();
                     return 0;
                 case WM_CONTEXTMENU:
-                case WM_RBUTTONUP:
                     show_menu();
                     return 0;
                 default:

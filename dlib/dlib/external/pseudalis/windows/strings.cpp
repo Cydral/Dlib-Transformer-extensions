@@ -114,21 +114,6 @@ namespace pseudalis
             { "err_service", { "The Pseudalis service does not answer ({e}).",
                 "Le service Pseudalis ne répond pas ({e}).", "Der Pseudalis-Dienst antwortet nicht ({e}).",
                 "Il servizio Pseudalis non risponde ({e}).", "El servicio Pseudalis no responde ({e})." } },
-            { "err_port_unavailable", { "The port {port} is in use or cannot be opened: choose another one.",
-                "Le port {port} est utilisé ou ne peut pas être ouvert : choisissez-en un autre.",
-                "Der Port {port} wird verwendet oder kann nicht geöffnet werden: Wählen Sie einen anderen.",
-                "La porta {port} è in uso o non può essere aperta: sceglietene un'altra.",
-                "El puerto {port} está en uso o no se puede abrir: elija otro." } },
-            { "err_proxy_password", { "The masked password of the proxy applies to its saved address and user only: "
-                "type the password again.",
-                "Le mot de passe masqué du proxy ne vaut que pour l'adresse et l'utilisateur enregistrés : "
-                "saisissez à nouveau le mot de passe.",
-                "Das maskierte Kennwort des Proxys gilt nur für die gespeicherte Adresse und den gespeicherten "
-                "Benutzer: Geben Sie das Kennwort erneut ein.",
-                "La password mascherata del proxy vale solo per l'indirizzo e l'utente salvati: digitate di nuovo "
-                "la password.",
-                "La contraseña oculta del proxy solo sirve para la dirección y el usuario guardados: escriba de "
-                "nuevo la contraseña." } },
             { "err_update_check", { "The update check failed: {e}", "La recherche de mise à jour a échoué : {e}",
                 "Die Update-Suche ist fehlgeschlagen: {e}", "La ricerca di aggiornamenti non è riuscita: {e}",
                 "La búsqueda de actualizaciones falló: {e}" } },
@@ -145,12 +130,6 @@ namespace pseudalis
                 "firmato.",
                 "Junto al programa de instalación de la versión {version} no hay ningún canal de actualización "
                 "firmado." } },
-            { "err_update_feed_missing_folder", { "{folder} holds no signed update feed (feed.json and "
-                "feed.json.sig).",
-                "{folder} ne contient aucun flux de mise à jour signé (feed.json et feed.json.sig).",
-                "{folder} enthält keinen signierten Update-Feed (feed.json und feed.json.sig).",
-                "{folder} non contiene alcun feed di aggiornamento firmato (feed.json e feed.json.sig).",
-                "{folder} no contiene ningún canal de actualización firmado (feed.json y feed.json.sig)." } },
             { "err_update_signature", { "The signature of {file} is not valid.",
                 "La signature de {file} n'est pas valide.", "Die Signatur von {file} ist ungültig.",
                 "La firma di {file} non è valida.", "La firma de {file} no es válida." } },
