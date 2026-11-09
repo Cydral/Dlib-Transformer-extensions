@@ -88,6 +88,13 @@ if [ -x "$BUILD/tests/test_runtime" ]; then
 else skip "attention" "no $BUILD/tests/test_runtime"
 fi
 
+# The attention of a device on the same tiny model, through the host code of dlib, when the tree
+# was configured with ALBIREO_ENGINE_DLIB=ON.
+if [ -x "$BUILD/tests/test_offload" ]; then
+  step "attention of the device" "all checks passed" "$BUILD/tests/test_offload" synthetic "$WORK"
+else skip "attention of the device" "no $BUILD/tests/test_offload (ALBIREO_ENGINE_DLIB=ON)"
+fi
+
 # Damaged model files, the chat format of the agents and the C interface of an engine under
 # concurrent requests, on tiny models the tests write in the work folder.
 if [ -x "$BUILD/tests/test_model_file" ]; then

@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.12 LANGUAGES C CXX)
+project(albireo VERSION 1.0.13 LANGUAGES C CXX)
 
 # The version is written in four places that must agree: project() above, the numbers of
 # common/version.h, which the version resources of the programs and of the installer carry and

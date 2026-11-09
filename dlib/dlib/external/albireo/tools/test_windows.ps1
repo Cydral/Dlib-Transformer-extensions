@@ -14,7 +14,8 @@
     than 2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on
     the device of -Device (CPU by default, which every machine has) and a question to the
     OpenVINO engine; with the CUDA tree, when the machine has a card it supports, a question to
-    the CUDA engine, then test_device_ops and test_offload on the card; the embedding model;
+    the CUDA engine, then test_device_ops, test_offload on the card and its check of the attention
+    of the card on a tiny model; the embedding model;
     the models that come with Albireo, prepared by the build, and a question to their language
     model, these engine steps with the PATH of the service, System32 and the Windows folder
     only; a sentence read aloud by the program of the speech synthesis; then the installed
@@ -162,12 +163,15 @@ try {
         else {
             Invoke-Check "engine cuda" "Paris" $chat @($cudaEngine, $Model, "--reasoning", "off", "--max", "40",
                 $question) | Out-Null
-            # The operations of dlib on the weights in their GGUF formats, then the products and the
-            # layers of the card against the processor.
+            # The operations of dlib on the weights in their GGUF formats and of the attention, then the
+            # products and the layers of the card against the processor, and the attention of the card
+            # on a tiny model written in the folder of the logs.
             Invoke-Check "cuda operations" "all checks passed" (Join-Path $cuda "tests\test_device_ops.exe") @() |
                 Out-Null
             Invoke-Check "offload cuda" "all checks passed" (Join-Path $cuda "tests\test_offload.exe") @($Model) |
                 Out-Null
+            Invoke-Check "attention cuda" "all checks passed" (Join-Path $cuda "tests\test_offload.exe") @(
+                "synthetic", $logs) | Out-Null
         }
     }
     else {

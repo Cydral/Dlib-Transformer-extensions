@@ -157,6 +157,8 @@ namespace albireo
         layer_pass_checked_ = false;
         layer_pass_memory_failures_ = 0;
         layer_pass_wait_ = 0;
+        attention_wait_ = 0;
+        attention_interval_ = 0;
         if (!offload_ || cfg_.is_moe()) return;
         dense_model m;
         m.d_model = cfg_.d_model;
@@ -165,6 +167,16 @@ namespace albireo
         m.d_ffn = cfg_.d_ffn;
         m.rms_eps = static_cast<float>(cfg_.rms_eps);
         m.residual_scale = static_cast<float>(cfg_.residual_scale);
+        m.n_heads = cfg_.n_heads;
+        m.n_kv_heads = cfg_.n_kv_heads;
+        m.head_dim = cfg_.head_dim;
+        m.rope_dims = cfg_.rope_dims;
+        m.neox = cfg_.rope == rope_style::neox;
+        m.attention_scale = cfg_.attention_scale > 0.0
+            ? static_cast<float>(cfg_.attention_scale)
+            : 1.0f / std::sqrt(static_cast<float>(cfg_.head_dim));
+        // The temperature of the attention of the long positions stays with the processor.
+        m.attention = cfg_.attn_temp_scale == 0.0;
         for (const layer& L : layers_)
         {
             dense_layer l;
@@ -177,6 +189,17 @@ namespace albireo
             l.w_gate = L.w_gate;
             l.w_up = L.w_up;
             l.w_down = L.w_down;
+            if (!L.bq.empty())
+            {
+                l.bq = L.bq.data();
+                l.bk = L.bk.data();
+                l.bv = L.bv.data();
+            }
+            if (!L.q_norm.empty())
+            {
+                l.q_norm = L.q_norm.data();
+                l.k_norm = L.k_norm.data();
+            }
             m.layers.push_back(l);
         }
         layer_pass_ = offload_->make_layer_pass(m);
@@ -200,17 +223,20 @@ namespace albireo
             const int s = free_sequences_.back();
             free_sequences_.pop_back();
             sequences_[static_cast<size_t>(s)].reset(new kv_sequence());
+            sequence_pools_[static_cast<size_t>(s)] = &kv_;
             return s;
         }
         sequences_.emplace_back(new kv_sequence());
+        sequence_pools_.push_back(&kv_);
         return static_cast<int>(sequences_.size() - 1);
     }
 
     void cpu_runtime::release_sequence(int seq)
     {
         if (seq < 0 || static_cast<size_t>(seq) >= sequences_.size() || !sequences_[static_cast<size_t>(seq)]) return;
-        sequences_[static_cast<size_t>(seq)]->clear(kv_);
+        sequences_[static_cast<size_t>(seq)]->clear(pool_of(seq));
         sequences_[static_cast<size_t>(seq)].reset();
+        sequence_pools_[static_cast<size_t>(seq)] = &kv_;
         free_sequences_.push_back(seq);
     }
 
@@ -221,20 +247,27 @@ namespace albireo
 
     void cpu_runtime::truncate_sequence(int seq, long length)
     {
-        sequences_.at(static_cast<size_t>(seq))->truncate(kv_, length);
+        kv_sequence& s = *sequences_.at(static_cast<size_t>(seq));
+        kv_pool& pool = pool_of(seq);
+        const long B = pool.block_positions();
+        // The copies of the device forget the rows the sequence gives up in the block it keeps last.
+        if (layer_pass_ && length >= 0 && length < s.length && length % B != 0)
+            layer_pass_->truncated(pool, s.blocks[static_cast<size_t>(length / B)], length % B);
+        s.truncate(pool, length);
     }
 
     bool cpu_runtime::reserve_sequence(int seq, long length)
     {
-        return sequences_.at(static_cast<size_t>(seq))->reserve(kv_, length);
+        return sequences_.at(static_cast<size_t>(seq))->reserve(pool_of(seq), length);
     }
 
     bool cpu_runtime::copy_sequence(int src, int dst, long length)
     {
         const kv_sequence& s = *sequences_.at(static_cast<size_t>(src));
         kv_sequence& d = *sequences_.at(static_cast<size_t>(dst));
+        if (&pool_of(src) != &pool_of(dst)) throw std::logic_error("cpu_runtime: sequences of two pools");
         // The full blocks are shared; each sequence copies a shared block before writing in it.
-        return d.share_prefix(kv_, s, length);
+        return d.share_prefix(pool_of(dst), s, length);
     }
 
     // Building blocks
@@ -454,13 +487,15 @@ namespace albireo
         const long hd = cfg_.head_dim;
         const long kvd = cfg_.kv_dim();
         const long B = kv_.block_positions();
-        const bool q8 = kv_.format() == kv_format::q8;
         const long scales_per_row = hd / kv_q8_group;
         token_sequences_.resize(static_cast<size_t>(T));
         for (const auto& s : batch.segments)
             for (long j = 0; j < s.count; ++j) token_sequences_[static_cast<size_t>(s.start + j)] = s.sequence;
         auto one = [&](long t, int thread) {
-            const kv_sequence& seq = *sequences_[static_cast<size_t>(token_sequences_[static_cast<size_t>(t)])];
+            const int sequence = token_sequences_[static_cast<size_t>(t)];
+            const kv_sequence& seq = *sequences_[static_cast<size_t>(sequence)];
+            kv_pool& kv = pool_of(sequence);
+            const bool q8 = kv.format() == kv_format::q8;
             const long pos = positions_[static_cast<size_t>(t)];
             const int block = seq.blocks[static_cast<size_t>(pos / B)];
             const long row = pos % B;
@@ -474,15 +509,15 @@ namespace albireo
                     // The keys are stored rotated (qk_rotate_row), the queries being rotated alike.
                     std::copy(k, k + hd, rotated);
                     qk_rotate_row(rotated, hd);
-                    qk_float_to_q8_row(rotated, reinterpret_cast<int8_t*>(kv_.keys(block, li, h)) + row * hd,
-                        kv_.key_scales(block, li, h) + row * scales_per_row, hd);
-                    qk_float_to_q8_row(v, reinterpret_cast<int8_t*>(kv_.values(block, li, h)) + row * hd,
-                        kv_.value_scales(block, li, h) + row * scales_per_row, hd);
+                    qk_float_to_q8_row(rotated, reinterpret_cast<int8_t*>(kv.keys(block, li, h)) + row * hd,
+                        kv.key_scales(block, li, h) + row * scales_per_row, hd);
+                    qk_float_to_q8_row(v, reinterpret_cast<int8_t*>(kv.values(block, li, h)) + row * hd,
+                        kv.value_scales(block, li, h) + row * scales_per_row, hd);
                 }
                 else
                 {
-                    qk_float_to_half_row(k, reinterpret_cast<uint16_t*>(kv_.keys(block, li, h)) + row * hd, hd);
-                    qk_float_to_half_row(v, reinterpret_cast<uint16_t*>(kv_.values(block, li, h)) + row * hd, hd);
+                    qk_float_to_half_row(k, reinterpret_cast<uint16_t*>(kv.keys(block, li, h)) + row * hd, hd);
+                    qk_float_to_half_row(v, reinterpret_cast<uint16_t*>(kv.values(block, li, h)) + row * hd, hd);
                 }
             }
         };
@@ -501,7 +536,6 @@ namespace albireo
         const long qd = cfg_.q_dim();
         const long rep = cfg_.n_heads / KVH;
         const long B = kv_.block_positions();
-        const bool q8 = kv_.format() == kv_format::q8;
         const long scales_per_row = hd / kv_q8_group;
         const float scale = cfg_.attention_scale > 0.0
             ? static_cast<float>(cfg_.attention_scale)
@@ -540,6 +574,8 @@ namespace albireo
             const long part = item % parts;
             const long h0 = kvh * rep;
             const kv_sequence& seq = *sequences_[static_cast<size_t>(tile.sequence)];
+            kv_pool& kv = pool_of(tile.sequence);
+            const bool q8 = kv.format() == kv_format::q8;
             attention_work& w = attention_work_[static_cast<size_t>(thread)];
             const long rows = tile.count * rep;
             const long last = positions[static_cast<size_t>(tile.start + tile.count - 1)];
@@ -567,12 +603,12 @@ namespace albireo
                 const long m = std::min(B - first, end - p);
                 if (q8)
                     qk_attention_scores_q8(w.q.data(), rows,
-                        reinterpret_cast<const int8_t*>(kv_.keys(block, layer_index, kvh)) + first * hd,
-                        kv_.key_scales(block, layer_index, kvh) + first * scales_per_row, m, hd, w.s.data(), B,
+                        reinterpret_cast<const int8_t*>(kv.keys(block, layer_index, kvh)) + first * hd,
+                        kv.key_scales(block, layer_index, kvh) + first * scales_per_row, m, hd, w.s.data(), B,
                         w.scratch.data());
                 else
                     qk_attention_scores(w.q.data(), rows,
-                        reinterpret_cast<const uint16_t*>(kv_.keys(block, layer_index, kvh)) + first * hd, m, hd,
+                        reinterpret_cast<const uint16_t*>(kv.keys(block, layer_index, kvh)) + first * hd, m, hd,
                         w.s.data(), B, w.scratch.data());
                 for (long a = 0; a < tile.count; ++a)
                 {
@@ -601,12 +637,12 @@ namespace albireo
                 }
                 if (q8)
                     qk_attention_values_q8(w.s.data(), B, rows,
-                        reinterpret_cast<const int8_t*>(kv_.values(block, layer_index, kvh)) + first * hd,
-                        kv_.value_scales(block, layer_index, kvh) + first * scales_per_row, m, hd, w.o.data(),
+                        reinterpret_cast<const int8_t*>(kv.values(block, layer_index, kvh)) + first * hd,
+                        kv.value_scales(block, layer_index, kvh) + first * scales_per_row, m, hd, w.o.data(),
                         w.scratch.data());
                 else
                     qk_attention_values(w.s.data(), B, rows,
-                        reinterpret_cast<const uint16_t*>(kv_.values(block, layer_index, kvh)) + first * hd, m, hd,
+                        reinterpret_cast<const uint16_t*>(kv.values(block, layer_index, kvh)) + first * hd, m, hd,
                         w.o.data(), w.scratch.data());
                 p += m;
             }
@@ -747,6 +783,55 @@ namespace albireo
         return !(cfg_.n_deepstack > 0 && !batch.embedding_rows.empty());
     }
 
+    bool cpu_runtime::plan_attention(const forward_batch& batch, bool given)
+    {
+        const long T = static_cast<long>(batch.tokens.size());
+        const long R = cfg_.rope_dims;
+        const long half = R / 2;
+        attention_plan& p = plan_;
+        p.pool = nullptr;
+        p.positions.assign(static_cast<size_t>(T), 0);
+        p.firsts.assign(static_cast<size_t>(T), 0);
+        p.blocks.clear();
+        p.segments.clear();
+        p.angles.resize(static_cast<size_t>(T * R));
+        for (const auto& s : batch.segments)
+        {
+            // The sequences of a pass share a pool, whose blocks the device copies.
+            kv_pool& pool = pool_of(s.sequence);
+            if (p.pool && p.pool != &pool) return false;
+            p.pool = &pool;
+            const kv_sequence& seq = *sequences_[static_cast<size_t>(s.sequence)];
+            const long B = pool.block_positions();
+            attention_plan::segment g;
+            g.first = static_cast<long>(p.blocks.size());
+            g.length = seq.length;
+            g.count = s.count;
+            const size_t blocks = static_cast<size_t>((seq.length + s.count + B - 1) / B);
+            if (blocks > seq.blocks.size()) return false;
+            p.blocks.insert(p.blocks.end(), seq.blocks.begin(), seq.blocks.begin() + static_cast<long>(blocks));
+            p.segments.push_back(g);
+            for (long j = 0; j < s.count; ++j)
+            {
+                const size_t t = static_cast<size_t>(s.start + j);
+                p.positions[t] = positions_[t];
+                p.firsts[t] = g.first;
+            }
+        }
+        // The angles of each token, from the positions the batch gives or from the position of the token.
+        for (long t = 0; t < T; ++t)
+        {
+            const size_t at = given ? static_cast<size_t>(t * half)
+                : static_cast<size_t>(positions_[static_cast<size_t>(t)] * half);
+            const float* c = (given ? given_cos_ : rope_cos_).data() + at;
+            const float* sn = (given ? given_sin_ : rope_sin_).data() + at;
+            float* a = p.angles.data() + t * R;
+            std::copy(c, c + half, a);
+            std::copy(sn, sn + half, a + half);
+        }
+        return p.pool != nullptr;
+    }
+
     void cpu_runtime::drop_layer_pass(const std::string& why)
     {
         layer_pass_->report(false, why);
@@ -755,14 +840,23 @@ namespace albireo
 
     /*
         Runs n tokens in a sequence of their own through the layers of the device, then through
-        the processor alone, and compares their logits: 1 when they agree, 0 when they differ, -1
-        when the keys and values or the device lack room for the probe.  detail describes the
-        comparison.
+        the processor alone, and compares their logits: 1 when they agree, the relative distance
+        of the logits of each token within tolerance, 0 when they differ, -1 when the keys and
+        values or the device lack room for the probe.  The keys and values of the probe go into
+        a pool of its own, in the given format, and the device attends the tokens itself when
+        attention is true and it takes the pass (attended).  detail describes the comparison.
     */
-    int cpu_runtime::probe_layer_pass(long n, std::string& detail)
+    int cpu_runtime::probe_layer_pass(long n, kv_format format, bool attention, double tolerance, bool& attended,
+        std::string& detail)
     {
         const long V = cfg_.vocab;
+        const long B = kv_.block_positions();
+        const size_t per_token = 2 * static_cast<size_t>(cfg_.n_layers) * static_cast<size_t>(cfg_.n_kv_heads)
+            * kv_row_bytes(format, cfg_.head_dim);
+        std::unique_ptr<kv_pool> own(new kv_pool(cfg_.n_layers, cfg_.n_kv_heads, cfg_.head_dim, B,
+            per_token * static_cast<size_t>((n + B - 1) / B * B), format));
         const int seq = create_sequence();
+        sequence_pools_[static_cast<size_t>(seq)] = own.get();
         struct release
         {
             cpu_runtime& rt;
@@ -775,7 +869,17 @@ namespace albireo
         b.segments.push_back({ seq, 0, n });
         for (long i = 0; i < n; ++i) b.logit_rows.push_back(i);
         std::vector<float> reference, device;
-        if (!run(b, device, true)) return -1;
+        {
+            struct restore
+            {
+                bool& flag;
+                ~restore() { flag = true; }
+            } scope{ attention_allowed_ };
+            attention_allowed_ = attention;
+            attended_ = false;
+            if (!run(b, device, true)) return -1;
+            attended = attended_;
+        }
         // The truncation gives the blocks back.
         truncate_sequence(seq, 0);
         if (!reserve_sequence(seq, n)) return -1;
@@ -806,51 +910,159 @@ namespace albireo
             }
             const double relative = std::sqrt(diff / std::max(norm, 1e-30));
             // Written so that a value that is not a number sets the row apart.
-            if (!(relative <= 0.01)) apart = true;
+            if (!(relative <= tolerance)) apart = true;
             if (relative > worst) worst = relative;
             if (ia == id) ++same;
         }
         std::ostringstream o;
-        o << "logits of " << n << " probe tokens within " << worst * 100 << "% of those of the processor"
-            << (apart && worst <= 0.01 ? ", some not numbers" : "") << ", " << same << " of " << n
-            << " most likely tokens the same";
+        o << "logits of " << n << " probe tokens" << (attended ? " attended by the device" : "")
+            << (format == kv_format::q8 ? " with keys and values in 8 bits" : "") << " within " << worst * 100
+            << "% of those of the processor" << (apart && worst <= tolerance ? ", some not numbers" : "") << ", "
+            << same << " of " << n << " most likely tokens the same";
         detail = o.str();
-        // Two candidates whose logits are nearly equal may change places: one row in sixteen may differ.
-        return !apart && same >= n - std::max<long>(1, n / 16) ? 1 : 0;
+        /*
+            Two candidates whose logits are nearly equal may change places: one row in sixteen may
+            differ, one in eight with the looser tolerance of the keys and values in 8 bits.
+        */
+        const long misses = std::max<long>(1, tolerance > probe_tolerance ? n / 8 : n / 16);
+        return !apart && same >= n - misses ? 1 : 0;
     }
 
     /*
         Keeps the layer pass when passes of the device agree with the processor, a defect of the
         device or of its kernels otherwise reaching every answer: a probe of probe_tokens tokens,
-        whose products read the blocks of the weights in place, and one of tiled_tokens() tokens,
-        whose products go through the tiles of the weights expanded.  The state stays unchecked
-        when the keys and values or the device lack room for a probe, so that a later pass checks
-        again.
+        whose products read the blocks of the weights in place and which the device attends
+        itself when it can, and one of tiled_tokens() tokens, whose products go through the tiles
+        of the weights expanded and whose attention stays on the processor.  The keys and values
+        of these probes stay in half precision: rounded to 8 bits, the keys of the two passes
+        would turn the small differences of the products of the device and of the processor into
+        differences of whole steps of their rounding.  With keys and values in 8 bits, a third
+        probe checks the attention of the device over them, within a looser tolerance.  The
+        device keeps the layers while the attention of the processor serves when only its own
+        attention differs.  The state stays unchecked when the keys and values or the device lack
+        room for a probe, so that a later pass checks again.
     */
-    void cpu_runtime::check_layer_pass()
+    long cpu_runtime::probe_size() const
     {
         // A copy of the constant, which std::max() takes by reference.
         long first = probe_tokens;
         first = std::max(first, layer_pass_->min_tokens());
         if (cfg_.ctx_train > 0) first = std::min(first, cfg_.ctx_train);
-        std::vector<long> sizes(1, first);
+        return first;
+    }
+
+    void cpu_runtime::check_layer_pass()
+    {
+        const long first = probe_size();
         const long tiled = layer_pass_->tiled_tokens();
-        if (tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train)) sizes.push_back(tiled);
         std::string details;
-        for (long n : sizes)
+        auto note = [&details](const std::string& d) { details += (details.empty() ? "" : "; ") + d; };
+        std::string detail;
+        bool attended = false;
+
+        // The passes of a few tokens, which the device attends itself when it can.
+        bool attention = layer_pass_->attends() && first <= attention_tokens;
+        // Without passes of a few tokens on the device, its attention would serve none.
+        if (!attention) layer_pass_->allow_attention(false);
+        int outcome = probe_layer_pass(first, kv_format::f16, attention, probe_tolerance, attended, detail);
+        if (outcome < 0) return;
+        if (attention && !attended)
         {
-            std::string detail;
-            const int outcome = probe_layer_pass(n, detail);
+            // No room for the copies of the keys and values: the probe checked the products alone.
+            note("no room on the device for its copies of the keys and values, the attention of the processor "
+                "serving until a later probe");
+            layer_pass_->allow_attention(false);
+            attention = false;
+            attention_interval_ = layer_pass_check_interval;
+            attention_wait_ = attention_interval_;
+        }
+        else if (attention && outcome == 0)
+        {
+            // The attention of the device differs, or its products do: the products are checked alone.
+            note(detail + ", the attention of the processor serving");
+            layer_pass_->allow_attention(false);
+            attention = false;
+            outcome = probe_layer_pass(first, kv_format::f16, false, probe_tolerance, attended, detail);
             if (outcome < 0) return;
-            details += (details.empty() ? "" : "; ") + detail;
+        }
+        note(detail);
+        if (outcome == 0)
+        {
+            drop_layer_pass(details);
+            return;
+        }
+
+        if (tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train))
+        {
+            outcome = probe_layer_pass(tiled, kv_format::f16, false, probe_tolerance, attended, detail);
+            if (outcome < 0) return;
+            note(detail);
             if (outcome == 0)
             {
                 drop_layer_pass(details);
                 return;
             }
         }
+
+        if (attention && kv_.format() == kv_format::q8)
+        {
+            outcome = probe_layer_pass(first, kv_format::q8, true, q8_probe_tolerance, attended, detail);
+            if (outcome < 0) return;
+            if (outcome == 0 || !attended)
+            {
+                note(attended ? detail + ", the attention of the processor serving"
+                    : "no room on the device for its copies of the keys and values in 8 bits, the attention of the "
+                    "processor serving until a later probe");
+                layer_pass_->allow_attention(false);
+                if (!attended)
+                {
+                    attention_interval_ = layer_pass_check_interval;
+                    attention_wait_ = attention_interval_;
+                }
+            }
+            else
+            {
+                note(detail);
+            }
+        }
         layer_pass_checked_ = true;
         layer_pass_->report(true, details);
+    }
+
+    /*
+        The probes of the attention of the device, as check_layer_pass() makes them, once the
+        layers of the device serve: the device attends the passes of a few tokens when it agrees
+        with the processor, keeps the attention with the processor when it differs, and probes
+        again later, twice as late, when its copies of the keys and values find no room again.
+    */
+    void cpu_runtime::check_attention()
+    {
+        const long first = probe_size();
+        layer_pass_->allow_attention(true);
+        std::string details, detail;
+        bool attended = false;
+        int outcome = probe_layer_pass(first, kv_format::f16, true, probe_tolerance, attended, detail);
+        if (outcome > 0 && attended && kv_.format() == kv_format::q8)
+        {
+            details = detail;
+            outcome = probe_layer_pass(first, kv_format::q8, true, q8_probe_tolerance, attended, detail);
+        }
+        if (outcome > 0 && attended)
+        {
+            details += (details.empty() ? "" : "; ") + detail;
+            layer_pass_->report(true, details);
+            return;
+        }
+        layer_pass_->allow_attention(false);
+        if (outcome < 0 || !attended)
+        {
+            // A copy of the constant, which std::min() takes by reference.
+            const int most = max_attention_check_interval;
+            attention_interval_ = std::min(2 * attention_interval_, most);
+            attention_wait_ = attention_interval_;
+            return;
+        }
+        layer_pass_->report(true, detail + ", the attention of the processor serving");
     }
 
     void cpu_runtime::forward(const forward_batch& batch, std::vector<float>& logits)
@@ -866,6 +1078,10 @@ namespace albireo
                 {
                     check_layer_pass();
                     if (!layer_pass_checked_) layer_pass_wait_ = layer_pass_check_interval;
+                }
+                else if (attention_wait_ > 0 && --attention_wait_ == 0)
+                {
+                    check_attention();
                 }
                 if (layer_pass_ && layer_pass_checked_ && run(batch, logits, true))
                 {
@@ -908,7 +1124,7 @@ namespace albireo
             kv_sequence& seq = *sequences_.at(static_cast<size_t>(s.sequence));
             if (static_cast<long>(seq.blocks.size()) * B < seq.length + s.count)
                 throw std::runtime_error("cpu_runtime: sequence storage was not reserved");
-            if (s.count > 0 && kv_.shared(seq.blocks[static_cast<size_t>(seq.length / B)]))
+            if (s.count > 0 && pool_of(s.sequence).shared(seq.blocks[static_cast<size_t>(seq.length / B)]))
                 throw std::runtime_error("cpu_runtime: a sequence would write in a block other sequences hold");
             for (long j = 0; j < s.count; ++j)
             {
@@ -940,10 +1156,19 @@ namespace albireo
         v_.resize(static_cast<size_t>(T * kvd));
         tmp_.resize(static_cast<size_t>(T * d));
         if (on_device && !layer_pass_->begin(x_.data(), T)) return false;
+        // A pass of a few tokens, as a step of a generation, runs whole on the device when it attends it.
+        const bool attending = on_device && attention_allowed_ && T <= attention_tokens && layer_pass_->attends()
+            && plan_attention(batch, given) && layer_pass_->begin_attention(plan_);
+        attended_ = attending;
 
         for (long li = 0; li < cfg_.n_layers; ++li)
         {
             const layer& L = layers_[static_cast<size_t>(li)];
+            if (attending)
+            {
+                layer_pass_->attend(li);
+                continue;
+            }
 
             // Attention block.
             if (on_device)

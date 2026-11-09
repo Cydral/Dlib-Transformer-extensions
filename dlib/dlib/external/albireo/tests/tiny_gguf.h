@@ -75,6 +75,13 @@ namespace albireo_test
             return *this;
         }
 
+        // Biases of the queries, keys and values in every layer, as the models of Qwen2 have.
+        tiny_gguf_writer& biases(bool on)
+        {
+            biases_ = on;
+            return *this;
+        }
+
         // The chat template of a model whose reasoning a request switches.
         static std::string switchable_template()
         {
@@ -120,6 +127,12 @@ namespace albireo_test
                 list.push_back({ p + "attn_k.weight", { uint64_t(d), uint64_t(kv_heads * hd) } });
                 list.push_back({ p + "attn_v.weight", { uint64_t(d), uint64_t(kv_heads * hd) } });
                 list.push_back({ p + "attn_output.weight", { uint64_t(heads * hd), uint64_t(d) } });
+                if (biases_)
+                {
+                    list.push_back({ p + "attn_q.bias", { uint64_t(heads * hd) } });
+                    list.push_back({ p + "attn_k.bias", { uint64_t(kv_heads * hd) } });
+                    list.push_back({ p + "attn_v.bias", { uint64_t(kv_heads * hd) } });
+                }
                 list.push_back({ p + "attn_q_norm.weight", { uint64_t(hd) } });
                 list.push_back({ p + "attn_k_norm.weight", { uint64_t(hd) } });
                 list.push_back({ p + "ffn_norm.weight", { uint64_t(d) } });
@@ -191,7 +204,8 @@ namespace albireo_test
                 while (out_.bytes.size() < out_.header_end + offsets[i]) out_.bytes.push_back(0);
                 uint64_t n = 1;
                 for (uint64_t x : list[i].dims) n *= x;
-                const bool norm = list[i].dims.size() == 1;
+                // The vectors are norms, of ones, except the biases.
+                const bool norm = list[i].dims.size() == 1 && list[i].name.find(".bias") == std::string::npos;
                 for (uint64_t k = 0; k < n; ++k)
                 {
                     state = state * 1664525u + 1013904223u;
@@ -206,6 +220,7 @@ namespace albireo_test
 
     private:
         long head_dim_ = 16;
+        bool biases_ = false;
 
         static std::vector<std::string> byte_tokens()
         {

@@ -4,6 +4,7 @@
 #define ALBIREO_ENGINE_KV_CACHE_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -64,7 +65,8 @@ namespace albireo
     public:
         kv_pool(long n_layers, long n_kv_heads, long head_dim, long block_positions, size_t budget_bytes,
             kv_format format = kv_format::f16)
-            : layers_(n_layers), heads_(n_kv_heads), head_dim_(head_dim), positions_(block_positions), format_(format)
+            : layers_(n_layers), heads_(n_kv_heads), head_dim_(head_dim), positions_(block_positions), format_(format),
+              id_(next_id())
         {
             if (n_layers <= 0 || n_kv_heads <= 0 || head_dim <= 0 || block_positions <= 0)
                 throw std::invalid_argument("kv_pool: invalid geometry");
@@ -83,6 +85,7 @@ namespace albireo
             // grow, so that giving a block back cannot fail.
             blocks_.reserve(max_blocks_);
             refs_.reserve(max_blocks_);
+            epochs_.reserve(max_blocks_);
             free_.reserve(max_blocks_);
             vacant_.reserve(max_blocks_);
         }
@@ -102,6 +105,27 @@ namespace albireo
         size_t block_bytes() const { return block_bytes_; }
         size_t max_blocks() const { return max_blocks_; }
         kv_format format() const { return format_; }
+        long layers() const { return layers_; }
+        long kv_heads() const { return heads_; }
+        long head_dim() const { return head_dim_; }
+
+        // A number no other pool of the process takes, which names the pool in the copies a device keeps.
+        unsigned long long id() const { return id_; }
+
+        /*
+            A number that changes whenever block b receives other keys and values than those it
+            held: at each allocation of the block and when copy_block() writes it.  A copy of the
+            block made under one epoch holds none of its rows under another.
+        */
+        uint32_t epoch(int b) const
+        {
+            std::lock_guard<std::mutex> l(m_);
+            return epochs_[static_cast<size_t>(b)];
+        }
+
+        // The bytes of block b, block_bytes() of them, in the layout of keys() and values().
+        uint8_t* block_memory(int b) { return blocks_[static_cast<size_t>(b)].get(); }
+        const uint8_t* block_memory(int b) const { return blocks_[static_cast<size_t>(b)].get(); }
 
         size_t allocated_blocks() const
         {
@@ -129,6 +153,7 @@ namespace albireo
                 const int b = free_.back();
                 free_.pop_back();
                 refs_[static_cast<size_t>(b)] = 1;
+                ++epochs_[static_cast<size_t>(b)];
                 return b;
             }
             if (guard_ && !guard_(block_bytes_, (blocks_.size() - vacant_.size()) * block_bytes_)) return -1;
@@ -138,12 +163,14 @@ namespace albireo
                 blocks_[static_cast<size_t>(b)].reset(new uint8_t[block_bytes_]);
                 vacant_.pop_back();
                 refs_[static_cast<size_t>(b)] = 1;
+                ++epochs_[static_cast<size_t>(b)];
                 return b;
             }
             if (blocks_.size() >= max_blocks_) return -1;
             std::unique_ptr<uint8_t[]> memory(new uint8_t[block_bytes_]);
             blocks_.push_back(std::move(memory));
             refs_.push_back(1);
+            epochs_.push_back(1);
             return static_cast<int>(blocks_.size() - 1);
         }
 
@@ -189,6 +216,8 @@ namespace albireo
             if (src == dst) return;
             const uint8_t* from = blocks_[static_cast<size_t>(src)].get();
             std::copy(from, from + block_bytes_, blocks_[static_cast<size_t>(dst)].get());
+            std::lock_guard<std::mutex> l(m_);
+            ++epochs_[static_cast<size_t>(dst)];
         }
 
         /*
@@ -221,8 +250,15 @@ namespace albireo
             return (static_cast<size_t>(layer) * heads_ + head) * slab_bytes_;
         }
 
+        static unsigned long long next_id()
+        {
+            static std::atomic<unsigned long long> last{0};
+            return ++last;
+        }
+
         long layers_, heads_, head_dim_, positions_;
         kv_format format_;
+        unsigned long long id_;
         size_t slab_bytes_ = 0;
         size_t bytes_per_kind_ = 0;
         size_t block_bytes_ = 0;
@@ -230,6 +266,7 @@ namespace albireo
         mutable std::mutex m_;
         std::vector<std::unique_ptr<uint8_t[]>> blocks_;
         std::vector<int> refs_;     // the number of sequences holding each block
+        std::vector<uint32_t> epochs_;   // the epoch of each block (epoch())
         std::vector<int> free_;     // blocks with memory, held by no sequence
         std::vector<int> vacant_;   // slots whose memory trim() freed
         std::function<bool(size_t, size_t)> guard_;

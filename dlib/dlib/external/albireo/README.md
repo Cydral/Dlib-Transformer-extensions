@@ -198,7 +198,7 @@ positions of a text with Qwen3-VL 4B, with a mean divergence of 6.5e-5 (KL), twe
 below the differences of the integer products of the generation; without the rotation, the keys
 alone gave 1.1e-2 with Qwen3 0.6B, and 7e-4 with it. The conversations that start with the same
 text share the full pages of that text, and a sequence copies a shared page before writing in it.
-The attention runs on the processor in every variant, by tiles: up to 64 rows of queries, the
+The attention of the processor runs by tiles: up to 64 rows of queries, the
 heads that share one key/value head for consecutive tokens of a prompt, read the pages one after
 the other with a running maximum and sum, as FlashAttention does, so that each key and value
 taken from memory serves the whole tile instead of a single row. On two cores, the 2,900 tokens
@@ -222,9 +222,10 @@ guard refuses a new page once the memory the system can still commit comes down 
 the request then waiting or ending as when the budget runs out. The memory of the keys and values follows the text actually
 held: the 262,144 positions of Qwen3-VL 4B take 20.5 GB in 8 bits (38.6 GB in half precision), which
 only a conversation of that length reaches, the paging file or the swap holding what the physical
-memory does not. The keys and values stay in the memory of the computer with every engine: the
-graphics engines keep the attention on the processor, and V²RAM extends the memory of the card for
-the weights. The web application sizes its own choices within that context (see the prompt of a
+memory does not. The keys and values stay in the memory of the computer with every engine; the
+engines of CUDA also keep copies of the pages that the steps of the generation read on the card,
+which attends these steps itself (see below), and V²RAM extends the memory of the card for the
+weights. The web application sizes its own choices within that context (see the prompt of a
 question below). The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from
 the next token of every request being generated and a slice of the prompts being read, and draws
 the next tokens of the pass in parallel. When the pages run out, a prompt being read gives its
@@ -270,19 +271,45 @@ in a budget:
   processor. Only the rows of a product cross the bus.
 
 With CUDA, the layers of a dense model run on the card as a whole (`layer_pass`): the hidden states
-of a pass stay on the card from the first layer to the last, the card computes the normalizations,
-the seven products, the SwiGLU gate and the residual sums of each layer, and the processor keeps
-the attention over the paged keys and values, the biases, the normalizations of queries and keys
-and the rotary positions. A layer crosses the bus once each way, the queries, keys and values of
-its tokens to the processor and the outputs of their attention back, through pinned memory and
-asynchronous copies, where the products alone crossed it twice per product. Before its first use,
-a pass of the card over 8 probe tokens, whose products read the blocks in place, and a pass over
-64, whose products go through the tiles, must give the logits of the processor alone within 1 %,
-the most likely token differing for one of the 8 probe tokens and four of the 64 at most, or the
-layers stay with the products; a check that the keys and values or the card put off is made
-again 64 passes later. A failure of the card brings the pass back to the processor, which
-computes it again. A model with a mixture of experts, and the passes that add the DeepStack
-slices of an image, keep the products.
+of a pass stay on the card from the first layer to the last, and the card computes the
+normalizations, the seven products, the SwiGLU gate and the residual sums of each layer. For a pass
+of up to 8 tokens, as a step of the generation, the card also computes the biases, the
+normalizations of queries and keys, the rotary positions and the attention
+([`dlib/cuda/kv_pages.h`](../../cuda/kv_pages.h), `tt::paged_kv_store()` and
+`tt::paged_attention()`): it keeps copies of the pages of keys and values in their format, writes
+the keys and values of the tokens of the pass into them, and attends them, the positions of a token
+split among the blocks of the card when its heads alone would leave most of it idle, the partial
+sums being merged afterwards (the split of FlashDecoding). The layers of a step then exchange
+nothing with the processor: the tokens go to the card at the start of the step, and the hidden
+state of the next token comes back at its end with the keys and values of the step, which go into
+the pages of the processor, where the layers of a step of a model of 36 layers crossed the bus 72
+times. A page that a step reads and the card lacks, or whose rows the processor wrote
+since, as after the prompt of a question, crosses whole before the step. The copies take room in
+the budget of the device and grow with the conversations; the page of the block least recently read
+goes to another block, an idle model gives its copies back with its matrices, and a step whose
+pages do not fit is attended by the processor. For the longer passes, as a prompt, the processor
+keeps the attention over its pages, the biases, the normalizations of queries and keys and the
+rotary positions: a layer crosses the bus once each way, the queries, keys and values of its tokens
+to the processor and the outputs of their attention back, through pinned memory and asynchronous
+copies, where the products alone crossed it twice per product.
+
+Before their first use, the layers of the card pass probes against the processor alone, with the
+keys and values of the probe tokens in half precision in a pool of their own: in 8 bits, the keys
+of the two passes would turn the small differences of their products into whole steps of their
+rounding. A pass over 8 probe tokens attended by the card, whose products read the blocks in place,
+and a pass over 64, whose products go through the tiles and whose attention stays on the processor,
+must give the logits of the processor within 1 %, the most likely token differing for one of the 8
+probe tokens and four of the 64 at most; with keys and values in 8 bits, a pass over 8 probe tokens
+attended by the card over keys and values in 8 bits must stay within 5 %, the most likely token
+differing for one of them at most. An attention of the card that differs leaves the attention to
+the processor and the layers to the card; one whose copies find no room is probed again 64 passes
+later, then twice as late each time; products that differ leave the layers with the products. The
+copies of the keys and values keep within the memory of the card, beyond which the passes of a few
+tokens stay on the processor. A check that the keys and values or the card put off is made again
+64 passes later. A failure of the card brings the pass back to the processor, which computes
+it again. A model with a mixture of experts, and the passes that add the DeepStack slices of an
+image, keep the products; a model whose attention grows with the positions (`attn_temp_scale`)
+keeps its attention on the processor.
 
 With OpenVINO, the products of a single token often stay on the processor, which serves them from
 the compact weights; the products of the prompts go to the device. The image encoder of a model sends its
@@ -299,7 +326,8 @@ model answers again. The embedding model takes part like the language models: wh
 being indexed or searched, its room goes to the models that answer. When every model has requests
 and the budget is full, a matrix without room is computed by the processor, or crosses the bus for
 a product of 128 tokens or more (CUDA), so that the requests of all the models go on together. The statistics of the device
-count the copies that left (`evictions`, `evicted_bytes`).
+count the copies that left (`evictions`, `evicted_bytes`), the passes the card attended
+(`attention_passes`) and the bytes of its copies of keys and values (`kv_bytes`).
 
 A model replaced or deactivated in the Models window leaves the engine once its requests are served
 (`engine_host::unload_model`): from that moment the service routes no new request to it, the
@@ -934,8 +962,8 @@ cmake --build build-albireo-win -j
 | `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
-| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing |
-| `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`) against the processor kernels, for every format, with activations on 16 bytes and off them, then the time of the products of a generated token on the matrices of a 2B model |
+| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor |
+| `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of a generated token on the matrices of a 2B model, and of its attention over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |

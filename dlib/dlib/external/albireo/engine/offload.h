@@ -19,12 +19,24 @@ namespace albireo
         before the attention and before the feed-forward block by RMS norms, with the four
         projections of the attention and a SwiGLU feed-forward block.  The norms and the
         matrices belong to the runtime, which keeps them while the layer_pass lives.
+
+        The attention of a layer may add biases to its queries, keys and values and normalize
+        the rows of its queries and keys (null pointers when the model does neither); its
+        queries and keys then turn by the rotary positions of their tokens, the first rope_dims
+        values of each head in pairs, (i, i + rope_dims/2) when neox is true and (2i, 2i + 1)
+        otherwise.  attention tells whether the model leaves nothing else to its attention, so
+        that a device may compute it (layer_pass::begin_attention()).
     !*/
     struct dense_layer
     {
         const float* attn_norm = nullptr;   // d_model values
         const float* ffn_norm = nullptr;    // d_model values
         weight_matrix wq, wk, wv, wo, w_gate, w_up, w_down;
+        const float* bq = nullptr;          // q_dim values
+        const float* bk = nullptr;          // kv_dim values
+        const float* bv = nullptr;          // kv_dim values
+        const float* q_norm = nullptr;      // head_dim values
+        const float* k_norm = nullptr;      // head_dim values
     };
 
     struct dense_model
@@ -37,6 +49,44 @@ namespace albireo
         // The factor of the outputs of the blocks added to the hidden states.
         float residual_scale = 1;
         std::vector<dense_layer> layers;
+
+        long n_heads = 0;
+        long n_kv_heads = 0;
+        long head_dim = 0;
+        long rope_dims = 0;
+        bool neox = true;
+        // The factor of the products of the queries and the keys.
+        float attention_scale = 1;
+        bool attention = false;
+    };
+
+    /*!
+        The tokens of a pass whose attention a device computes (layer_pass::begin_attention()),
+        their keys and values going into the blocks of a kv_pool.  Token t of the pass sits at
+        positions[t] of its sequence, where its keys and values go, and attends the positions
+        [0, positions[t]] of that sequence, whose blocks are blocks[firsts[t] + j] for j <=
+        positions[t] / pool->block_positions().  Its rotary angles are angles[t * rope_dims +
+        i], rope_dims/2 cosines then rope_dims/2 sines.  Each segment of the pass describes the
+        blocks of one sequence: its run of blocks starts at first, and it held length positions
+        before the pass, which writes count more.
+    !*/
+    class kv_pool;
+
+    struct attention_plan
+    {
+        struct segment
+        {
+            long first = 0;
+            long length = 0;
+            long count = 0;
+        };
+
+        kv_pool* pool = nullptr;
+        std::vector<long> positions;
+        std::vector<long> firsts;
+        std::vector<int> blocks;
+        std::vector<float> angles;
+        std::vector<segment> segments;
     };
 
     /*!
@@ -70,6 +120,13 @@ namespace albireo
                 layer in turn, then end().  The functions that compute throw device_failure
                 when the device fails, the pass then being lost: the runtime computes it again
                 with its products.
+
+                A device that keeps copies of the blocks of the keys and values may also attend
+                the tokens of a pass itself, as for the few tokens of a generation step: after
+                begin(), begin_attention() takes the pass, whose layers then run whole on the
+                device through attend(), and the pass exchanges nothing with the processor
+                before end(), which returns the keys and values of its tokens with the hidden
+                states.
 
             THREAD SAFETY
                 One thread uses an object at a time: the thread that runs the forward passes
@@ -137,6 +194,61 @@ namespace albireo
                   stops using the object (ok false).
         !*/
         virtual void report(bool ok, const std::string& detail) = 0;
+
+        /*
+            Whether the device can attend the tokens of a pass itself (begin_attention()), for the
+            model and as allow_attention() leaves it.
+        */
+        virtual bool attends() const { return false; }
+
+        // Lets the device attend the tokens of the passes, or keeps their attention on the processor.
+        virtual void allow_attention(bool on) { (void)on; }
+
+        /*!
+            requires
+                - begin() returned true, and no layer of the pass was computed yet.
+                - plan describes the n tokens of the pass (attention_plan), their keys and values
+                  at the positions before theirs being in the blocks of plan.pool.
+            ensures
+                - Returns true when the device computes the attention of the pass itself: the
+                  device keeps copies of the blocks of the pool, which it updates from the pool
+                  before the pass, and the layers then run through attend(); end() writes the
+                  keys and values of the tokens of the pass into their blocks of the pool.
+                - Returns false when the device does not attend the pass, for lack of room for
+                  the blocks or because attends() is false: the layers then run through
+                  attention_inputs() and attention_output().
+        !*/
+        virtual bool begin_attention(const attention_plan& plan)
+        {
+            (void)plan;
+            return false;
+        }
+
+        /*!
+            requires
+                - begin_attention() returned true for this pass, and every layer before layer had
+                  its attend().
+            ensures
+                - Computes layer for the tokens of the pass on the device, their attention
+                  included: the normalizations, the products, the biases, the normalizations of
+                  the queries and keys, the rotary positions, the keys and values written into
+                  the copies of their blocks, the attention, the feed-forward block and the
+                  residual sums.
+        !*/
+        virtual void attend(long layer) { (void)layer; }
+
+        /*!
+            ensures
+                - The copies of the device hold no row of block of pool from row on: the
+                  sequence of the block was cut there, and the processor writes these rows
+                  again.
+        !*/
+        virtual void truncated(const kv_pool& pool, int block, long row)
+        {
+            (void)pool;
+            (void)block;
+            (void)row;
+        }
     };
 
     class matmul_offload

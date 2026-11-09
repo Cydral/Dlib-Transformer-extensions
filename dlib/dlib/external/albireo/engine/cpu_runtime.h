@@ -134,11 +134,30 @@ namespace albireo
         // The tokens of the passes that compare the layers of the device with the processor.
         static const long probe_tokens = 8;
 
+        /*
+            The relative distance of the logits of the device and of the processor a probe allows,
+            and the distance its probe of the attention of the device over keys and values in 8
+            bits allows, whose rounding turns the small differences of the products into larger
+            ones.
+        */
+        static constexpr double probe_tolerance = 0.01;
+        static constexpr double q8_probe_tolerance = 0.05;
+
+        /*
+            The tokens of the passes, at most, that the device attends itself when it can, as the
+            steps of a generation: the attention of the longer passes, as a prompt, stays on the
+            processor, which reads each block of keys and values once for a tile of tokens.
+        */
+        static const long attention_tokens = 8;
+
         // Failures for lack of device memory in a row after which the layers stay on the processor.
         static const int max_layer_pass_memory_failures = 4;
 
         // The passes that follow a check of the layer pass put off for lack of room, before the next one.
         static const int layer_pass_check_interval = 64;
+
+        // The passes, at most, between two probes of an attention of the device that found no room.
+        static const int max_attention_check_interval = 4096;
 
         // Consecutive tokens of one segment of the batch, which attend together.
         struct attention_tile
@@ -177,8 +196,15 @@ namespace albireo
         */
         bool run(const forward_batch& batch, std::vector<float>& logits, bool on_device);
         bool takes_layer_pass(const forward_batch& batch) const;
-        int probe_layer_pass(long n, std::string& detail);
+        // The tokens of a pass whose attention the device may compute, in plan_; false when they cannot be planned.
+        bool plan_attention(const forward_batch& batch, bool given);
+        int probe_layer_pass(long n, kv_format format, bool attention, double tolerance, bool& attended,
+            std::string& detail);
         void check_layer_pass();
+        // Probes again the attention of the device, which found no room at its probe.
+        void check_attention();
+        // The size of the probes of the layer pass.
+        long probe_size() const;
         void drop_layer_pass(const std::string& why);
         // Y = X W^T through the offload when there is one, with the kernels of qkernels.h
         // otherwise.
@@ -194,11 +220,25 @@ namespace albireo
         bool layer_pass_checked_ = false;
         int layer_pass_memory_failures_ = 0;
         int layer_pass_wait_ = 0;
+        /*
+            The passes before the attention of the device, whose probe found no room, is probed
+            again (0 when no probe is due), and their number, which doubles at each new lack of
+            room.
+        */
+        int attention_wait_ = 0;
+        int attention_interval_ = 0;
         // The products of the probe passes of the processor do not go to the offload.
         bool host_only_ = false;
+        // Whether the device may attend the passes (false in a probe of the layers alone), and attended the last one.
+        bool attention_allowed_ = true;
+        bool attended_ = false;
+        attention_plan plan_;
         kv_pool kv_;
         std::vector<std::unique_ptr<kv_sequence>> sequences_;
         std::vector<int> free_sequences_;
+        // The pool of each sequence: kv_, or the pool in half precision of a probe of the device.
+        std::vector<kv_pool*> sequence_pools_;
+        kv_pool& pool_of(int seq) const { return *sequence_pools_[static_cast<size_t>(seq)]; }
 
         std::vector<layer> layers_;
         weight_matrix token_embd_, output_;

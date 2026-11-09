@@ -4,6 +4,7 @@
 #define DLIB_CPU_GGUF_H_
 
 #include "tensor.h"
+#include "kv_pages.h"
 
 namespace dlib
 {
@@ -11,8 +12,9 @@ namespace dlib
     {
         /*
             The processor versions of the operations of tensor_tools.h on weight matrices kept
-            in their GGUF formats (gguf_blocks.h), and of the row operations of the forward pass
-            of a decoder.  tensor_tools.h documents them.
+            in their GGUF formats (gguf_blocks.h), of the row operations of the forward pass of
+            a decoder, and of its keys and values in pages (kv_pages.h).  tensor_tools.h
+            documents them.
         */
 
         void gguf_matvec (
@@ -45,6 +47,44 @@ namespace dlib
         void silu_multiply (
             tensor& gate,
             const tensor& up
+        );
+
+        void rope_rows (
+            tensor& rows,
+            const tensor& angles,
+            long heads,
+            long head_dim,
+            long rope_dims,
+            bool neox
+        );
+
+        void paged_kv_store (
+            tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const tensor& keys,
+            const tensor& values,
+            const tensor& slots
+        );
+
+        void paged_kv_gather (
+            tensor& dest,
+            const tensor& pages,
+            const kv_page_layout& layout,
+            const tensor& slots
+        );
+
+        void paged_attention (
+            tensor& out,
+            const tensor& queries,
+            long q_heads,
+            float scale,
+            const tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const tensor& tokens,
+            const tensor& tables,
+            long span
         );
     }
 }

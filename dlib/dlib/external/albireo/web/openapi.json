@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Albireo Community Edition local interface",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, albireo-background the model that comes with Albireo, which the web application uses for its work in the background, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.\n\nRequests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, DELETE and OPTIONS take no body (400). While the JSON bodies being read at once hold the values of their budget, a route that reads one answers 503 with the code busy and a Retry-After of 2 seconds. An answer being written whose model has no memory left for its keys and values ends with the error code out_of_memory.\n\nBefore any route, the server refuses, as plain text: a request whose Host header names another server than this computer (421), a request whose Origin header names another origin than the local server (403), so that no web site drives the service through a browser, and a body of more than 8 MB while four such bodies are being read (503, with a Retry-After header).",
   "license": {
    "name": "Boost Software License 1.0",

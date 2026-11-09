@@ -13,6 +13,7 @@
 #include "cpu_gguf.h"
 #include "cuda_gguf.h"
 #include "gguf_blocks.h"
+#include "kv_pages.h"
 #include "npu_dlib.h"
 #include "../rand.h"
 #include <memory>
@@ -3202,6 +3203,124 @@ namespace dlib { namespace tt
         ensures
             - #gate[i] == gate[i]*sigmoid(gate[i])*up[i] for all i, the gate of a SwiGLU
               feed-forward block.
+    !*/
+
+    void rope_rows (
+        tensor& rows,
+        const tensor& angles,
+        long heads,
+        long head_dim,
+        long rope_dims,
+        bool neox
+    );
+    /*!
+        requires
+            - heads > 0 and head_dim > 0
+            - 0 < rope_dims <= head_dim and rope_dims is even
+            - angles.size() == n*rope_dims for some n
+            - rows.size() == n*heads*head_dim
+        ensures
+            - Applies the rotary positions of a decoder to the rows of head_dim values of rows:
+              the heads rows of token t, the rows [t*heads, (t+1)*heads), have the pairs of
+              their first rope_dims values turned by the angles of t, pair i by
+              c == angles[t*rope_dims + i] and s == angles[t*rope_dims + rope_dims/2 + i]:
+                #x0 == x0*c - x1*s
+                #x1 == x0*s + x1*c
+              the pair being (x[i], x[i + rope_dims/2]) when neox is true, as in the models of
+              the NeoX family, and (x[2*i], x[2*i + 1]) otherwise.  The values beyond rope_dims
+              keep their values.
+            - The cosines and sines may carry a factor, the scale of the attention that some
+              extensions of the context apply with the rotation.
+    !*/
+
+    void paged_kv_store (
+        tensor& pages,
+        const kv_page_layout& layout,
+        long layer,
+        const tensor& keys,
+        const tensor& values,
+        const tensor& slots
+    );
+    /*!
+        requires
+            - layout.valid() == true
+            - 0 <= layer < layout.layers
+            - slots.size() == n for some n, each of its floats holding the bits of a 32-bit
+              signed integer: the slot of token t is s == slots[t], the row s %
+              layout.block_positions of the page s / layout.block_positions.
+            - keys.size() == values.size() == n*layout.heads*layout.head_dim
+            - 0 <= s and (s/layout.block_positions + 1)*layout.page_bytes() <=
+              pages.size()*sizeof(float) for every slot s, the slots being distinct
+            - pages, keys, values and slots are distinct objects
+        ensures
+            - Writes the keys and the values of layer of the n tokens into the pages
+              (kv_page_layout), the rows of head h of token t, at keys[(t*layout.heads +
+              h)*layout.head_dim] and values[(t*layout.heads + h)*layout.head_dim], going to
+              the slabs of layer and h, at the row of the slot of t:
+                - in half precision, rounded to the nearest, when layout.q8 is false;
+                - otherwise in the 8-bit format, the keys rotated by kv_pages::rotate_row(),
+                  each group of 32 values with the scale kv_pages::q8_scale() of its largest
+                  magnitude and the integers kv_pages::q8_level().
+            - The pages keep their other bytes.
+    !*/
+
+    void paged_kv_gather (
+        tensor& dest,
+        const tensor& pages,
+        const kv_page_layout& layout,
+        const tensor& slots
+    );
+    /*!
+        requires
+            - layout.valid() == true
+            - slots as for paged_kv_store(), n slots of pages
+            - dest.size()*sizeof(float) >= n*layout.page_bytes()/layout.block_positions
+            - dest, pages and slots are distinct objects
+        ensures
+            - Copies into dest the bytes of the rows of the n slots, every layer, kind and
+              head of each: the rows of slot t start t*2*layout.layers*layout.heads*
+              layout.row_bytes() bytes in, the keys first then the values, layer after
+              layer and head after head, each row as its layout.data_bytes() bytes followed
+              by its layout.scale_bytes() bytes of scales.  These are the rows the
+              paged_kv_store() calls of a pass wrote, in a form that crosses to the host in
+              one copy.
+    !*/
+
+    void paged_attention (
+        tensor& out,
+        const tensor& queries,
+        long q_heads,
+        float scale,
+        const tensor& pages,
+        const kv_page_layout& layout,
+        long layer,
+        const tensor& tokens,
+        const tensor& tables,
+        long span
+    );
+    /*!
+        requires
+            - layout.valid() == true and 0 <= layer < layout.layers
+            - layout.head_dim is 32, 64, 96, 128 or 256
+            - q_heads > 0 and q_heads % layout.heads == 0
+            - tokens.size() == 2*n for some n, and queries.size() == out.size() ==
+              n*q_heads*layout.head_dim
+            - tokens and tables hold the bits of 32-bit signed integers in their floats.
+              Token t attends the positions [0, p] of its sequence, p == tokens[2*t] >= 0,
+              p < span, the pages of these positions being tables[f + j] for j <= p /
+              layout.block_positions, f == tokens[2*t + 1]: pages of pages that hold the keys
+              and values of these positions.
+            - out is distinct from queries, pages, tokens and tables
+        ensures
+            - Computes the attention of the decoders: for query head h of token t, whose
+              key/value head is g == h/(q_heads/layout.heads), the row h of t in out becomes
+                sum over j <= p of a[j]*V[j], a == softmax over j <= p of scale*dot(Q, K[j])
+              Q being the row h of t in queries, K[j] and V[j] the key and the value of g at
+              position j of layer as the pages store them.  With layout.q8, the keys are
+              stored rotated: Q is rotated alike (kv_pages::rotate_row()) before the products.
+            - The work on the positions of a token is split along them when the tokens and
+              heads alone leave the device idle, the parts being merged afterwards; span bounds
+              the positions of the tokens for that split.
     !*/
 
 // ----------------------------------------------------------------------------------------

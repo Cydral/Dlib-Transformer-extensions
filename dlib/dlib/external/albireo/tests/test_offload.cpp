@@ -18,17 +18,33 @@
            rounding of the device; with CUDA and the host code of dlib, the layers of a
            dense model run on the device (layer_pass) when the budget holds the matrices
            of its layers, the prompt through tiles of the weights expanded for cuBLAS and
-           the steps through the blocks read in place;
+           the steps through the blocks read in place, the device attending the steps itself;
         2. the same with a budget of 16 MB for the copies of the weights, so that most
            matrices cross the bus at each product of the prompt, or are left to the
            processor;
-        3. the measured routing with the usual kernels, compared as distributions, and the
+        3. with CUDA and the host code of dlib, keys and values in 8 bits, the device
+           attending the steps over its copies of them, against the exact products with the
+           same keys and values, compared as distributions;
+        4. the measured routing with the usual kernels, compared as distributions, and the
            routes it chose.
+
+        test_offload synthetic [folder] [device]
+
+    checks the attention of the device on the tiny model of tiny_gguf.h, written in folder,
+    with keys and values in half precision and in 8 bits, without and with the biases of
+    the attention: a script of passes (a prompt, single steps across blocks, two sequences
+    stepping together, one of them sharing the start of the other, a sequence cut inside a
+    block and continued by a pass of a few tokens and by a longer one) runs through the
+    processor alone and through the device, whose layers and attention must run there and
+    whose logits must agree with those of the processor; then the same with a budget of 1 MB,
+    which holds the matrices but no copy of the keys and values: the layers run on the device,
+    the processor attends.
 */
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -39,6 +55,7 @@
 #include "../common/engine_api.h"
 #include "../engine/cpu_runtime.h"
 #include "../engine/tensor_backend.h"
+#include "tiny_gguf.h"
 
 using namespace albireo;
 
@@ -152,15 +169,179 @@ namespace
         static const char* names[] = { "debug", "info", "warning", "error" };
         std::printf("  [%s] %s\n", names[std::max(0, std::min(3, level))], message.c_str());
     }
+
+    // A deterministic token of the tiny vocabulary.
+    int next_token(uint32_t& state)
+    {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<int>((state >> 8) % 256);
+    }
+
+    // Runs a pass of count tokens on each of the given sequences and appends the logits of its rows to out.
+    void pass(cpu_runtime& rt, const std::vector<int>& seqs, long count, uint32_t& state, std::vector<float>& out)
+    {
+        forward_batch b;
+        for (int s : seqs)
+        {
+            const long start = static_cast<long>(b.tokens.size());
+            for (long i = 0; i < count; ++i) b.tokens.push_back(next_token(state));
+            b.segments.push_back({ s, start, count });
+            expect(rt.reserve_sequence(s, rt.sequence_length(s) + count), "reserve");
+        }
+        for (long i = 0; i < static_cast<long>(b.tokens.size()); ++i) b.logit_rows.push_back(i);
+        std::vector<float> logits;
+        rt.forward(b, logits);
+        out.insert(out.end(), logits.begin(), logits.end());
+    }
+
+    /*
+        The passes of the synthetic check, the same for every runtime, with blocks of 16
+        positions: a prompt of 40 tokens, 20 single steps, a second sequence holding the first
+        37 positions of the first (two blocks shared, the third copied), both stepping together
+        10 times, the first cut at 50 positions and continued by a pass of 5 tokens, 4 steps, a
+        cut at 61, a pass of 12 tokens and 6 steps; returns the logits of every row.
+    */
+    std::vector<float> script(cpu_runtime& rt)
+    {
+        std::vector<float> out;
+        uint32_t state = 99;
+        const int a = rt.create_sequence();
+        pass(rt, { a }, 40, state, out);
+        for (int i = 0; i < 20; ++i) pass(rt, { a }, 1, state, out);
+        const int b = rt.create_sequence();
+        expect(rt.copy_sequence(a, b, 37), "copy of the start of a sequence");
+        for (int i = 0; i < 10; ++i) pass(rt, { a, b }, 1, state, out);
+        rt.truncate_sequence(a, 50);
+        pass(rt, { a }, 5, state, out);
+        for (int i = 0; i < 4; ++i) pass(rt, { a }, 1, state, out);
+        rt.truncate_sequence(a, 61);
+        pass(rt, { a }, 12, state, out);
+        for (int i = 0; i < 6; ++i) pass(rt, { a, b }, 1, state, out);
+        rt.release_sequence(b);
+        rt.release_sequence(a);
+        expect(rt.kv_bytes_used() == 0, "every block returned");
+        return out;
+    }
+
+    int synthetic(const std::string& folder, const std::string& device)
+    {
+        std::string backend, runtime, reason, reason_code;
+        json reason_args = json::object();
+        tensor_device::describe(backend, runtime, reason, reason_code, reason_args);
+        if (backend != "cuda" && backend != "dlib")
+        {
+            // The routing of OpenVINO takes products only: no layer and no attention to check.
+            std::printf("backend %s: the device takes products only\nall checks passed\n", backend.c_str());
+            return 0;
+        }
+        const std::string path = folder + "test_offload_synthetic.gguf";
+        thread_pool pool(2);
+        for (int with_biases = 0; with_biases < 2; ++with_biases)
+        {
+            const albireo_test::tiny_gguf model = albireo_test::tiny_gguf_writer().head_dim(32)
+                .biases(with_biases != 0).build();
+            if (!model.save(path, model.bytes))
+            {
+                std::printf("cannot write %s\n", path.c_str());
+                return 2;
+            }
+            auto file = std::make_shared<model_file>(path);
+            const model_config cfg = read_model_config(*file);
+            std::printf("%s%s\n", describe(cfg).c_str(), with_biases ? ", biases" : "");
+            const long V = cfg.vocab;
+            for (kv_format format : { kv_format::f16, kv_format::q8 })
+            {
+                const bool q8 = format == kv_format::q8;
+                qk_set_exact_products(true);
+                std::vector<float> reference;
+                {
+                    cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16, format);
+                    reference = script(rt);
+                }
+                tensor_device dev(device_config(device, 0, "device"), pool, print_log);
+                std::vector<float> got;
+                json st;
+                {
+                    cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16, format);
+                    rt.set_offload(dev.make_offload());
+                    got = script(rt);
+                    st = dev.stats();
+                }
+                qk_set_exact_products(false);
+                expect(dev.stats()["kv_bytes"].as_int() == 0, "the copies of the keys and values left with the model");
+                const long rows = static_cast<long>(reference.size()) / V;
+                expect(got.size() == reference.size(), "the same rows");
+                const stats d = compare(reference.data(), got.data(), rows, V);
+                report(q8 ? "device, keys and values in 8 bits" : "device, keys and values in half precision", d);
+                std::printf("  passes on the device %lld, attended there %lld, copies of keys and values %lld bytes\n",
+                    st["layer_passes"].as_int(), st["attention_passes"].as_int(), st["kv_bytes"].as_int());
+                expect(st["layer_passes"].as_int() > 0, "the layers ran on the device");
+                // The 41 passes of 1 to 5 tokens of the script, and the probes of the attention.
+                expect(st["attention_passes"].as_int() >= 41, "the device attended the steps");
+                expect(st["kv_bytes"].as_int() > 0, "copies of the keys and values on the device");
+                expect(st["failures"].as_int() == 0, "no device failure");
+                // A key rounded to the other side of a step of the 8-bit format moves its scores a little more.
+                if (q8)
+                    expect(d.mean_kl < 1e-4 && d.top1 >= 0.97, "attention of the device, 8 bits");
+                else
+                    expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale) && d.top1 >= 0.99, "attention of the device");
+            }
+            if (with_biases) continue;
+
+            /*
+                A device whose budget of 1 MB holds the matrices of the tiny model but not one page of
+                4,096 positions: the layers run on the device, the processor attends the passes, and
+                the attention of the device is probed again 64 passes later, the script running twice.
+            */
+            qk_set_exact_products(true);
+            std::vector<float> reference;
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 4096, kv_format::f16);
+                reference = script(rt);
+                const std::vector<float> again = script(rt);
+                reference.insert(reference.end(), again.begin(), again.end());
+            }
+            tensor_device dev(device_config(device, 1, "device"), pool, print_log);
+            std::vector<float> got;
+            json st;
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 4096, kv_format::f16);
+                rt.set_offload(dev.make_offload());
+                got = script(rt);
+                const std::vector<float> again = script(rt);
+                got.insert(got.end(), again.begin(), again.end());
+                st = dev.stats();
+            }
+            qk_set_exact_products(false);
+            expect(got.size() == reference.size(), "the same rows, without room");
+            const stats d = compare(reference.data(), got.data(), static_cast<long>(reference.size()) / V, V);
+            report("device without room for its pages", d);
+            expect(st["layer_passes"].as_int() > 0, "the layers ran on the device without room for the pages");
+            expect(st["attention_passes"].as_int() == 0, "the processor attended the passes");
+            expect(st["failures"].as_int() == 0, "no device failure without room");
+            expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale) && d.top1 >= 0.99, "layers of the device without room");
+        }
+        std::remove(path.c_str());
+        if (failures)
+        {
+            std::printf("%d checks FAILED\n", failures);
+            return 1;
+        }
+        std::printf("all checks passed\n");
+        return 0;
+    }
 }
 
 static int run_checks(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: test_offload model.gguf [device] [threads] [budget]\n");
+        std::printf("usage: test_offload model.gguf [device] [threads] [budget]\n"
+            "       test_offload synthetic [folder] [device]\n");
         return 2;
     }
+    if (std::string(argv[1]) == "synthetic")
+        return synthetic(argc > 2 ? std::string(argv[2]) + "/" : std::string(), argc > 3 ? argv[3] : "");
     const std::string device = argc > 2 ? argv[2] : "";
     const int threads = argc > 3 ? std::atoi(argv[3]) : 2;
     const long first_budget = argc > 4 ? std::max(0L, std::atol(argv[4])) : 0L;
@@ -249,7 +430,10 @@ static int run_checks(int argc, char** argv)
         if ((backend == "cuda" || backend == "dlib") && !small && !cfg.is_moe())
         {
             if (st["weights_budget"].as_double(0) >= layer_bytes)
+            {
                 expect(st["layer_passes"].as_int() > 0, "the layers ran on the device");
+                expect(st["attention_passes"].as_int() > 0, "the device attended the steps");
+            }
             else
                 std::printf("  the budget holds %.0f MB of the %.0f MB of the matrices of the layers: they stay "
                     "on the processor\n", st["weights_budget"].as_double(0) / 1048576.0, layer_bytes / 1048576.0);
@@ -269,7 +453,37 @@ static int run_checks(int argc, char** argv)
         expect(st["failures"].as_int() == 0, "no device failure");
     }
 
-    // 3: the measured routing with the usual kernels.
+    /*
+        3: keys and values in 8 bits, as the engine keeps them for a language model: the probes
+        of the layers keep half precision, the device attends the steps over its copies in 8
+        bits, against the processor with the same keys and values.
+    */
+    if ((backend == "cuda" || backend == "dlib") && !cfg.is_moe())
+    {
+        std::vector<float> exact8;
+        {
+            cpu_runtime rt(file, cfg, pool, kv, 16, kv_format::q8);
+            exact8 = run(rt, tokens, k, ms);
+        }
+        tensor_device dev(device_config(device, first_budget, "device"), pool, print_log);
+        cpu_runtime rt(file, cfg, pool, kv, 16, kv_format::q8);
+        rt.set_offload(dev.make_offload());
+        const std::vector<float> got = run(rt, tokens, k, ms);
+        const json st = dev.stats();
+        std::printf("device, keys and values in 8 bits: %.1f ms, %lld passes attended by the device\n", ms,
+            st["attention_passes"].as_int());
+        const stats d = compare(exact8.data(), got.data(), T, V);
+        report("device vs exact, 8 bits", d);
+        expect(d.mean_kl < 0.01 && d.top1 >= 0.9, "device products and attention, 8 bits");
+        if (st["weights_budget"].as_double(0) >= layer_bytes)
+        {
+            expect(st["layer_passes"].as_int() > 0, "the layers ran on the device, 8 bits");
+            expect(st["attention_passes"].as_int() > 0, "the device attended the steps, 8 bits");
+        }
+        expect(st["failures"].as_int() == 0, "no device failure, 8 bits");
+    }
+
+    // 4: the measured routing with the usual kernels.
     qk_set_exact_products(false);
     std::vector<float> usual;
     double host_ms = 0;

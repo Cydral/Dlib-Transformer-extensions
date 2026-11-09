@@ -2041,6 +2041,72 @@ namespace dlib { namespace tt
 #endif
     }
 
+    void rope_rows (
+        tensor& rows,
+        const tensor& angles,
+        long heads,
+        long head_dim,
+        long rope_dims,
+        bool neox
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::rope_rows(rows, angles, heads, head_dim, rope_dims, neox);
+#else
+        cpu::rope_rows(rows, angles, heads, head_dim, rope_dims, neox);
+#endif
+    }
+
+    void paged_kv_store (
+        tensor& pages,
+        const kv_page_layout& layout,
+        long layer,
+        const tensor& keys,
+        const tensor& values,
+        const tensor& slots
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::paged_kv_store(pages, layout, layer, keys, values, slots);
+#else
+        cpu::paged_kv_store(pages, layout, layer, keys, values, slots);
+#endif
+    }
+
+    void paged_kv_gather (
+        tensor& dest,
+        const tensor& pages,
+        const kv_page_layout& layout,
+        const tensor& slots
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::paged_kv_gather(dest, pages, layout, slots);
+#else
+        cpu::paged_kv_gather(dest, pages, layout, slots);
+#endif
+    }
+
+    void paged_attention (
+        tensor& out,
+        const tensor& queries,
+        long q_heads,
+        float scale,
+        const tensor& pages,
+        const kv_page_layout& layout,
+        long layer,
+        const tensor& tokens,
+        const tensor& tables,
+        long span
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::paged_attention(out, queries, q_heads, scale, pages, layout, layer, tokens, tables, span);
+#else
+        cpu::paged_attention(out, queries, q_heads, scale, pages, layout, layer, tokens, tables, span);
+#endif
+    }
+
 // ----------------------------------------------------------------------------------------
 
 }}

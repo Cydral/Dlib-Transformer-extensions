@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -37,6 +39,7 @@
 
 #include <dlib/cuda/extended_memory.h>
 #include <dlib/cuda/gguf_blocks.h>
+#include <dlib/cuda/kv_pages.h>
 #include <dlib/cuda/tensor_tools.h>
 #ifdef DLIB_USE_CUDA
 #include <cuda_runtime_api.h>
@@ -53,6 +56,7 @@
 
 #include "../common/engine_api.h"
 #include "../common/system_info.h"
+#include "kv_cache.h"
 #include "thread_pool.h"
 
 namespace albireo
@@ -267,6 +271,9 @@ namespace albireo
         // The bytes of a tile of a matrix expanded to single precision for a product.
         const size_t expanded_tile_bytes = size_t(64) << 20;
 
+        // The pages of keys and values a first growth of the copies of a layer pass makes at least.
+        const long min_kv_pages = 8;
+
         /*
             The rows of a new copy in a GGUF format that the device multiplies with probe
             activations, against the same products of the processor, before the copy serves: a
@@ -362,6 +369,7 @@ namespace albireo
     }
 
     class tensor_offload;
+    class tensor_layer_pass;
 
     struct tensor_device::impl
     {
@@ -399,6 +407,9 @@ namespace albireo
         std::atomic<unsigned long long> failures{0};
         std::atomic<unsigned long long> layer_passes{0};
         std::atomic<unsigned long long> layer_pass_tokens{0};
+        // The passes the device attended itself, and the bytes of the budget its copies of keys and values hold.
+        std::atomic<unsigned long long> attention_passes{0};
+        std::atomic<size_t> kv_page_bytes{0};
         std::atomic<bool> disabled{false};
         // The GGUF formats, as bits 1 << type, whose products on the device differed from those of
         // the processor, whose matrices are copied in single precision, and those that agreed.
@@ -509,7 +520,7 @@ namespace albireo
 
         size_t copy_bytes() const
         {
-            size_t total = 0;
+            size_t total = pass_room();
             for (const auto& kv : weights_) total += kv.second.bytes;
             return total;
         }
@@ -530,6 +541,8 @@ namespace albireo
                 it = weights_.erase(it);
             }
             if (freed > 0) d_.release(freed);
+            // The copies of the keys and values go last: the next pass of the model copies its blocks again.
+            if (freed < wanted) freed += release_pass_pages();
             return freed;
         }
 
@@ -569,6 +582,10 @@ namespace albireo
 
     private:
         friend class tensor_layer_pass;
+
+        // The bytes of the budget the pages of the layer pass hold, and their release (tensor_layer_pass).
+        size_t pass_room() const;
+        size_t release_pass_pages();
 
         struct copy
         {
@@ -1277,6 +1294,8 @@ namespace albireo
         dlib::resizable_tensor tile_, tile_out_;
         // The matrix expanded on the host before it goes to w_ (CUDA).
         std::vector<float> expanded_;
+        // The layer pass of the model, which keeps copies of its keys and values.
+        tensor_layer_pass* pass_ = nullptr;
     };
 
     /*
@@ -1288,16 +1307,46 @@ namespace albireo
         for the device once, when its queries, keys and values arrive.  The matrices are the
         copies of the offload, which the first pass makes and which stay while the model has
         requests; the norms are copied to the device at the first pass.
+
+        The device also attends the passes the runtime gives it (begin_attention()).  It keeps
+        copies of the blocks of keys and values of the pool of the runtime in pages, a page per
+        block in the layout of the pool (dlib::kv_page_layout), and knows of each copy the epoch
+        of its block and the rows it holds.  Before a pass, a block the pass reads whose copy
+        lacks rows crosses whole from the pool; the layers of the pass then run without an
+        exchange with the processor, their keys and values going into the pages; at the end of
+        the pass, the rows of its tokens cross to the host in one copy and go into the blocks of
+        the pool.  The pages take room in the budget of the copies and grow as the passes need
+        them, the page of the block least recently read going to another block; an idle model
+        gives them back with its matrices.
     */
     class tensor_layer_pass : public layer_pass
     {
     public:
-        tensor_layer_pass(tensor_offload& o, const dense_model& m) : o_(o), m_(m) {}
+        tensor_layer_pass(tensor_offload& o, const dense_model& m) : o_(o), m_(m)
+        {
+            const long hd = m.head_dim;
+            attends_ = m.attention && m.n_heads > 0 && m.n_kv_heads > 0 && m.n_heads % m.n_kv_heads == 0
+                && (hd == 32 || hd == 64 || hd == 96 || hd == 128 || hd == 256)
+                && m.q_dim == m.n_heads * hd && m.kv_dim == m.n_kv_heads * hd
+                && m.rope_dims > 0 && m.rope_dims <= hd && m.rope_dims % 2 == 0;
+            // make_room() reaches the pages of an idle model through its offload, under this lock.
+            std::lock_guard<std::mutex> lock(o_.d_.registry_m);
+            o_.pass_ = this;
+        }
+
+        ~tensor_layer_pass() override
+        {
+            std::lock_guard<std::mutex> lock(o_.d_.registry_m);
+            o_.pass_ = nullptr;
+            // The pages go with their tensor; their room returns to the budget.
+            if (reserved_ > 0) release_room();
+        }
 
         bool begin(const float* x, long n) override
         {
             auto& d = o_.d_;
             o_.last_use_ = now_ns();
+            attending_ = false;
             if (n <= 0 || n < d.min_tokens || d.disabled.load() || !d.bind_thread()) return false;
             // Once the copies exceed the card, a generated token waits for the extended memory.
             if (n < qk_float_product_tokens && d.resident.load(std::memory_order_relaxed) > d.card_bytes) return false;
@@ -1349,19 +1398,9 @@ namespace albireo
         void attention_inputs(long layer, float* q, float* k, float* v) override
         {
             guarded([&]() {
-                const long d = m_.d_model, qd = m_.q_dim, kvd = m_.kv_dim;
-                const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
-                const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+                const long qd = m_.q_dim, kvd = m_.kv_dim;
                 dlib::device_scope pin({ &x_, &xn_, &qkv_, &o_.tile_, &o_.tile_out_ });
-                dlib::alias_tensor_instance x = view(x_, n_, d);
-                dlib::alias_tensor_instance xn = view(xn_, n_, d);
-                dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer)], m_.rms_eps);
-                dlib::alias_tensor_instance qv = view(qkv_, n_, qd);
-                dlib::alias_tensor_instance kv = view(qkv_, n_, kvd, n_ * qd);
-                dlib::alias_tensor_instance vv = view(qkv_, n_, kvd, n_ * (qd + kvd));
-                o_.product_on_device(L.wq, *c[0]->t, c[0]->quantized, xn, qv);
-                o_.product_on_device(L.wk, *c[1]->t, c[1]->quantized, xn, kv);
-                o_.product_on_device(L.wv, *c[2]->t, c[2]->quantized, xn, vv);
+                project(layer);
                 const size_t qn = static_cast<size_t>(n_ * qd), kn = static_cast<size_t>(n_ * kvd);
                 const float* all = download(view(qkv_, n_, qd + 2 * kvd), qn + 2 * kn);
                 std::memcpy(q, all, sizeof(float) * qn);
@@ -1373,33 +1412,108 @@ namespace albireo
         void attention_output(long layer, const float* ctx) override
         {
             guarded([&]() {
-                const long d = m_.d_model, qd = m_.q_dim, df = m_.d_ffn;
-                const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
-                const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
                 dlib::device_scope pin({ &x_, &xn_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.tile_out_ });
-                dlib::alias_tensor_instance x = view(x_, n_, d);
-                dlib::alias_tensor_instance xn = view(xn_, n_, d);
-                dlib::alias_tensor_instance tmp = view(tmp_, n_, d);
-                dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
-                upload(attended, ctx, static_cast<size_t>(n_ * qd));
-                o_.product_on_device(L.wo, *c[3]->t, c[3]->quantized, attended, tmp);
-                dlib::tt::add(1, x, m_.residual_scale, tmp);
-                dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer) + 1], m_.rms_eps);
-                dlib::alias_tensor_instance gate = view(gate_, n_, df);
-                dlib::alias_tensor_instance up = view(up_, n_, df);
-                o_.product_on_device(L.w_gate, *c[4]->t, c[4]->quantized, xn, gate);
-                o_.product_on_device(L.w_up, *c[5]->t, c[5]->quantized, xn, up);
-                dlib::tt::silu_multiply(gate, up);
-                o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp);
-                dlib::tt::add(1, x, m_.residual_scale, tmp);
+                dlib::alias_tensor_instance attended = view(ctx_, n_, m_.q_dim);
+                upload(attended, ctx, static_cast<size_t>(n_ * m_.q_dim));
+                finish(layer);
             });
+        }
+
+        bool attends() const override
+        {
+            return attends_ && allowed_;
+        }
+
+        void allow_attention(bool on) override
+        {
+            allowed_ = on;
+            // The copies of the keys and values serve the attention of the device alone.
+            if (!on) release_pages();
+        }
+
+        bool begin_attention(const attention_plan& plan) override
+        {
+            attending_ = false;
+            if (!attends() || n_ <= 0 || !plan.pool) return false;
+            const kv_pool& pool = *plan.pool;
+            if (pool.layers() != static_cast<long>(m_.layers.size()) || pool.kv_heads() != m_.n_kv_heads
+                || pool.head_dim() != m_.head_dim || static_cast<long>(plan.positions.size()) != n_)
+                return false;
+            dlib::kv_page_layout layout;
+            layout.layers = pool.layers();
+            layout.heads = pool.kv_heads();
+            layout.head_dim = pool.head_dim();
+            layout.block_positions = pool.block_positions();
+            layout.q8 = pool.format() == kv_format::q8;
+            if (!layout.valid() || layout.page_bytes() != pool.block_bytes()) return false;
+            bool taken = false;
+            try
+            {
+                taken = prepare(plan, layout);
+            }
+            catch (const std::exception& e)
+            {
+                settle();
+                if (lack_of_memory(e)) return false;
+                throw device_failure(e.what(), false);
+            }
+            if (!taken) return false;
+            attending_ = true;
+            ++o_.d_.attention_passes;
+            return true;
+        }
+
+        void attend(long layer) override
+        {
+            guarded([&]() {
+                const long qd = m_.q_dim, kvd = m_.kv_dim, H = m_.n_heads, KVH = m_.n_kv_heads, hd = m_.head_dim;
+                const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
+                dlib::device_scope pin({ &x_, &xn_, &qkv_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin_pages({ &pages_, &plan_ });
+                project(layer);
+                dlib::alias_tensor_instance q = view(qkv_, n_, qd);
+                dlib::alias_tensor_instance k = view(qkv_, n_, kvd, n_ * qd);
+                dlib::alias_tensor_instance v = view(qkv_, n_, kvd, n_ * (qd + kvd));
+                const size_t at = 5 * static_cast<size_t>(layer);
+                if (L.bq)
+                {
+                    dlib::tt::add(1, q, 1, extras_[at]);
+                    dlib::tt::add(1, k, 1, extras_[at + 1]);
+                    dlib::tt::add(1, v, 1, extras_[at + 2]);
+                }
+                if (L.q_norm)
+                {
+                    dlib::tt::rms_norm_rows(q, q, extras_[at + 3], m_.rms_eps);
+                    dlib::tt::rms_norm_rows(k, k, extras_[at + 4], m_.rms_eps);
+                }
+                const long T = n_;
+                dlib::alias_tensor_instance slots = view(plan_, T, 1);
+                dlib::alias_tensor_instance tokens = view(plan_, 2 * T, 1, T);
+                dlib::alias_tensor_instance tables = view(plan_, table_entries_, 1, 3 * T);
+                dlib::alias_tensor_instance angles = view(plan_, T, m_.rope_dims, 3 * T + table_entries_);
+                dlib::tt::rope_rows(q, angles, H, hd, m_.rope_dims, m_.neox);
+                dlib::tt::rope_rows(k, angles, KVH, hd, m_.rope_dims, m_.neox);
+                dlib::tt::paged_kv_store(pages_, layout_, layer, k, v, slots);
+                dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
+                dlib::tt::paged_attention(attended, q, H, m_.attention_scale, pages_, layout_, layer, tokens, tables,
+                    span_);
+                finish(layer);
+            });
+        }
+
+        void truncated(const kv_pool& pool, int block, long row) override
+        {
+            if (pool.id() != mirrored_pool_) return;
+            auto it = entries_.find(block);
+            if (it != entries_.end()) it->second.rows = std::min(it->second.rows, std::max(0L, row));
         }
 
         void end(const std::vector<long>& rows, float* x) override
         {
             guarded([&]() {
                 const long d = m_.d_model;
-                dlib::device_scope pin({ &x_ });
+                dlib::device_scope pin({ &x_, &pages_, &plan_, &gathered_ });
+                const uint8_t* written = attending_ ? gather_written() : nullptr;
                 if (rows.size() == 1)
                 {
                     // The row of the next token of a single sequence, the usual case.
@@ -1420,7 +1534,10 @@ namespace albireo
                     cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
                 }
 #endif
+                // The copies of the rows crossed with the hidden states, which the device waited for.
+                if (written) scatter_written(written);
             });
+            attending_ = false;
             n_ = 0;
         }
 
@@ -1436,13 +1553,41 @@ namespace albireo
 
         void report(bool ok, const std::string& detail) override
         {
-            if (ok)
+            if (ok && attends())
+                o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + o_.model() + "' run on the device, which "
+                    "attends the tokens of the generation itself, from its copies of the keys and values, and "
+                    "exchanges the inputs and outputs of the attention of the longer passes with the processor once "
+                    "per layer (" + detail + ")");
+            else if (ok)
                 o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + o_.model() + "' run on the device, which "
                     "exchanges the inputs and outputs of the attention with the processor once per layer (" + detail
                     + ")");
             else
                 o_.d_.message(ALBIREO_LOG_WARNING, "device: the layers of '" + o_.model() + "' return to the "
                     "processor, which hands their products to the device one by one (" + detail + ")");
+        }
+
+        // The bytes of the budget the pages hold.
+        size_t page_room() const
+        {
+            return reserved_;
+        }
+
+        // Frees the pages and returns the bytes of the budget they held; the copies of the blocks are forgotten.
+        size_t release_pages()
+        {
+            const size_t freed = reserved_;
+            {
+                // The tensor goes without waiting for the device, which no pass uses between two passes.
+                dlib::resizable_tensor gone;
+                pages_.swap(gone);
+            }
+            capacity_ = 0;
+            entries_.clear();
+            free_pages_.clear();
+            mirrored_pool_ = 0;
+            if (freed > 0) release_room();
+            return freed;
         }
 
     private:
@@ -1466,19 +1611,390 @@ namespace albireo
             return true;
         }
 
+        // Copies a vector of the model to a tensor of one row, or leaves the tensor empty without one.
+        static void copy_vector(dlib::resizable_tensor& t, const float* values, long count)
+        {
+            if (!values) return;
+            t.set_size(1, count);
+            std::memcpy(t.host_write_only(), values, sizeof(float) * static_cast<size_t>(count));
+        }
+
+        /*
+            The norms of the blocks, and for the attention of the device the biases of the
+            queries, keys and values and the norms of the queries and keys, five tensors per
+            layer, empty when the model lacks them.
+        */
         void copy_norms()
         {
             const long d = m_.d_model;
             std::vector<dlib::resizable_tensor> norms(2 * m_.layers.size());
+            std::vector<dlib::resizable_tensor> extras(5 * m_.layers.size());
             for (size_t i = 0; i < m_.layers.size(); ++i)
-                for (size_t j = 0; j < 2; ++j)
-                {
-                    dlib::resizable_tensor& t = norms[2 * i + j];
-                    t.set_size(d);
-                    std::memcpy(t.host_write_only(), j == 0 ? m_.layers[i].attn_norm : m_.layers[i].ffn_norm,
-                        sizeof(float) * static_cast<size_t>(d));
-                }
+            {
+                const dense_layer& L = m_.layers[i];
+                copy_vector(norms[2 * i], L.attn_norm, d);
+                copy_vector(norms[2 * i + 1], L.ffn_norm, d);
+                if (!attends_) continue;
+                copy_vector(extras[5 * i], L.bq, m_.q_dim);
+                copy_vector(extras[5 * i + 1], L.bk, m_.kv_dim);
+                copy_vector(extras[5 * i + 2], L.bv, m_.kv_dim);
+                copy_vector(extras[5 * i + 3], L.q_norm, m_.head_dim);
+                copy_vector(extras[5 * i + 4], L.k_norm, m_.head_dim);
+            }
             norms_.swap(norms);
+            extras_.swap(extras);
+        }
+
+        // The queries, keys and values of the tokens of the pass for layer, into qkv_.
+        void project(long layer)
+        {
+            const long d = m_.d_model, qd = m_.q_dim, kvd = m_.kv_dim;
+            const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
+            const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+            dlib::alias_tensor_instance x = view(x_, n_, d);
+            dlib::alias_tensor_instance xn = view(xn_, n_, d);
+            dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer)], m_.rms_eps);
+            dlib::alias_tensor_instance qv = view(qkv_, n_, qd);
+            dlib::alias_tensor_instance kv = view(qkv_, n_, kvd, n_ * qd);
+            dlib::alias_tensor_instance vv = view(qkv_, n_, kvd, n_ * (qd + kvd));
+            o_.product_on_device(L.wq, *c[0]->t, c[0]->quantized, xn, qv);
+            o_.product_on_device(L.wk, *c[1]->t, c[1]->quantized, xn, kv);
+            o_.product_on_device(L.wv, *c[2]->t, c[2]->quantized, xn, vv);
+        }
+
+        // The projection of the outputs of the attention in ctx_, then the feed-forward block, with both residual sums.
+        void finish(long layer)
+        {
+            const long d = m_.d_model, qd = m_.q_dim, df = m_.d_ffn;
+            const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
+            const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+            dlib::alias_tensor_instance x = view(x_, n_, d);
+            dlib::alias_tensor_instance xn = view(xn_, n_, d);
+            dlib::alias_tensor_instance tmp = view(tmp_, n_, d);
+            dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
+            o_.product_on_device(L.wo, *c[3]->t, c[3]->quantized, attended, tmp);
+            dlib::tt::add(1, x, m_.residual_scale, tmp);
+            dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer) + 1], m_.rms_eps);
+            dlib::alias_tensor_instance gate = view(gate_, n_, df);
+            dlib::alias_tensor_instance up = view(up_, n_, df);
+            o_.product_on_device(L.w_gate, *c[4]->t, c[4]->quantized, xn, gate);
+            o_.product_on_device(L.w_up, *c[5]->t, c[5]->quantized, xn, up);
+            dlib::tt::silu_multiply(gate, up);
+            o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp);
+            dlib::tt::add(1, x, m_.residual_scale, tmp);
+        }
+
+        /*
+            Gives the blocks of the pass their pages, copies the blocks whose pages lack rows the
+            pass reads, and the tokens of the pass to the device; false when the pages cannot hold
+            the blocks of the pass.
+        */
+        bool prepare(const attention_plan& plan, const dlib::kv_page_layout& layout)
+        {
+            const kv_pool& pool = *plan.pool;
+            const long B = layout.block_positions;
+            const long T = n_;
+            const long R = m_.rope_dims;
+            if (static_cast<long>(plan.firsts.size()) != T || static_cast<long>(plan.angles.size()) != T * R
+                || plan.blocks.empty())
+                return false;
+            if (pool.id() != mirrored_pool_ || layout.q8 != layout_.q8 || layout.page_bytes() != layout_.page_bytes()
+                || B != layout_.block_positions)
+            {
+                // Another pool: its blocks have other numbers, and pages of another size are made again.
+                if (layout.page_bytes() != layout_.page_bytes()) release_pages();
+                entries_.clear();
+                free_pages_.clear();
+                for (long p = capacity_; p-- > 0;) free_pages_.push_back(p);
+                mirrored_pool_ = pool.id();
+                layout_ = layout;
+            }
+            ++clock_;
+
+            // The rows each block of the pass must hold before the pass, a block shared by
+            // segments needing the most of them.
+            needed_.clear();
+            for (const attention_plan::segment& s : plan.segments)
+            {
+                const long blocks = (s.length + s.count + B - 1) / B;
+                if (s.first < 0 || s.first + blocks > static_cast<long>(plan.blocks.size())) return false;
+                for (long i = 0; i < blocks; ++i)
+                    needed_.push_back(std::make_pair(plan.blocks[static_cast<size_t>(s.first + i)],
+                        std::max(0L, std::min(B, s.length - i * B))));
+            }
+            std::sort(needed_.begin(), needed_.end());
+            size_t kept = 0;
+            for (size_t i = 0; i < needed_.size(); ++i)
+            {
+                if (kept > 0 && needed_[kept - 1].first == needed_[i].first)
+                    needed_[kept - 1].second = std::max(needed_[kept - 1].second, needed_[i].second);
+                else
+                    needed_[kept++] = needed_[i];
+            }
+            needed_.resize(kept);
+
+            // The copies of the blocks of the pass whose blocks changed since leave their pages.
+            size_t missing = 0;
+            for (const auto& b : needed_)
+            {
+                auto it = entries_.find(b.first);
+                if (it != entries_.end() && it->second.epoch == pool.epoch(b.first))
+                {
+                    it->second.used = clock_;
+                    continue;
+                }
+                if (it != entries_.end())
+                {
+                    free_pages_.push_back(it->second.page);
+                    entries_.erase(it);
+                }
+                ++missing;
+            }
+            if (missing > free_pages_.size())
+            {
+                // The pages of the blocks the pass does not read can go to its blocks.
+                size_t idle = 0;
+                for (const auto& e : entries_)
+                    if (e.second.used != clock_) ++idle;
+                if (missing > free_pages_.size() + idle && !grow(capacity_ + static_cast<long>(missing
+                    - free_pages_.size() - idle), pool))
+                {
+                    const long wanted = capacity_ + static_cast<long>(missing - free_pages_.size() - idle);
+                    if (!told_room_)
+                        o_.d_.message(ALBIREO_LOG_INFO, "device: the copies of the keys and values of '" + o_.model()
+                            + "' found no room for " + std::to_string(wanted) + (wanted == 1 ? " block" : " blocks")
+                            + " of " + megabytes(layout.page_bytes()) + ": the processor attends the passes that read "
+                            "more blocks than the device holds");
+                    told_room_ = true;
+                    return false;
+                }
+            }
+            while (free_pages_.size() < missing)
+            {
+                auto oldest = entries_.end();
+                for (auto it = entries_.begin(); it != entries_.end(); ++it)
+                    if (it->second.used != clock_
+                        && (oldest == entries_.end() || it->second.used < oldest->second.used))
+                        oldest = it;
+                if (oldest == entries_.end()) return false;
+                free_pages_.push_back(oldest->second.page);
+                entries_.erase(oldest);
+            }
+
+            /*
+                The buffers of the tokens and of the rows they write take their size before the
+                pins: a tensor of the extended memory that grows leaves its record, which a pin
+                would still hold.
+            */
+            table_entries_ = static_cast<long>(plan.blocks.size());
+            const size_t words = static_cast<size_t>(3 * T + table_entries_ + T * R);
+            tensor_offload::reserve_buffer(plan_, words);
+            tensor_offload::reserve_buffer(gathered_, (static_cast<size_t>(T) * token_kv_bytes() + sizeof(float) - 1)
+                / sizeof(float));
+
+            dlib::device_scope pin({ &pages_, &plan_ });
+            for (const auto& b : needed_)
+            {
+                auto it = entries_.find(b.first);
+                if (it == entries_.end())
+                {
+                    page_entry e;
+                    e.page = free_pages_.back();
+                    e.epoch = pool.epoch(b.first);
+                    e.used = clock_;
+                    free_pages_.pop_back();
+                    it = entries_.emplace(b.first, e).first;
+                }
+                if (it->second.rows < b.second)
+                {
+                    upload_block(pool, b.first, it->second.page);
+                    it->second.rows = b.second;
+                }
+            }
+
+            // The tokens: their slots, their positions and first entries, the pages of the blocks, their angles.
+            plan_host_.resize(words);
+            written_.resize(static_cast<size_t>(T));
+            long span = 0;
+            for (long t = 0; t < T; ++t)
+            {
+                const long p = plan.positions[static_cast<size_t>(t)];
+                const long f = plan.firsts[static_cast<size_t>(t)];
+                if (p < 0 || f < 0 || f + p / B >= table_entries_ || p >= std::numeric_limits<int32_t>::max())
+                    return false;
+                const int block = plan.blocks[static_cast<size_t>(f + p / B)];
+                const page_entry& e = entries_.at(block);
+                put_integer(static_cast<size_t>(t), static_cast<int32_t>(e.page * B + p % B));
+                put_integer(static_cast<size_t>(T + 2 * t), static_cast<int32_t>(p));
+                put_integer(static_cast<size_t>(T + 2 * t + 1), static_cast<int32_t>(f));
+                written_[static_cast<size_t>(t)] = std::make_pair(block, p % B);
+                span = std::max(span, p + 1);
+            }
+            for (long i = 0; i < table_entries_; ++i)
+                put_integer(static_cast<size_t>(3 * T + i),
+                    static_cast<int32_t>(entries_.at(plan.blocks[static_cast<size_t>(i)]).page));
+            std::memcpy(plan_host_.data() + 3 * T + table_entries_, plan.angles.data(),
+                sizeof(float) * static_cast<size_t>(T * R));
+            span_ = span;
+            pool_ = plan.pool;
+            upload_plan(words);
+            return true;
+        }
+
+        void put_integer(size_t at, int32_t value)
+        {
+            std::memcpy(&plan_host_[at], &value, sizeof(value));
+        }
+
+        /*
+            Gives the pages room for wanted pages at least, twice as many as they had if the budget
+            allows, within the blocks the pool can ever hold; false when the budget lacks room.
+            The pages keep their contents.
+        */
+        bool grow(long wanted, const kv_pool& pool)
+        {
+            const long limit = static_cast<long>(pool.max_blocks());
+            if (wanted > limit) return false;
+            const size_t page = layout_.page_bytes();
+            auto& d = o_.d_;
+            for (long target : { std::min(limit, std::max(wanted, std::max(2 * capacity_, min_kv_pages))), wanted })
+            {
+                if (target < wanted) continue;
+                const size_t extra = static_cast<size_t>(target - capacity_) * page;
+                /*
+                    Without the extended memory, every tensor of dlib has a copy in the memory of the
+                    host: the pages then keep to an eighth of the budget.
+                */
+                if (!d.v2ram && reserved_ + extra > d.budget / 8) continue;
+                /*
+                    Beyond the memory of the card, the passes of a few tokens stay on the processor
+                    (begin()): the pages keep within it.
+                */
+                if (d.card_bytes != std::numeric_limits<size_t>::max()
+                    && d.resident.load(std::memory_order_relaxed) + extra > d.card_bytes)
+                    continue;
+                if (!d.reserve(extra) && !(d.make_room(extra, &o_) && d.reserve(extra))) continue;
+                try
+                {
+                    dlib::resizable_tensor bigger;
+                    bigger.set_size(static_cast<long long>((static_cast<size_t>(target) * page + sizeof(float) - 1)
+                        / sizeof(float)));
+                    if (capacity_ > 0)
+                    {
+                        dlib::device_scope pin({ &pages_, &bigger });
+                        const size_t bytes = static_cast<size_t>(capacity_) * page;
+#if defined(DLIB_USE_CUDA)
+                        cuda_check(cudaMemcpy(bigger.device(), pages_.device(), bytes, cudaMemcpyDeviceToDevice),
+                            "copy of keys and values on the device");
+#else
+                        std::memcpy(bigger.host(), pages_.host(), bytes);
+#endif
+                    }
+                    pages_.swap(bigger);
+                }
+                catch (const std::exception& e)
+                {
+                    d.release(extra);
+                    if (lack_of_memory(e)) continue;
+                    throw;
+                }
+                reserved_ += extra;
+                d.kv_page_bytes += extra;
+                for (long p = target; p-- > capacity_;) free_pages_.push_back(p);
+                capacity_ = target;
+                return true;
+            }
+            return false;
+        }
+
+        void release_room()
+        {
+            o_.d_.release(reserved_);
+            o_.d_.kv_page_bytes -= reserved_;
+            reserved_ = 0;
+        }
+
+        // Copies block b of the pool, whole, into a page.
+        void upload_block(const kv_pool& pool, int b, long page)
+        {
+            const size_t bytes = layout_.page_bytes();
+#if defined(DLIB_USE_CUDA)
+            uint8_t* dst = reinterpret_cast<uint8_t*>(pages_.device()) + static_cast<size_t>(page) * bytes;
+            cuda_check(cudaMemcpy(dst, pool.block_memory(b), bytes, cudaMemcpyHostToDevice),
+                "copy of keys and values to the device");
+#else
+            std::memcpy(reinterpret_cast<uint8_t*>(pages_.host()) + static_cast<size_t>(page) * bytes,
+                pool.block_memory(b), bytes);
+#endif
+        }
+
+        // Copies the first words of plan_host_ to plan_.
+        void upload_plan(size_t words)
+        {
+#if defined(DLIB_USE_CUDA)
+            // The pinned buffer is free: the previous pass waited for the device at its end.
+            float* staging = plan_staging_.reserve(words);
+            std::memcpy(staging, plan_host_.data(), sizeof(float) * words);
+            cuda_check(cudaMemcpyAsync(plan_.device(), staging, sizeof(float) * words, cudaMemcpyHostToDevice, 0),
+                "copy of the tokens of a pass to the device");
+#else
+            std::memcpy(plan_.host(), plan_host_.data(), sizeof(float) * words);
+#endif
+        }
+
+        // The bytes of the keys and values of a token in the order of dlib::tt::paged_kv_gather().
+        size_t token_kv_bytes() const
+        {
+            return 2 * static_cast<size_t>(layout_.layers) * static_cast<size_t>(layout_.heads) * layout_.row_bytes();
+        }
+
+        /*
+            Gathers the rows the tokens of the pass wrote in the pages and starts their copy to the
+            host: the returned bytes are complete once the device has been waited for.  prepare()
+            gave gathered_ its size.
+        */
+        const uint8_t* gather_written()
+        {
+            const size_t bytes = static_cast<size_t>(n_) * token_kv_bytes();
+            const size_t values = (bytes + sizeof(float) - 1) / sizeof(float);
+            dlib::alias_tensor_instance gathered = view(gathered_, static_cast<long>(values), 1);
+            dlib::alias_tensor_instance slots = view(plan_, n_, 1);
+            dlib::tt::paged_kv_gather(gathered, pages_, layout_, slots);
+#if defined(DLIB_USE_CUDA)
+            float* staging = kv_from_device_.reserve(values);
+            cuda_check(cudaMemcpyAsync(staging, gathered_.device(), bytes, cudaMemcpyDeviceToHost, 0),
+                "copy of keys and values from the device");
+            return reinterpret_cast<const uint8_t*>(staging);
+#else
+            return reinterpret_cast<const uint8_t*>(gathered_.host());
+#endif
+        }
+
+        // Writes the rows of the tokens of the pass into their blocks of the pool, which the pages now hold too.
+        void scatter_written(const uint8_t* src)
+        {
+            kv_pool& pool = *pool_;
+            const size_t data = layout_.data_bytes();
+            const size_t scales = layout_.scale_bytes();
+            const size_t at_scales = static_cast<size_t>(layout_.block_positions) * data;
+            for (const auto& w : written_)
+            {
+                uint8_t* block = pool.block_memory(w.first);
+                const size_t r = static_cast<size_t>(w.second);
+                for (long kind = 0; kind < 2; ++kind)
+                    for (long l = 0; l < layout_.layers; ++l)
+                        for (long h = 0; h < layout_.heads; ++h)
+                        {
+                            uint8_t* slab = block + layout_.slab_offset(kind, l, h);
+                            std::memcpy(slab + r * data, src, data);
+                            src += data;
+                            if (scales == 0) continue;
+                            std::memcpy(slab + at_scales + r * scales, src, scales);
+                            src += scales;
+                        }
+                auto it = entries_.find(w.first);
+                if (it != entries_.end()) it->second.rows = std::max(it->second.rows, w.second + 1);
+            }
         }
 
         // The n rows of cols floats of a buffer that start first floats in, as a tensor.
@@ -1549,18 +2065,71 @@ namespace albireo
 #endif
         }
 
+        struct page_entry
+        {
+            long page = 0;
+            uint32_t epoch = 0;
+            // The rows of the block the page holds as the pool does, from the first.
+            long rows = 0;
+            // The last pass that read the block.
+            unsigned long long used = 0;
+        };
+
         tensor_offload& o_;
         const dense_model m_;
         long n_ = 0;
         std::vector<const tensor_offload::copy*> copies_;
         // The norms of the attention and of the feed-forward block of each layer, in turn.
         std::vector<dlib::resizable_tensor> norms_;
+        // The biases and norms of the queries and keys of each layer (copy_norms()).
+        std::vector<dlib::resizable_tensor> extras_;
         dlib::resizable_tensor x_, xn_, tmp_, qkv_, ctx_, gate_, up_;
+
+        // The attention of the device: whether the model and the runtime allow it, and the pass takes it.
+        bool attends_ = false;
+        bool allowed_ = true;
+        bool attending_ = false;
+        // Whether the log told that the pages found no room.
+        bool told_room_ = false;
+        // The pages, capacity_ of them, the bytes of the budget they hold, and the pages without a block.
+        dlib::kv_page_layout layout_;
+        dlib::resizable_tensor pages_;
+        long capacity_ = 0;
+        size_t reserved_ = 0;
+        std::vector<long> free_pages_;
+        // The copies of the blocks of the pool whose id is mirrored_pool_, by block.
+        std::unordered_map<int, page_entry> entries_;
+        unsigned long long mirrored_pool_ = 0;
+        unsigned long long clock_ = 0;
+        std::vector<std::pair<int, long>> needed_;
+        /*
+            The tokens of the pass on the device, as dlib::tt::paged_attention() reads them: their
+            slots, their positions with their first entries, the pages of the blocks of the plan
+            (table_entries_ of them), as integers, then their angles.
+        */
+        dlib::resizable_tensor plan_;
+        std::vector<float> plan_host_;
+        long table_entries_ = 0;
+        long span_ = 0;
+        // The block and the row of each token of the pass, in the pool the pass writes.
+        std::vector<std::pair<int, long>> written_;
+        kv_pool* pool_ = nullptr;
+        dlib::resizable_tensor gathered_;
 #if defined(DLIB_USE_CUDA)
-        // The rows that cross the bus, each way.
-        pinned_floats to_device_, from_device_;
+        // The rows that cross the bus, each way, the tokens of a pass, and the keys and values they wrote.
+        pinned_floats to_device_, from_device_, plan_staging_, kv_from_device_;
 #endif
     };
+
+    size_t tensor_offload::pass_room() const
+    {
+        return pass_ ? pass_->page_room() : 0;
+    }
+
+    size_t tensor_offload::release_pass_pages()
+    {
+        return pass_ ? pass_->release_pages() : 0;
+    }
 
     std::unique_ptr<layer_pass> tensor_offload::make_layer_pass(const dense_model& model)
     {
@@ -1776,6 +2345,9 @@ namespace albireo
         // The passes whose layers ran on the device (layer_pass), and their tokens.
         s["layer_passes"] = d.layer_passes.load();
         s["layer_pass_tokens"] = d.layer_pass_tokens.load();
+        // The passes the device attended itself, and the bytes of its copies of keys and values.
+        s["attention_passes"] = d.attention_passes.load();
+        s["kv_bytes"] = static_cast<unsigned long long>(d.kv_page_bytes.load());
         s["disabled"] = d.disabled.load();
         s["evictions"] = d.evictions.load();
         s["evicted_bytes"] = d.evicted_bytes.load();
