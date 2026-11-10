@@ -47,8 +47,21 @@ namespace albireo
     public:
         explicit sampler(const sampling_params& p);
 
-        // Draws the next token from a row of logits (modified in place).
-        int sample(float* logits, long vocab);
+        /*!
+            ensures
+                - Draws the next token from a row of logits (modified in place).
+                - The n_pending tokens of pending count for the penalties as tokens of the
+                  history after those accept() recorded: the tokens drawn before this one in
+                  the verification of a draft, which the engine records once it keeps them.
+                - When draft >= 0, the token proposed for this place by a draft: with a
+                  temperature of 0, the most likely token is returned, as without a draft;
+                  otherwise the draft is returned with the probability the filters give it,
+                  and when it is not, a token drawn among the other candidates in proportion
+                  to their probabilities.  The tokens then follow the distribution of the
+                  draws without a draft (speculative sampling), which the caller checks by
+                  comparing the result with the draft.
+        !*/
+        int sample(float* logits, long vocab, int draft = -1, const int* pending = nullptr, size_t n_pending = 0);
 
         // Records a token of the sequence (generated or prompt) for the penalties.
         void accept(int token);

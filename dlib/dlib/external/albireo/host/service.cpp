@@ -422,6 +422,8 @@ namespace albireo
         c["max_sequences"] = s.max_sequences;
         c["kv_mb"] = s.kv_mb;
         c["kv_type"] = s.kv_type;
+        c["draft_tokens"] = s.draft_tokens;
+        c["integer_prompt"] = s.integer_prompt;
         c["v2ram"] = s.v2ram;
         c["v2ram_max_mb"] = s.v2ram_max_mb;
         c["offload_mb"] = s.device_mb;
@@ -1404,6 +1406,7 @@ namespace albireo
             options["max_sequences"] = st.max_sequences;
             if (st.kv_mb > 0) options["kv_mb"] = st.kv_mb;
             options["kv_type"] = st.kv_type;
+            options["draft_tokens"] = st.draft_tokens;
         }
         // The vision encoder of a model that reads images.
         if (!m.projector.empty())

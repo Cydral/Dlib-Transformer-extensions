@@ -115,6 +115,8 @@ namespace albireo
         j["max_sequences"] = max_sequences;
         j["kv_mb"] = kv_mb;
         j["kv_type"] = kv_type;
+        j["draft_tokens"] = draft_tokens;
+        j["integer_prompt"] = integer_prompt;
         json a = json::object();
         for (const auto& kv : active) a[kv.first] = kv.second;
         j["active"] = a;
@@ -148,6 +150,9 @@ namespace albireo
         kv_mb = j["kv_mb"].as_int(d.kv_mb);
         kv_type = j["kv_type"].str(d.kv_type);
         if (kv_type != "auto" && kv_type != "q8" && kv_type != "f16") kv_type = d.kv_type;
+        draft_tokens = static_cast<int>(j["draft_tokens"].as_int(d.draft_tokens));
+        if (draft_tokens < 0 || draft_tokens > 6) draft_tokens = d.draft_tokens;
+        integer_prompt = j["integer_prompt"].as_bool(d.integer_prompt);
         active.clear();
         for (const auto& kv : j["active"].items())
         {

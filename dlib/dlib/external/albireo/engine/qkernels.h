@@ -127,12 +127,16 @@ namespace albireo
     };
 
     /*!
-        From this number of tokens on, qk_matmul() expands the weights to floats, a tile of
-        rows at a time, and multiplies them with the activations as they are: the expansion
-        is then shared by enough tokens to cost little, and the products run at the full
-        rate of the floating point units.  Below it, the activations are quantized and the
-        integer kernels compute each dot product from the compact weights, which is what a
-        generation step, bound by the reading of the weights, needs.
+        From this number of tokens on, qk_matmul() lays out the weights a tile of rows at a
+        time and computes the products of all the tokens with each tile, which then shares
+        the cost of the layout: the kernels of the prompt passes.  For the formats of
+        qk_integer_prompt(), the weights go into panels of 8-bit integers and the
+        activations are quantized by groups of 32 values, the products of bytes computing
+        four times as many products per instruction as the floats; for the other formats,
+        the weights are expanded to floats and multiplied with the activations as they
+        are.  Below this number, the activations are quantized and the integer kernels
+        compute each dot product from the compact weights, which is what a generation step,
+        bound by the reading of the weights, needs.
     !*/
     const long qk_float_product_tokens = 8;
 
@@ -145,13 +149,39 @@ namespace albireo
             - path selects the kernels.  The experts of a mixture receive a varying share
               of the tokens of a pass; they follow the size of the whole pass, so that a
               token is computed the same way whichever expert it reaches.
+            - With the integer kernels, and with the 8-bit kernels of the prompt, the result of a
+              token never depends on the other tokens of the product; the automatic path changes
+              kernels at qk_float_product_tokens tokens, and the kernels of floats change the
+              order of their sums with the number of tokens.
     !*/
     enum class qk_path
     {
-        automatic,  // floats from qk_float_product_tokens tokens on, integers below
+        automatic,  // the kernels of the prompt from qk_float_product_tokens tokens on, integers below
         integer,    // quantized activations and integer kernels
-        floats      // weights expanded to floats
+        floats,     // weights expanded to floats
+        prompt      // the kernels of the prompt whatever the number of tokens
     };
+
+    /*!
+        ensures
+            - Returns true when the kernels of the prompt compute the products of a matrix
+              of type t and cols input features on 8-bit integers: weights of type Q4_0,
+              Q4_K, Q5_K, Q6_K, or Q8_0 with the instructions of VNNI, in a build for AVX2,
+              with cols a multiple of 256, and qk_set_integer_prompt() not turned off.
+            - Each weight keeps its exact value, and the activations are rounded to 8 bits
+              by groups of 32 values (act_format::q8_0): the results stand within the
+              rounding of the activations of those of floats, as the integer kernels of the
+              generation do.
+    !*/
+    bool qk_integer_prompt(dlib::ggml_type t, long cols);
+
+    /*!
+        ensures
+            - Turns the 8-bit integer products of the prompt on or off (on by default) for
+              every product that starts after the call: when off, the kernels of the prompt
+              expand the weights to floats for every format.
+    !*/
+    void qk_set_integer_prompt(bool on);
 
     void qk_matmul(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
         float* Y, long y_stride, thread_pool& pool, qk_scratch& scratch, bool accumulate = false,

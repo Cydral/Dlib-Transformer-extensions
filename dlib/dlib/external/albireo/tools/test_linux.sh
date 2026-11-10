@@ -104,6 +104,10 @@ fi
 if [ -x "$BUILD/tests/test_chat_format" ]; then step "chat format" "all checks passed" "$BUILD/tests/test_chat_format"
 else skip "chat format" "no $BUILD/tests/test_chat_format"
 fi
+# The draws of the sampler with the drafts of the answers, against the draws without them.
+if [ -x "$BUILD/tests/test_sampler" ]; then step "sampler" "all checks passed" "$BUILD/tests/test_sampler"
+else skip "sampler" "no $BUILD/tests/test_sampler"
+fi
 if [ -x "$BUILD/tests/test_engine_api" ] && [ -f "$ENGINES/libalbireo-engine-cpu.so" ]; then
   step "engine interface" "all checks passed" "$BUILD/tests/test_engine_api" "$ENGINES/libalbireo-engine-cpu.so" "$WORK"
 else skip "engine interface" "no $BUILD/tests/test_engine_api or no portable engine"

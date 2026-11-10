@@ -300,6 +300,8 @@ namespace albireo
         long context = 0;
         long max_sequences = 8;
         long batch_tokens = 512;
+        // The tokens of a draft a step verifies at most for an answer, 0 for none (draft_tokens).
+        long draft_tokens = 0;
         kv_format kv_type = kv_format::f16;
         std::vector<int> stops;
         std::vector<cache_entry> idle;
@@ -345,6 +347,9 @@ namespace albireo
         // active or waiting, which n_active and the waiting requests of the statistics leave out.
         std::atomic<uint64_t> warmed{0};
         std::atomic<long> n_warming{0};
+        // The tokens of the drafts the steps verified, and those the model kept.
+        std::atomic<uint64_t> drafted{0};
+        std::atomic<uint64_t> draft_kept{0};
     };
 
     // A request of an embedding model: one vector per input, every input computed as a
@@ -442,6 +447,18 @@ namespace albireo
         long repeated = 0;
         bool in_reasoning = false;
         bool repetition = false;
+        /*
+            The verification of drafts (propose_draft()): the tokens proposed after next_token,
+            which the step computes with it, the tokens drawn from their logits (the drafts the
+            model keeps, then the token that follows them), the tokens the next draft may hold,
+            the steps that propose none after drafts the model refused, and the verifications in
+            a row that kept nothing.
+        */
+        std::vector<int> draft;
+        std::vector<int> drawn;
+        long draft_room = 0;
+        long draft_pause = 0;
+        long draft_misses = 0;
 
         bool is_cancelled() const { return cancelled || (job && job->cancelled); }
     };
@@ -632,6 +649,73 @@ namespace albireo
         const size_t encoding_budget = size_t(256) << 20;
         // The tokens of prompts a pass reads at most while answers are being written, in any model.
         const long prefill_while_answering = 64;
+
+        /*
+            The drafts of the answers (speculative decoding): a step computes, after the next
+            token of an answer, the tokens a lookup of its context proposes to follow it, and
+            keeps those the model would have drawn itself, which writes several tokens for the
+            reading of the weights of one step.  The lookup takes the tokens that followed the
+            latest earlier occurrence of the last tokens of the context (prompt lookup
+            decoding): an answer that takes up a document, a code or a list given to it, or its
+            own text, finds whole runs of tokens there.
+                - draft_match: the length of the occurrence looked for, at most; the longest one
+                  wins, the latest among equals.
+                - draft_min_match: the length below which an occurrence proposes nothing.
+                - draft_span: the last tokens of the context the lookup reads.
+                - draft_pass_tokens: the tokens of the answers a pass computes at most with their
+                  drafts, shared by its answers: below qk_float_product_tokens, the integer
+                  kernels of the generation compute each token as a step of its own does, and
+                  the pass stays within the attention of the devices (8 tokens).
+                - draft_misses_pause: the verifications in a row that keep nothing after which an
+                  answer proposes no draft for draft_pause_steps steps, doubled at each such pause
+                  up to draft_pause_most.
+        */
+        const long draft_match = 4;
+        const long draft_min_match = 2;
+        const long draft_span = 65536;
+        const long draft_pass_tokens = qk_float_product_tokens - 1;
+        const long draft_misses_pause = 2;
+        const long draft_pause_steps = 4;
+        const long draft_pause_most = 64;
+
+        /*
+            Writes to draft the tokens, most at most, that followed the latest longest earlier
+            occurrence of the last tokens of the context, keys followed by next: none when no
+            occurrence reaches draft_min_match tokens.  A draft stops before a key of an image,
+            which is no token of the vocabulary.
+        */
+        void propose_draft(const std::vector<int>& keys, int next, long most, long vocab, std::vector<int>& draft)
+        {
+            draft.clear();
+            const long n = static_cast<long>(keys.size());
+            if (most <= 0 || n < draft_min_match) return;
+            // Token i of the context, next being token n.
+            auto token = [&](long i) { return i == n ? next : keys[static_cast<size_t>(i)]; };
+            long best = -1, best_length = 0;
+            const long first = std::max<long>(0, n - draft_span);
+            for (long j = n - 1; j >= first; --j)
+            {
+                if (keys[static_cast<size_t>(j)] != next) continue;
+                long length = 1;
+                while (length < draft_match && j - length >= 0
+                    && keys[static_cast<size_t>(j - length)] == token(n - length))
+                    ++length;
+                if (length > best_length)
+                {
+                    best_length = length;
+                    best = j;
+                    if (length == draft_match) break;
+                }
+            }
+            if (best < 0 || best_length < draft_min_match) return;
+            for (long i = best + 1; i <= n && static_cast<long>(draft.size()) < most; ++i)
+            {
+                const int t = token(i);
+                if (t < 0 || t >= vocab) break;
+                draft.push_back(t);
+            }
+        }
+
         // The decoded image pixels the requests of one model may hold at once, waiting to be encoded.
         const size_t queued_pixels_budget = size_t(1) << 30;
         // The tokens a history must leave to compute for a warm-up to read it ahead.
@@ -962,6 +1046,8 @@ namespace albireo
         // A spin of a tenth of a second at most, since a longer one keeps the processor busy between passes.
         pool_->set_spin_time(std::chrono::microseconds(bounded(settings_["spin_us"], 2000, 0, 100000)));
         warm_history_ = settings_["warm_history"].as_bool(true);
+        // The products of the prompts on 8-bit integers (qk_integer_prompt()), on by default.
+        qk_set_integer_prompt(settings_["integer_prompt"].as_bool(true));
         log(ALBIREO_LOG_INFO, std::string("engine ") + ALBIREO_ENGINE_VARIANT + " " + ALBIREO_VERSION + ", "
             + std::to_string(threads_) + " threads, kernels " + qk_isa());
 #ifdef ALBIREO_TENSOR_BACKEND
@@ -1211,6 +1297,8 @@ namespace albireo
             : std::max<long>(1, static_cast<long>(setting("max_sequences", 8, 0, 256)));
         m->batch_tokens = embedding && !options.contains("batch_tokens") ? 256
             : std::max<long>(16, static_cast<long>(setting("batch_tokens", 512, 0, 65536)));
+        // The drafts of the answers (propose_draft()): 4 tokens by default, 0 for none, 6 at most.
+        m->draft_tokens = embedding ? 0 : static_cast<long>(setting("draft_tokens", 4, 0, draft_pass_tokens - 1));
 
         /*
             The storage of the keys and values (kv_format): auto takes the 8-bit integers for a
@@ -1547,6 +1635,7 @@ namespace albireo
             || !(presence >= -100 && presence <= 100) || !(frequency >= -100 && frequency <= 100))
             throw std::invalid_argument("sampling parameters out of range");
         r->smp.reset(new sampler(sp));
+        r->draft_room = m->draft_tokens;
 
         const long room = m->context - static_cast<long>(r->prompt.size());
         // Compared before any narrowing: long has 32 bits on Windows.
@@ -2262,7 +2351,11 @@ namespace albireo
         }
         if (m.vision_job) advance_encoding(m);
 
-        // The next token of every request being generated, then slices of the prompts.
+        /*
+            The next token of every request being generated, with its draft, then slices of the
+            prompts.  A row of an answer holds its next token and its draft, with the logits of
+            each of them.
+        */
         struct row { request_state* r; long count; bool logits; };
         std::vector<row> rows;
         forward_batch& b = m.batch;
@@ -2270,10 +2363,13 @@ namespace albireo
         b.hidden_only = m.cfg.is_embedding();
         const bool multimodal = m.cfg.multimodal_rope();
         long budget = budget_tokens;
+        // The answers whose next token the pass computes, each with the memory of that token.
+        std::vector<request_state*> answers;
         for (auto& rp : m.active)
         {
             request_state& r = *rp;
             if (r.ph != request_state::phase::decode) continue;
+            r.draft.clear();
             const long len = m.runtime->sequence_length(r.seq);
             if (len + 1 > m.context)
             {
@@ -2288,17 +2384,47 @@ namespace albireo
                 fail(r, "out_of_memory", "no memory left for the keys and values of this answer");
                 continue;
             }
-            b.segments.push_back({ r.seq, static_cast<long>(b.tokens.size()), 1 });
-            b.logit_rows.push_back(static_cast<long>(b.tokens.size()));
+            answers.push_back(&r);
+        }
+        // The tokens of drafts each answer may add to the pass.
+        const long n_answers = static_cast<long>(answers.size());
+        const long draft_share = n_answers > 0 ? std::max<long>(0, draft_pass_tokens - n_answers) / n_answers : 0;
+        for (request_state* rp : answers)
+        {
+            request_state& r = *rp;
+            const long len = m.runtime->sequence_length(r.seq);
+            /*
+                A draft, within the context, and within the memory the pool has left once every
+                answer holds the place of its next token: a draft takes no block from a cached
+                sequence or from a prompt being read.  None while the engine writes the end of
+                a reasoning.
+            */
+            const long most = std::min(std::min(draft_share, r.draft_room), m.context - len - 1);
+            if (r.draft_pause > 0)
+            {
+                --r.draft_pause;
+            }
+            else if (most > 0 && r.forced.empty())
+            {
+                propose_draft(r.kv_tokens, r.next_token, most, m.cfg.vocab, r.draft);
+                if (!r.draft.empty()
+                    && !m.runtime->reserve_sequence(r.seq, len + 1 + static_cast<long>(r.draft.size())))
+                    r.draft.clear();
+            }
+            const long count = 1 + static_cast<long>(r.draft.size());
+            const long row0 = static_cast<long>(b.tokens.size());
+            b.segments.push_back({ r.seq, row0, count });
+            for (long i = 0; i < count; ++i) b.logit_rows.push_back(row0 + i);
             b.tokens.push_back(r.next_token);
+            b.tokens.insert(b.tokens.end(), r.draft.begin(), r.draft.end());
             if (multimodal)
             {
                 // A generated token follows the last position of the prompt.
                 const long p = r.next_position + len - static_cast<long>(r.prompt.size());
-                b.positions.insert(b.positions.end(), { p, p, p });
+                for (long i = 0; i < count; ++i) b.positions.insert(b.positions.end(), { p + i, p + i, p + i });
             }
-            rows.push_back({ &r, 1, true });
-            --budget;
+            rows.push_back({ &r, count, true });
+            budget -= count;
         }
         requeue_preempted(m);
         // While answers to users are being written, in this model or another, a pass reads few tokens of prompts.
@@ -2473,7 +2599,9 @@ namespace albireo
                 }
             }
             if (!w.logits) continue;
-            const long this_row = static_cast<long>(logit_row++);
+            const long this_row = static_cast<long>(logit_row);
+            // The row of an answer holds the logits of its next token and of its draft.
+            logit_row += r.ph == request_state::phase::decode ? static_cast<size_t>(w.count) : 1;
             if (r.job)
             {
                 // An input of an embedding request, read to its end.
@@ -2503,25 +2631,53 @@ namespace albireo
             }
             draws.push_back({ &r, lg, -1 });
         }
+        /*
+            The draw of an answer with a draft goes through its logits in order: each token of the
+            draft drawn again is kept, and the first one the draw refuses ends the verification,
+            with the token drawn in its place; a draft kept whole gains the token its last logits
+            draw.  The penalties of each draw count the tokens drawn before it.
+        */
+        auto sample = [&](draw& d) {
+            request_state& r = *d.r;
+            if (r.draft.empty())
+            {
+                d.token = r.smp->sample(d.logits, V);
+                return;
+            }
+            r.drawn.clear();
+            for (size_t i = 0; i <= r.draft.size(); ++i)
+            {
+                const int proposed = i < r.draft.size() ? r.draft[i] : -1;
+                const int t = r.smp->sample(d.logits + static_cast<long>(i) * V, V, proposed, r.drawn.data(),
+                    r.drawn.size());
+                r.drawn.push_back(t);
+                if (t != proposed) break;
+            }
+            d.token = r.drawn.front();
+        };
         if (draws.size() == 1)
-            draws[0].token = draws[0].r->smp->sample(draws[0].logits, V);
+            sample(draws[0]);
         else if (draws.size() > 1)
-            pool_->parallel_for(static_cast<long>(draws.size()), [&](long i, int) {
-                draw& d = draws[static_cast<size_t>(i)];
-                d.token = d.r->smp->sample(d.logits, V);
-            });
+            pool_->parallel_for(static_cast<long>(draws.size()),
+                [&](long i, int) { sample(draws[static_cast<size_t>(i)]); });
         for (const draw& d : draws)
         {
+            request_state& r = *d.r;
+            if (!r.draft.empty())
+            {
+                generated += verify_draft(m, r);
+                continue;
+            }
             ++generated;
             int token = d.token;
             // The end of a reasoning that reached its budget takes the place of the tokens drawn.
-            d.r->forcing = !d.r->forced.empty();
-            if (d.r->forcing)
+            r.forcing = !r.forced.empty();
+            if (r.forcing)
             {
-                token = d.r->forced.front();
-                d.r->forced.pop_front();
+                token = r.forced.front();
+                r.forced.pop_front();
             }
-            handle_token(m, *d.r, token);
+            handle_token(m, r, token);
         }
 
         m.prompted += static_cast<uint64_t>(prompt_tokens);
@@ -2546,7 +2702,53 @@ namespace albireo
         return true;
     }
 
-    void engine::handle_token(loaded_model& m, request_state& r, int token)
+    long engine::verify_draft(loaded_model& m, request_state& r)
+    {
+        /*
+            The keys and values of the step: the next token, then the draft.  The model keeps the
+            first drawn - 1 tokens of the draft, the last token drawn following them; the keys and
+            values of the tokens of the draft it refused go back to the pool.
+        */
+        const long proposed = static_cast<long>(r.draft.size());
+        const long kept = static_cast<long>(r.drawn.size()) - 1;
+        const long base = m.runtime->sequence_length(r.seq) - proposed;
+        m.drafted += static_cast<uint64_t>(proposed);
+        m.draft_kept += static_cast<uint64_t>(kept);
+        if (kept < proposed) m.runtime->truncate_sequence(r.seq, base + kept);
+        long handled = 0;
+        for (long i = 0; i <= kept; ++i)
+        {
+            if (i > 0) r.kv_tokens.push_back(r.draft[static_cast<size_t>(i - 1)]);
+            ++handled;
+            r.forcing = false;
+            handle_token(m, r, r.drawn[static_cast<size_t>(i)], base + i);
+            if (r.ph == request_state::phase::done) break;
+            if (!r.forced.empty() && i < kept)
+            {
+                // The engine writes the end of the reasoning from here: the draft after this token goes.
+                m.runtime->truncate_sequence(r.seq, base + i);
+                break;
+            }
+        }
+        /*
+            The next draft holds one token more than this one kept; verifications in a row that
+            keep nothing pause the drafts, longer at each pause.
+        */
+        r.draft_room = std::min(m.draft_tokens, std::max<long>(1, kept + 1));
+        if (kept > 0)
+        {
+            r.draft_misses = 0;
+        }
+        else if (++r.draft_misses % draft_misses_pause == 0)
+        {
+            const long pauses = std::min<long>(r.draft_misses / draft_misses_pause - 1, 4);
+            r.draft_pause = std::min(draft_pause_most, draft_pause_steps << pauses);
+        }
+        r.draft.clear();
+        return handled;
+    }
+
+    void engine::handle_token(loaded_model& m, request_state& r, int token, long length)
     {
         if (std::binary_search(m.stops.begin(), m.stops.end(), token))
         {
@@ -2606,7 +2808,7 @@ namespace albireo
             r.forced.assign(r.closing.begin(), r.closing.end());
             r.closing.clear();
         }
-        if (r.generated >= r.max_tokens || m.runtime->sequence_length(r.seq) + 1 >= m.context)
+        if (r.generated >= r.max_tokens || (length >= 0 ? length : m.runtime->sequence_length(r.seq)) + 1 >= m.context)
         {
             finish(m, r, "length");
             return;
@@ -2770,6 +2972,9 @@ namespace albireo
         {
             if (keep_cache && !r.kv_tokens.empty())
             {
+                // The keys and values of a draft beyond the tokens kept go back to the pool.
+                const long kept = static_cast<long>(r.kv_tokens.size());
+                if (m.runtime->sequence_length(r.seq) > kept) m.runtime->truncate_sequence(r.seq, kept);
                 cache_entry e;
                 e.seq = r.seq;
                 e.tokens.swap(r.kv_tokens);
@@ -3039,6 +3244,8 @@ namespace albireo
             j["generated_total"] = static_cast<unsigned long long>(m.generated.load());
             j["prompt_total"] = static_cast<unsigned long long>(m.prompted.load());
             j["warmed_total"] = static_cast<unsigned long long>(m.warmed.load());
+            j["drafted_total"] = static_cast<unsigned long long>(m.drafted.load());
+            j["draft_kept_total"] = static_cast<unsigned long long>(m.draft_kept.load());
             active += m.n_active.load();
             waiting += queued;
             models.push_back(j);

@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -295,28 +296,42 @@ namespace
             std::vector<float> Y2 = Y;
             qk_matmul(W, X.data(), tokens, xs, Y2.data(), ys, pool, scratch, true);
 
-            // Few tokens go through the integer kernels, many through floats.
-            const bool floats = tokens >= qk_float_product_tokens;
-            const act_format af = qk_activation_format(f.type);
+            /*
+                Few tokens go through the integer kernels of the generation, many through the
+                kernels of the prompt: 8-bit panels for the formats of qk_integer_prompt(),
+                whose activations are rounded as act_format::q8_0, and floats for the others.
+            */
+            const bool prompt = tokens >= qk_float_product_tokens;
+            const bool panels = prompt && qk_integer_prompt(f.type, cols);
+            const act_format af = panels ? act_format::q8_0 : qk_activation_format(f.type);
             std::vector<uint8_t> act(qk_activation_row_bytes(af, cols));
             std::vector<float> wf(static_cast<size_t>(cols));
+            // A pass without the first token, whose tokens get the results of the whole pass.
+            std::vector<float> Y3;
+            if (panels && tokens - 1 >= qk_float_product_tokens)
+            {
+                Y3.assign(static_cast<size_t>((tokens - 1) * ys), 7.0f);
+                qk_matmul(W, X.data() + xs, tokens - 1, xs, Y3.data(), ys, pool, scratch);
+            }
             for (long t = 0; t < tokens; ++t)
             {
                 qk_quantize_row(af, X.data() + t * xs, act.data(), cols);
+                const std::vector<float> xt(X.begin() + t * xs, X.begin() + t * xs + cols);
+                const std::vector<double> a = activation_values(af, act, xt);
                 for (long r = 0; r < rows; ++r)
                 {
                     float ref;
                     // Single precision sums: their rounding follows the magnitude of
                     // the terms rather than that of the result.
                     double mag = 0;
-                    if (floats)
+                    if (prompt)
                     {
                         qk_dequantize_row(f.type, W.data + r * W.row_bytes, wf.data(), cols);
                         double d = 0;
                         for (long i = 0; i < cols; ++i)
                         {
-                            const double p = static_cast<double>(wf[static_cast<size_t>(i)])
-                                * X[static_cast<size_t>(t * xs + i)];
+                            const double v = panels ? a[static_cast<size_t>(i)] : X[static_cast<size_t>(t * xs + i)];
+                            const double p = static_cast<double>(wf[static_cast<size_t>(i)]) * v;
                             d += p;
                             mag += std::fabs(p);
                         }
@@ -328,9 +343,14 @@ namespace
                     }
                     const float got = Y[static_cast<size_t>(t * ys + r)];
                     const double tol = 1e-5 * (std::fabs(ref) + 1) + 2e-6 * mag;
-                    check(std::fabs(got - ref) <= tol, "matmul", got, ref);
+                    check(std::fabs(got - ref) <= tol, panels ? "matmul on 8-bit panels" : "matmul", got, ref);
                     // Each token of a pass gets the result it gets alone, whatever the other tokens.
-                    if (!floats) check(got == ref, "integer product independent of the other tokens", got, ref);
+                    if (!prompt) check(got == ref, "integer product independent of the other tokens", got, ref);
+                    if (t > 0 && !Y3.empty())
+                    {
+                        const float other = Y3[static_cast<size_t>((t - 1) * ys + r)];
+                        check(got == other, "8-bit product independent of the other tokens", got, other);
+                    }
                     check(std::fabs(Y2[static_cast<size_t>(t * ys + r)] - 2 * ref) <= 2 * tol,
                         "matmul accumulate", Y2[static_cast<size_t>(t * ys + r)], 2 * ref);
                 }
@@ -347,9 +367,20 @@ namespace
             test_matmul_case(f, 512, rng, pool);
             // The formats of single values also take a length that no vector divides.
             if (f.block == 1) test_matmul_case(f, 523, rng, pool);
+            // Rows of several slices of the 8-bit panels.
+            if (qk_integer_prompt(f.type, 2304)) test_matmul_case(f, 2304, rng, pool);
         }
+        // The kernels of the prompt on floats for every format.
+        qk_set_integer_prompt(false);
+        for (const fmt& f : formats())
+            if (f.block != 1) test_matmul_case(f, 512, rng, pool);
+        qk_set_integer_prompt(true);
         std::printf("  matmul: every format, 1 to 300 tokens, integer, float and packed paths, strided, accumulated\n");
         std::printf("  integer products: each token as computed alone\n");
+        std::string panels = "none in this build";
+        if (qk_integer_prompt(ggml_type::Q4_K, 512))
+            panels = std::string("Q4_0, Q4_K, Q5_K, Q6_K") + (qk_integer_prompt(ggml_type::Q8_0, 512) ? ", Q8_0" : "");
+        std::printf("  8-bit products of the prompt (%s): each token as computed in another pass\n", panels.c_str());
     }
 
     void test_helpers(std::mt19937& rng)

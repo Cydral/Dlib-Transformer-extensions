@@ -3,11 +3,13 @@
 /*
     Measures the processor runtime on a model:
 
-        bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel] [f16|q8]
+        bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel] [f16|q8] [floats]
 
     Reports the prompt throughput, the time of one generation step for a single
     sequence, and the throughput of steps that advance several sequences together, with
-    the keys and values in half precision (by default) or in 8 bits.
+    the keys and values in half precision (by default) or in 8 bits.  floats computes the
+    products of the prompt on floats (qk_set_integer_prompt()) rather than on 8-bit
+    integers.
 */
 
 #include <algorithm>
@@ -32,7 +34,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel] [f16|q8]\n");
+        std::printf("usage: bench_runtime model.gguf [threads] [prompt_tokens] [steps] [parallel] [f16|q8] [floats]\n");
         return 2;
     }
     const int threads = argc > 2 ? std::atoi(argv[2]) : static_cast<int>(std::thread::hardware_concurrency());
@@ -40,6 +42,7 @@ int main(int argc, char** argv)
     const long steps = argc > 4 ? std::atol(argv[4]) : 32;
     const long parallel = argc > 5 ? std::atol(argv[5]) : 4;
     const kv_format format = argc > 6 && std::string(argv[6]) == "q8" ? kv_format::q8 : kv_format::f16;
+    if (argc > 7 && std::string(argv[7]) == "floats") qk_set_integer_prompt(false);
 
     auto file = std::make_shared<model_file>(argv[1]);
     const model_config cfg = read_model_config(*file);

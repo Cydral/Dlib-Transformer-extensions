@@ -805,8 +805,8 @@ namespace albireo
         bool validate_settings(const json& body, std::string& error)
         {
             static const char* const keys[] = { "port", "language", "engine", "accelerator", "v2ram", "v2ram_max_mb",
-                "device_mb", "threads", "context", "max_sequences", "kv_mb", "kv_type", "check_updates", "offline",
-                "proxy", "web_access", "web_search" };
+                "device_mb", "threads", "context", "max_sequences", "kv_mb", "kv_type", "draft_tokens",
+                "integer_prompt", "check_updates", "offline", "proxy", "web_access", "web_search" };
             for (const auto& kv : body.items())
             {
                 if (std::find_if(std::begin(keys), std::end(keys), [&](const char* k) { return kv.first == k; })
@@ -847,6 +847,7 @@ namespace albireo
                 && one_of("accelerator", { "auto", "none", "npu", "gpu", "both" })
                 && in_range("port", 1024, 65535) && in_range("threads", 0, 1024) && in_range("context", 0, 1 << 20)
                 && in_range("max_sequences", 1, 64) && in_range("kv_mb", 0, 1 << 24)
+                && in_range("draft_tokens", 0, 6) && boolean("integer_prompt")
                 && in_range("v2ram_max_mb", 0, 1 << 24) && in_range("device_mb", 0, 1 << 24) && boolean("v2ram")
                 && boolean("check_updates")
                 && boolean("offline");
@@ -1627,7 +1628,8 @@ namespace albireo
                 || after.v2ram_max_mb != before.v2ram_max_mb || after.device_mb != before.device_mb
                 || after.threads != before.threads
                 || after.context != before.context || after.max_sequences != before.max_sequences
-                || after.kv_mb != before.kv_mb || after.kv_type != before.kv_type;
+                || after.kv_mb != before.kv_mb || after.kv_type != before.kv_type
+                || after.draft_tokens != before.draft_tokens || after.integer_prompt != before.integer_prompt;
             json o = ok_result(true);
             o["restart"] = restart;
             send_json(res, 200, o);

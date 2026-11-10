@@ -827,6 +827,10 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
    add_executable(test_chat_format tests/test_chat_format.cpp engine/chat_format.cpp)
    target_include_directories(test_chat_format PRIVATE ${ALBIREO_INCLUDE_DIR})
    albireo_output_dir(test_chat_format ${CMAKE_BINARY_DIR}/tests)
+   # The draws of the sampler with the drafts of the answers.
+   add_executable(test_sampler tests/test_sampler.cpp engine/sampler.cpp)
+   target_compile_options(test_sampler PRIVATE ${ALBIREO_WARNINGS})
+   albireo_output_dir(test_sampler ${CMAKE_BINARY_DIR}/tests)
    # The kernels of the other families: their checks and their speed, on the processors
    # that have their instructions (the others skip them).
    foreach (family avxvnni vnni256)

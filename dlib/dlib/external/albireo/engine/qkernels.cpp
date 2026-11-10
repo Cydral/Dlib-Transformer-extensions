@@ -2099,6 +2099,623 @@ namespace albireo
         }
     }
 
+    // Products of several tokens on 8-bit integers
+
+    namespace
+    {
+        std::atomic<bool> integer_prompt{true};
+
+#if ALBIREO_QK_AVX2
+        /*
+            The products of the passes of many tokens on 8-bit integers, for the formats whose
+            weights are 8-bit integers times a scale, plus an offset for some of them: an
+            instruction of the products of bytes then computes 32 products where a vector of
+            floats computes 8.
+
+            The input features go by groups of 256, a group by 8 chunks of 32 features.  A token
+            is quantized by chunks as for act_format::q8_0: a scale sx, the largest magnitude of
+            the chunk over 127, and integers xq = round(x / sx) within [-127, 127], kept as the
+            unsigned bytes xq + 128.  A weight is the product of a signed 8-bit integer s by the
+            scale A of its chunk, or of its half of a chunk for the formats with a scale per 16
+            features, plus the offset B of its chunk for the formats with minimums: w = A s + B,
+            the value of its format.
+
+            A panel holds the 256 bytes of a group transposed by units of 4 bytes: vector k of
+            the group holds, in its lane of 32 bits j, the bytes 4k to 4k + 3 of chunk j.  The
+            products of the bytes of a lane, which the instruction adds together, then belong to
+            one chunk, and the 8 vectors of a group give the dot products of its 8 chunks in one
+            register; the formats with a scale per 16 features read them as two halves of 4
+            vectors.  As the sum over a lane of (xq + 128) s is dot(xq, s) + 128 sum(s),
+                sum over a chunk of w x = sx (A dot + Bw) + B c
+            with Bw = -128 A sum(s), a constant of the weights, and c = sx sum(xq), a constant
+            of the token.  The products of the bytes are exact, and the results differ from the
+            products on floats by the rounding of the activations to 8 bits, as those of the
+            integer kernels of the generation.
+        */
+        enum class panel_kind { none, q4_0, q8_0, q4_K, q5_K, q6_K };
+
+        panel_kind panel_kind_of(ggml_type t)
+        {
+            switch (t)
+            {
+            case ggml_type::Q4_0: return panel_kind::q4_0;
+            case ggml_type::Q4_K: return panel_kind::q4_K;
+            case ggml_type::Q5_K: return panel_kind::q5_K;
+            case ggml_type::Q6_K: return panel_kind::q6_K;
+#if ALBIREO_QK_VNNI
+            // Its signed bytes times the bytes of the activations overflow the 16-bit sums of AVX2.
+            case ggml_type::Q8_0: return panel_kind::q8_0;
+#endif
+            default: return panel_kind::none;
+            }
+        }
+
+        // A scale per 16 features, read as two halves of the vectors of a group.
+        inline bool panel_halves(panel_kind k) { return k == panel_kind::q6_K; }
+        // An offset per chunk, times the sums of the activations.
+        inline bool panel_minimums(panel_kind k) { return k == panel_kind::q4_K || k == panel_kind::q5_K; }
+        /*
+            The floats of a group of a row: A then Bw of its chunks, then B for the formats with
+            minimums; A and Bw of the first halves, then of the second ones, for the formats with
+            a scale per 16 features.
+        */
+        inline long panel_floats(panel_kind k) { return panel_halves(k) ? 32 : panel_minimums(k) ? 24 : 16; }
+
+        /*
+            Transposes the 8 x 8 units of 32 bits of v: unit j of vector i becomes unit i of
+            vector j.
+        */
+        inline void transpose_units(__m256i v[8])
+        {
+            const __m256i t0 = _mm256_unpacklo_epi32(v[0], v[1]);
+            const __m256i t1 = _mm256_unpackhi_epi32(v[0], v[1]);
+            const __m256i t2 = _mm256_unpacklo_epi32(v[2], v[3]);
+            const __m256i t3 = _mm256_unpackhi_epi32(v[2], v[3]);
+            const __m256i t4 = _mm256_unpacklo_epi32(v[4], v[5]);
+            const __m256i t5 = _mm256_unpackhi_epi32(v[4], v[5]);
+            const __m256i t6 = _mm256_unpacklo_epi32(v[6], v[7]);
+            const __m256i t7 = _mm256_unpackhi_epi32(v[6], v[7]);
+            // Units 0 and 1, 2 and 3 of vectors 0 to 3 in each half, then of vectors 4 to 7.
+            const __m256i u0 = _mm256_unpacklo_epi64(t0, t2);
+            const __m256i u1 = _mm256_unpackhi_epi64(t0, t2);
+            const __m256i u2 = _mm256_unpacklo_epi64(t1, t3);
+            const __m256i u3 = _mm256_unpackhi_epi64(t1, t3);
+            const __m256i u4 = _mm256_unpacklo_epi64(t4, t6);
+            const __m256i u5 = _mm256_unpackhi_epi64(t4, t6);
+            const __m256i u6 = _mm256_unpacklo_epi64(t5, t7);
+            const __m256i u7 = _mm256_unpackhi_epi64(t5, t7);
+            v[0] = _mm256_permute2x128_si256(u0, u4, 0x20);
+            v[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+            v[2] = _mm256_permute2x128_si256(u2, u6, 0x20);
+            v[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+            v[4] = _mm256_permute2x128_si256(u0, u4, 0x31);
+            v[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+            v[6] = _mm256_permute2x128_si256(u2, u6, 0x31);
+            v[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+        }
+
+        /*
+            The panel of a token: its groups quantized by chunks, each group as its 256 bytes
+            xq + 128 transposed, written to bytes, and as the scales sx and the sums c of its 8
+            chunks, written to floats.
+        */
+        void quantize_panel(const float* x, long groups, uint8_t* bytes, float* floats)
+        {
+            const __m256i flip = _mm256_set1_epi8(static_cast<char>(0x80));
+            block_q8_0x b[8];
+            for (long g = 0; g < groups; ++g, x += 256, bytes += 256, floats += 16)
+            {
+                quantize_row_q8_0x(x, b, 256);
+                __m256i v[8];
+                for (int j = 0; j < 8; ++j)
+                {
+                    v[j] = _mm256_xor_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b[j].qs)), flip);
+                    floats[j] = b[j].d;
+                    floats[8 + j] = b[j].s;
+                }
+                transpose_units(v);
+                for (int k = 0; k < 8; ++k) _mm256_store_si256(reinterpret_cast<__m256i*>(bytes + 32 * k), v[k]);
+            }
+        }
+
+        /*
+            The 8 chunks of the group of weights at p as signed bytes, in the order of the
+            features, and the floats of the group that come from its format: A in f[0..7], and
+            in f[16..23] B, or A of the second halves.
+        */
+        void weight_chunks(panel_kind k, const uint8_t* p, __m256i c[8], float* f)
+        {
+            const __m256i m4 = _mm256_set1_epi8(0x0F);
+            switch (k)
+            {
+            case panel_kind::q4_0:
+                for (int j = 0; j < 8; ++j, p += 18)
+                {
+                    f[j] = h2f(p);
+                    c[j] = _mm256_sub_epi8(nibbles_to_bytes(p + 2), _mm256_set1_epi8(8));
+                }
+                break;
+            case panel_kind::q8_0:
+                for (int j = 0; j < 8; ++j, p += 34)
+                {
+                    f[j] = h2f(p);
+                    c[j] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 2));
+                }
+                break;
+            case panel_kind::q4_K:
+            case panel_kind::q5_K:
+            {
+                // w = d sc q - dmin m for a chunk of scale sc and minimum m.
+                uint32_t utmp[4];
+                unpack_k4_scales(p + 4, utmp);
+                const __m128i sm = _mm_loadu_si128(reinterpret_cast<const __m128i*>(utmp));
+                const __m256 sc = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(sm));
+                const __m256 mn = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(sm, 8)));
+                _mm256_store_ps(f, _mm256_mul_ps(_mm256_set1_ps(h2f(p)), sc));
+                _mm256_store_ps(f + 16, _mm256_mul_ps(_mm256_set1_ps(-h2f(p + 2)), mn));
+                if (k == panel_kind::q4_K)
+                {
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 16 + 32 * j));
+                        c[2 * j] = _mm256_and_si256(v, m4);
+                        c[2 * j + 1] = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+                    }
+                }
+                else
+                {
+                    // Bit 2j of each byte of the high bits is the fifth bit of chunk 2j, bit 2j + 1 that of 2j + 1.
+                    const __m256i hb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 16));
+                    const __m256i one = _mm256_set1_epi8(1);
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 48 + 32 * j));
+                        const __m256i h0 = _mm256_and_si256(_mm256_srl_epi16(hb, _mm_cvtsi32_si128(2 * j)), one);
+                        const __m256i h1 = _mm256_and_si256(_mm256_srl_epi16(hb, _mm_cvtsi32_si128(2 * j + 1)), one);
+                        c[2 * j] = _mm256_or_si256(_mm256_and_si256(v, m4), _mm256_slli_epi16(h0, 4));
+                        c[2 * j + 1] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v, 4), m4),
+                            _mm256_slli_epi16(h1, 4));
+                    }
+                }
+                break;
+            }
+            case panel_kind::q6_K:
+            {
+                // w = d sc (q - 32), sc the signed scale of 16 features: the even ones scale the first halves.
+                const __m256 d = _mm256_set1_ps(h2f(p + 208));
+                const __m128i sc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 192));
+                const __m128i even = _mm_shuffle_epi8(sc, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
+                    0, 2, 4, 6, 8, 10, 12, 14));
+                const __m128i odd = _mm_shuffle_epi8(sc, _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15,
+                    1, 3, 5, 7, 9, 11, 13, 15));
+                _mm256_store_ps(f, _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(even))));
+                _mm256_store_ps(f + 16, _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(odd))));
+                const __m256i m2 = _mm256_set1_epi8(3);
+                const __m256i offset = _mm256_set1_epi8(32);
+                for (int half = 0; half < 2; ++half)
+                {
+                    // The low four bits, then the two high bits moved to bits 4 and 5, as dequantize_q6_K_avx2().
+                    const uint8_t* ql = p + 64 * half;
+                    const __m256i l0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql));
+                    const __m256i l1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 32));
+                    const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 128 + 32 * half));
+                    __m256i* q = c + 4 * half;
+                    q[0] = _mm256_or_si256(_mm256_and_si256(l0, m4), _mm256_slli_epi16(_mm256_and_si256(h, m2), 4));
+                    q[1] = _mm256_or_si256(_mm256_and_si256(l1, m4),
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 2), m2), 4));
+                    q[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(l0, 4), m4),
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 4), m2), 4));
+                    q[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(l1, 4), m4),
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 6), m2), 4));
+                    for (int j = 0; j < 4; ++j) q[j] = _mm256_sub_epi8(q[j], offset);
+                }
+                break;
+            }
+            default:
+                // No format of the panels: zeros.
+                for (int j = 0; j < 8; ++j) c[j] = _mm256_setzero_si256();
+                _mm256_store_ps(f, _mm256_setzero_ps());
+                _mm256_store_ps(f + 16, _mm256_setzero_ps());
+                break;
+            }
+        }
+
+        // Lays out the group of weights at p in a panel: its 256 bytes, then its floats (panel_floats()).
+        void pack_panel_group(panel_kind k, const uint8_t* p, uint8_t* bytes, float* f)
+        {
+            __m256i c[8];
+            weight_chunks(k, p, c, f);
+            transpose_units(c);
+            // The sums of the bytes s of each lane over the first and over the second half of the vectors.
+            const __m256i ones8 = _mm256_set1_epi8(1);
+            const __m256i ones16 = _mm256_set1_epi16(1);
+            __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+            for (int j = 0; j < 4; ++j)
+            {
+                s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, c[j]), ones16));
+                s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, c[j + 4]), ones16));
+            }
+            for (int j = 0; j < 8; ++j) _mm256_store_si256(reinterpret_cast<__m256i*>(bytes + 32 * j), c[j]);
+            const __m256 m128 = _mm256_set1_ps(-128.0f);
+            if (panel_halves(k))
+            {
+                _mm256_store_ps(f + 8, _mm256_mul_ps(_mm256_mul_ps(_mm256_load_ps(f), m128), _mm256_cvtepi32_ps(s0)));
+                _mm256_store_ps(f + 24, _mm256_mul_ps(_mm256_mul_ps(_mm256_load_ps(f + 16), m128),
+                    _mm256_cvtepi32_ps(s1)));
+            }
+            else
+            {
+                _mm256_store_ps(f + 8, _mm256_mul_ps(_mm256_mul_ps(_mm256_load_ps(f), m128),
+                    _mm256_cvtepi32_ps(_mm256_add_epi32(s0, s1))));
+            }
+        }
+
+        // A block of rows of weights and of tokens in their panels, from one group on.
+        struct panel_block
+        {
+            const uint8_t* w = nullptr;   // the bytes of the first row
+            const float* wf = nullptr;    // the floats of the first row
+            long w_stride = 0;            // bytes from a row to the next
+            long wf_stride = 0;           // floats from a row to the next
+            long wf_group = 0;            // floats of a group of a row
+            const uint8_t* x = nullptr;   // the bytes of the first token
+            const float* xf = nullptr;    // the floats of the first token
+            long x_stride = 0;            // bytes from a token to the next
+            long xf_stride = 0;           // floats from a token to the next
+            long groups = 0;
+        };
+
+        // acc + the products of the scaled dot products of the lanes of a half: sx (A dot + Bw).
+        inline void panel_fold(__m256& acc, __m256i dot, const float* f, const float* sx)
+        {
+            const __m256 v = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_load_ps(f), _mm256_load_ps(f + 8));
+            acc = _mm256_fmadd_ps(v, _mm256_load_ps(sx), acc);
+        }
+
+        /*
+            The kernels: R <= 2 rows of weights against T <= 4 tokens over the groups of a
+            block, each pair with its own accumulators, written to out[r * T + t].  The pairs go
+            through the same operations whatever R and T, so that a token gets the same results
+            in every block.  With VNNI, an instruction adds the four products of the bytes of
+            each lane to its sum.  With AVX2, the products of pairs of bytes add up in 16 bits
+            over RUN vectors, as many as the bounds of the format allow without overflow, before
+            their sums in 32 bits.  The accumulators are named variables rather than arrays so
+            that no compiler leaves them in memory.
+        */
+        template <int R, int T, bool HALVES, bool MINS, int RUN>
+        void panel_kernel(const panel_block& b, float* out)
+        {
+            static_assert(R >= 1 && R <= 2 && T >= 1 && T <= 4, "blocks of 2 rows and 4 tokens at most");
+            static_assert((HALVES ? 4 : 8) % RUN == 0, "the runs of 16-bit sums divide the halves");
+            const __m256 zf = _mm256_setzero_ps();
+            __m256 a00 = zf, a01 = zf, a02 = zf, a03 = zf, a10 = zf, a11 = zf, a12 = zf, a13 = zf;
+#if !ALBIREO_QK_VNNI
+            const __m256i ones16 = _mm256_set1_epi16(1);
+#endif
+            for (long g = 0; g < b.groups; ++g)
+            {
+                const uint8_t* w0 = b.w + 256 * g;
+                const uint8_t* w1 = R > 1 ? w0 + b.w_stride : w0;
+                const uint8_t* x0 = b.x + 256 * g;
+                const uint8_t* x1 = T > 1 ? x0 + b.x_stride : x0;
+                const uint8_t* x2 = T > 2 ? x1 + b.x_stride : x0;
+                const uint8_t* x3 = T > 3 ? x2 + b.x_stride : x0;
+                const float* f0 = b.wf + b.wf_group * g;
+                const float* f1 = R > 1 ? f0 + b.wf_stride : f0;
+                const float* s0 = b.xf + 16 * g;
+                const float* s1 = T > 1 ? s0 + b.xf_stride : s0;
+                const float* s2 = T > 2 ? s1 + b.xf_stride : s0;
+                const float* s3 = T > 3 ? s2 + b.xf_stride : s0;
+                for (int h = 0; h < (HALVES ? 2 : 1); ++h)
+                {
+                    const __m256i zi = _mm256_setzero_si256();
+                    __m256i d00 = zi, d01 = zi, d02 = zi, d03 = zi, d10 = zi, d11 = zi, d12 = zi, d13 = zi;
+                    const int first = HALVES ? 4 * h : 0;
+                    const int last = HALVES ? 4 * h + 4 : 8;
+#if ALBIREO_QK_VNNI
+                    for (int k = first; k < last; ++k)
+                    {
+                        const __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(w0 + 32 * k));
+                        const __m256i v1 = R > 1
+                            ? _mm256_load_si256(reinterpret_cast<const __m256i*>(w1 + 32 * k)) : zi;
+                        __m256i x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x0 + 32 * k));
+                        d00 = dpbusd(d00, x, v0);
+                        if (R > 1) d10 = dpbusd(d10, x, v1);
+                        if (T > 1)
+                        {
+                            x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x1 + 32 * k));
+                            d01 = dpbusd(d01, x, v0);
+                            if (R > 1) d11 = dpbusd(d11, x, v1);
+                        }
+                        if (T > 2)
+                        {
+                            x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x2 + 32 * k));
+                            d02 = dpbusd(d02, x, v0);
+                            if (R > 1) d12 = dpbusd(d12, x, v1);
+                        }
+                        if (T > 3)
+                        {
+                            x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x3 + 32 * k));
+                            d03 = dpbusd(d03, x, v0);
+                            if (R > 1) d13 = dpbusd(d13, x, v1);
+                        }
+                    }
+#else
+                    for (int k = first; k < last; k += RUN)
+                    {
+                        __m256i e00 = zi, e01 = zi, e02 = zi, e03 = zi, e10 = zi, e11 = zi, e12 = zi, e13 = zi;
+                        for (int j = k; j < k + RUN; ++j)
+                        {
+                            const __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(w0 + 32 * j));
+                            const __m256i v1 = R > 1
+                                ? _mm256_load_si256(reinterpret_cast<const __m256i*>(w1 + 32 * j)) : zi;
+                            __m256i x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x0 + 32 * j));
+                            e00 = _mm256_add_epi16(e00, _mm256_maddubs_epi16(x, v0));
+                            if (R > 1) e10 = _mm256_add_epi16(e10, _mm256_maddubs_epi16(x, v1));
+                            if (T > 1)
+                            {
+                                x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x1 + 32 * j));
+                                e01 = _mm256_add_epi16(e01, _mm256_maddubs_epi16(x, v0));
+                                if (R > 1) e11 = _mm256_add_epi16(e11, _mm256_maddubs_epi16(x, v1));
+                            }
+                            if (T > 2)
+                            {
+                                x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x2 + 32 * j));
+                                e02 = _mm256_add_epi16(e02, _mm256_maddubs_epi16(x, v0));
+                                if (R > 1) e12 = _mm256_add_epi16(e12, _mm256_maddubs_epi16(x, v1));
+                            }
+                            if (T > 3)
+                            {
+                                x = _mm256_load_si256(reinterpret_cast<const __m256i*>(x3 + 32 * j));
+                                e03 = _mm256_add_epi16(e03, _mm256_maddubs_epi16(x, v0));
+                                if (R > 1) e13 = _mm256_add_epi16(e13, _mm256_maddubs_epi16(x, v1));
+                            }
+                        }
+                        d00 = _mm256_add_epi32(d00, _mm256_madd_epi16(e00, ones16));
+                        if (R > 1) d10 = _mm256_add_epi32(d10, _mm256_madd_epi16(e10, ones16));
+                        if (T > 1) d01 = _mm256_add_epi32(d01, _mm256_madd_epi16(e01, ones16));
+                        if (T > 1 && R > 1) d11 = _mm256_add_epi32(d11, _mm256_madd_epi16(e11, ones16));
+                        if (T > 2) d02 = _mm256_add_epi32(d02, _mm256_madd_epi16(e02, ones16));
+                        if (T > 2 && R > 1) d12 = _mm256_add_epi32(d12, _mm256_madd_epi16(e12, ones16));
+                        if (T > 3) d03 = _mm256_add_epi32(d03, _mm256_madd_epi16(e03, ones16));
+                        if (T > 3 && R > 1) d13 = _mm256_add_epi32(d13, _mm256_madd_epi16(e13, ones16));
+                    }
+#endif
+                    const float* g0 = f0 + 16 * h;
+                    const float* g1 = f1 + 16 * h;
+                    panel_fold(a00, d00, g0, s0);
+                    if (R > 1) panel_fold(a10, d10, g1, s0);
+                    if (T > 1) panel_fold(a01, d01, g0, s1);
+                    if (T > 1 && R > 1) panel_fold(a11, d11, g1, s1);
+                    if (T > 2) panel_fold(a02, d02, g0, s2);
+                    if (T > 2 && R > 1) panel_fold(a12, d12, g1, s2);
+                    if (T > 3) panel_fold(a03, d03, g0, s3);
+                    if (T > 3 && R > 1) panel_fold(a13, d13, g1, s3);
+                }
+                if (MINS)
+                {
+                    // The offsets of the chunks times the sums of the activations: B c.
+                    const __m256 m0 = _mm256_load_ps(f0 + 16);
+                    const __m256 m1 = _mm256_load_ps(f1 + 16);
+                    a00 = _mm256_fmadd_ps(m0, _mm256_load_ps(s0 + 8), a00);
+                    if (R > 1) a10 = _mm256_fmadd_ps(m1, _mm256_load_ps(s0 + 8), a10);
+                    if (T > 1) a01 = _mm256_fmadd_ps(m0, _mm256_load_ps(s1 + 8), a01);
+                    if (T > 1 && R > 1) a11 = _mm256_fmadd_ps(m1, _mm256_load_ps(s1 + 8), a11);
+                    if (T > 2) a02 = _mm256_fmadd_ps(m0, _mm256_load_ps(s2 + 8), a02);
+                    if (T > 2 && R > 1) a12 = _mm256_fmadd_ps(m1, _mm256_load_ps(s2 + 8), a12);
+                    if (T > 3) a03 = _mm256_fmadd_ps(m0, _mm256_load_ps(s3 + 8), a03);
+                    if (T > 3 && R > 1) a13 = _mm256_fmadd_ps(m1, _mm256_load_ps(s3 + 8), a13);
+                }
+            }
+            out[0] = hsum_ps(a00);
+            if (T > 1) out[1] = hsum_ps(a01);
+            if (T > 2) out[2] = hsum_ps(a02);
+            if (T > 3) out[3] = hsum_ps(a03);
+            if (R > 1)
+            {
+                out[T] = hsum_ps(a10);
+                if (T > 1) out[T + 1] = hsum_ps(a11);
+                if (T > 2) out[T + 2] = hsum_ps(a12);
+                if (T > 3) out[T + 3] = hsum_ps(a13);
+            }
+        }
+
+        typedef void (*panel_fn)(const panel_block&, float*);
+
+        // The kernels of a format, for 1 or 2 rows and 1 to 4 tokens.
+        template <bool HALVES, bool MINS, int RUN>
+        void panel_kernels(panel_fn fns[2][4])
+        {
+            fns[0][0] = panel_kernel<1, 1, HALVES, MINS, RUN>;
+            fns[0][1] = panel_kernel<1, 2, HALVES, MINS, RUN>;
+            fns[0][2] = panel_kernel<1, 3, HALVES, MINS, RUN>;
+            fns[0][3] = panel_kernel<1, 4, HALVES, MINS, RUN>;
+            fns[1][0] = panel_kernel<2, 1, HALVES, MINS, RUN>;
+            fns[1][1] = panel_kernel<2, 2, HALVES, MINS, RUN>;
+            fns[1][2] = panel_kernel<2, 3, HALVES, MINS, RUN>;
+            fns[1][3] = panel_kernel<2, 4, HALVES, MINS, RUN>;
+        }
+
+        /*
+            The runs of 16-bit sums of AVX2: (xq + 128) s summed over two bytes stays within
+            2 x 255 x max |s|, and RUN of these sums within 32767: 8 for Q4_0 (s within [-8, 7]),
+            4 for Q4_K (s within [0, 15]), 2 for Q5_K ([0, 31]) and Q6_K ([-32, 31]).
+        */
+        void panel_kernels(panel_kind k, panel_fn fns[2][4])
+        {
+            switch (k)
+            {
+            case panel_kind::q4_0: panel_kernels<false, false, 8>(fns); break;
+            case panel_kind::q8_0: panel_kernels<false, false, 8>(fns); break;
+            case panel_kind::q4_K: panel_kernels<false, true, 4>(fns); break;
+            case panel_kind::q5_K: panel_kernels<false, true, 2>(fns); break;
+            case panel_kind::q6_K: panel_kernels<true, false, 2>(fns); break;
+            default: break;
+            }
+        }
+
+        /*
+            The tokens of a block of the kernels: 4 when the 32 vector registers of AVX-512 hold
+            the 16 accumulators of 2 rows and 4 tokens, 3 in the 16 registers of AVX2.
+        */
+#if ALBIREO_QK_VNNI_FORM_EVEX
+        const long panel_tokens = 4;
+#else
+        const long panel_tokens = 3;
+#endif
+        const long panel_tile = 32;    // rows of weights per task
+        const long panel_slice = 8;    // groups of 256 features per slice of the weights of a task
+        // The bytes of the panels of the tokens a thread keeps from one product to the next (16 MB).
+        const size_t panel_bytes_kept = size_t(1) << 24;
+
+        /*
+            The memory of the panels: n elements on 64 bytes, left as they are, a buffer that
+            grows losing its contents.  Its functions belong to this file alone, so that each
+            family of kernels keeps its own copy of them, compiled with its own instructions.
+        */
+        template <typename T>
+        class panel_buffer
+        {
+        public:
+            panel_buffer() {}
+            panel_buffer(const panel_buffer&) = delete;
+            panel_buffer& operator=(const panel_buffer&) = delete;
+            ~panel_buffer() { release(); }
+
+            T* get(size_t n)
+            {
+                if (n > size_)
+                {
+                    release();
+                    if (n > (static_cast<size_t>(-1) - 128) / sizeof(T)) throw std::bad_alloc();
+                    raw_ = static_cast<char*>(::operator new(n * sizeof(T) + 64));
+                    const uintptr_t at = reinterpret_cast<uintptr_t>(raw_);
+                    data_ = reinterpret_cast<T*>(raw_ + (64 - at % 64) % 64);
+                    size_ = n;
+                }
+                return data_;
+            }
+
+            size_t size() const { return size_; }
+
+            void release()
+            {
+                ::operator delete(raw_);
+                raw_ = nullptr;
+                data_ = nullptr;
+                size_ = 0;
+            }
+
+        private:
+            char* raw_ = nullptr;
+            T* data_ = nullptr;
+            size_t size_ = 0;
+        };
+
+        void matmul_panels(const weight_matrix& W, panel_kind kind, const float* X, long n_tokens, long x_stride,
+            float* Y, long y_stride, thread_pool& pool, bool accumulate)
+        {
+            const long rows = W.rows;
+            const long groups = W.cols / 256;
+            const long fg = panel_floats(kind);
+            const size_t group_bytes = qk_row_bytes(W.type, 256);
+            panel_fn fns[2][4];
+            panel_kernels(kind, fns);
+
+            // The panels of the tokens, once for all the rows.
+            static thread_local panel_buffer<uint8_t> token_bytes;
+            static thread_local panel_buffer<float> token_floats;
+            uint8_t* const xb = token_bytes.get(static_cast<size_t>(n_tokens * groups) * 256);
+            float* const xf = token_floats.get(static_cast<size_t>(n_tokens * groups) * 16);
+            pool.parallel_for(n_tokens, [&](long t, int) {
+                const size_t at = static_cast<size_t>(t) * static_cast<size_t>(groups);
+                quantize_panel(X + static_cast<size_t>(t) * static_cast<size_t>(x_stride), groups, xb + at * 256,
+                    xf + at * 16);
+            });
+
+            /*
+                A task lays out a tile of rows by slices of groups, then runs every block of
+                tokens against the rows of the slice, 2 rows at a time: the panels of a block of
+                tokens stay in the first level cache while the rows of the slice go by.
+            */
+            const long n_tiles = (rows + panel_tile - 1) / panel_tile;
+            pool.parallel_for(n_tiles, [&](long tile, int) {
+                static thread_local panel_buffer<uint8_t> weight_bytes;
+                static thread_local panel_buffer<float> weight_floats;
+                const long r0 = tile * panel_tile;
+                const long nr = std::min(panel_tile, rows - r0);
+                const long slice = std::min(panel_slice, groups);
+                uint8_t* const wb = weight_bytes.get(static_cast<size_t>(nr * slice) * 256);
+                float* const wf = weight_floats.get(static_cast<size_t>(nr * slice * fg));
+                for (long g0 = 0; g0 < groups; g0 += panel_slice)
+                {
+                    const long ng = std::min(panel_slice, groups - g0);
+                    for (long r = 0; r < nr; ++r)
+                    {
+                        const uint8_t* src = W.data + static_cast<size_t>(r0 + r) * W.row_bytes
+                            + static_cast<size_t>(g0) * group_bytes;
+                        for (long g = 0; g < ng; ++g)
+                            pack_panel_group(kind, src + static_cast<size_t>(g) * group_bytes,
+                                wb + (r * ng + g) * 256, wf + (r * ng + g) * fg);
+                    }
+                    // The first slice writes the results, the next ones add to them.
+                    const bool add = accumulate || g0 > 0;
+                    panel_block b;
+                    b.w_stride = ng * 256;
+                    b.wf_stride = ng * fg;
+                    b.wf_group = fg;
+                    b.x_stride = groups * 256;
+                    b.xf_stride = groups * 16;
+                    b.groups = ng;
+                    for (long t0 = 0; t0 < n_tokens; t0 += panel_tokens)
+                    {
+                        const long nt = std::min(panel_tokens, n_tokens - t0);
+                        const size_t at = static_cast<size_t>(t0) * static_cast<size_t>(groups)
+                            + static_cast<size_t>(g0);
+                        b.x = xb + at * 256;
+                        b.xf = xf + at * 16;
+                        for (long r = 0; r < nr; r += 2)
+                        {
+                            const long rr = std::min<long>(2, nr - r);
+                            b.w = wb + r * ng * 256;
+                            b.wf = wf + r * ng * fg;
+                            float out[8];
+                            fns[rr - 1][nt - 1](b, out);
+                            for (long i = 0; i < rr; ++i)
+                                for (long t = 0; t < nt; ++t)
+                                {
+                                    float& y = Y[static_cast<size_t>(t0 + t) * static_cast<size_t>(y_stride)
+                                        + static_cast<size_t>(r0 + r + i)];
+                                    y = add ? y + out[i * nt + t] : out[i * nt + t];
+                                }
+                        }
+                    }
+                }
+            });
+            // Larger buffers go back to the system: the thread would otherwise keep the largest ones it needed.
+            if (token_bytes.size() > panel_bytes_kept)
+            {
+                token_bytes.release();
+                token_floats.release();
+            }
+        }
+#endif
+    }
+
+    bool qk_integer_prompt(ggml_type t, long cols)
+    {
+#if ALBIREO_QK_AVX2
+        return integer_prompt.load(std::memory_order_relaxed) && cols % 256 == 0
+            && panel_kind_of(t) != panel_kind::none;
+#else
+        (void)t;
+        (void)cols;
+        return false;
+#endif
+    }
+
+    void qk_set_integer_prompt(bool on) { integer_prompt.store(on); }
+
     void qk_matmul(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
         float* Y, long y_stride, thread_pool& pool, qk_scratch& scratch, bool accumulate, qk_path path)
     {
@@ -2108,7 +2725,19 @@ namespace albireo
             matmul_exact(W, X, n_tokens, x_stride, Y, y_stride, pool, accumulate);
             return;
         }
-        if (path == qk_path::floats || (path == qk_path::automatic && n_tokens >= qk_float_product_tokens))
+        if (path == qk_path::prompt || (path == qk_path::automatic && n_tokens >= qk_float_product_tokens))
+        {
+#if ALBIREO_QK_AVX2
+            if (qk_integer_prompt(W.type, W.cols))
+            {
+                matmul_panels(W, panel_kind_of(W.type), X, n_tokens, x_stride, Y, y_stride, pool, accumulate);
+                return;
+            }
+#endif
+            matmul_float(W, X, n_tokens, x_stride, Y, y_stride, pool, accumulate);
+            return;
+        }
+        if (path == qk_path::floats)
         {
             matmul_float(W, X, n_tokens, x_stride, Y, y_stride, pool, accumulate);
             return;
@@ -2392,6 +3021,42 @@ namespace albireo
         }
 
         /*
+            The dot products of R rows of queries with one key, s[r][0] = dot(q[r], k), through
+            the operations of dot_rows_x4() for each of its keys: the score of a key never
+            depends on the keys computed with it, so that a token gets the scores of a step of
+            its own in a pass of several tokens of its sequence.
+        */
+        template <int R>
+        void dot_rows_x1(const float* const* q, const float* k, long hd, float* const* s)
+        {
+            long i = 0;
+#if ALBIREO_QK_AVX2
+            __m256 w[R];
+            for (int r = 0; r < R; ++r) w[r] = _mm256_setzero_ps();
+            for (; i + 8 <= hd; i += 8)
+            {
+                const __m256 kv = _mm256_loadu_ps(k + i);
+                for (int r = 0; r < R; ++r) w[r] = _mm256_fmadd_ps(_mm256_loadu_ps(q[r] + i), kv, w[r]);
+            }
+            for (int r = 0; r < R; ++r) s[r][0] = _mm_cvtss_f32(hsum4_ps(w[r], w[r], w[r], w[r]));
+            if (i < hd)
+                for (int r = 0; r < R; ++r)
+                {
+                    float t = 0;
+                    for (long e = i; e < hd; ++e) t += q[r][e] * k[e];
+                    s[r][0] += t;
+                }
+#else
+            for (int r = 0; r < R; ++r)
+            {
+                float t = 0;
+                for (i = 0; i < hd; ++i) t += q[r][i] * k[i];
+                s[r][0] = t;
+            }
+#endif
+        }
+
+        /*
             The values of g keys weighted for R rows (R being 1 or 2) and added to the rows of
             the output: o[r][i] += sum over j < g of p[r][j] * v[j * hd + i].
         */
@@ -2469,7 +3134,10 @@ namespace albireo
                         dot_rows_x4<2>(q, scratch + j * hd, hd, s);
                     }
                     for (; j < g; ++j)
-                        for (int e = 0; e < 2; ++e) S[(r + e) * lds + j0 + j] = qk_dot_f32(q[e], scratch + j * hd, hd);
+                    {
+                        float* s[2] = { S + r * lds + j0 + j, S + (r + 1) * lds + j0 + j };
+                        dot_rows_x1<2>(q, scratch + j * hd, hd, s);
+                    }
                 }
                 for (; r < rows; ++r)
                 {
@@ -2480,7 +3148,11 @@ namespace albireo
                         float* s[1] = { S + r * lds + j0 + j };
                         dot_rows_x4<1>(q, scratch + j * hd, hd, s);
                     }
-                    for (; j < g; ++j) S[r * lds + j0 + j] = qk_dot_f32(q[0], scratch + j * hd, hd);
+                    for (; j < g; ++j)
+                    {
+                        float* s[1] = { S + r * lds + j0 + j };
+                        dot_rows_x1<1>(q, scratch + j * hd, hd, s);
+                    }
                 }
             }
         }

@@ -454,7 +454,14 @@ namespace albireo
     {
         if (!offload_ || host_only_)
         {
-            qk_matmul(W, X, n, x_stride, Y, y_stride, pool_, scratch_[0], false, path);
+            /*
+                The reference of the probes of the device computes the products of the prompts on
+                floats, the closest to the products of the device, rather than on 8-bit integers.
+            */
+            const bool prompt = path == qk_path::prompt
+                || (path == qk_path::automatic && n >= qk_float_product_tokens);
+            qk_matmul(W, X, n, x_stride, Y, y_stride, pool_, scratch_[0], false,
+                host_only_ && prompt ? qk_path::floats : path);
             return;
         }
         offload_->matmul(W, X, n, x_stride, Y, y_stride,
@@ -749,7 +756,7 @@ namespace albireo
         aligned_floats& ge = expert_gate_;
         aligned_floats& ue = expert_up_;
         aligned_floats& ye = expert_y_;
-        const qk_path path = T >= qk_float_product_tokens ? qk_path::floats : qk_path::integer;
+        const qk_path path = T >= qk_float_product_tokens ? qk_path::prompt : qk_path::integer;
         for (long e = 0; e < n_exp; ++e)
         {
             const auto& list = routed[static_cast<size_t>(e)];

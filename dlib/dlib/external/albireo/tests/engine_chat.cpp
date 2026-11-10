@@ -24,6 +24,9 @@
         --pause SECONDS      waits between the turns, as a user reads the answer (the engine
                              reads the history of the answer meanwhile)
         --no-warm            does not read the histories ahead ("warm_history": false)
+        --draft N            tokens of the drafts the steps verify at most per answer (draft_tokens),
+                             0 for none
+        --floats             computes the products of the prompts on floats ("integer_prompt": false)
         --tools              offers a weather tool to the model
         --tool-result TEXT   with --tools, gives TEXT as the result of the calls of the weather tool
                              and asks the model again with the calls and their results, as the agent
@@ -335,7 +338,8 @@ int main(int argc, char** argv)
     bool advised = false;
     long budget = -2;
     double presence = -1000.0;
-    bool parallel = false, turns = false, tools = false, warm = true;
+    bool parallel = false, turns = false, tools = false, warm = true, floats = false;
+    long draft = -1;
     double pause = 0;
     int threads = 0;
     long context = 4096;
@@ -359,6 +363,8 @@ int main(int argc, char** argv)
         else if (a == "--turns") turns = true;
         else if (a == "--pause" && i + 1 < argc) pause = std::atof(argv[++i]);
         else if (a == "--no-warm") warm = false;
+        else if (a == "--draft" && i + 1 < argc) draft = std::atol(argv[++i]);
+        else if (a == "--floats") floats = true;
         else if (a == "--tools") tools = true;
         else if (a == "--tool-result" && i + 1 < argc)
         {
@@ -450,6 +456,7 @@ int main(int argc, char** argv)
     if (!device.empty()) config["device"] = device;
     if (!routing.empty()) config["routing"] = routing;
     if (!warm) config["warm_history"] = false;
+    if (floats) config["integer_prompt"] = false;
     char err[1024] = { 0 };
     albireo_engine* e = lib.create(config.dump().c_str(), render_mode ? nullptr : on_log, nullptr, err, sizeof(err));
     if (!e)
@@ -459,6 +466,7 @@ int main(int argc, char** argv)
     }
     json options = json::object();
     options["context"] = context;
+    if (draft >= 0) options["draft_tokens"] = draft;
     if (!projector.empty()) options["projector"] = projector;
     if (lib.load_model(e, "m", argv[2], options.dump().c_str(), err, sizeof(err)) != ALBIREO_OK)
     {

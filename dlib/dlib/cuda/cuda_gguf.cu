@@ -7,6 +7,10 @@
 #include "gguf_blocks.h"
 #include "kv_pages.h"
 
+// CUDART_INF_F: the INFINITY of the headers of Visual Studio is a constant beyond the range of a float,
+// which nvcc warns of in every kernel that uses it.
+#include <math_constants.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -504,7 +508,7 @@ namespace dlib
 #pragma unroll
                 for (int g = 0; g < G; ++g)
                 {
-                    m[g] = -INFINITY;
+                    m[g] = -CUDART_INF_F;
                     l[g] = 0;
 #pragma unroll
                     for (int i = 0; i < DPL; ++i)
@@ -560,11 +564,11 @@ namespace dlib
                 {
                     const int g = i / HD;
                     const int e = i % HD;
-                    float mx = -INFINITY;
+                    float mx = -CUDART_INF_F;
                     for (int w = 0; w < attention_warps; ++w) mx = fmaxf(mx, m_shared[w][g]);
                     float sum = 0, acc = 0;
                     // A part without positions has no maximum: its sums stay 0.
-                    if (mx > -INFINITY)
+                    if (mx > -CUDART_INF_F)
                         for (int w = 0; w < attention_warps; ++w)
                         {
                             const float f = expf(m_shared[w][g] - mx);
@@ -603,7 +607,7 @@ namespace dlib
             {
                 const size_t row = blockIdx.x;
                 const float* first = partial + row * static_cast<size_t>(parts) * (hd + 2);
-                float mx = -INFINITY;
+                float mx = -CUDART_INF_F;
                 for (int q = 0; q < parts; ++q)
                     if (first[q * (hd + 2) + hd + 1] > 0.0f) mx = fmaxf(mx, first[q * (hd + 2) + hd]);
                 for (int e = threadIdx.x; e < hd; e += blockDim.x)

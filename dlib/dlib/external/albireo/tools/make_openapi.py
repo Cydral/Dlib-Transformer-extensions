@@ -322,6 +322,15 @@ schemas = {
                     "description": "Storage of the keys and values of the language models: q8, 8-bit integers by "
                                    "groups of 32 values with a scale, the keys rotated; f16, half precision. auto "
                                    "takes q8 for the models whose heads hold whole groups."},
+        "draft_tokens": {"type": "integer", "minimum": 0, "maximum": 6, "default": 4,
+                         "description": "Tokens of the drafts of the answers a step of a language model verifies at "
+                                        "most: the tokens that followed the last ones in the context, which the "
+                                        "model keeps when it would have drawn them itself, the answers keeping the "
+                                        "distribution of their tokens. 0 turns the drafts off."},
+        "integer_prompt": {"type": "boolean", "default": True,
+                           "description": "Products of the prompts on 8-bit integers for the weights in Q4_0, Q4_K, "
+                                          "Q5_K, Q6_K and Q8_0, the activations rounded to 8 bits by groups of 32 "
+                                          "values; false computes them on floats."},
         "check_updates": {"type": "boolean"},
         "offline": {"type": "boolean", "description": "No access to the network: the catalog, the models and the "
                     "updates come from imports, and the service opens no connection."},

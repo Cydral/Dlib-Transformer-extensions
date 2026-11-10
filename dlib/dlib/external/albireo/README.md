@@ -181,9 +181,19 @@ quantize the activations to 8 bits per block, so that a generated token reads ea
 When several answers are written together, the Q4_K and Q6_K kernels of AVX2 and AVX-VNNI compute
 two to four tokens for each weight they unpack, each token with the arithmetic it would get
 alone: with four answers at once, a step takes 32 to 40 % less time (Qwen3 0.6B and 1.7B, two
-cores). A pass of eight tokens or more computes in single precision, with a packed matrix product
-from 256 tokens; the weights of Q6_K are expanded by a
-vector kernel of their own, bit for bit with dlib; the work buffers lie on lines of 64 bytes.
+cores). A pass of eight tokens or more computes on 8-bit integers for the weights in Q4_0, Q4_K,
+Q5_K and Q6_K, and in Q8_0 with VNNI (`integer_prompt`): the weights keep their exact values in
+panels whose lanes of 32 bits each hold four bytes of one group of 32 weights, the activations are
+rounded to 8 bits by groups of 32 values, and an instruction of VNNI computes 32 products where a
+vector of floats computes 8. On two cores, Qwen3 0.6B read a prompt of 512 tokens at 230 tokens per
+second with AVX-VNNI against 126 on floats, and at 154 against 125 with AVX2; a prompt of 2,048
+tokens at 164 against 102, and at 121 against 98. The rounding of the activations moved the logits
+of a text of 47 tokens from those of the reference by a mean divergence of 2.4e-3 (KL), the order of
+the integer kernels of the generation, against 5e-7 on floats, and the answers to 162 prompts of 50
+to 400 tokens drawn from this file began with the same token as on floats; each token of a pass gets
+the results it gets in any other pass. The other formats compute in single precision, with a packed
+matrix product from 256 tokens; the weights of Q6_K are expanded by a vector kernel of their own,
+bit for bit with dlib; the work buffers lie on lines of 64 bytes.
 These paths keep each result within the tolerances of the tests, and the numbers of a pass
 depend on its size: at temperature 0, the first answer to a prompt, whose last token is read
 within the whole prompt, may differ from the next ones, which take the prompt from the cache.
@@ -211,6 +221,25 @@ step of Qwen3 0.6B after 8,192 positions took 102 ms with the 8-bit keys and val
 116 ms in half precision. The sums of the ranges come in another order than in a single task, so
 that the logits of a step differ by the rounding of the floats from one number of threads to
 another.
+
+An answer writes several tokens per step when its context foretells them (`draft_tokens`, 4 by
+default): the engine looks for the latest earlier occurrence of the last two to four tokens of the
+context, prompt and answer together, and computes in the same pass, after the next token, the tokens
+that followed that occurrence, up to four. The model keeps those it would have drawn itself, in
+their order, and the first one it refuses gives way to the token it draws in its place: a token of
+the draft is kept with the probability the sampling gives it, and the token drawn in its place comes
+from the other candidates, so that the tokens of the answer keep the distribution of the sampling
+(speculative sampling). The answers of a pass hold seven tokens at most with their drafts, so that
+the integer kernels of the generation compute each token as a step of its own does, within the
+attention of the devices; the scores of each key come out of a pass of several tokens as out of a
+step of one, and at temperature 0 the answers of 48 tokens to 30 prompts drawn from this file
+matched those of the steps one token at a time. When a step splits the positions of a long context
+among more threads than the model has heads of keys and values, the longer pass cuts other ranges,
+which moves its logits by the rounding of the floats. A draft takes the memory the pool has left
+once every answer holds the place of its next token, and an answer whose last two drafts kept
+nothing proposes none for 4 steps, then 8, up to 64. On two cores, Qwen3 0.6B rewrote a function of
+eight lines at 25.5 tokens per second against 19.7, keeping 16 of the 33 tokens of its drafts, and
+wrote prose at the speed of the steps one token at a time.
 
 The context of a model is the one it was trained for, which the engine brings down only when the
 keys and values of a full context exceed the memory the system can commit, its physical memory and
@@ -959,17 +988,18 @@ cmake --build build-albireo-win -j
 
 | Program          | Checks                                                                               |
 |------------------|--------------------------------------------------------------------------------------|
-| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
+| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor |
 | `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of a generated token on the matrices of a 2B model, and of its attention over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
-| `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
+| `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
+| `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
-| `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
+| `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
@@ -1136,6 +1166,8 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `max_sequences` | 4       | requests computed together per model                                      |
 | `kv_mb`         | 0       | memory of the keys and values, 0 for two contexts within the memory the system can commit, a reserve left |
 | `kv_type`       | `auto`  | keys and values: `q8` (8 bits, the keys rotated), `f16` (half precision), `auto` (`q8` for the language models whose heads hold whole groups of 32 values) |
+| `draft_tokens`  | 4       | tokens of the drafts an answer verifies per step, 0 to 6, 0 for none      |
+| `integer_prompt` | true   | products of the prompts on 8-bit integers (Q4_0, Q4_K, Q5_K, Q6_K, and Q8_0 with VNNI), `false` on floats |
 | `check_updates` | true    | checks the feed at each start and every six hours                          |
 | `default_model` | true    | downloads the default language model of the catalog at the first start    |
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |

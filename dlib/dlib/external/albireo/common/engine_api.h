@@ -117,6 +117,14 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_describe(char* json
    background once the answer ends, as the next request of the conversation renders it, so that
    this request computes its new message only; the "stats" query counts these tokens per model
    in "warmed_total", and the reads in progress in "warming".
+   "integer_prompt" (true by default) computes the products of the prompts on 8-bit integers for
+   the weights in Q4_0, Q4_K, Q5_K, Q6_K and Q8_0 (qk_integer_prompt()), false on floats; it is a
+   setting of the library in the process, which the engine created last gives.
+   "draft_tokens" (4 by default, 0 to 6), also an option of albireo_engine_load_model(): the tokens
+   of the drafts of the answers a step verifies at most, the tokens that followed the last ones
+   in the context, which the answer keeps when the model would have drawn them itself; the
+   "stats" query counts per model the tokens of the drafts in "drafted_total" and those kept in
+   "draft_kept_total".
    Returns NULL on failure, with the reason in error. */
 ALBIREO_ENGINE_EXPORT albireo_engine* ALBIREO_ENGINE_CALL albireo_engine_create(const char* config_json,
     albireo_log_callback log, void* log_user, char* error, size_t error_capacity);

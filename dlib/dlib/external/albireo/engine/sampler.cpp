@@ -53,21 +53,32 @@ namespace albireo
         if (p_.repeat_last_n < 0) ++counts_[token];
     }
 
-    int sampler::sample(float* logits, long vocab)
+    int sampler::sample(float* logits, long vocab, int draft, const int* pending, size_t n_pending)
     {
         for (const auto& b : p_.logit_bias)
             if (b.first >= 0 && b.first < vocab) logits[b.first] += b.second;
 
-        // Penalties over the recent tokens, or over the whole history with the counts kept as it grew.
+        /*
+            Penalties over the recent tokens, or over the whole history with the counts kept as it
+            grew; the pending tokens follow the history.
+        */
         if (p_.repeat_penalty != 1.0f || p_.presence_penalty != 0.0f || p_.frequency_penalty != 0.0f)
         {
             std::unordered_map<int, int> recent;
             if (p_.repeat_last_n >= 0)
             {
-                const size_t n = std::min(history_.size(), static_cast<size_t>(p_.repeat_last_n));
+                const size_t last = static_cast<size_t>(p_.repeat_last_n);
+                const size_t from_pending = std::min(n_pending, last);
+                const size_t n = std::min(history_.size(), last - from_pending);
                 for (size_t i = history_.size() - n; i < history_.size(); ++i) ++recent[history_[i]];
+                for (size_t i = n_pending - from_pending; i < n_pending; ++i) ++recent[pending[i]];
             }
-            const std::unordered_map<int, int>& counts = p_.repeat_last_n < 0 ? counts_ : recent;
+            else if (n_pending > 0)
+            {
+                recent = counts_;
+                for (size_t i = 0; i < n_pending; ++i) ++recent[pending[i]];
+            }
+            const std::unordered_map<int, int>& counts = p_.repeat_last_n < 0 && n_pending == 0 ? counts_ : recent;
             for (const auto& c : counts)
             {
                 if (c.first < 0 || c.first >= vocab) continue;
@@ -175,20 +186,56 @@ namespace albireo
         }
         double total = 0;
         for (size_t i = 0; i < keep; ++i) total += candidates_[i].first;
+        // The mass of the candidates, which gives the probability of the token drawn.
+        const double mass = total;
+        // The candidate a draw leaves out: the draft refused, none otherwise.
+        size_t excluded = keep;
+        if (draft >= 0)
+        {
+            double p = 0;
+            for (size_t i = 0; i < keep; ++i)
+                if (candidates_[i].second == draft)
+                {
+                    p = candidates_[i].first;
+                    excluded = i;
+                    break;
+                }
+            std::uniform_real_distribution<double> accept(0.0, total);
+            if (accept(rng_) < p)
+            {
+                last_p_ = static_cast<float>(p / mass);
+                return draft;
+            }
+            // The other candidates share the mass; a draft that held all of it was kept above.
+            if (excluded < keep) total -= p;
+            if (!(total > 0))
+            {
+                last_p_ = static_cast<float>(p / mass);
+                return draft;
+            }
+        }
         std::uniform_real_distribution<double> uni(0.0, total);
         const double r = uni(rng_);
         double acc = 0;
+        size_t last = keep;
         for (size_t i = 0; i < keep; ++i)
         {
+            if (i == excluded) continue;
+            last = i;
             acc += candidates_[i].first;
             if (r < acc)
             {
-                last_p_ = static_cast<float>(candidates_[i].first / total);
+                last_p_ = static_cast<float>(candidates_[i].first / mass);
                 return candidates_[i].second;
             }
         }
-        last_p_ = static_cast<float>(candidates_[keep - 1].first / total);
-        return candidates_[keep - 1].second;
+        if (last == keep)
+        {
+            last_p_ = 1.0f;
+            return draft;
+        }
+        last_p_ = static_cast<float>(candidates_[last].first / mass);
+        return candidates_[last].second;
     }
 
 }

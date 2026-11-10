@@ -166,7 +166,8 @@ int main(int argc, char** argv)
     expect(lib.load_model(e, nullptr, path.c_str(), nullptr, err, sizeof(err)) == ALBIREO_E_INVALID_ARGUMENT,
         "load without an identifier");
     for (const char* options : { "{\"kv_mb\": -1}", "{\"max_sequences\": 100000}", "{\"context\": -5}",
-        "{\"batch_tokens\": 1e999}", "{\"kv_mb\": \"lots\"}", "{\"context\": " })
+        "{\"batch_tokens\": 1e999}", "{\"kv_mb\": \"lots\"}", "{\"context\": ", "{\"draft_tokens\": 7}",
+        "{\"draft_tokens\": -1}" })
         expect(lib.load_model(e, "m", path.c_str(), options, err, sizeof(err)) == ALBIREO_E_INVALID_ARGUMENT,
             std::string("load options refused: ") + options);
     expect(lib.load_model(e, "m", (folder + "missing.gguf").c_str(), nullptr, err, sizeof(err)) != ALBIREO_OK,
@@ -521,8 +522,39 @@ int main(int argc, char** argv)
         expect(trimmed(stopped.content) == std::string(40, 'a') && l["finish_reason"].as_string() == "length",
             "the stop sequences apply to the answer: " + l.dump());
 
+        /*
+            The drafts of the answers: the answers that repeat "a" find their drafts in their own
+            text, and the model keeps them.  The same model without drafts writes the same
+            reasoning and the same answer, stopped at the same token.
+        */
+        const std::string undrafted = "{\"context\": 1024, \"max_sequences\": 16, \"kv_mb\": 1, \"draft_tokens\": 0}";
+        expect(lib.load_model(e, "u", thinking_path.c_str(), undrafted.c_str(), err, sizeof(err)) == ALBIREO_OK,
+            std::string("the model without drafts loads: ") + err);
+        collector plainly;
+        const json k0 = ask("u", ",\"reasoning\":true,\"max_tokens\":1500", plainly);
+        expect(plainly.reasoning == both.reasoning && plainly.content == both.content
+            && k0["usage"]["completion_tokens"].as_int(-1) == k["usage"]["completion_tokens"].as_int(-2)
+            && k0["finish_reason"].as_string() == k["finish_reason"].as_string(),
+            "the drafts leave the answer unchanged: " + k0.dump() + " against " + k.dump());
+        json drafts;
+        expect(lib.run_query(e, json::parse_or_null("{\"op\":\"stats\"}"), drafts) == ALBIREO_OK, "stats query");
+        long long drafted = -1, kept = -1, undrafted_total = -1;
+        for (const auto& m : drafts["models"].elements())
+        {
+            if (m["id"].as_string() == "t")
+            {
+                drafted = m["drafted_total"].as_int(-1);
+                kept = m["draft_kept_total"].as_int(-1);
+            }
+            if (m["id"].as_string() == "u") undrafted_total = m["drafted_total"].as_int(-1);
+        }
+        expect(drafted > 0 && kept > 0 && kept <= drafted && undrafted_total == 0, "the answers that repeat are "
+            "drafted (" + std::to_string(kept) + " of " + std::to_string(drafted) + " tokens kept)");
+        expect(lib.unload_model(e, "u") == ALBIREO_OK, "the model without drafts unloads");
+
         expect(lib.unload_model(e, "t") == ALBIREO_OK, "the model that always reasons unloads");
         std::printf("  the answers that loop stopped, the reasoning of a model that always reasons bounded\n");
+        std::printf("  drafts: %lld of %lld tokens kept, the answers those of the model without them\n", kept, drafted);
     }
 
     /*

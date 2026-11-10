@@ -117,7 +117,14 @@ namespace albireo
         void abandon(loaded_model& m, const std::string& code, const std::string& message);
         void trim_after_failure(loaded_model& m);
         void trim_idle(const std::vector<std::shared_ptr<loaded_model>>& models);
-        void handle_token(loaded_model& m, request_state& r, int token);
+        /*
+            Handles a token of an answer.  length, when given, stands for the length of its
+            sequence, the positions before the token: the keys and values of a draft beyond them
+            stay until the end of its verification.
+        */
+        void handle_token(loaded_model& m, request_state& r, int token, long length = -1);
+        // Handles the tokens of the verification of the draft of r, returns their number (step()).
+        long verify_draft(loaded_model& m, request_state& r);
         void emit_text(loaded_model& m, request_state& r, const std::string& text);
         void finish(loaded_model& m, request_state& r, const std::string& reason, bool keep_cache = true);
         // Queues the reading of the history of the answer of r, whose sequence holds the tokens cached.

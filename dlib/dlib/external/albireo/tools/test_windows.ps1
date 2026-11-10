@@ -93,6 +93,11 @@ foreach ($family in @("", "_avxvnni")) {
 # The loading of damaged model files and of a model file of more than 2 GiB, mapped and streamed.
 Invoke-Check "model files" "all checks passed" (Join-Path $main "tests\test_model_file.exe") @($logs) | Out-Null
 
+# The draws of the sampler with the drafts of the answers, against the draws without them.
+$samplerTest = Join-Path $main "tests\test_sampler.exe"
+if (Test-Path $samplerTest) { Invoke-Check "sampler" "all checks passed" $samplerTest @() | Out-Null }
+else { Add-Result "sampler" "SKIP" "no $samplerTest (build_windows.ps1 -Tests)" 0 }
+
 # The attention of the steps split among the threads, against one task per key/value head, with keys and values
 # in half precision and in 8 bits, on a tiny model written in the folder of the logs.
 $runtimeTest = Join-Path $main "tests\test_runtime.exe"

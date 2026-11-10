@@ -49,6 +49,8 @@ namespace albireo
         int max_sequences = 4;                  // requests computed together per model
         long long kv_mb = 0;                    // 0: automatic
         std::string kv_type = "auto";           // keys and values: auto (8 bits), q8 or f16
+        int draft_tokens = 4;                   // tokens of the drafts a step verifies per answer, 0 to 6, 0: none
+        bool integer_prompt = true;             // products of the prompts on 8-bit integers
         std::map<std::string, std::string> active;   // role -> model identifier
         bool check_updates = true;
         bool default_model = true;              // download the default model of the catalog at the first start
