@@ -16,7 +16,8 @@
 # settings as the web application does, imposes terms, makes room for newer originals, restores from
 # their tags an archive whose picture was forgotten and a text written elsewhere from anonymized
 # values, protects files, a text and the drive without tags, restores files protected twice,
-# imposes columns on a CSV file, and stops.
+# imposes columns on a CSV file, an IP column of both forms among them, keeps the encoding of a
+# Windows-1252 file, and stops.
 # The exit code is the number of failed steps.
 
 set -u
@@ -573,6 +574,65 @@ print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])
     record "imposed columns" PASS "substitutes below their names, the original back, edited on the drive: both"
   else record "imposed columns" FAIL "$(sed -n 3p "$WORK/export.anon.csv" | head -c 100) / $BAD_COLS / \
     $(tail -c 120 "$WORK/export.back2.csv")"
+  fi
+  # A Windows-1252 file whose accented letters all stand in an imposed column, protected in plain ASCII:
+  # edited on the drive, it comes back in Windows-1252, the encoding of its original.
+  admin_json PUT /v1/columns '{"columns": [{"column": "Nom", "type": "PERSON"}]}' > /dev/null
+  printf 'Nom;Ville\nH\351l\350ne;Rennes\n' > "$WORK/accents.csv"
+  cp "$WORK/accents.csv" "$DRIVE/accents.csv"
+  accents_done() {
+    ! cmp -s "$WORK/accents.csv" "$DRIVE/accents.csv" && [ -n "$(record_of "$DRIVE/accents.csv")" ]
+  }
+  wait_for 60 accents_done
+  { cat "$DRIVE/accents.csv"; printf 'Martin;Lyon\n'; } > "$WORK/accents.edit.csv"
+  cp "$WORK/accents.edit.csv" "$DRIVE/accents.csv"
+  accents_edited() {
+    ! cmp -s "$WORK/accents.edit.csv" "$DRIVE/accents.csv" && [ -n "$(record_of "$DRIVE/accents.csv")" ]
+  }
+  wait_for 60 accents_edited
+  cp "$DRIVE/accents.csv" "$WORK/accents.anon2.csv"
+  restore_to "$WORK/accents.anon2.csv" "$WORK/accents.back2.csv"
+  { cat "$WORK/accents.csv"; printf 'Martin;Lyon\n'; } > "$WORK/accents.expected.csv"
+  admin_json PUT /v1/columns '{"columns": []}' > /dev/null
+  if ! LC_ALL=C grep -q "$(printf '[\200-\377]')" "$WORK/accents.edit.csv" &&
+     ! grep -q -e Martin "$WORK/accents.anon2.csv" && cmp -s "$WORK/accents.expected.csv" "$WORK/accents.back2.csv"
+  then
+    record "Windows-1252 kept" PASS "protected in plain ASCII, edited on the drive: back in Windows-1252"
+  else record "Windows-1252 kept" FAIL "$(od -An -c "$WORK/accents.back2.csv" | head -c 160)"
+  fi
+  # An IP column, given as IPV4, takes both forms of address: each address takes the substitute of its form,
+  # its prefix length and its port kept; the original comes back, and from a file edited on the drive, both.
+  IP_COLS=$(admin_json PUT /v1/columns '{"columns": [{"column": "ip_address", "type": "IPV4"}]}')
+  printf 'host;ip_address\nweb;192.168.1.5\ndb;2001:db8::1\nnet;10.0.0.0/8\napi;[2001:db8::1]:443\n' \
+    > "$WORK/hosts.csv"
+  api -X POST --data-binary @"$WORK/hosts.csv" -D "$WORK/hosts.headers" -o "$WORK/hosts.anon.csv" \
+    "$URL/v1/anonymize?name=hosts.csv&tags=true&record=true"
+  restore_to "$WORK/hosts.anon.csv" "$WORK/hosts.back.csv"
+  cp "$WORK/hosts.csv" "$DRIVE/hosts.csv"
+  hosts_done() {
+    ! cmp -s "$WORK/hosts.csv" "$DRIVE/hosts.csv" && [ -n "$(record_of "$DRIVE/hosts.csv")" ]
+  }
+  wait_for 60 hosts_done
+  { cat "$DRIVE/hosts.csv"; printf 'vpn;fe80::1%%eth0\n'; } > "$WORK/hosts.edit.csv"
+  cp "$WORK/hosts.edit.csv" "$DRIVE/hosts.csv"
+  hosts_edited() {
+    ! cmp -s "$WORK/hosts.edit.csv" "$DRIVE/hosts.csv" && [ -n "$(record_of "$DRIVE/hosts.csv")" ]
+  }
+  wait_for 60 hosts_edited
+  cp "$DRIVE/hosts.csv" "$WORK/hosts.anon2.csv"
+  restore_to "$WORK/hosts.anon2.csv" "$WORK/hosts.back2.csv"
+  { cat "$WORK/hosts.csv"; printf 'vpn;fe80::1%%eth0\n'; } > "$WORK/hosts.expected.csv"
+  admin_json PUT /v1/columns '{"columns": []}' > /dev/null
+  if printf '%s' "$IP_COLS" | grep -q '"type":"IP"' &&
+     ! grep -q -F -e 192.168.1.5 -e 2001:db8::1 -e 10.0.0.0 "$WORK/hosts.anon.csv" &&
+     grep -q '/8$' "$WORK/hosts.anon.csv" && grep -q ']:443$' "$WORK/hosts.anon.csv" &&
+     ! grep -q -F '[[' "$WORK/hosts.anon.csv" && cmp -s "$WORK/hosts.csv" "$WORK/hosts.back.csv" &&
+     ! grep -q -F 'fe80::1' "$WORK/hosts.anon2.csv" && grep -q '%eth0$' "$WORK/hosts.anon2.csv" &&
+     cmp -s "$WORK/hosts.expected.csv" "$WORK/hosts.back2.csv"
+  then
+    record "IP column" PASS "IPv4 and IPv6 in one column, the original back, edited on the drive: both"
+  else record "IP column" FAIL "$(head -c 160 "$WORK/hosts.anon.csv") / $IP_COLS / \
+    $(tail -c 80 "$WORK/hosts.back2.csv")"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

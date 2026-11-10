@@ -34,13 +34,16 @@ namespace pseudalis
         std::string type = "PERSON";
     };
 
-    // The types an imposed column may take, in the order the interface lists them.
+    /*
+        The types an imposed column may take, in the order the interface lists them.  IP stands for
+        the IP addresses of both forms, each value taking the substitute of its own, IPv4 or IPv6,
+        with its prefix length, zone or port kept; IPV4 and IPV6 are read as IP.
+    */
     inline const std::vector<std::string>& imposed_column_types()
     {
         static const std::vector<std::string> types = { "PERSON", "ORG", "LOCATION", "ADDRESS", "EMAIL", "PHONE",
-                                                        "ID", "DATE", "IBAN", "CARD", "NIR", "SIRET", "URL", "IPV4",
-                                                        "IPV6", "MAC", "PLATE", "GEO", "TITLE", "GENDER",
-                                                        "NATIONALITY" };
+                                                        "ID", "DATE", "IBAN", "CARD", "NIR", "SIRET", "URL", "IP",
+                                                        "MAC", "PLATE", "GEO", "TITLE", "GENDER", "NATIONALITY" };
         return types;
     }
 
@@ -52,7 +55,7 @@ namespace pseudalis
                                max_imposed_column_length, on several lines, with a control
                                character or invalid UTF-8, or without a letter or a digit;
             columns_too_many   more than max_imposed_columns;
-            columns_type       a type out of imposed_column_types();
+            columns_type       a type out of imposed_column_types(), IPV4 and IPV6 aside;
             columns_duplicate  a name given twice, without regard to case and accents.
     */
     inline bool parse_imposed_columns(const json& list, std::vector<imposed_column>& columns, std::string& message,
@@ -102,6 +105,7 @@ namespace pseudalis
                 return false;
             }
             c.type = item["type"].str("PERSON");
+            if (c.type == "IPV4" || c.type == "IPV6") c.type = "IP";
             bool known = false;
             for (const std::string& k : imposed_column_types()) known = known || k == c.type;
             if (!known)

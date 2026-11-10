@@ -29,6 +29,7 @@ namespace dlib
     struct document_report
     {
         std::string format;
+        std::string encoding;
         std::string operation;
         std::string key_fingerprint;
         std::map<std::string, std::size_t> entities;
@@ -73,7 +74,8 @@ namespace dlib
             };
             std::ostringstream o;
             o << "{\n  \"operation\": \"" << esc(operation) << "\",\n  \"format\": \"" << esc(format)
-              << "\",\n  \"key_fingerprint\": \"" << esc(key_fingerprint) << "\",\n  \"text_units\": " << text_units
+              << "\",\n  \"encoding\": \"" << esc(encoding) << "\",\n  \"key_fingerprint\": \""
+              << esc(key_fingerprint) << "\",\n  \"text_units\": " << text_units
               << ",\n  \"entities\": {";
             bool first = true;
             for (const auto& e : entities)

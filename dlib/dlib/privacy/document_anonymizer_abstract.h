@@ -144,7 +144,8 @@ namespace dlib
                 Restoration of text and delimited files gives back the original bytes when
                 every tag verifies, with one exception: a Windows-1252 file whose protected
                 form holds only ASCII is restored in UTF-8, since nothing tells its
-                encoding any more (the reports note it). In markup, everything outside the
+                encoding any more (the reports note it), unless the caller knows it and
+                says so (set_ascii_windows_1252()). In markup, everything outside the
                 replaced values keeps its exact bytes; a restored value is written with
                 plain characters, and a value that spanned several inline elements comes
                 back in the first of them. A tag never forms "]]>" with the text after it:
@@ -319,6 +320,28 @@ namespace dlib
                 - An empty function, the default, restores no substitute of the text.
         !*/
 
+        void set_ascii_windows_1252(
+            bool yes
+        );
+        /*!
+            ensures
+                - #ascii_windows_1252() == yes
+        !*/
+
+        bool ascii_windows_1252(
+        ) const;
+        /*!
+            ensures
+                - Returns whether restore() writes in Windows-1252 a text file whose bytes
+                  are plain ASCII, false by default. Such a text says nothing of the
+                  encoding of its original: a Windows-1252 original whose protected form
+                  holds only ASCII, all its accented letters taken by values, comes back in
+                  UTF-8 unless the caller, which kept the encoding of the original
+                  (document_report::encoding), says so here. The text is written in
+                  Windows-1252 when that encoding writes every character restored, in UTF-8
+                  otherwise; a text that holds other bytes keeps its own encoding.
+        !*/
+
         void set_imposed_columns(
             const std::vector<pii_imposed_column>& columns
         );
@@ -348,6 +371,15 @@ namespace dlib
                       carries no check, and only a resolver that knows it gives its value back.
                       A civility, a sex or a nationality takes another substitute at each
                       place, listed each time. A date stays in clear under date_policy::keep.
+                    - A column of type ipv4 or ipv6 takes the addresses of both forms: each
+                      address takes the substitute of its own form, counted under that type,
+                      and keeps what surrounds it in the cell, a prefix length
+                      ("10.0.0.0/8"), the brackets and the port ("[2001:db8::1]:443",
+                      "192.0.2.1:8080") or a zone ("fe80::1%eth0"). An address written
+                      otherwise than in its canonical form (capitals, leading zeros), whose
+                      substitute is an opaque code, gives one opaque code to the whole value,
+                      what surrounds it included, and a value of no IP form takes the
+                      substitute of the type of the column.
                     - The values are not read by the detector: each is recorded once as a
                       value of the type of its column (pii_detector::learn_value()), so that
                       the other cells of the file, a comment that names a client for
@@ -355,9 +387,10 @@ namespace dlib
                       leave them out.
                     - restore() gives each value below the name of an imposed column, whole, to
                       the text resolver: the first tag returned that decodes to a value of the
-                      type of the column takes its place, counted in
-                      report.substitutes_restored; the other values are restored as in any
-                      cell.
+                      type of the column, or of either IP form in an IP column, takes its place,
+                      counted in report.substitutes_restored; in an IP column, the address of a
+                      value is given alone when the whole value is not known, what surrounds it
+                      staying in place. The other values are restored as in any cell.
                     - A file is found delimited by its header. In a file named .csv, .tsv or
                       .tab, a title may stand above the header, and a first line "sep=;"
                       written by Excel gives the delimiter; such a file may also hold one

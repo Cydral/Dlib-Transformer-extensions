@@ -977,7 +977,7 @@
 
   let columns = [];
   let columnTypes = ['PERSON', 'ORG', 'LOCATION', 'ADDRESS', 'EMAIL', 'PHONE', 'ID', 'DATE', 'IBAN', 'CARD', 'NIR',
-    'SIRET', 'URL', 'IPV4', 'IPV6', 'MAC', 'PLATE', 'GEO', 'TITLE', 'GENDER', 'NATIONALITY'];
+    'SIRET', 'URL', 'IP', 'MAC', 'PLATE', 'GEO', 'TITLE', 'GENDER', 'NATIONALITY'];
   let columnsMax = 100, columnLength = 200;
 
   function renderColumns() {

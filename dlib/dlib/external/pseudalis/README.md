@@ -287,10 +287,14 @@ once, to the files processed afterwards.
 
 A CSV file with a header holds its values in columns, the names of the clients or their e-mail addresses
 in an export for instance. The administrators name up to 100 such columns, each with the type of all its
-values (PERSON, ORG, LOCATION, ADDRESS, EMAIL, PHONE, ID, DATE, IBAN, CARD, NIR, SIRET, URL, IPV4, IPV6,
-MAC, PLATE, GEO, TITLE, GENDER or NATIONALITY). Every value below the name of such a column takes its
+values (PERSON, ORG, LOCATION, ADDRESS, EMAIL, PHONE, ID, DATE, IBAN, CARD, NIR, SIRET, URL, IP, MAC,
+PLATE, GEO, TITLE, GENDER or NATIONALITY). Every value below the name of such a column takes its
 substitute, without detection and without tag, whatever the tags of the rest of the file; an empty cell
-stays empty, and the spaces around a value stay in place.
+stays empty, and the spaces around a value stay in place. Such files are typically the exports of a
+production database (PostgreSQL, Oracle, MySQL), protected before they are imported into a program under
+development or under acceptance tests: a value takes the same substitute wherever an imposed column of
+its type holds it, in the file and in the other exports, so that the joins between the tables hold, and
+the record gives the originals back.
 
 - The header is found by these names: it is the first of the first 16 rows that names an imposed column
   in a cell, compared without regard to case and accents, the spaces at its ends left out (`Prénom` names
@@ -298,12 +302,20 @@ stays empty, and the spaces around a value stay in place.
   Excel gives the delimiter. A file of one column is read too. A text of another extension, or without
   extension, is read as a CSV file when its header holds the delimiter and the two records that follow it
   hold it as many times; a text that names a column in a sentence stays a text.
+- An IP column takes the IPv4 and the IPv6 addresses alike, mixed in its rows as the source wrote them:
+  each address takes the substitute of its own form, and what surrounds it stays, a prefix length
+  (`10.0.0.0/8`), the brackets and the port (`[2001:db8::1]:443`, `192.0.2.1:8080`) or a zone
+  (`fe80::1%eth0`); the restoration gives each value back as it was written. The types IPV4 and IPV6 of
+  a list written before are read as IP.
 - The values of these columns are learned as values of their types: a client named in a comment of the
   same file takes the tag of the value of its column, whose body is that substitute. The other columns
   are read as before, their names typing them when they are labels (`ville`, `telephone`).
 - The record of the file keeps each substitute with the tag it stands for, as for a file protected
   without tags: its copies give back the original, a copy edited on the drive its values, while the
   record lasts. Without record, the report says that they cannot come back (`"restorable": false`).
+- A file in Windows-1252 whose accented letters all stand in imposed columns is plain ASCII once
+  protected. Its record keeps its encoding, so that its restoration writes it in Windows-1252 again, from
+  a copy and from a copy edited on the drive too.
 - The web application edits the list in its Imposed columns card, the interface through `GET` and
   `PUT /v1/columns`; the service keeps it in its database, which only SYSTEM and the administrators read,
   and the engine applies a new list at once, to the files processed afterwards. The sheets of the
@@ -625,8 +637,16 @@ icon. Their messages and logs never name the places they read.
   service made: its original then comes back whole from the vault.
 - The values of the imposed columns come back from the record of their file alone. A copy of the
   protected CSV file reworked elsewhere, by another program for instance, gives back the values of its
-  tags alone. A value written in clear in such a column of a file of the drive, which equals a substitute
-  of that file, a shifted date for instance, is taken for that substitute.
+  tags alone, and comes back in UTF-8 when its original was written in Windows-1252 and its protection in
+  plain ASCII. A value written in clear in such a column of a file of the drive, which equals a
+  substitute of that file, a shifted date for instance, is taken for that substitute.
+- A value of an imposed column takes the form that its substitute can keep. In an ID column, a number of
+  fewer than six digits and a code of fewer than four letters and digits, in an IP column, a value of no
+  IP form and an IPv6 address written otherwise than in the canonical form of RFC 5952 (leading zeros,
+  capitals), with its port or its prefix length, take an opaque code of letters; a network keeps its
+  prefix length after the substitute of its address, whose bits beyond the prefix are seldom zero. A
+  program that checks these values when the protected file is imported, a column of integers or the type
+  `cidr` of PostgreSQL for instance, may refuse them; all of them come back.
 - The analysis reads some tens of kilobytes per second on each processor when nearly every word is
   personal data: a text file of tens of megabytes takes minutes.
 - The protection is a pseudonymization in the sense of the GDPR: the key restores the data, which stay

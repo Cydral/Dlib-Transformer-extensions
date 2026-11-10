@@ -6,6 +6,7 @@
 #include "document_anonymizer_abstract.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -167,6 +168,33 @@ namespace dlib
             return out;
         }
 
+        inline const char* text_encoding_name(text_encoding enc)
+        {
+            switch (enc)
+            {
+                case text_encoding::utf8: return "utf-8";
+                case text_encoding::utf8_bom: return "utf-8-bom";
+                case text_encoding::utf16le: return "utf-16le";
+                case text_encoding::utf16be: return "utf-16be";
+                case text_encoding::utf16le_plain: return "utf-16le-nobom";
+                case text_encoding::utf16be_plain: return "utf-16be-nobom";
+                case text_encoding::cp1252: return "windows-1252";
+            }
+            return "";
+        }
+
+        // Whether Windows-1252 writes every character of a text, which encode_text() would replace by '?'.
+        inline bool cp1252_writes(const std::string& utf8)
+        {
+            std::size_t i = 0;
+            while (i < utf8.size())
+            {
+                if ((utf8[i] & 0x80) == 0) { ++i; continue; }
+                if (unicode_to_cp1252(static_cast<std::uint32_t>(utf8_next(utf8, i))) < 0) return false;
+            }
+            return true;
+        }
+
         inline std::string encode_text(const std::string& utf8, text_encoding enc)
         {
             switch (enc)
@@ -319,6 +347,75 @@ namespace dlib
                 ++i;
             }
             return cells;
+        }
+
+        /*
+            The address of a value of an IP column, with what may surround it: a prefix length
+            ("10.0.0.0/8", "2001:db8::/32"), a port ("192.0.2.1:443", "[2001:db8::1]:443") or a
+            zone ("fe80::1%eth0").  Returns ipv4 or ipv6 with the bounds [b, e) of the address in
+            v, or none for a value of another form.
+        */
+        inline pii_type ip_address_in(const std::string& v, std::size_t& b, std::size_t& e)
+        {
+            // A number of 1 to digits digits, from i to the end of v, of at most limit.
+            const auto number_to_end = [&v](std::size_t i, std::size_t digits, unsigned long limit) {
+                if (i >= v.size() || v.size() - i > digits) return false;
+                unsigned long n = 0;
+                for (std::size_t k = i; k < v.size(); ++k)
+                {
+                    if (!is_ascii_digit_char(v[k])) return false;
+                    n = n * 10 + static_cast<unsigned long>(v[k] - '0');
+                }
+                return n <= limit;
+            };
+            std::uint32_t a4 = 0;
+            std::array<unsigned char, 16> a6;
+            if (!v.empty() && v[0] == '[')
+            {
+                const std::size_t close = v.find(']');
+                if (close == std::string::npos || !parse_ipv6(v.substr(1, close - 1), a6)) return pii_type::none;
+                if (close + 1 != v.size() && (v[close + 1] != ':' || !number_to_end(close + 2, 5, 65535)))
+                    return pii_type::none;
+                b = 1;
+                e = close;
+                return pii_type::ipv6;
+            }
+            const std::size_t slash = v.find('/');
+            const std::string head = v.substr(0, slash);
+            if (parse_ipv4(head, a4))
+            {
+                if (slash != std::string::npos && !number_to_end(slash + 1, 2, 32)) return pii_type::none;
+                b = 0;
+                e = head.size();
+                return pii_type::ipv4;
+            }
+            const std::size_t colon = head.find(':');
+            if (slash == std::string::npos && colon != std::string::npos &&
+                head.find(':', colon + 1) == std::string::npos && parse_ipv4(head.substr(0, colon), a4))
+            {
+                if (!number_to_end(colon + 1, 5, 65535)) return pii_type::none;
+                b = 0;
+                e = colon;
+                return pii_type::ipv4;
+            }
+            const std::size_t zone = head.find('%');
+            const std::string address = head.substr(0, zone);
+            if (!parse_ipv6(address, a6)) return pii_type::none;
+            if (zone != std::string::npos)
+            {
+                if (slash != std::string::npos || zone + 1 >= head.size()) return pii_type::none;
+                for (std::size_t k = zone + 1; k < head.size(); ++k)
+                {
+                    const char c = head[k];
+                    if (!is_ascii_digit_char(c) && !((c | 0x20) >= 'a' && (c | 0x20) <= 'z') && c != '.' && c != '_' &&
+                        c != '-')
+                        return pii_type::none;
+                }
+            }
+            if (slash != std::string::npos && !number_to_end(slash + 1, 3, 128)) return pii_type::none;
+            b = 0;
+            e = address.size();
+            return pii_type::ipv6;
         }
 
         /*
@@ -541,6 +638,10 @@ namespace dlib
             text_resolve_ = resolve;
         }
 
+        void set_ascii_windows_1252(bool yes) { ascii_1252_ = yes; }
+
+        bool ascii_windows_1252() const { return ascii_1252_; }
+
         void set_imposed_columns(const std::vector<pii_imposed_column>& columns)
         {
             columns_.clear();
@@ -742,10 +843,24 @@ namespace dlib
                     else out = plain_text(text, report, restoring);
                     const bool ascii = std::all_of(out.begin(), out.end(), [](char c) { return (c & 0x80) == 0; });
                     if (!restoring && enc == text_encoding::cp1252 && ascii)
-                        report.note("the protected text is plain ASCII: its restoration will be written in UTF-8");
+                        report.note("the protected text is plain ASCII: its restoration will be written in UTF-8, "
+                                    "unless the caller knows its original was written in Windows-1252");
                     if (restoring && enc == text_encoding::utf8 && !ascii &&
                         std::all_of(text.begin(), text.end(), [](char c) { return (c & 0x80) == 0; }))
-                        report.note("the restored text is written in UTF-8, the encoding of ASCII input is unknown");
+                    {
+                        /* A text of plain ASCII says nothing of the encoding of its original: the caller
+                           that knows it was Windows-1252 has it written so, when that encoding writes
+                           every character restored. */
+                        if (ascii_1252_ && cp1252_writes(out))
+                        {
+                            enc = text_encoding::cp1252;
+                            report.note("the restored text is written in Windows-1252, the encoding of its original");
+                        }
+                        else
+                            report.note("the restored text is written in UTF-8, the encoding of ASCII input is "
+                                        "unknown");
+                    }
+                    report.encoding = text_encoding_name(enc);
                     return encode_text(out, enc);
                 }
                 case document_format::legacy_office:
@@ -941,12 +1056,46 @@ namespace dlib
             return std::make_pair(b, v.find_last_not_of(" \t\r\n") + 1);
         }
 
+        // Whether a value of type known stands in a column of type: an IP column takes both forms.
+        static bool column_family(pii_type known, pii_type type)
+        {
+            const auto ip = [](pii_type t) { return t == pii_type::ipv4 || t == pii_type::ipv6; };
+            return known == type || (ip(known) && ip(type));
+        }
+
+        // Whether s is an address of the form given, ipv4 or ipv6.
+        static bool address_of_form(const std::string& s, pii_type form)
+        {
+            std::uint32_t a4 = 0;
+            std::array<unsigned char, 16> a6;
+            return form == pii_type::ipv4 ? privacy_impl::parse_ipv4(s, a4) : privacy_impl::parse_ipv6(s, a6);
+        }
+
+        // Whether the text resolver knows candidate as a substitute of the family of type, and its value.
+        bool known_substitute(const std::string& candidate, pii_type type, std::string* original) const
+        {
+            if (!text_resolve_ || candidate.empty()) return false;
+            for (const std::string& tag : text_resolve_(candidate))
+            {
+                pii_type known = pii_type::none;
+                std::string value;
+                if (!p_.decode(tag, known, value) || !column_family(known, type)) continue;
+                if (original) *original = value;
+                return true;
+            }
+            return false;
+        }
+
         /*
             The protected form of the value of a cell of an imposed column: its substitute, with or
             without untagged text, the spaces at its ends kept; listed in report.substitutions once
             for each value, made is the substitute of each value already written.  A substitute
             that the text resolver knows for the type, written by a protection before, stays, and
-            a tag stands for its value.
+            a tag stands for its value.  An IP column takes the IPv4 and the IPv6 addresses alike,
+            each by its form, and keeps what surrounds the address: a prefix length, a zone, the
+            brackets and the port.  An address whose substitute is no address, written with
+            capitals or leading zeros, takes an opaque code with what surrounds it, so that the
+            restoration finds that code whole.
         */
         std::string column_value(const std::string& value, pii_type type, document_report& report,
                                  std::unordered_map<std::string, std::string>& made) const
@@ -954,49 +1103,76 @@ namespace dlib
             const std::pair<std::size_t, std::size_t> r = value_bounds(value);
             if (r.first >= r.second || p_.keeps_in_clear(type)) return value;
             std::string core = value.substr(r.first, r.second - r.first);
-            if (text_resolve_)
-                for (const std::string& tag : text_resolve_(core))
-                {
-                    pii_type known = pii_type::none;
-                    std::string original;
-                    if (p_.decode(tag, known, original) && known == type) return value;
-                }
+            if (known_substitute(core, type, nullptr)) return value;
             pii_type tagged = pii_type::none;
             std::string original;
             if (p_.decode(core, tagged, original)) core = original;
-            report.count(type);
+            std::size_t ab = 0, ae = core.size();
+            pii_type form = type;
+            if (type == pii_type::ipv4 || type == pii_type::ipv6)
+            {
+                std::size_t b = 0, e = 0;
+                const pii_type found = privacy_impl::ip_address_in(core, b, e);
+                if (found != pii_type::none)
+                {
+                    const std::string part = core.substr(b, e - b);
+                    if (known_substitute(part, type, nullptr)) return value;
+                    form = found;
+                    if (address_of_form(p_.substitute(found, part), found))
+                    {
+                        ab = b;
+                        ae = e;
+                    }
+                }
+            }
+            const std::string address = core.substr(ab, ae - ab);
+            const std::string before = value.substr(0, r.first) + core.substr(0, ab);
+            const std::string after = core.substr(ae) + value.substr(r.second);
+            report.count(form);
             // A civility, a sex or a nationality takes another substitute at each place, as its tags do.
-            const bool varying = type == pii_type::title || type == pii_type::gender || type == pii_type::nationality;
-            const std::string key = std::string(pii_type_keyword(type)) + '\x1f' + core;
+            const bool varying = form == pii_type::title || form == pii_type::gender || form == pii_type::nationality;
+            const std::string key = std::string(pii_type_keyword(form)) + '\x1f' + address;
             if (!varying)
             {
                 const auto it = made.find(key);
-                if (it != made.end()) return value.substr(0, r.first) + it->second + value.substr(r.second);
+                if (it != made.end()) return before + it->second + after;
             }
             document_substitution s;
-            s.substitute = p_.substitute(type, core, &s.tag);
+            s.substitute = p_.substitute(form, address, &s.tag);
             s.text = true;
             report.substitutions.push_back(s);
             if (!varying && made.size() < 262144) made[key] = s.substitute;
-            return value.substr(0, r.first) + s.substitute + value.substr(r.second);
+            return before + s.substitute + after;
         }
 
-        // The value of a cell of an imposed column that the text resolver knows as a substitute of its type.
+        /*
+            The value of a cell of an imposed column that the text resolver knows as a substitute of
+            its type, whole or, in an IP column, as the address that a prefix length, a zone or a port
+            surrounds.
+        */
         bool column_original(const std::string& value, pii_type type, std::string& out, document_report& report) const
         {
-            if (!text_resolve_) return false;
             const std::pair<std::size_t, std::size_t> r = value_bounds(value);
-            if (r.first >= r.second) return false;
-            for (const std::string& tag : text_resolve_(value.substr(r.first, r.second - r.first)))
+            if (r.first >= r.second || !text_resolve_) return false;
+            const std::string core = value.substr(r.first, r.second - r.first);
+            std::size_t ab = 0, ae = core.size();
+            std::string original;
+            bool found = known_substitute(core, type, &original);
+            if (!found && (type == pii_type::ipv4 || type == pii_type::ipv6))
             {
-                pii_type known = pii_type::none;
-                std::string original;
-                if (!p_.decode(tag, known, original) || known != type) continue;
-                out = value.substr(0, r.first) + original + value.substr(r.second);
-                ++report.substitutes_restored;
-                return true;
+                std::size_t b = 0, e = 0;
+                if (privacy_impl::ip_address_in(core, b, e) != pii_type::none &&
+                    known_substitute(core.substr(b, e - b), type, &original))
+                {
+                    found = true;
+                    ab = b;
+                    ae = e;
+                }
             }
-            return false;
+            if (!found) return false;
+            out = value.substr(0, r.first) + core.substr(0, ab) + original + core.substr(ae) + value.substr(r.second);
+            ++report.substitutes_restored;
+            return true;
         }
 
         std::string delimited(const std::string& text, document_report& report, bool restoring)
@@ -1685,6 +1861,7 @@ namespace dlib
         std::vector<pii_imposed_column> columns_;
         // fold_key() of the names of columns_, in the same order.
         std::vector<std::string> column_keys_;
+        bool ascii_1252_ = false;
     };
 
 // ----------------------------------------------------------------------------------------

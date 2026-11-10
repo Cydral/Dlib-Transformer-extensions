@@ -229,7 +229,13 @@ int main()
                                                         std::string(max_imposed_column_length, 'a') + "\"}]"),
                                     columns, message, code, index));
         for (const std::string& t : imposed_column_types())
-            CHECK(dlib::pii_type_from_keyword(t) != dlib::pii_type::none);
+            CHECK(t == "IP" || dlib::pii_type_from_keyword(t) != dlib::pii_type::none);
+        // The two forms of IP address make one type, which the former names give too.
+        CHECK(parse_imposed_columns(json::parse_or_null("[{\"column\": \"ip_address\", \"type\": \"IPV4\"}, "
+                                                        "{\"column\": \"ip6\", \"type\": \"IPV6\"}, "
+                                                        "{\"column\": \"ip\", \"type\": \"IP\"}]"),
+                                    columns, message, code, index) &&
+              columns.size() == 3 && columns[0].type == "IP" && columns[1].type == "IP" && columns[2].type == "IP");
     }
 
     // The database: records, pictures and the tree of the drive.
@@ -387,6 +393,31 @@ int main()
             file_record back;
             CHECK(migrated.find_by_output(bare.output_sha256, back) && !back.tags &&
                   migrated.text_substitutes(id).size() == 1);
+        }
+        // A database of the version 3, as Pseudalis 1.0.8 left it: the encoding of its records is unknown, and
+        // kept from then on.
+        const std::string v3_path = join_path(dir, "version3.db");
+        {
+            store fresh(v3_path);
+            CHECK(fresh.add_file(r) > 0);
+        }
+        CHECK(sqlite3_open(v3_path.c_str(), &raw) == SQLITE_OK);
+        CHECK(sqlite3_exec(raw, "ALTER TABLE files DROP COLUMN encoding; PRAGMA user_version = 3;",
+                           nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+        {
+            store migrated(v3_path);
+            file_record before;
+            CHECK(migrated.find_by_output(r.output_sha256, before) && before.encoding.empty());
+            file_record text = r;
+            text.output_sha256 = std::string(64, 'e');
+            text.encoding = "windows-1252";
+            CHECK(migrated.add_file(text) > 0);
+        }
+        {
+            store reopened(v3_path);
+            file_record back;
+            CHECK(reopened.find_by_output(std::string(64, 'e'), back) && back.encoding == "windows-1252");
         }
 
         // The files of the folder of the drive as the service left them, and what they weigh.

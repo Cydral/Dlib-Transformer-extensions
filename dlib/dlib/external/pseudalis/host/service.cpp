@@ -632,6 +632,20 @@ namespace pseudalis
             r.output_size = static_cast<long long>(out.bytes.size());
             r.kind = out.kind;
             r.tags = tags;
+            /* The encoding of a text, by which its restoration writes a text of plain ASCII: an original
+               of plain ASCII, a protected file edited on the drive for instance, takes that of the record
+               it comes from. */
+            r.encoding = result["report"]["encoding"].str();
+            if (std::all_of(bytes.begin(), bytes.end(), [](char c) { return (c & 0x80) == 0; }))
+                for (long long id : sources)
+                {
+                    file_record source_record;
+                    if (db_->get_file(id, source_record) && source_record.encoding == "windows-1252")
+                    {
+                        r.encoding = source_record.encoding;
+                        break;
+                    }
+                }
             std::vector<entry_record> entries;
             for (const json& w : result["entries"].elements())
             {
@@ -725,6 +739,8 @@ namespace pseudalis
             request["operation"] = "restore";
             request["name"] = r.original_name;
             if (!inherited.empty()) request["substitutions"] = inherited;
+            // A text of plain ASCII comes back in the encoding of the original it stands for.
+            if (text && r.encoding == "windows-1252") request["ascii_encoding"] = r.encoding;
             std::string restored, e;
             const bool done =
                 engine_->process(request, out.bytes, result, restored, nullptr, e, substitute_lookup());
@@ -909,6 +925,8 @@ namespace pseudalis
         {
             const json known = text_substitutes_of(r.id);
             if (!known.empty()) request["substitutions"] = known;
+            // A text of plain ASCII comes back in the encoding of its original.
+            if (r.encoding == "windows-1252") request["ascii_encoding"] = r.encoding;
         }
         json result;
         std::string e;

@@ -834,6 +834,19 @@ int main()
         known["substitutions"] = kept;
         CHECK(process(e, "restore", "clients.csv", bare, res, restored, false, false, known) && restored == csv);
         CHECK(res["report"]["substitutes_restored"].as_int() == 6);
+        // A Windows-1252 file protected in plain ASCII comes back in that encoding when the caller tells it.
+        const std::string accents = "Nom;Ville\nH\xE9l\xE8ne;Rennes\n";
+        std::string ascii, back;
+        CHECK(process(e, "anonymize", "accents.csv", accents, res, ascii) &&
+              res["report"]["encoding"].str() == "windows-1252" &&
+              std::all_of(ascii.begin(), ascii.end(), [](char c) { return (c & 0x80) == 0; }));
+        json told = json::object();
+        told["substitutions"] = text_substitutes(res);
+        CHECK(process(e, "restore", "accents.csv", ascii, res, back, false, false, told) &&
+              back == "Nom;Ville\nH\xC3\xA9l\xC3\xA8ne;Rennes\n" && res["report"]["encoding"].str() == "utf-8");
+        told["ascii_encoding"] = "windows-1252";
+        CHECK(process(e, "restore", "accents.csv", ascii, res, back, false, false, told) && back == accents &&
+              res["report"]["encoding"].str() == "windows-1252");
         // A list the engine does not take changes nothing; an empty one removes the columns.
         const std::string wrong = "[{\"column\": \"Nom\", \"type\": \"NONE\"}]";
         CHECK(psd_set_columns(e, wrong.data(), wrong.size(), &err) == 0 && err.data);
@@ -842,6 +855,25 @@ int main()
         CHECK(psd_set_columns(e, "[]", 2, &err) == 1);
         psd_free(&err);
         CHECK(process(e, "anonymize", "clients.csv", csv, res, bare) && text_substitutes(res).size() == 0);
+        // An IP column takes both forms, each address keeping its form, its prefix length and its port.
+        const std::string ip = "[{\"column\": \"ip_address\", \"type\": \"IP\"}]";
+        CHECK(psd_set_columns(e, ip.data(), ip.size(), &err) == 1);
+        psd_free(&err);
+        const std::string hosts = "host;ip_address\nweb;192.168.1.5\ndb;2001:db8::1\nnet;10.0.0.0/8\n"
+                                  "api;[2001:db8::1]:443\nnone;N/A\n";
+        std::string hidden, shown;
+        CHECK(process(e, "anonymize", "hosts.csv", hosts, res, hidden));
+        const json ip_known = text_substitutes(res);
+        // A value of no IP form takes a substitute of the type of the column, as any value of the column.
+        CHECK(ip_known.size() == 4 && res["report"]["values"]["IPV4"].as_int() == 3 &&
+              res["report"]["values"]["IPV6"].as_int() == 2);
+        CHECK(hidden.find("192.168.1.5") == std::string::npos && hidden.find("2001:db8::1") == std::string::npos &&
+              hidden.find("/8\n") != std::string::npos && hidden.find("]:443\n") != std::string::npos);
+        json ip_told = json::object();
+        ip_told["substitutions"] = ip_known;
+        CHECK(process(e, "restore", "hosts.csv", hidden, res, shown, false, false, ip_told) && shown == hosts);
+        CHECK(psd_set_columns(e, "[]", 2, &err) == 1);
+        psd_free(&err);
     }
 
     psd_buffer fp = { nullptr, 0 };

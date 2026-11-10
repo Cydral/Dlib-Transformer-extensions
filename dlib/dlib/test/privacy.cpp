@@ -3426,6 +3426,49 @@ namespace
                   openings.substr(e.back().begin, e.back().end - e.back().begin) == "projet alpha");
     }
 
+    void test_ascii_windows_1252()
+    {
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x41')));
+        pii_detector detector;
+        const std::vector<pii_imposed_column> columns = { { "Nom", pii_type::person } };
+        // A Windows-1252 file whose accented letters all stand in an imposed column: its protected form is ASCII.
+        const string csv = "Nom;Ville\nH\xE9l\xE8ne;Rennes\nJos\xE9;Lyon\n";
+        document_anonymizer a(p, detector);
+        a.set_imposed_columns(columns);
+        document_report r;
+        const string out = a.anonymize(csv, document_format::delimited, r, "a.csv");
+        DLIB_TEST(r.encoding == "windows-1252" && !a.ascii_windows_1252());
+        DLIB_TEST(std::all_of(out.begin(), out.end(), [](char c) { return (c & 0x80) == 0; }));
+        // Nothing tells its encoding: UTF-8 by default, Windows-1252 when the caller knows it.
+        document_anonymizer b(p, detector);
+        b.set_imposed_columns(columns);
+        b.set_text_substitute_resolver(resolver_of(r.substitutions));
+        document_report r1;
+        DLIB_TEST(b.restore(out, document_format::delimited, r1, "a.csv") ==
+                  "Nom;Ville\nH\xC3\xA9l\xC3\xA8ne;Rennes\nJos\xC3\xA9;Lyon\n" && r1.encoding == "utf-8");
+        b.set_ascii_windows_1252(true);
+        document_report r2;
+        DLIB_TEST(b.restore(out, document_format::delimited, r2, "a.csv") == csv && r2.encoding == "windows-1252");
+        DLIB_TEST(b.restore(out, document_format::text, r2, "a.csv") == csv);
+        // A letter that Windows-1252 cannot write keeps the text in UTF-8, as its original was.
+        const string polish = "Nom;Ville\n\xC5\x81ukasz;Rennes\n";
+        document_report rp;
+        const string pout = a.anonymize(polish, document_format::delimited, rp, "a.csv");
+        DLIB_TEST(rp.encoding == "utf-8" &&
+                  std::all_of(pout.begin(), pout.end(), [](char c) { return (c & 0x80) == 0; }));
+        document_anonymizer c(p, detector);
+        c.set_imposed_columns(columns);
+        c.set_text_substitute_resolver(resolver_of(rp.substitutions));
+        c.set_ascii_windows_1252(true);
+        document_report rc;
+        DLIB_TEST(c.restore(pout, document_format::delimited, rc, "a.csv") == polish && rc.encoding == "utf-8");
+        // A text that holds other bytes keeps its own encoding, and the other formats report none.
+        const string utf8_text = "Caf\xC3\xA9 de M. Dupont\n";
+        document_report ua, ur;
+        DLIB_TEST(c.restore(a.anonymize(utf8_text, document_format::text, ua), document_format::text, ur) ==
+                  utf8_text && ua.encoding == "utf-8" && ur.encoding == "utf-8");
+    }
+
     std::vector<string> lines_of(const string& text)
     {
         std::vector<string> lines;
@@ -3602,6 +3645,72 @@ namespace
         const string pout = plain.anonymize(csv, document_format::delimited, pr, "clients.csv");
         DLIB_TEST(pr.substitutions.empty() && pout.find(p.tag(pii_type::person, "Martin")) != string::npos);
         DLIB_TEST(lines_of(pout)[0] == header);
+    }
+
+    void test_ip_columns()
+    {
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x41')));
+        pii_detector detector;
+        // An IP column takes the IPv4 and the IPv6 addresses alike, whichever of the two types names it.
+        const string csv = "host;ip_address\n"
+                           "web;192.168.1.5\n"
+                           "db;2001:db8::1\n"
+                           "net;10.0.0.0/8\n"
+                           "api;[2001:db8::1]:443\n"
+                           "link;fe80::1%eth0\n"
+                           "srv;192.0.2.1:8080\n"
+                           "v6net;2001:db8::/32\n"
+                           "long;2001:0db8:0000:0000:0000:0000:0000:0001\n"
+                           "upper;[2001:0DB8::1]:443\n"
+                           "zeros;fe80::0001%eth0\n"
+                           "wide;2001:0db8::/32\n"
+                           "none;N/A\n";
+        const std::size_t values = 12;
+        std::vector<string> first;
+        for (pii_type column_type : { pii_type::ipv4, pii_type::ipv6 })
+        {
+            document_anonymizer a(p, detector);
+            a.set_imposed_columns({ { "ip_address", column_type } });
+            document_report r;
+            const string out = a.anonymize(csv, document_format::delimited, r, "hosts.csv");
+            const std::vector<string> rows = lines_of(out);
+            DLIB_TEST_MSG(rows.size() == values + 1 && rows[0] == "host;ip_address", out);
+            if (rows.size() != values + 1) continue;
+            // Each address takes the substitute of its form; its prefix length, brackets, port and zone stay.
+            const string v4 = p.substitute(pii_type::ipv4, "192.168.1.5");
+            const string v6 = p.substitute(pii_type::ipv6, "2001:db8::1");
+            DLIB_TEST_MSG(rows[1] == "web;" + v4 && rows[2] == "db;" + v6, out);
+            DLIB_TEST_MSG(rows[3] == "net;" + p.substitute(pii_type::ipv4, "10.0.0.0") + "/8", out);
+            DLIB_TEST_MSG(rows[4] == "api;[" + v6 + "]:443", out);
+            DLIB_TEST_MSG(rows[5] == "link;" + p.substitute(pii_type::ipv6, "fe80::1") + "%eth0", out);
+            DLIB_TEST_MSG(rows[6] == "srv;" + p.substitute(pii_type::ipv4, "192.0.2.1") + ":8080", out);
+            DLIB_TEST_MSG(rows[7] == "v6net;" + p.substitute(pii_type::ipv6, "2001:db8::") + "/32", out);
+            // An address written otherwise than in its canonical form takes an opaque code, whole with what
+            // surrounds it, so that its restoration finds it.
+            DLIB_TEST_MSG(rows[8] == "long;" + p.substitute(pii_type::ipv6, "2001:0db8:0000:0000:0000:0000:0000:0001"),
+                          out);
+            DLIB_TEST_MSG(rows[9] == "upper;" + p.substitute(pii_type::ipv6, "[2001:0DB8::1]:443"), out);
+            DLIB_TEST_MSG(rows[10] == "zeros;" + p.substitute(pii_type::ipv6, "fe80::0001%eth0"), out);
+            DLIB_TEST_MSG(rows[11] == "wide;" + p.substitute(pii_type::ipv6, "2001:0db8::/32"), out);
+            DLIB_TEST(r.entities["IPV4"] + r.entities["IPV6"] == values);
+            DLIB_TEST(out.find("192.168") == string::npos && out.find("2001:db8:") == string::npos &&
+                      out.find("2001:0db8") == string::npos && out.find("0DB8") == string::npos &&
+                      out.find("N/A") == string::npos);
+            // Both types of column give the same addresses the same substitutes.
+            if (first.empty()) first = rows;
+            else for (std::size_t i = 0; i < values; ++i) DLIB_TEST_MSG(rows[i] == first[i], rows[i]);
+
+            // The record gives every value back as it was written, and a protected file protected again stays.
+            document_anonymizer b(p, detector);
+            b.set_imposed_columns({ { "ip_address", column_type } });
+            b.set_text_substitute_resolver(resolver_of(r.substitutions));
+            document_report back;
+            DLIB_TEST_MSG(b.restore(out, document_format::delimited, back, "hosts.csv") == csv, out);
+            DLIB_TEST(back.substitutes_restored == values);
+            document_report again;
+            DLIB_TEST(b.anonymize(out, document_format::delimited, again, "hosts.csv") == out);
+            DLIB_TEST(again.substitutions.empty());
+        }
     }
 
     void test_dataset()
@@ -4004,6 +4113,8 @@ namespace
             print_spinner();
             test_imposed_terms();
             test_imposed_columns();
+            test_ip_columns();
+            test_ascii_windows_1252();
             print_spinner();
             test_dataset();
             print_spinner();

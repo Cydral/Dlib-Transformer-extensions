@@ -167,11 +167,15 @@ namespace pseudalis
             with the tags of its description (from a run of Word, with the gray text box of a
             slide, from over the gray box of a PDF, which stays), and so does the text file of a
             picture from an archive, report["pictures_removed"] counting them; the service gives
-            back the picture of a text file alone from its vault.
+            back the picture of a text file alone from its vault.  A text whose bytes are plain
+            ASCII says nothing of the encoding of its original: ascii_windows_1252, which the
+            caller sets when that original was written in Windows-1252 (report["encoding"] of its
+            protection), has it restored in that encoding rather than in UTF-8.
         */
         engine_result restore(const std::string& bytes, const std::string& name,
             const substitute_lookup& lookup = substitute_lookup(),
-            const std::vector<substitution>& text = std::vector<substitution>()) const;
+            const std::vector<substitution>& text = std::vector<substitution>(),
+            bool ascii_windows_1252 = false) const;
         /*
             The bytes of the entry at path in the archive bytes named name, read as anonymize()
             reads it: path is entry_written::original, the archives inside joined by '!'.  Throws

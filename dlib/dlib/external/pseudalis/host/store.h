@@ -40,6 +40,7 @@ namespace pseudalis
         std::string path;               // where the protected file was written, when known
         int64_t removed = 0;            // when its file left the drive (Unix time), else 0
         bool tags = true;               // whether the protected file holds the tags of its values
+        std::string encoding;           // a text: the encoding of its original ("windows-1252"...), else empty
     };
 
     struct entry_record

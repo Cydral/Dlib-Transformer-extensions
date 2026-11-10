@@ -26,13 +26,17 @@
         "substitutions" [{"substitute", "tag"}]: the substitutes of the text of a file or of
                         a text protected without tags, which "restore" and "restore_text" give
                         back and "anonymize" leaves as they are
+        "ascii_encoding" "restore": "windows-1252" writes in that encoding a text file whose
+                        bytes are plain ASCII, its original having been written so (the
+                        "encoding" of the report of its protection); UTF-8 otherwise
     result receives a JSON object: "name" (the name of the output, protected or restored:
     "photo.png.txt" for a picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx",
     "pdf", "image", "zip", "tar", "tar.gz" or "text"), "report" ({"values": {type: count},
     "removed": [...], "notes": [...], "dropped": [entries of an archive left out],
     "tags_restored", "tags_rejected", "substitutes", "substitutes_restored", "pictures_removed"
     (the picture markers that "restore" removed, which no restoration gives back into a
-    document)}), "pictures"
+    document), "encoding" (a text file: the encoding written, "utf-8", "utf-8-bom",
+    "utf-16le", "utf-16be", "utf-16le-nobom", "utf-16be-nobom" or "windows-1252")}), "pictures"
     (the identifiers of the pictures found) and, for "anonymize" and "anonymize_name",
     "substitutions" ([{"substitute", "tag"}]: the values written without their tags in the
     names and the properties, which the caller records for "restore", and, "text": true, in

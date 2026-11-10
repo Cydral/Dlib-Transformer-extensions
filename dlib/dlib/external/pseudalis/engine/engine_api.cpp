@@ -243,7 +243,7 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
         {
             pseudalis::engine_result r = op == "anonymize"
                 ? engine->e->anonymize(bytes, name, handler, tags_of, tags, known)
-                : engine->e->restore(bytes, name, tags_of, known);
+                : engine->e->restore(bytes, name, tags_of, known, req["ascii_encoding"].str() == "windows-1252");
             res = result_of(r);
             out = std::move(r.bytes);
         }

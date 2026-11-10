@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -214,7 +214,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding the marker of a picture the vault keeps (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. A file protected without tags gives back its original while its record lasts, a copy edited since, known by its object identifier, the values of the substitutes that its record keeps (tags then counts them with the tags, in \"substitutes_restored\"). The original of a file protected again is a protected file itself: the original that its own record keeps comes back in its place, and the values of its tags otherwise, so that the values of both protections come back. A protected file whose original was forgotten, at the request of a user, at the end of its time after the file left the drive or to make room for newer originals, and a file written elsewhere from protected values, an answer of a language model for instance, are restored from their tags; the report then gives \"original_forgotten\": {\"date\", \"reason\"} for the first, the reason \"forgotten\", \"expired\" or \"space\". A restoration from the tags cannot give a picture back: the markers of the pictures leave the document (its runs, the gray text boxes of its slides, the texts over the gray boxes of a PDF, which stay), the text files of pictures leave an archive, and \"pictures_removed\" counts them. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected (code not_protected), or when it is the text file of a picture the vault does not keep (code picture_missing); 410 when that picture was forgotten (code picture_forgotten), its date in args.date. 410 too when the file was protected without tags and its original was forgotten, its values gone with its record (code tagless_forgotten), the date in args.date. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding the marker of a picture the vault keeps (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. A file protected without tags gives back its original while its record lasts, a copy edited since, known by its object identifier, the values of the substitutes that its record keeps (tags then counts them with the tags, in \"substitutes_restored\"). The original of a file protected again is a protected file itself: the original that its own record keeps comes back in its place, and the values of its tags otherwise, so that the values of both protections come back. A protected file whose original was forgotten, at the request of a user, at the end of its time after the file left the drive or to make room for newer originals, and a file written elsewhere from protected values, an answer of a language model for instance, are restored from their tags; the report then gives \"original_forgotten\": {\"date\", \"reason\"} for the first, the reason \"forgotten\", \"expired\" or \"space\". A restoration from the tags cannot give a picture back: the markers of the pictures leave the document (its runs, the gray text boxes of its slides, the texts over the gray boxes of a PDF, which stay), the text files of pictures leave an archive, and \"pictures_removed\" counts them. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. A text in Windows-1252 whose accented letters all stood in imposed columns is plain ASCII once protected: its record keeps its encoding, so that it comes back in Windows-1252, its copies and its copies edited on the drive too; restored from its tags alone, it comes back in UTF-8. 404 when the file holds no value this key protected (code not_protected), or when it is the text file of a picture the vault does not keep (code picture_missing); 410 when that picture was forgotten (code picture_forgotten), its date in args.date. 410 too when the file was protected without tags and its original was forgotten, its values gone with its record (code tagless_forgotten), the date in args.date. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -1770,8 +1770,7 @@
        "NIR",
        "SIRET",
        "URL",
-       "IPV4",
-       "IPV6",
+       "IP",
        "MAC",
        "PLATE",
        "GEO",
@@ -1780,7 +1779,7 @@
        "NATIONALITY"
       ],
       "default": "PERSON",
-      "description": "The type of every value of the column"
+      "description": "The type of every value of the column. IP takes the IPv4 and the IPv6 addresses alike, each by its own form, keeping its prefix length (10.0.0.0/8), its brackets and its port ([2001:db8::1]:443) or its zone (fe80::1%eth0); IPV4 and IPV6 are taken for IP"
      }
     }
    },

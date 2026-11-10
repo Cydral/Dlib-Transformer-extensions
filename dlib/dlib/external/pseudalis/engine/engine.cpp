@@ -170,6 +170,7 @@ namespace pseudalis
             j["substitutes_restored"] = static_cast<unsigned long long>(r.substitutes_restored);
             j["pictures_removed"] = static_cast<unsigned long long>(r.pictures_removed);
             j["dropped"] = json::array();
+            if (!r.encoding.empty()) j["encoding"] = r.encoding;
             return j;
         }
 
@@ -972,6 +973,8 @@ namespace pseudalis
             pseudonymizer::substitute_resolver text;
             // The imposed columns of the moment, which the whole call reads.
             std::vector<pii_imposed_column> columns;
+            // Restoration: a text of plain ASCII whose original was written in Windows-1252, the file alone.
+            bool ascii_1252 = false;
         };
 
         // The resolver of a list of substitutes: the tags of a substitute, in the order of the list.
@@ -1299,6 +1302,8 @@ namespace pseudalis
             a.set_text_substitute_resolver(c.text);
             // The values of the imposed columns of a CSV file take substitutes, with or without tags.
             a.set_imposed_columns(c.columns);
+            // A text of plain ASCII comes back in the encoding of its original, which the caller knows.
+            a.set_ascii_windows_1252(restoring && c.ascii_1252);
             // A restoration cannot give a picture back into a document: its marker leaves.
             if (restoring) a.set_picture_text_finder(picture_markers);
             /*
@@ -1473,6 +1478,9 @@ namespace pseudalis
             engine_result out;
             out.kind = archive_kind_name(ak);
             out.report = report_json(document_report());
+            // The encoding of an original concerns the file alone, never the entries of an archive.
+            call_options inner = c;
+            inner.ascii_1252 = false;
             {
                 document_report r;
                 out.name = folder_of(name) + (restoring ? restore_alone(base_name(name), lookup, r)
@@ -1518,7 +1526,7 @@ namespace pseudalis
                 }
                 try
                 {
-                    engine_result r = any(e.data, e.name, handler, restoring, lookup, depth + 1, budget, c,
+                    engine_result r = any(e.data, e.name, handler, restoring, lookup, depth + 1, budget, inner,
                                           restoring ? nullptr : &kind);
                     const std::string read_as = e.name;
                     const std::string renamed =
@@ -1677,12 +1685,14 @@ namespace pseudalis
     }
 
     engine_result engine::restore(const std::string& bytes, const std::string& name,
-                                  const substitute_lookup& lookup, const std::vector<substitution>& text) const
+                                  const substitute_lookup& lookup, const std::vector<substitution>& text,
+                                  bool ascii_windows_1252) const
     {
         uint64_t budget = decompression_budget(bytes.size());
         call_options c;
         c.text = resolver_of_list(text);
         c.columns = p_->imposed_columns();
+        c.ascii_1252 = ascii_windows_1252;
         return p_->any(bytes, name, picture_handler(), true, lookup, 0, budget, c);
     }
 
@@ -1836,7 +1846,8 @@ namespace pseudalis
         {
             pii_imposed_column one;
             one.name = c.name;
-            one.type = pii_type_from_keyword(c.type);
+            // An IP column takes both forms of address, which the anonymizer reads in a column of ipv4.
+            one.type = c.type == "IP" ? pii_type::ipv4 : pii_type_from_keyword(c.type);
             if (one.type != pii_type::none && !one.name.empty()) converted.push_back(one);
         }
         std::lock_guard<std::mutex> lock(p_->terms_m);

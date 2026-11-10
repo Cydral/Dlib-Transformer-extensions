@@ -41,6 +41,13 @@ namespace dlib
                 next to the protected document.
 
                 format          - the name of the document format
+                encoding        - the encoding in which a text file (formats txt, csv and
+                                  xml) was written: "utf-8", "utf-8-bom", "utf-16le",
+                                  "utf-16be", "utf-16le-nobom", "utf-16be-nobom" or
+                                  "windows-1252", the encoding it was read in, but for a
+                                  text of plain ASCII that restore() writes in Windows-1252
+                                  (document_anonymizer::set_ascii_windows_1252()); empty
+                                  for the other formats
                 operation       - "anonymize" or "restore"
                 key_fingerprint - the fingerprint of the key used (pseudonymizer::
                                   key_fingerprint()), which identifies the key without
@@ -70,6 +77,7 @@ namespace dlib
                                   (document_anonymizer::set_picture_text_finder())
         !*/
         std::string format;
+        std::string encoding;
         std::string operation;
         std::string key_fingerprint;
         std::map<std::string, std::size_t> entities;
