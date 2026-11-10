@@ -10,17 +10,9 @@
   // The text card is ready: its marks follow the language (renderMarks()).
   let textReady = false;
 
-  /* The language of the page: the one chosen in its menu while the page stays open, else the
-     first language of the browser, which follows the system unless its user chose otherwise,
-     that the application knows, else English.  A choice kept in the browser by an earlier
-     version goes, so that each opening of the application takes the language of the browser. */
+  /* The language of the page: the first language of the browser, which follows the system
+     unless its user chose otherwise, that the application knows, else English. */
   function pick() {
-    let chosen = null;
-    try {
-      chosen = sessionStorage.getItem('pseudalis.language');
-      localStorage.removeItem('pseudalis.language');
-    } catch (e) { /* storage unavailable */ }
-    if (chosen && texts[chosen]) return chosen;
     const wanted = navigator.languages && navigator.languages.length ? navigator.languages
       : [navigator.language || 'en'];
     for (let i = 0; i < wanted.length; ++i) {
@@ -52,6 +44,7 @@
     if (admin) {
       renderRecords();
       renderTerms();
+      renderColumns();
     }
   }
 
@@ -889,6 +882,7 @@
       const check = el('td', 'check');
       const box = el('input');
       box.type = 'checkbox';
+      box.setAttribute('role', 'switch');
       box.checked = !!term.case_sensitive;
       box.setAttribute('aria-label', t('col_case'));
       box.addEventListener('change', function () { term.case_sensitive = box.checked; });
@@ -978,9 +972,118 @@
     message('terms-message', t('terms_saved', { n: terms.length }));
   }
 
+  // ---------------------------------------------------------------------------------------
+  // The imposed columns: below their names in the header of a CSV file, each value written without tag.
+
+  let columns = [];
+  let columnTypes = ['PERSON', 'ORG', 'LOCATION', 'ADDRESS', 'EMAIL', 'PHONE', 'ID', 'DATE', 'IBAN', 'CARD', 'NIR',
+    'SIRET', 'URL', 'IPV4', 'IPV6', 'MAC', 'PLATE', 'GEO', 'TITLE', 'GENDER', 'NATIONALITY'];
+  let columnsMax = 100, columnLength = 200;
+
+  function renderColumns() {
+    const body = document.getElementById('columns');
+    if (!body) return;
+    body.textContent = '';
+    columns.forEach(function (column, i) {
+      const tr = el('tr');
+      if (column.bad) tr.className = 'bad';
+      const cell = el('td');
+      const input = el('input');
+      input.type = 'text';
+      input.maxLength = columnLength;
+      input.value = column.column;
+      input.setAttribute('aria-label', t('col_column'));
+      input.addEventListener('input', function () {
+        column.column = input.value;
+        column.bad = false;
+        tr.className = '';
+      });
+      cell.appendChild(input);
+      tr.appendChild(cell);
+      const type = el('td');
+      const select = el('select');
+      select.setAttribute('aria-label', t('col_type'));
+      columnTypes.forEach(function (k) {
+        const o = el('option', '', t('tag_' + k));
+        o.value = k;
+        select.appendChild(o);
+      });
+      select.value = columnTypes.indexOf(column.type) >= 0 ? column.type : columnTypes[0];
+      column.type = select.value;
+      select.addEventListener('change', function () { column.type = select.value; });
+      type.appendChild(select);
+      tr.appendChild(type);
+      const actions = el('td', 'actions');
+      const remove = el('button', 'secondary', t('btn_remove'));
+      remove.addEventListener('click', function () {
+        columns.splice(i, 1);
+        renderColumns();
+      });
+      actions.appendChild(remove);
+      tr.appendChild(actions);
+      body.appendChild(tr);
+    });
+    document.getElementById('columns-none').hidden = columns.length > 0;
+    document.getElementById('columns-add').disabled = columns.length >= columnsMax;
+    document.getElementById('columns-count').textContent =
+      t('columns_count', { n: columns.length, max: columnsMax });
+  }
+
+  async function loadColumns() {
+    let r;
+    try {
+      r = await adminFetch('v1/columns');
+    } catch (e) {
+      return;
+    }
+    if (!r.ok) return;
+    const body = await r.json().catch(function () { return null; });
+    if (!body) return;
+    if (Array.isArray(body.types) && body.types.length) columnTypes = body.types;
+    columnsMax = body.max || columnsMax;
+    columnLength = body.max_length || columnLength;
+    columns = (body.columns || []).map(function (x) { return { column: x.column, type: x.type }; });
+    renderColumns();
+  }
+
+  function addColumn() {
+    if (columns.length >= columnsMax) return;
+    columns.push({ column: '', type: columnTypes[0] });
+    renderColumns();
+    const inputs = document.querySelectorAll('#columns input[type=text]');
+    if (inputs.length) inputs[inputs.length - 1].focus();
+  }
+
+  async function saveColumns() {
+    // The rows left empty are no columns; the others keep their place for the errors.
+    const rows = [];
+    const list = [];
+    columns.forEach(function (x, i) {
+      x.bad = false;
+      const name = (x.column || '').trim();
+      if (!name) return;
+      rows.push(i);
+      list.push({ column: name, type: x.type });
+    });
+    const r = await sendJson('v1/columns', { columns: list }, 'PUT');
+    if (!r.ok) {
+      const b = r.body || {};
+      const at = b.args && b.args.index !== undefined ? Number(b.args.index) : -1;
+      const row = at >= 0 && at < rows.length ? rows[at] : -1;
+      if (row >= 0) columns[row].bad = true;
+      renderColumns();
+      const known = ['columns_invalid', 'columns_too_many', 'columns_type', 'columns_duplicate'].indexOf(b.code) >= 0;
+      return message('columns-message', known ? t('err_' + b.code, { n: row + 1, max: columnsMax,
+        length: columnLength }) : failure(r), true);
+    }
+    columns = (r.body.columns || []).map(function (x) { return { column: x.column, type: x.type }; });
+    renderColumns();
+    message('columns-message', t('columns_saved', { n: columns.length }));
+  }
+
   async function startAdmin() {
     if (!admin || !(await loadRecords(false))) return;
-    ['records-card', 'key-card', 'settings-card', 'terms-card'].forEach(function (id) {
+    ['records-card', 'key-card', 'settings-card', 'terms-card', 'columns-card'].forEach(function (id) {
       document.getElementById(id).hidden = false;
     });
     const info = await fetch('v1/info', { cache: 'no-store' }).then(function (r) { return r.json(); })
@@ -989,6 +1092,7 @@
     document.getElementById('fingerprint').textContent = fingerprint;
     loadSettings();
     loadTerms();
+    loadColumns();
   }
 
   document.getElementById('records-more').addEventListener('click', function () { loadRecords(true); });
@@ -1001,14 +1105,17 @@
   document.getElementById('settings-save').addEventListener('click', saveSettings);
   document.getElementById('terms-add').addEventListener('click', addTerm);
   document.getElementById('terms-save').addEventListener('click', saveTerms);
+  document.getElementById('columns-add').addEventListener('click', addColumn);
+  document.getElementById('columns-save').addEventListener('click', saveColumns);
 
-  const select = document.getElementById('language');
   language = pick();
-  select.value = language;
-  select.addEventListener('change', function () {
-    language = select.value;
-    try { sessionStorage.setItem('pseudalis.language', language); } catch (e) { /* storage unavailable */ }
-    translate();
+  // A change of the languages of the browser applies to the open page.
+  window.addEventListener('languagechange', function () {
+    const next = pick();
+    if (next !== language) {
+      language = next;
+      translate();
+    }
   });
   translate();
   fetch('v1/info', { cache: 'no-store' }).then(function (r) { return r.json(); })

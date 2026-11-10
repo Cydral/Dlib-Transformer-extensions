@@ -16,13 +16,6 @@
     <span class="tagline" data-t="tagline"></span>
     <nav>
       <a href="docs/" data-t="api"></a>
-      <select id="language" aria-label="Language">
-        <option value="en">English</option>
-        <option value="fr">Français</option>
-        <option value="de">Deutsch</option>
-        <option value="it">Italiano</option>
-        <option value="es">Español</option>
-      </select>
     </nav>
   </header>
 
@@ -38,9 +31,10 @@
       </label>
       <div class="buttons"><label class="button secondary file"><input type="file" id="protect-folder" webkitdirectory>
         <span data-t="choose_folder"></span></label></div>
-      <label class="option"><input type="checkbox" id="keep" checked> <span data-t="keep"></span></label>
+      <label class="option"><input type="checkbox" role="switch" id="keep" checked> <span data-t="keep"></span></label>
       <!-- The tags of these files alone, from the setting of the tags by default. -->
-      <label class="option"><input type="checkbox" id="tags" checked> <span data-t="tags_option"></span></label>
+      <label class="option"><input type="checkbox" role="switch" id="tags" checked>
+        <span data-t="tags_option"></span></label>
       <p class="hint sub" data-t="tags_option_hint"></p>
       <p class="hint warn" id="no-restore" data-t="no_restore_hint" hidden></p>
       <ul class="results" id="protect-results"></ul>
@@ -80,7 +74,8 @@
         <button id="text-detect" class="secondary" data-t="text_detect"></button>
       </div>
       <!-- The tags of this text alone, the parameter of the interface tried here, from the setting. -->
-      <label class="option"><input type="checkbox" id="text-tags" checked> <span data-t="text_tags"></span></label>
+      <label class="option"><input type="checkbox" role="switch" id="text-tags" checked>
+        <span data-t="text_tags"></span></label>
       <p class="hint sub" data-t="text_tags_hint"></p>
       <p class="hint warn" id="text-untagged" data-t="text_untagged_hint" hidden></p>
       <pre id="text-result" class="output" hidden></pre>
@@ -122,7 +117,7 @@
     <section class="card" id="settings-card" hidden>
       <h2 data-t="settings_title"></h2>
       <!-- The tags by default: the drive follows them, the interface and the boxes of the cards start from them. -->
-      <label class="option"><input type="checkbox" id="set-tags"> <span data-t="set_tags"></span></label>
+      <label class="option"><input type="checkbox" role="switch" id="set-tags"> <span data-t="set_tags"></span></label>
       <p class="hint sub" data-t="set_tags_hint"></p>
       <div class="fields">
         <label><span data-t="set_language"></span>
@@ -147,8 +142,10 @@
           <input type="number" id="set-history" min="1" max="1048576" step="1"></label>
       </div>
       <p class="hint" data-t="set_removed_hint"></p>
-      <label class="option"><input type="checkbox" id="set-albireo"> <span data-t="set_albireo"></span></label>
-      <label class="option"><input type="checkbox" id="set-updates"> <span data-t="set_updates"></span></label>
+      <label class="option"><input type="checkbox" role="switch" id="set-albireo">
+        <span data-t="set_albireo"></span></label>
+      <label class="option"><input type="checkbox" role="switch" id="set-updates">
+        <span data-t="set_updates"></span></label>
       <div class="buttons"><button id="settings-save" data-t="btn_save"></button></div>
       <p class="message" id="settings-message" hidden></p>
     </section>
@@ -169,6 +166,24 @@
         <span class="count" id="terms-count"></span>
       </div>
       <p class="message" id="terms-message" hidden></p>
+    </section>
+
+    <section class="card" id="columns-card" hidden>
+      <h2 data-t="columns_title"></h2>
+      <p class="hint" data-t="columns_hint"></p>
+      <table class="records terms">
+        <thead>
+          <tr><th data-t="col_column"></th><th data-t="col_type"></th><th></th></tr>
+        </thead>
+        <tbody id="columns"></tbody>
+      </table>
+      <p class="hint" id="columns-none" data-t="columns_none" hidden></p>
+      <div class="buttons">
+        <button class="secondary" id="columns-add" data-t="columns_add"></button>
+        <button id="columns-save" data-t="columns_save"></button>
+        <span class="count" id="columns-count"></span>
+      </div>
+      <p class="message" id="columns-message" hidden></p>
     </section>
   </main>
 

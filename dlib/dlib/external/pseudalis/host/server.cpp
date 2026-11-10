@@ -702,6 +702,33 @@ namespace pseudalis
             j["terms"] = s->terms();
             send_json(res, 200, j);
         });
+        // The imposed columns, whose values the CSV files with a header give to their substitutes.
+        srv.Get("/v1/columns", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
+            json j = json::object();
+            j["columns"] = s->columns();
+            j["max"] = static_cast<unsigned long long>(max_imposed_columns);
+            j["max_length"] = static_cast<unsigned long long>(max_imposed_column_length);
+            json types = json::array();
+            for (const std::string& t : imposed_column_types()) types.push_back(t);
+            j["types"] = types;
+            send_json(res, 200, j);
+        });
+        srv.Put("/v1/columns", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
+            json parsed;
+            if (!parse_body(req, res, parsed)) return;
+            const json& body = parsed;
+            user_error e;
+            if (!s->set_columns(body["columns"], e))
+            {
+                send_error(res, e.code == "engine" || e.code == "database" ? 500 : 400, e);
+                return;
+            }
+            json j = json::object();
+            j["columns"] = s->columns();
+            send_json(res, 200, j);
+        });
         srv.Post("/v1/restart", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             send_json(res, 200, json::object());

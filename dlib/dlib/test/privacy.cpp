@@ -3426,6 +3426,184 @@ namespace
                   openings.substr(e.back().begin, e.back().end - e.back().begin) == "projet alpha");
     }
 
+    std::vector<string> lines_of(const string& text)
+    {
+        std::vector<string> lines;
+        std::istringstream in(text);
+        string line;
+        while (std::getline(in, line)) lines.push_back(line);
+        return lines;
+    }
+
+    void test_imposed_columns()
+    {
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x41')));
+        pii_detector detector;
+        const std::vector<pii_imposed_column> columns = {
+            { "Nom", pii_type::person }, { "prenom", pii_type::person }, { " E-mail ", pii_type::email },
+            { "Matricule", pii_type::identifier }, { "Sexe", pii_type::gender }, { "  ", pii_type::person },
+            { "NOM", pii_type::location }, { "Ville", pii_type::none } };
+        document_anonymizer a(p, detector);
+        a.set_imposed_columns(columns);
+        DLIB_TEST(a.imposed_columns().size() == 5);
+
+        // The header stays; each value below an imposed name takes its substitute, without detection nor tag.
+        const string header = "PRENOM;Nom;E-MAIL;Ville;Commentaire;Matricule;Sexe";
+        const string csv = header + "\n"
+                           "Jean;Dupont;jean.dupont@exemple.fr;Rennes;Rappeler M. Dupont lundi;582134;M\n"
+                           "Hélène;Martin;h.martin@exemple.fr;Lyon;RAS;4521;F\n"
+                           "Ali; Ben Salah ;;Paris;Client de Jean Dupont depuis 2019;77;M\n";
+        document_report report;
+        const string out = a.anonymize(csv, document_format::delimited, report, "clients.csv");
+        const std::vector<string> rows = lines_of(out);
+        DLIB_TEST_MSG(rows.size() == 4 && rows[0] == header, out);
+        DLIB_TEST_MSG(rows[1].find(p.substitute(pii_type::person, "Jean") + ";" +
+                                   p.substitute(pii_type::person, "Dupont") + ";" +
+                                   p.substitute(pii_type::email, "jean.dupont@exemple.fr") + ";") == 0, out);
+        DLIB_TEST_MSG(rows[1].find(";" + p.substitute(pii_type::identifier, "582134") + ";") != string::npos, out);
+        // The other cells are read as before, the names of the columns found there too.
+        DLIB_TEST_MSG(rows[1].find(p.tag(pii_type::person, "Dupont")) != string::npos, out);
+        DLIB_TEST_MSG(rows[3].find("; " + p.substitute(pii_type::person, "Ben Salah") + " ;;") != string::npos, out);
+        DLIB_TEST_MSG(out.find("Dupont") == string::npos && out.find("Martin") == string::npos &&
+                      out.find("dupont@") == string::npos && out.find("4521") == string::npos, out);
+        DLIB_TEST(report.substitutions.size() == 14 && report.entities["GENDER"] == 3 && report.entities["ID"] == 3);
+        for (const document_substitution& s : report.substitutions)
+            DLIB_TEST_MSG(s.text && out.find(s.substitute) != string::npos && s.tag.compare(0, 2, "[[") == 0,
+                          s.substitute);
+        // A sex takes another substitute at each place.
+        DLIB_TEST(rows[1].substr(rows[1].rfind(';')) != rows[3].substr(rows[3].rfind(';')));
+
+        // The substitutes come back from their list, the tags as always.
+        document_anonymizer b(p, detector);
+        b.set_imposed_columns(columns);
+        document_report none;
+        const string tags_only = b.restore(out, document_format::delimited, none, "clients.csv");
+        DLIB_TEST(none.substitutes_restored == 0 && none.tags_restored > 0);
+        DLIB_TEST(tags_only.find(p.substitute(pii_type::person, "Martin")) != string::npos);
+        b.set_text_substitute_resolver(resolver_of(report.substitutions));
+        document_report back;
+        DLIB_TEST(b.restore(out, document_format::delimited, back, "clients.csv") == csv);
+        DLIB_TEST(back.substitutes_restored == 14);
+
+        // Protected again with its substitutes known, the file keeps them as they are.
+        document_anonymizer again(p, detector);
+        again.set_imposed_columns(columns);
+        again.set_text_substitute_resolver(resolver_of(report.substitutions));
+        document_report second;
+        DLIB_TEST(again.anonymize(out, document_format::delimited, second, "clients.csv") == out);
+        DLIB_TEST(second.substitutions.empty());
+
+        // Without tags, the other values take substitutes too, all given back.
+        document_anonymizer untagged(p, detector);
+        untagged.set_imposed_columns(columns);
+        untagged.set_untagged_text(true);
+        document_report ureport;
+        const string uout = untagged.anonymize(csv, document_format::delimited, ureport, "clients.csv");
+        DLIB_TEST_MSG(uout.find("[[") == string::npos && uout.find("Rennes") == string::npos, uout);
+        document_anonymizer uback(p, detector);
+        uback.set_imposed_columns(columns);
+        uback.set_text_substitute_resolver(resolver_of(ureport.substitutions));
+        document_report ur;
+        DLIB_TEST(uback.restore(uout, document_format::delimited, ur, "clients.csv") == csv);
+
+        // A title above the header, the "sep=" line of Excel, a text of another name.
+        const string titled = "Export du 12/03/2024\n" + csv;
+        for (const string& name : { string("clients.csv"), string("clients.txt"), string("") })
+        {
+            document_report r;
+            const string t = a.anonymize(titled, document_format::text, r, name);
+            DLIB_TEST_MSG(r.format == "csv" && lines_of(t)[1] == header && t.find("Martin") == string::npos, name);
+            DLIB_TEST_MSG(t.find(p.substitute(pii_type::person, "Martin") + ";") != string::npos, name);
+            document_anonymizer c(p, detector);
+            c.set_imposed_columns(columns);
+            c.set_text_substitute_resolver(resolver_of(r.substitutions));
+            document_report rb;
+            DLIB_TEST_MSG(c.restore(t, document_format::text, rb, name) == titled, name);
+        }
+        document_report excel;
+        const string sep = a.anonymize("sep=;\r\n" + csv, document_format::delimited, excel, "export.csv");
+        DLIB_TEST_MSG(sep.compare(0, 7 + header.size(), "sep=;\r\n" + header) == 0 && excel.substitutions.size() == 14,
+                      sep);
+        // A text that only names a column in a sentence stays a text.
+        const string letter = "Nom: Dupont\nUne lettre, Nom et adresse.\nRien de plus.\n";
+        document_report lr;
+        a.anonymize(letter, document_format::text, lr, "lettre.txt");
+        DLIB_TEST(lr.format == "txt" && lr.substitutions.empty());
+        DLIB_TEST(privacy_impl::imposed_delimiter(letter, { "nom" }, "lettre.txt") == 0);
+        DLIB_TEST(privacy_impl::imposed_delimiter("Nom;Ville\nDupont;Rennes\n", { "nom" }, "a.txt") == 0);
+        DLIB_TEST(privacy_impl::imposed_delimiter("Nom;Ville\nDupont;Rennes\nMartin;Lyon\n", { "nom" }, "a.txt") ==
+                  ';');
+        DLIB_TEST(privacy_impl::imposed_delimiter("\"Nom\",\"Ville, pays\"\n", { "ville, pays" }, "a.csv") == ',');
+        DLIB_TEST(privacy_impl::imposed_delimiter("Id\tNom\n", { "nom" }, "a.tsv") == '\t');
+        DLIB_TEST(privacy_impl::imposed_delimiter("Id|Nom|Ville\n", { "prenom" }, "a.csv") == 0);
+
+        // A column alone, the values holding commas and semicolons.
+        const string single = "Nom\nDupont\nMartin, Jean\n\"Durand; Paul\"\n";
+        document_report sr;
+        const string sout = a.anonymize(single, document_format::delimited, sr, "noms.csv");
+        DLIB_TEST_MSG(sout == "Nom\n" + p.substitute(pii_type::person, "Dupont") + "\n" +
+                      p.substitute(pii_type::person, "Martin, Jean") + "\n\"" +
+                      p.substitute(pii_type::person, "Durand; Paul") + "\"\n", sout);
+
+        // Under names that are no labels, the values of the columns are found in the other cells too.
+        const string partners = "Interlocuteur;Partenaire;Note\n"
+                                "Kowalczyk;Norvexa;Point avec Kowalczyk sur le dossier Norvexa demain\n";
+        pii_detector fresh;
+        document_anonymizer pa(p, fresh);
+        pa.set_imposed_columns({ { "Interlocuteur", pii_type::person }, { "Partenaire", pii_type::organization } });
+        document_report par;
+        const string partners_out = pa.anonymize(partners, document_format::delimited, par, "a.csv");
+        DLIB_TEST_MSG(partners_out.find(p.substitute(pii_type::person, "Kowalczyk") + ";" +
+                                        p.substitute(pii_type::organization, "Norvexa") + ";Point avec " +
+                                        p.tag(pii_type::person, "Kowalczyk")) != string::npos, partners_out);
+        DLIB_TEST_MSG(partners_out.find(p.tag(pii_type::organization, "Norvexa") + " demain") != string::npos,
+                      partners_out);
+        DLIB_TEST(fresh.learned_name_count() == 1);
+
+        // A cell written without quotes keeps the quotes it holds as they are, with or without imposed columns.
+        const string literal = "Nom;Remarque\nDupont;Ecran 5\" pour M. Dupont\n";
+        for (int with = 0; with < 2; ++with)
+        {
+            document_anonymizer q(p, detector);
+            if (with) q.set_imposed_columns(columns);
+            document_report qr;
+            const string qout = q.anonymize(literal, document_format::delimited, qr, "a.csv");
+            DLIB_TEST_MSG(qout.find(";Ecran 5\" pour ") != string::npos && qout.find("Dupont") == string::npos, qout);
+            document_anonymizer qb(p, detector);
+            if (with) qb.set_imposed_columns(columns);
+            qb.set_text_substitute_resolver(resolver_of(qr.substitutions));
+            document_report qback;
+            DLIB_TEST_MSG(qb.restore(qout, document_format::delimited, qback, "a.csv") == literal, qout);
+        }
+
+        // A tag in a column stands for its value; a header below the first 16 rows is no header.
+        const string tagged = "Nom;Ville\n" + p.tag(pii_type::organization, "Dupont") + ";Rennes\n";
+        document_report tr;
+        DLIB_TEST(lines_of(a.anonymize(tagged, document_format::delimited, tr, "a.csv"))[1].find(
+                  p.substitute(pii_type::person, "Dupont") + ";") == 0);
+        string deep;
+        for (int i = 0; i < 16; ++i) deep += "Ligne " + std::to_string(i) + "\n";
+        document_report dr;
+        const string dout = a.anonymize(deep + csv, document_format::delimited, dr, "a.csv");
+        DLIB_TEST_MSG(dr.substitutions.empty() && dout.find(p.tag(pii_type::person, "Martin")) != string::npos, dout);
+
+        // A date kept in clear by the policy stays in clear in its column.
+        pseudonymizer_options keep;
+        keep.dates = date_policy::keep;
+        const pseudonymizer pk(pseudonymization_key::from_bytes(string(32, '\x41')), keep);
+        document_anonymizer k(pk, detector);
+        k.set_imposed_columns({ { "Naissance", pii_type::date }, { "Nom", pii_type::person } });
+        document_report kr;
+        const string kout = k.anonymize("Nom;Naissance\nDupont;12/03/1985\n", document_format::delimited, kr, "a.csv");
+        DLIB_TEST_MSG(kout.find(";12/03/1985\n") != string::npos && kr.substitutions.size() == 1, kout);
+        // Without imposed columns, nothing changes.
+        document_anonymizer plain(p, detector);
+        document_report pr;
+        const string pout = plain.anonymize(csv, document_format::delimited, pr, "clients.csv");
+        DLIB_TEST(pr.substitutions.empty() && pout.find(p.tag(pii_type::person, "Martin")) != string::npos);
+        DLIB_TEST(lines_of(pout)[0] == header);
+    }
+
     void test_dataset()
     {
         const pii_example ex = parse_pii_example(
@@ -3825,6 +4003,7 @@ namespace
             test_technical_documents();
             print_spinner();
             test_imposed_terms();
+            test_imposed_columns();
             print_spinner();
             test_dataset();
             print_spinner();

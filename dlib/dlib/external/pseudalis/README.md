@@ -46,7 +46,7 @@ or a file sent outside, but nothing in it tells a value from its substitute any 
 alone gives its values back. The setting Write the tags by default, at the top of the Settings card
 of the web application (`tags`, on by default, kept with the other settings when the service starts
 again), decides for the drive and for the requests of the interface that do not say it (`tags=false`
-or `true`); the boxes of the cards Protect files and Protect a text start from it, and each applies to
+or `true`); the switches of the cards Protect files and Protect a text start from it, and each applies to
 its files or to its text alone, which tries the interface live; the commands of the Explorer offer
 both.
 
@@ -230,13 +230,13 @@ anonymized or restored and downloaded back, a folder dropped or chosen there as 
 tree, texts are anonymized or restored in place, their tags highlighted and their values restored
 underlined in the color of their kind, or analyzed, the values found listed below them, and, opened from
 the icon, it lists the originals kept (download, forget), exports and imports the key, and changes the
-settings and the imposed terms. Its files and its texts take their tags or not as the box of their card
-says, which starts from the setting Write the tags by default, and it asks and tells in a window of its
-own, over the page, Escape or a click beside it cancelling. The interface it uses is described with
-Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu of the icon), without
-account: the operations of administration take the token of the data folder in the header
-`X-Pseudalis-Admin`, which the pages opened by the icon receive in the fragment of their address and use
-by themselves.
+settings, the imposed terms and the imposed columns. Its options are switches. Its files and its texts take their tags or not
+as the switch of their card says, which starts from the setting Write the tags by default, and it asks
+and tells in a window of its own, over the page, Escape or a click beside it cancelling. The interface it
+uses is described with Swagger UI at `https://localhost:8444/docs/` (Interface documentation in the menu
+of the icon), without account: the operations of administration take the token of the data folder in the
+header `X-Pseudalis-Admin`, which the pages opened by the icon receive in the fragment of their address
+and use by themselves.
 
 | Route | Purpose |
 |---|---|
@@ -252,6 +252,7 @@ by themselves.
 | `GET /v1/records`, `GET /v1/records/{id}/original`, `DELETE /v1/records/{id}` | the originals kept (token) |
 | `GET /v1/settings`, `PUT /v1/settings`, `POST /v1/restart` | the settings and the restart (token) |
 | `GET /v1/terms`, `PUT /v1/terms` | the imposed terms (token) |
+| `GET /v1/columns`, `PUT /v1/columns` | the imposed columns of the CSV files (token) |
 | `GET /v1/updates`, `POST /v1/updates/check`, `POST /v1/updates/apply` | the updates |
 | `POST /v1/key/export`, `POST /v1/key/import` | the key, protected by a passphrase (token) |
 | `GET /v1/logs` | the last lines of the log (token) |
@@ -282,6 +283,32 @@ the list in its Imposed terms card, the interface through `GET` and `PUT /v1/ter
 in its database, which only SYSTEM and the administrators read, and the engine applies a new list at
 once, to the files processed afterwards.
 
+### Imposed columns
+
+A CSV file with a header holds its values in columns, the names of the clients or their e-mail addresses
+in an export for instance. The administrators name up to 100 such columns, each with the type of all its
+values (PERSON, ORG, LOCATION, ADDRESS, EMAIL, PHONE, ID, DATE, IBAN, CARD, NIR, SIRET, URL, IPV4, IPV6,
+MAC, PLATE, GEO, TITLE, GENDER or NATIONALITY). Every value below the name of such a column takes its
+substitute, without detection and without tag, whatever the tags of the rest of the file; an empty cell
+stays empty, and the spaces around a value stay in place.
+
+- The header is found by these names: it is the first of the first 16 rows that names an imposed column
+  in a cell, compared without regard to case and accents, the spaces at its ends left out (`Prénom` names
+  the columns `PRENOM` and ` prénom `). A title may stand above it, and a first line `sep=;` written by
+  Excel gives the delimiter. A file of one column is read too. A text of another extension, or without
+  extension, is read as a CSV file when its header holds the delimiter and the two records that follow it
+  hold it as many times; a text that names a column in a sentence stays a text.
+- The values of these columns are learned as values of their types: a client named in a comment of the
+  same file takes the tag of the value of its column, whose body is that substitute. The other columns
+  are read as before, their names typing them when they are labels (`ville`, `telephone`).
+- The record of the file keeps each substitute with the tag it stands for, as for a file protected
+  without tags: its copies give back the original, a copy edited on the drive its values, while the
+  record lasts. Without record, the report says that they cannot come back (`"restorable": false`).
+- The web application edits the list in its Imposed columns card, the interface through `GET` and
+  `PUT /v1/columns`; the service keeps it in its database, which only SYSTEM and the administrators read,
+  and the engine applies a new list at once, to the files processed afterwards. The sheets of the
+  workbooks, and the other kinds of files, are read as before.
+
 ### Pictures and Albireo
 
 When Albireo, the local inference service, is installed on the same computer and one of its models reads
@@ -305,12 +332,13 @@ those kept included.
 
 The installer, the icon, the commands of the Explorer and the web application speak English, French,
 German, Italian and Spanish, and English for any other language. They follow the language of the system:
-the icon and the commands of each user take the language of that user's Windows, the web application, at
-each opening, the first language of the browser that it speaks (its menu shows another one until the page
-closes), and the installer the language of Windows, which its first page changes. The documentation of
-the interface stays in English. The setting `language`, `auto` by default, sets one language for every
-user instead; a language chosen in the installer other than the one of Windows becomes that setting. The
-errors of the service reach the web application and the windows as codes, written in their language.
+the icon and the commands of each user take the language of that user's Windows, the web application the
+first language of the browser that it speaks, without a menu of its own, and the installer the language
+of Windows, which its first page changes. The documentation of the interface stays in English. The
+setting `language`, `auto` by default, sets one language for the icon, the commands and the descriptions
+of pictures of every user instead; a language chosen in the installer other than the one of Windows
+becomes that setting. The web application keeps the language of the browser. The errors of the service
+reach the web application and the windows as codes, written in their language.
 
 ## Programs and data
 
@@ -595,6 +623,10 @@ icon. Their messages and logs never name the places they read.
   text that may hold such values should be read again before it is shared.
 - A restored archive gives back its pictures as their text files, unless the archive is the one the
   service made: its original then comes back whole from the vault.
+- The values of the imposed columns come back from the record of their file alone. A copy of the
+  protected CSV file reworked elsewhere, by another program for instance, gives back the values of its
+  tags alone. A value written in clear in such a column of a file of the drive, which equals a substitute
+  of that file, a shifted date for instance, is taken for that substitute.
 - The analysis reads some tens of kilobytes per second on each processor when nearly every word is
   personal data: a text file of tens of megabytes takes minutes.
 - The protection is a pseudonymization in the sense of the GDPR: the key restores the data, which stay

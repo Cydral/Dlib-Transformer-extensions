@@ -7,8 +7,10 @@
 #include <string>
 #include <vector>
 
+#include <dlib/privacy/pii_types.h>
 #include <sqlite3.h>
 
+#include "../common/imposed_columns.h"
 #include "../common/imposed_terms.h"
 #include "../common/platform.h"
 #include "../host/keys.h"
@@ -185,6 +187,49 @@ int main()
                       "terms_invalid", 0));
         CHECK(parse_imposed_terms(json::parse_or_null("[{\"term\": \"" + std::string(max_imposed_term_length, 'a') +
                                                       "\"}]"), terms, message, code, index));
+    }
+
+    // The imposed columns: a list the service takes, or the reason and the place of its refusal.
+    {
+        std::vector<imposed_column> columns;
+        std::string message, code;
+        long long index = -1;
+        json list = json::parse_or_null("[{\"column\": \"  Nom \", \"type\": \"PERSON\"}, "
+                                        "{\"column\": \"E-mail\", \"type\": \"EMAIL\"}, "
+                                        "{\"column\": \"Naissance\", \"type\": \"DATE\"}, "
+                                        "{\"column\": \"N° client\"}]");
+        CHECK(parse_imposed_columns(list, columns, message, code, index) && columns.size() == 4 &&
+              columns[0].name == "Nom" && columns[2].type == "DATE" && columns[3].type == "PERSON" && index == -1);
+        const json canonical = imposed_columns_json(columns);
+        std::vector<imposed_column> back;
+        CHECK(parse_imposed_columns(canonical, back, message, code, index) && back.size() == 4 &&
+              back[3].name == "N° client" && canonical[0]["column"].str() == "Nom");
+        CHECK(parse_imposed_columns(json::parse_or_null("[]"), columns, message, code, index) && columns.empty());
+        auto refused = [&](const char* text, const char* expected, long long at) {
+            std::vector<imposed_column> c;
+            std::string m, k;
+            long long i = -2;
+            return !parse_imposed_columns(json::parse_or_null(text), c, m, k, i) && k == expected && i == at &&
+                   !m.empty();
+        };
+        CHECK(refused("{}", "columns_invalid", -1));
+        CHECK(refused("[{\"column\": \"   \"}]", "columns_invalid", 0));
+        CHECK(refused("[{\"column\": \"Nom\"}, {\"column\": \"---\"}]", "columns_invalid", 1));
+        CHECK(refused("[{\"column\": \"Nom\\tPrenom\"}]", "columns_invalid", 0));
+        CHECK(refused("[{\"term\": \"Nom\"}]", "columns_invalid", 0));
+        CHECK(refused("[{\"column\": \"Nom\", \"type\": \"NONE\"}]", "columns_type", 0));
+        CHECK(refused("[{\"column\": \"Prénom\"}, {\"column\": \"PRENOM\"}]", "columns_duplicate", 1));
+        std::string many = "[";
+        for (int k = 0; k <= static_cast<int>(max_imposed_columns); ++k)
+            many += std::string(k ? "," : "") + "{\"column\": \"column " + std::to_string(k) + "\"}";
+        CHECK(refused((many + "]").c_str(), "columns_too_many", -1));
+        CHECK(refused(("[{\"column\": \"" + std::string(max_imposed_column_length + 1, 'a') + "\"}]").c_str(),
+                      "columns_invalid", 0));
+        CHECK(parse_imposed_columns(json::parse_or_null("[{\"column\": \"" +
+                                                        std::string(max_imposed_column_length, 'a') + "\"}]"),
+                                    columns, message, code, index));
+        for (const std::string& t : imposed_column_types())
+            CHECK(dlib::pii_type_from_keyword(t) != dlib::pii_type::none);
     }
 
     // The database: records, pictures and the tree of the drive.

@@ -445,6 +445,13 @@ namespace dlib
                     if (software_version(text, t, b, e, m.format) && doc_versions_.size() < 4096)
                         doc_versions_.insert(privacy_impl::cp_substr(t, text, b, e));
                 }
+            remember(text, t, found);
+        }
+
+        // Keeps the values found in a text that the rest of the document repeats bare.
+        void remember(const std::string& text, const privacy_impl::utf8_text& t,
+                      const std::vector<privacy_impl::pii_candidate>& found)
+        {
             for (const privacy_impl::pii_candidate& c : found)
             {
                 const std::string value = privacy_impl::cp_substr(t, text, c.b, c.e);
@@ -507,6 +514,23 @@ namespace dlib
         }
 
     public:
+        void learn_value(const std::string& value, pii_type type)
+        {
+            // Only the names, the places, the organisations and the e-mail addresses teach the document.
+            if (type != pii_type::person && type != pii_type::location && type != pii_type::organization &&
+                type != pii_type::email)
+                return;
+            if (!enabled(type) || value.find("[[") != std::string::npos) return;
+            const privacy_impl::utf8_text t(value, true);
+            std::size_t b = 0, e = t.size();
+            while (b < e && privacy_impl::is_space(t.cps[b])) ++b;
+            while (e > b && privacy_impl::is_space(t.cps[e - 1])) --e;
+            std::vector<privacy_impl::pii_candidate> found;
+            add(found, b, e, type, 1.0, 200, true);
+            for (privacy_impl::pii_candidate& c : found) c.kept = true;
+            remember(value, t, found);
+        }
+
         std::vector<pii_entity> detect(
             const std::string& text,
             const detection_context& context = detection_context()

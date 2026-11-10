@@ -177,6 +177,27 @@ namespace pseudalis
             terms_ = kept;
             if (!kept.empty()) log_info("terms: " + std::to_string(kept.size()) + " imposed term(s)");
         }
+        // The imposed columns that the database keeps, read the same way.
+        {
+            std::vector<imposed_column> kept;
+            std::string message, code;
+            long long index = -1;
+            const json list = json::parse_or_null(db_->value("imposed_columns"));
+            if (!list.is_null() && !parse_imposed_columns(list, kept, message, code, index))
+            {
+                log_warning("columns: the imposed columns of the database are left aside: " + message);
+                kept.clear();
+            }
+            std::string ce;
+            if (!engine_->set_columns(imposed_columns_json(kept), ce))
+            {
+                error = "the engine refuses the imposed columns: " + ce;
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(terms_m_);
+            columns_ = kept;
+            if (!kept.empty()) log_info("columns: " + std::to_string(kept.size()) + " imposed column(s)");
+        }
         log_info("engine: " + library_->path() + " (" + engine_->variant() + ", " + engine_->build() + "), key " +
                  key_fingerprint_);
         return true;
@@ -541,14 +562,14 @@ namespace pseudalis
         request["operation"] = "anonymize";
         request["name"] = name;
         request["tags"] = tags;
-        /* A file protected here without tags, protected again, by a newer engine for instance, or
-           edited on the drive: the substitutes that its record keeps stay as they are, and the new
-           record inherits them, which give back the values of its original. */
+        /* A file protected here without tags, or with imposed columns, protected again, by a newer
+           engine for instance, or edited on the drive: the substitutes that its record keeps stay as
+           they are, and the new record inherits them, which give back the values of its original. */
         std::vector<long long> sources;
         {
             file_record before;
-            if (db_->find_by_output(sha256_hex(bytes), before) && !before.tags) sources.push_back(before.id);
-            if (previous > 0 && db_->get_file(previous, before) && !before.tags &&
+            if (db_->find_by_output(sha256_hex(bytes), before)) sources.push_back(before.id);
+            if (previous > 0 && db_->get_file(previous, before) &&
                 std::find(sources.begin(), sources.end(), previous) == sources.end())
                 sources.push_back(previous);
             json known = json::array();
@@ -639,9 +660,9 @@ namespace pseudalis
                 return false;
             }
         }
-        // Without tags and without record, nothing gives the values of the file back.
+        // Without tags, or with substitutes in imposed columns, and without record, nothing gives them back.
         out.report["tags"] = tags;
-        out.report["restorable"] = tags || out.record > 0;
+        out.report["restorable"] = (tags && text_made.empty()) || out.record > 0;
         return true;
     }
 
@@ -793,8 +814,8 @@ namespace pseudalis
             record = db_->add_file(r);
             // An archive extracted from the archive keeps the entries inside it, for the files extracted from it.
             db_->add_entries(record, db_->entries_inside(e));
-            // Without tags, the substitutes of the archive, which hold those of the entry.
-            if (!archive.tags) db_->copy_text_substitutes(archive.id, record);
+            // Without tags, or with imposed columns, the substitutes of the archive, which hold those of the entry.
+            db_->copy_text_substitutes(archive.id, record);
             counts_changed();
         }
         catch (const std::exception& x)
@@ -882,8 +903,13 @@ namespace pseudalis
         json request = json::object();
         request["operation"] = "restore";
         request["name"] = name;
-        // A file protected without tags and edited since, known by its object identifier: its substitutes.
-        if (tracked && !r.tags) request["substitutions"] = text_substitutes_of(r.id);
+        /* A file protected without tags, or with imposed columns, and edited since, known by its object
+           identifier: its substitutes. */
+        if (tracked)
+        {
+            const json known = text_substitutes_of(r.id);
+            if (!known.empty()) request["substitutions"] = known;
+        }
         json result;
         std::string e;
         if (!engine_->process(request, bytes, result, out.bytes, nullptr, e, substitute_lookup()))
@@ -1236,6 +1262,48 @@ namespace pseudalis
         }
         terms_ = parsed;
         log_info("terms: " + std::to_string(parsed.size()) + " imposed term(s) set");
+        return true;
+    }
+
+    json service::columns()
+    {
+        std::lock_guard<std::mutex> lock(terms_m_);
+        return imposed_columns_json(columns_);
+    }
+
+    bool service::set_columns(const json& list, user_error& error)
+    {
+        std::vector<imposed_column> parsed;
+        std::string message, code;
+        long long index = -1;
+        if (!parse_imposed_columns(list, parsed, message, code, index))
+        {
+            error.set(message, code);
+            if (index >= 0) error.arg("index", std::to_string(index));
+            return false;
+        }
+        const json canonical = imposed_columns_json(parsed);
+        std::lock_guard<std::mutex> lock(terms_m_);
+        std::string e;
+        if (!engine_ || !engine_->set_columns(canonical, e))
+        {
+            error.set(e.empty() ? "the engine is not ready" : e, "engine");
+            return false;
+        }
+        try
+        {
+            db_->set_value("imposed_columns", canonical.dump());
+        }
+        catch (const std::exception& x)
+        {
+            // The engine keeps the columns it had: those of the database, which the next start reads.
+            std::string ignored;
+            engine_->set_columns(imposed_columns_json(columns_), ignored);
+            error.set(x.what(), "database");
+            return false;
+        }
+        columns_ = parsed;
+        log_info("columns: " + std::to_string(parsed.size()) + " imposed column(s) set");
         return true;
     }
 

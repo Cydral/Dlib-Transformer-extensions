@@ -806,6 +806,44 @@ int main()
               restored.find("Jean Dupont") != std::string::npos);
     }
 
+    // The imposed columns: the values of a CSV file below their names take substitutes, with tags elsewhere.
+    {
+        const std::string columns = "[{\"column\": \"Nom\", \"type\": \"PERSON\"}, "
+                                    "{\"column\": \"courriel\", \"type\": \"EMAIL\"}, "
+                                    "{\"column\": \"N° client\", \"type\": \"ID\"}]";
+        CHECK(psd_set_columns(e, columns.data(), columns.size(), &err) == 1);
+        psd_free(&err);
+        const std::string csv = "Export du 12/03/2024\n"
+                                "NOM;Courriel;N° client;Commentaire\n"
+                                "Dupont;jean.dupont@exemple.fr;CL-2024-0042;Rappeler M. Dupont\n"
+                                "Martin;h.martin@exemple.fr;CL-2024-0043;RAS\n";
+        std::string bare, restored;
+        CHECK(process(e, "anonymize", "clients.csv", csv, res, bare));
+        CHECK(bare.find("NOM;Courriel;N° client;Commentaire\n") != std::string::npos);
+        CHECK(bare.find("Dupont") == std::string::npos && bare.find("Martin") == std::string::npos &&
+              bare.find("CL-2024-0042") == std::string::npos && bare.find("[[PERSON:") != std::string::npos);
+        const json kept = text_substitutes(res);
+        CHECK(kept.size() == 6 && res["report"]["values"]["ID"].as_int() == 2);
+        // The cells hold the substitutes alone, which the record gives back.
+        for (const json& s : kept.elements())
+            CHECK(bare.find(";" + s["substitute"].str() + ";") != std::string::npos ||
+                  bare.find("\n" + s["substitute"].str() + ";") != std::string::npos);
+        CHECK(process(e, "restore", "clients.csv", bare, res, restored) && restored != csv &&
+              restored.find("Rappeler M. Dupont") != std::string::npos);
+        json known = json::object();
+        known["substitutions"] = kept;
+        CHECK(process(e, "restore", "clients.csv", bare, res, restored, false, false, known) && restored == csv);
+        CHECK(res["report"]["substitutes_restored"].as_int() == 6);
+        // A list the engine does not take changes nothing; an empty one removes the columns.
+        const std::string wrong = "[{\"column\": \"Nom\", \"type\": \"NONE\"}]";
+        CHECK(psd_set_columns(e, wrong.data(), wrong.size(), &err) == 0 && err.data);
+        psd_free(&err);
+        CHECK(process(e, "anonymize", "clients.csv", csv, res, bare) && text_substitutes(res).size() == 6);
+        CHECK(psd_set_columns(e, "[]", 2, &err) == 1);
+        psd_free(&err);
+        CHECK(process(e, "anonymize", "clients.csv", csv, res, bare) && text_substitutes(res).size() == 0);
+    }
+
     psd_buffer fp = { nullptr, 0 };
     CHECK(psd_key_fingerprint(e, &fp) == 1 && fp.size > 0);
     psd_free(&fp);

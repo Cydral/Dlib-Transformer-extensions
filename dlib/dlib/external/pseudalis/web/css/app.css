@@ -28,7 +28,6 @@ a { color: var(--navy-2); }
 .top nav { margin-left: auto; display: flex; align-items: center; gap: 16px; }
 .top nav a { color: #9fe3dc; text-decoration: none; }
 .top nav a:hover { text-decoration: underline; }
-.top select { border: 1px solid #3c6a93; background: var(--navy); color: #fff; border-radius: 6px; padding: 4px 6px; }
 
 main { max-width: 980px; margin: 24px auto; padding: 0 16px; display: grid; gap: 18px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
@@ -47,8 +46,8 @@ main { max-width: 980px; margin: 24px auto; padding: 0 16px; display: grid; gap:
   text-align: center; color: var(--faint); cursor: pointer; transition: background .15s, border-color .15s; }
 .drop:hover, .drop.over { border-color: var(--teal); background: var(--teal-soft); color: var(--text); }
 .drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-.option { display: inline-flex; gap: 6px; align-items: center; margin-top: 10px; font-size: 14px; color: var(--faint); }
-
+.option { display: inline-flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 14px; color: var(--faint);
+  cursor: pointer; }
 .results { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
 .results li { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 12px; }
@@ -137,3 +136,19 @@ section .option { display: flex; }
 .terms td.check { text-align: center; }
 .terms tr.bad td input[type=text] { border-color: var(--bad); }
 .count { align-self: center; color: var(--faint); font-size: 13px; }
+
+/* The options are switches: a track that turns teal when on, its knob drawn as a radial gradient
+   that slides from left to right, so that no pseudo-element of the input is needed. */
+input[type=checkbox] { appearance: none; -webkit-appearance: none; flex: none; margin: 0; padding: 0; border: 0;
+  cursor: pointer;
+  width: 38px; height: 22px; border-radius: 11px; vertical-align: middle;
+  background-color: #c5ced8; background-image: radial-gradient(circle, #fff 0 8px, transparent 8.6px);
+  background-repeat: no-repeat; background-size: 22px 22px; background-position: 0 50%;
+  box-shadow: inset 0 1px 2px rgba(15, 42, 68, 0.25);
+  transition: background-color 0.15s ease, background-position 0.15s ease; }
+input[type=checkbox]:checked { background-color: var(--teal); background-position: 16px 50%; }
+input[type=checkbox]:hover { background-color: #b3bec9; }
+input[type=checkbox]:checked:hover { background-color: #16a191; }
+input[type=checkbox]:focus-visible { outline: 2px solid var(--navy-2); outline-offset: 2px; }
+input[type=checkbox]:disabled { opacity: 0.5; cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { input[type=checkbox] { transition: none; } }

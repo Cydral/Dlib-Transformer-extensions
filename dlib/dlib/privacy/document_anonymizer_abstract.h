@@ -4,6 +4,7 @@
 #ifdef DLIB_DOCUMENT_ANONYMIZER_ABSTRACT_H_
 
 #include <string>
+#include <vector>
 #include "../documents/document_image_abstract.h"
 #include "pii_detector_abstract.h"
 #include "pseudonymizer_abstract.h"
@@ -79,6 +80,25 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct pii_imposed_column
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A column of the delimited files whose values are all personal data of one
+                type, the column of the names of the clients or of their e-mail addresses in
+                an export for instance (document_anonymizer::set_imposed_columns()).
+
+                name - the name of the column in the header of a file, compared without
+                       regard to case and accents, the spaces at its ends left out
+                       ("Prénom" names the columns headed "PRENOM" and " prénom ")
+                type - the type of every value of the column
+        !*/
+        std::string name;
+        pii_type type = pii_type::none;
+    };
+
+// ----------------------------------------------------------------------------------------
+
     class document_anonymizer
     {
         /*!
@@ -99,9 +119,12 @@ namespace dlib
                                 rows feed the learning pass, so that a name established in
                                 one row is replaced in every cell, and detection runs cell
                                 by cell, so that a value never spills over a column.
-                                Quoting is kept, and added where a tag needs it. A file
-                                that does not parse is processed as plain text, with a
-                                note.
+                                Quoting is kept, and added where a value needs it (a
+                                delimiter, a line break); a cell written without quotes
+                                keeps the quotes it holds as they are. A file that does
+                                not parse is processed as plain text, with a note. The
+                                columns that set_imposed_columns() names take
+                                substitutes, without detection.
                     markup    - character data, CDATA sections, comments and attribute
                                 values are rewritten, nothing else. HTML and SVG are read
                                 with the tolerance of HTML parsers (unquoted and valueless
@@ -294,6 +317,56 @@ namespace dlib
                 - anonymize() and anonymize_text() leave as they are the substitutes that
                   resolve knows, an untagged document protected again.
                 - An empty function, the default, restores no substitute of the text.
+        !*/
+
+        void set_imposed_columns(
+            const std::vector<pii_imposed_column>& columns
+        );
+        /*!
+            ensures
+                - #imposed_columns() == columns, without those of type none, those whose
+                  name holds nothing but spaces and the later ones of a name given twice.
+        !*/
+
+        const std::vector<pii_imposed_column>& imposed_columns(
+        ) const;
+        /*!
+            ensures
+                - Returns the columns of the delimited files whose values are replaced whole,
+                  without detection, empty by default:
+                    - The header of a file is the first of its first 16 rows that holds the
+                      name of an imposed column in a cell. Its cells stay as they are, and the
+                      labels among them type their columns as in any header.
+                    - anonymize() writes the substitute of each value below the name of an
+                      imposed column (pseudonymizer::substitute() for the type of the column),
+                      with or without untagged text, the spaces and line breaks at its ends
+                      kept and an empty cell left empty. The tag of a value stands for that
+                      value, and a substitute that the text resolver knows for the type of
+                      the column (set_text_substitute_resolver()), a file protected before,
+                      stays as it is. Each value is counted in report.entities and listed with
+                      its tag in report.substitutions, text set to true, once: a substitute
+                      carries no check, and only a resolver that knows it gives its value back.
+                      A civility, a sex or a nationality takes another substitute at each
+                      place, listed each time. A date stays in clear under date_policy::keep.
+                    - The values are not read by the detector: each is recorded once as a
+                      value of the type of its column (pii_detector::learn_value()), so that
+                      the other cells of the file, a comment that names a client for
+                      instance, give it up too. The whole rows that the learning pass reads
+                      leave them out.
+                    - restore() gives each value below the name of an imposed column, whole, to
+                      the text resolver: the first tag returned that decodes to a value of the
+                      type of the column takes its place, counted in
+                      report.substitutes_restored; the other values are restored as in any
+                      cell.
+                    - A file is found delimited by its header. In a file named .csv, .tsv or
+                      .tab, a title may stand above the header, and a first line "sep=;"
+                      written by Excel gives the delimiter; such a file may also hold one
+                      column alone, its name alone on its line. A text given as
+                      document_format::text, or under another name, is read as delimited
+                      when its header holds the delimiter and the two records that follow it
+                      hold it as many times.
+                    - The values of the sheets of a workbook and of the other formats are
+                      detected as before.
         !*/
 
         std::string anonymize_name(

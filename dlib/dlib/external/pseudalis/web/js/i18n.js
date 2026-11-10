@@ -81,19 +81,19 @@ window.PSEUDALIS_TEXTS = {
     dialog_error: 'Operation not done',
     records_untagged: 'protected without tags',
     tags_option: 'Write the tags in these files',
-    tags_option_hint: 'With them, any copy is restored with the key of this computer. This box applies to the ' +
+    tags_option_hint: 'With them, any copy is restored with the key of this computer. This switch applies to the ' +
       'files dropped here alone; the general setting, which the drive follows, is in the Settings of the ' +
       'application opened from the icon.',
     no_restore_hint: 'Without tags and without the original kept, the protected files cannot be restored.',
     protected_untagged: 'without tags',
     not_restorable: 'it cannot be restored',
     text_tags: 'Write the tags in this text',
-    text_tags_hint: 'This box applies to this text alone; the general setting, which the drive follows, is ' +
+    text_tags_hint: 'This switch applies to this text alone; the general setting, which the drive follows, is ' +
       'in the Settings of the application opened from the icon.',
     text_untagged_hint: 'Without tags, this page alone restores the text, while it stays open.',
     set_tags: 'Write the tags by default',
     set_tags_hint: 'The drive follows this setting, the interface applies it to the requests without the ' +
-      'parameter tags, and the boxes of the cards Protect files and Protect a text start from it. Without tags, a ' +
+      'parameter tags, and the switches of the cards Protect files and Protect a text start from it. Without tags, a ' +
       'file comes back only while its original is kept.',
     err_tagless_forgotten: 'This file was protected without tags and its original was forgotten on {date}: its ' +
       'values cannot come back.',
@@ -184,7 +184,38 @@ window.PSEUDALIS_TEXTS = {
     err_terms_invalid: 'Term {n}: a term is a text of one line, of 1 to {length} characters, with a letter or a digit.',
     err_terms_too_many: 'At most {max} terms may be imposed.',
     err_terms_type: 'Term {n}: its tag is not one the service takes.',
-    err_terms_duplicate: 'Term {n} is given twice.'
+    err_terms_duplicate: 'Term {n} is given twice.',
+    columns_title: 'Imposed columns',
+    columns_hint: 'In a CSV file with a header, each value below the name of an imposed column is protected as a ' +
+      'value of its type, without detection and written without tag, whatever the tags of the rest of the file, the ' +
+      'names of the clients or their e-mail addresses in an export for instance. As without tags, these values come ' +
+      'back while the original of the file is kept. A name is compared without regard to case and accents; a title ' +
+      'may stand above the header. At most 100 columns.',
+    col_column: 'Column',
+    col_type: 'Type',
+    columns_none: 'No imposed column.',
+    columns_add: 'Add a column',
+    columns_save: 'Save the columns',
+    columns_count: '{n} of {max} columns',
+    columns_saved: 'Saved: {n} imposed columns.',
+    tag_DATE: 'Date (DATE)',
+    tag_IBAN: 'Bank account (IBAN)',
+    tag_CARD: 'Payment card (CARD)',
+    tag_NIR: 'Social security number (NIR)',
+    tag_SIRET: 'Company number (SIRET)',
+    tag_IPV4: 'IPv4 address (IPV4)',
+    tag_IPV6: 'IPv6 address (IPV6)',
+    tag_MAC: 'MAC address (MAC)',
+    tag_PLATE: 'Licence plate (PLATE)',
+    tag_GEO: 'GPS coordinates (GEO)',
+    tag_TITLE: 'Civility (TITLE)',
+    tag_GENDER: 'Sex (GENDER)',
+    tag_NATIONALITY: 'Nationality (NATIONALITY)',
+    err_columns_invalid: 'Column {n}: a name is a text of one line, of 1 to {length} characters, with a letter or ' +
+      'a digit.',
+    err_columns_too_many: 'At most {max} columns may be imposed.',
+    err_columns_type: 'Column {n}: its type is not one the service takes.',
+    err_columns_duplicate: 'Column {n} is given twice.'
   },
   fr: {
     tagline: 'Protection des données personnelles de vos documents',
@@ -265,20 +296,20 @@ window.PSEUDALIS_TEXTS = {
     dialog_error: 'Opération impossible',
     records_untagged: 'protégé sans balises',
     tags_option: 'Écrire les balises dans ces fichiers',
-    tags_option_hint: 'Avec elles, toute copie se restaure avec la clé de cet ordinateur. Cette case ne vaut ' +
+    tags_option_hint: 'Avec elles, toute copie se restaure avec la clé de cet ordinateur. Cet interrupteur ne vaut ' +
       'que pour les fichiers déposés ici ; le réglage général, que suit le lecteur, est dans les Réglages ' +
       'de l’application ouverte depuis l’icône.',
     no_restore_hint: 'Sans balises ni original conservé, les fichiers protégés ne pourront pas être restaurés.',
     protected_untagged: 'sans balises',
     not_restorable: 'il ne pourra pas être restauré',
     text_tags: 'Écrire les balises dans ce texte',
-    text_tags_hint: 'Cette case ne vaut que pour ce texte ; le réglage général, que suit le lecteur, est ' +
+    text_tags_hint: 'Cet interrupteur ne vaut que pour ce texte ; le réglage général, que suit le lecteur, est ' +
       'dans les Réglages de l’application ouverte depuis l’icône.',
     text_untagged_hint: 'Sans balises, seule cette page restaure le texte, tant qu’elle reste ouverte.',
     set_tags: 'Écrire les balises par défaut',
     set_tags_hint: 'Le lecteur suit ce réglage, l’interface l’applique aux requêtes sans paramètre tags, et ' +
-      'les cases des encadrés Protéger des fichiers et Protéger un texte en partent. Sans balises, un fichier ne ' +
-      'revient que tant que son original est conservé.',
+      'les interrupteurs des encadrés Protéger des fichiers et Protéger un texte en partent. Sans balises, un ' +
+      'fichier ne revient que tant que son original est conservé.',
     err_tagless_forgotten: 'Ce fichier a été protégé sans balises et son original a été oublié le {date} : ses ' +
       'valeurs ne peuvent plus revenir.',
     key_title: 'Clé de cet ordinateur',
@@ -370,7 +401,38 @@ window.PSEUDALIS_TEXTS = {
       'ou un chiffre.',
     err_terms_too_many: '{max} termes au plus peuvent être imposés.',
     err_terms_type: 'Terme {n} : son étiquette n’est pas une de celles que le service accepte.',
-    err_terms_duplicate: 'Le terme {n} figure deux fois.'
+    err_terms_duplicate: 'Le terme {n} figure deux fois.',
+    columns_title: 'Colonnes imposées',
+    columns_hint: 'Dans un fichier CSV à en-tête, chaque valeur placée sous le nom d’une colonne imposée est ' +
+      'protégée comme une valeur de son type, sans détection et écrite sans balise, quelles que soient les balises ' +
+      'du reste du fichier, les noms des clients ou leurs adresses e-mail dans un export par exemple. Comme sans ' +
+      'balises, ces valeurs reviennent tant que l’original du fichier est conservé. Le nom est comparé sans tenir ' +
+      'compte de la casse ni des accents ; un titre peut précéder l’en-tête. 100 colonnes au plus.',
+    col_column: 'Colonne',
+    col_type: 'Type',
+    columns_none: 'Aucune colonne imposée.',
+    columns_add: 'Ajouter une colonne',
+    columns_save: 'Enregistrer les colonnes',
+    columns_count: '{n} colonne(s) sur {max}',
+    columns_saved: 'Enregistré : {n} colonne(s) imposée(s).',
+    tag_DATE: 'Date (DATE)',
+    tag_IBAN: 'Compte bancaire (IBAN)',
+    tag_CARD: 'Carte de paiement (CARD)',
+    tag_NIR: 'Numéro de sécurité sociale (NIR)',
+    tag_SIRET: 'Numéro d’entreprise (SIRET)',
+    tag_IPV4: 'Adresse IPv4 (IPV4)',
+    tag_IPV6: 'Adresse IPv6 (IPV6)',
+    tag_MAC: 'Adresse MAC (MAC)',
+    tag_PLATE: 'Plaque d’immatriculation (PLATE)',
+    tag_GEO: 'Coordonnées GPS (GEO)',
+    tag_TITLE: 'Civilité (TITLE)',
+    tag_GENDER: 'Sexe (GENDER)',
+    tag_NATIONALITY: 'Nationalité (NATIONALITY)',
+    err_columns_invalid: 'Colonne {n} : un nom est un texte d’une ligne, de 1 à {length} caractères, avec une ' +
+      'lettre ou un chiffre.',
+    err_columns_too_many: '{max} colonnes au plus peuvent être imposées.',
+    err_columns_type: 'Colonne {n} : son type n’est pas un de ceux que le service accepte.',
+    err_columns_duplicate: 'La colonne {n} figure deux fois.'
   },
   de: {
     tagline: 'Schutz personenbezogener Daten in Ihren Dokumenten',
@@ -453,19 +515,19 @@ window.PSEUDALIS_TEXTS = {
     records_untagged: 'ohne Markierungen geschützt',
     tags_option: 'Markierungen in diese Dateien schreiben',
     tags_option_hint: 'Mit ihnen lässt sich jede Kopie mit dem Schlüssel dieses Computers wiederherstellen. ' +
-      'Dieses Kästchen gilt nur für die hier abgelegten Dateien; die allgemeine Einstellung, der das ' +
+      'Dieser Schalter gilt nur für die hier abgelegten Dateien; die allgemeine Einstellung, der das ' +
       'Laufwerk folgt, steht in den Einstellungen der über das Symbol geöffneten Anwendung.',
     no_restore_hint: 'Ohne Markierungen und ohne aufbewahrtes Original lassen sich die geschützten Dateien nicht ' +
       'wiederherstellen.',
     protected_untagged: 'ohne Markierungen',
     not_restorable: 'sie lässt sich nicht wiederherstellen',
     text_tags: 'Markierungen in diesen Text schreiben',
-    text_tags_hint: 'Dieses Kästchen gilt nur für diesen Text; die allgemeine Einstellung, der das ' +
+    text_tags_hint: 'Dieser Schalter gilt nur für diesen Text; die allgemeine Einstellung, der das ' +
       'Laufwerk folgt, steht in den Einstellungen der über das Symbol geöffneten Anwendung.',
     text_untagged_hint: 'Ohne Markierungen stellt nur diese Seite den Text wieder her, solange sie geöffnet bleibt.',
     set_tags: 'Markierungen standardmäßig schreiben',
     set_tags_hint: 'Das Laufwerk folgt dieser Einstellung, die Schnittstelle wendet sie auf Anfragen ohne den ' +
-      'Parameter tags an, und die Kästchen der Karten Dateien schützen und Einen Text schützen gehen von ihr aus. ' +
+      'Parameter tags an, und die Schalter der Karten Dateien schützen und Einen Text schützen gehen von ihr aus. ' +
       'Ohne Markierungen kehrt eine Datei nur zurück, solange ihr Original aufbewahrt wird.',
     err_tagless_forgotten: 'Diese Datei wurde ohne Markierungen geschützt und ihr Original am {date} vergessen: ' +
       'Ihre Werte können nicht zurückkehren.',
@@ -561,7 +623,39 @@ window.PSEUDALIS_TEXTS = {
       'Buchstabe oder eine Ziffer.',
     err_terms_too_many: 'Höchstens {max} Begriffe können vorgegeben werden.',
     err_terms_type: 'Begriff {n}: Seine Kennzeichnung nimmt der Dienst nicht an.',
-    err_terms_duplicate: 'Der Begriff {n} steht doppelt in der Liste.'
+    err_terms_duplicate: 'Der Begriff {n} steht doppelt in der Liste.',
+    columns_title: 'Vorgegebene Spalten',
+    columns_hint: 'In einer CSV-Datei mit Kopfzeile wird jeder Wert unter dem Namen einer vorgegebenen Spalte als ' +
+      'Wert ihres Typs geschützt, ohne Erkennung und ohne Markierung geschrieben, unabhängig von den Markierungen ' +
+      'der übrigen Datei, etwa die Namen der Kunden oder ihre E-Mail-Adressen in einem Export. Wie ohne Markierungen ' +
+      'kehren diese Werte zurück, solange das Original der Datei aufbewahrt wird. Der Name wird ohne Beachtung von ' +
+      'Groß- und Kleinschreibung und Akzenten verglichen; ein Titel darf über der Kopfzeile stehen. Höchstens 100 ' +
+      'Spalten.',
+    col_column: 'Spalte',
+    col_type: 'Typ',
+    columns_none: 'Keine vorgegebene Spalte.',
+    columns_add: 'Spalte hinzufügen',
+    columns_save: 'Spalten speichern',
+    columns_count: '{n} von {max} Spalten',
+    columns_saved: 'Gespeichert: {n} vorgegebene Spalten.',
+    tag_DATE: 'Datum (DATE)',
+    tag_IBAN: 'Bankkonto (IBAN)',
+    tag_CARD: 'Zahlungskarte (CARD)',
+    tag_NIR: 'Sozialversicherungsnummer (NIR)',
+    tag_SIRET: 'Unternehmensnummer (SIRET)',
+    tag_IPV4: 'IPv4-Adresse (IPV4)',
+    tag_IPV6: 'IPv6-Adresse (IPV6)',
+    tag_MAC: 'MAC-Adresse (MAC)',
+    tag_PLATE: 'Kfz-Kennzeichen (PLATE)',
+    tag_GEO: 'GPS-Koordinaten (GEO)',
+    tag_TITLE: 'Anrede (TITLE)',
+    tag_GENDER: 'Geschlecht (GENDER)',
+    tag_NATIONALITY: 'Staatsangehörigkeit (NATIONALITY)',
+    err_columns_invalid: 'Spalte {n}: Ein Name ist ein Text einer Zeile mit 1 bis {length} Zeichen, darunter ein ' +
+      'Buchstabe oder eine Ziffer.',
+    err_columns_too_many: 'Höchstens {max} Spalten können vorgegeben werden.',
+    err_columns_type: 'Spalte {n}: Ihren Typ nimmt der Dienst nicht an.',
+    err_columns_duplicate: 'Die Spalte {n} steht doppelt in der Liste.'
   },
   it: {
     tagline: 'Protezione dei dati personali dei tuoi documenti',
@@ -643,20 +737,20 @@ window.PSEUDALIS_TEXTS = {
     dialog_error: 'Operazione non riuscita',
     records_untagged: 'protetto senza tag',
     tags_option: 'Scrivere i tag in questi file',
-    tags_option_hint: 'Con essi, ogni copia si ripristina con la chiave di questo computer. Questa casella ' +
+    tags_option_hint: 'Con essi, ogni copia si ripristina con la chiave di questo computer. Questo interruttore ' +
       'vale solo per i file depositati qui; l’impostazione generale, che l’unità segue, è nelle ' +
       'Impostazioni dell’applicazione aperta dall’icona.',
     no_restore_hint: 'Senza tag e senza l’originale conservato, i file protetti non potranno essere ripristinati.',
     protected_untagged: 'senza tag',
     not_restorable: 'non potrà essere ripristinato',
     text_tags: 'Scrivere i tag in questo testo',
-    text_tags_hint: 'Questa casella vale solo per questo testo; l’impostazione generale, che l’unità ' +
+    text_tags_hint: 'Questo interruttore vale solo per questo testo; l’impostazione generale, che l’unità ' +
       'segue, è nelle Impostazioni dell’applicazione aperta dall’icona.',
     text_untagged_hint: 'Senza tag, solo questa pagina ripristina il testo, finché resta aperta.',
     set_tags: 'Scrivere i tag per impostazione predefinita',
     set_tags_hint: 'L’unità segue questa impostazione, l’interfaccia la applica alle richieste senza il ' +
-      'parametro tags e le caselle delle schede Proteggere file e Proteggere un testo partono da essa. Senza tag, ' +
-      'un file ritorna solo finché il suo originale è conservato.',
+      'parametro tags e gli interruttori delle schede Proteggere file e Proteggere un testo partono da essa. ' +
+      'Senza tag, un file ritorna solo finché il suo originale è conservato.',
     err_tagless_forgotten: 'Questo file è stato protetto senza tag e il suo originale è stato dimenticato il {date}: ' +
       'i suoi valori non possono più tornare.',
     key_title: 'Chiave di questo computer',
@@ -750,7 +844,38 @@ window.PSEUDALIS_TEXTS = {
       'una cifra.',
     err_terms_too_many: 'Si possono imporre al massimo {max} termini.',
     err_terms_type: 'Termine {n}: la sua etichetta non è tra quelle che il servizio accetta.',
-    err_terms_duplicate: 'Il termine {n} compare due volte.'
+    err_terms_duplicate: 'Il termine {n} compare due volte.',
+    columns_title: 'Colonne imposte',
+    columns_hint: 'In un file CSV con intestazione, ogni valore sotto il nome di una colonna imposta è protetto come ' +
+      'valore del suo tipo, senza rilevamento e scritto senza tag, qualunque siano i tag del resto del file, per ' +
+      'esempio i nomi dei clienti o i loro indirizzi e-mail in un’esportazione. Come senza tag, questi valori ' +
+      'ritornano finché l’originale del file è conservato. Il nome è confrontato senza distinzione tra maiuscole e ' +
+      'minuscole né accenti; un titolo può precedere l’intestazione. Al massimo 100 colonne.',
+    col_column: 'Colonna',
+    col_type: 'Tipo',
+    columns_none: 'Nessuna colonna imposta.',
+    columns_add: 'Aggiungi una colonna',
+    columns_save: 'Salva le colonne',
+    columns_count: '{n} colonne su {max}',
+    columns_saved: 'Salvato: {n} colonne imposte.',
+    tag_DATE: 'Data (DATE)',
+    tag_IBAN: 'Conto bancario (IBAN)',
+    tag_CARD: 'Carta di pagamento (CARD)',
+    tag_NIR: 'Numero di previdenza sociale (NIR)',
+    tag_SIRET: 'Numero d’impresa (SIRET)',
+    tag_IPV4: 'Indirizzo IPv4 (IPV4)',
+    tag_IPV6: 'Indirizzo IPv6 (IPV6)',
+    tag_MAC: 'Indirizzo MAC (MAC)',
+    tag_PLATE: 'Targa (PLATE)',
+    tag_GEO: 'Coordinate GPS (GEO)',
+    tag_TITLE: 'Titolo di cortesia (TITLE)',
+    tag_GENDER: 'Sesso (GENDER)',
+    tag_NATIONALITY: 'Nazionalità (NATIONALITY)',
+    err_columns_invalid: 'Colonna {n}: un nome è un testo di una riga, da 1 a {length} caratteri, con una lettera o ' +
+      'una cifra.',
+    err_columns_too_many: 'Si possono imporre al massimo {max} colonne.',
+    err_columns_type: 'Colonna {n}: il suo tipo non è tra quelli che il servizio accetta.',
+    err_columns_duplicate: 'La colonna {n} compare due volte.'
   },
   es: {
     tagline: 'Protección de los datos personales de sus documentos',
@@ -831,19 +956,19 @@ window.PSEUDALIS_TEXTS = {
     dialog_error: 'Operación imposible',
     records_untagged: 'protegido sin etiquetas',
     tags_option: 'Escribir las etiquetas en estos archivos',
-    tags_option_hint: 'Con ellas, cualquier copia se restaura con la clave de este equipo. Esta casilla ' +
+    tags_option_hint: 'Con ellas, cualquier copia se restaura con la clave de este equipo. Este interruptor ' +
       'solo vale para los archivos depositados aquí; el ajuste general, que sigue la unidad, está en los ' +
       'Ajustes de la aplicación abierta desde el icono.',
     no_restore_hint: 'Sin etiquetas ni original conservado, los archivos protegidos no podrán restaurarse.',
     protected_untagged: 'sin etiquetas',
     not_restorable: 'no podrá restaurarse',
     text_tags: 'Escribir las etiquetas en este texto',
-    text_tags_hint: 'Esta casilla solo vale para este texto; el ajuste general, que sigue la unidad, ' +
+    text_tags_hint: 'Este interruptor solo vale para este texto; el ajuste general, que sigue la unidad, ' +
       'está en los Ajustes de la aplicación abierta desde el icono.',
     text_untagged_hint: 'Sin etiquetas, solo esta página restaura el texto, mientras siga abierta.',
     set_tags: 'Escribir las etiquetas por defecto',
     set_tags_hint: 'La unidad sigue este ajuste, la interfaz lo aplica a las peticiones sin el parámetro tags ' +
-      'y las casillas de las tarjetas Proteger archivos y Proteger un texto parten de él. Sin etiquetas, un ' +
+      'y los interruptores de las tarjetas Proteger archivos y Proteger un texto parten de él. Sin etiquetas, un ' +
       'archivo solo vuelve mientras se conserva su original.',
     err_tagless_forgotten: 'Este archivo se protegió sin etiquetas y su original se olvidó el {date}: sus valores ' +
       'ya no pueden volver.',
@@ -939,6 +1064,38 @@ window.PSEUDALIS_TEXTS = {
       'letra o una cifra.',
     err_terms_too_many: 'Se pueden imponer como máximo {max} términos.',
     err_terms_type: 'Término {n}: su etiqueta no es una de las que acepta el servicio.',
-    err_terms_duplicate: 'El término {n} aparece dos veces.'
+    err_terms_duplicate: 'El término {n} aparece dos veces.',
+    columns_title: 'Columnas impuestas',
+    columns_hint: 'En un archivo CSV con encabezado, cada valor bajo el nombre de una columna impuesta se protege ' +
+      'como un valor de su tipo, sin detección y escrito sin etiqueta, sean cuales sean las etiquetas del resto del ' +
+      'archivo, por ejemplo los nombres de los clientes o sus correos electrónicos en una exportación. Como sin ' +
+      'etiquetas, estos valores vuelven mientras se conserva el original del archivo. El nombre se compara sin ' +
+      'distinguir mayúsculas, minúsculas ni acentos; un título puede preceder al encabezado. Como máximo 100 ' +
+      'columnas.',
+    col_column: 'Columna',
+    col_type: 'Tipo',
+    columns_none: 'Ninguna columna impuesta.',
+    columns_add: 'Añadir una columna',
+    columns_save: 'Guardar las columnas',
+    columns_count: '{n} de {max} columnas',
+    columns_saved: 'Guardado: {n} columnas impuestas.',
+    tag_DATE: 'Fecha (DATE)',
+    tag_IBAN: 'Cuenta bancaria (IBAN)',
+    tag_CARD: 'Tarjeta de pago (CARD)',
+    tag_NIR: 'Número de seguridad social (NIR)',
+    tag_SIRET: 'Número de empresa (SIRET)',
+    tag_IPV4: 'Dirección IPv4 (IPV4)',
+    tag_IPV6: 'Dirección IPv6 (IPV6)',
+    tag_MAC: 'Dirección MAC (MAC)',
+    tag_PLATE: 'Matrícula (PLATE)',
+    tag_GEO: 'Coordenadas GPS (GEO)',
+    tag_TITLE: 'Tratamiento (TITLE)',
+    tag_GENDER: 'Sexo (GENDER)',
+    tag_NATIONALITY: 'Nacionalidad (NATIONALITY)',
+    err_columns_invalid: 'Columna {n}: un nombre es un texto de una línea, de 1 a {length} caracteres, con una ' +
+      'letra o una cifra.',
+    err_columns_too_many: 'Se pueden imponer como máximo {max} columnas.',
+    err_columns_type: 'Columna {n}: su tipo no es uno de los que acepta el servicio.',
+    err_columns_duplicate: 'La columna {n} aparece dos veces.'
   }
 };

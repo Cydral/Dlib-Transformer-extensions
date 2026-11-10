@@ -15,8 +15,8 @@
 # drive, an archive whose original was forgotten coming back and the copies of a file, saves the
 # settings as the web application does, imposes terms, makes room for newer originals, restores from
 # their tags an archive whose picture was forgotten and a text written elsewhere from anonymized
-# values, protects files, a text and the drive without tags, restores files protected twice, and
-# stops.
+# values, protects files, a text and the drive without tags, restores files protected twice,
+# imposes columns on a CSV file, and stops.
 # The exit code is the number of failed steps.
 
 set -u
@@ -536,6 +536,43 @@ print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])
     record "drive without tags" PASS "the setting followed, the original back, edited: the values of both"
   else record "drive without tags" FAIL "$(head -c 100 "$WORK/courrier.anon.txt") / $DRIVE_TAGS / \
     $(head -c 100 "$WORK/courrier.back2.txt")"
+  fi
+  # The imposed columns: below their names, a title above the header, substitutes alone, the other values
+  # tagged; the original comes back, and from a file edited on the drive, the values of both.
+  COLS=$(admin_json PUT /v1/columns '{"columns": [{"column": "Nom", "type": "PERSON"},
+    {"column": "Courriel", "type": "EMAIL"}]}')
+  BAD_COLS=$(admin_json PUT /v1/columns '{"columns": [{"column": "Nom", "type": "NONE"}]}')
+  LISTED_COLS=$(api -H "X-Pseudalis-Admin: $TOKEN" "$URL/v1/columns")
+  printf 'Export du 12/03/2024\nNOM;Courriel;Ville\nLemoine;paul.lemoine@exemple.fr;Rennes\n' > "$WORK/export.csv"
+  api -X POST --data-binary @"$WORK/export.csv" -D "$WORK/export.headers" -o "$WORK/export.anon.csv" \
+    "$URL/v1/anonymize?name=export.csv&tags=true&record=true"
+  restore_to "$WORK/export.anon.csv" "$WORK/export.back.csv"
+  cp "$WORK/export.csv" "$DRIVE/export.csv"
+  export_done() {
+    ! cmp -s "$WORK/export.csv" "$DRIVE/export.csv" && [ -n "$(record_of "$DRIVE/export.csv")" ]
+  }
+  wait_for 60 export_done
+  { cat "$DRIVE/export.csv"; printf 'Martin;h.martin@exemple.fr;Lyon\n'; } > "$WORK/export.edit.csv"
+  cp "$WORK/export.edit.csv" "$DRIVE/export.csv"
+  export_edited() {
+    ! cmp -s "$WORK/export.edit.csv" "$DRIVE/export.csv" && [ -n "$(record_of "$DRIVE/export.csv")" ]
+  }
+  wait_for 60 export_edited
+  cp "$DRIVE/export.csv" "$WORK/export.anon2.csv"
+  restore_to "$WORK/export.anon2.csv" "$WORK/export.back2.csv"
+  admin_json PUT /v1/columns '{"columns": []}' > /dev/null
+  if printf '%s' "$COLS" | grep -q '"column":"Nom"' && printf '%s' "$BAD_COLS" | grep -q '"code":"columns_type"' &&
+     printf '%s' "$LISTED_COLS" | grep -q '"max":100' &&
+     sed -n 2p "$WORK/export.anon.csv" | grep -q '^NOM;Courriel;Ville$' &&
+     ! grep -q -e Lemoine -e paul.lemoine "$WORK/export.anon.csv" &&
+     ! sed -n 3p "$WORK/export.anon.csv" | grep -q '^\[\[' && grep -q '\[\[LOCATION:' "$WORK/export.anon.csv" &&
+     report_of "$WORK/export.headers" | grep -q '"restorable":true' &&
+     cmp -s "$WORK/export.csv" "$WORK/export.back.csv" && ! grep -q -e Lemoine -e Martin "$WORK/export.anon2.csv" &&
+     [ "$(cat "$WORK/export.back2.csv")" = "$(cat "$WORK/export.csv"; printf 'Martin;h.martin@exemple.fr;Lyon')" ]
+  then
+    record "imposed columns" PASS "substitutes below their names, the original back, edited on the drive: both"
+  else record "imposed columns" FAIL "$(sed -n 3p "$WORK/export.anon.csv" | head -c 100) / $BAD_COLS / \
+    $(tail -c 120 "$WORK/export.back2.csv")"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

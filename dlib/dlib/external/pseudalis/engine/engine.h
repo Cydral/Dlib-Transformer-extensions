@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "../common/imposed_columns.h"
 #include "../common/imposed_terms.h"
 #include "../common/json.h"
 
@@ -113,7 +114,9 @@ namespace pseudalis
                 Without tags (anonymize() and anonymize_text() with tags false), each value of
                 the text takes its substitute too: the file holds no tag, and its values come
                 back only from the substitutes that the caller keeps (engine_result::
-                substitutions, text true) and gives back to restore().
+                substitutions, text true) and gives back to restore().  The values of the
+                imposed columns of a CSV file take their substitutes so, with or without tags
+                (set_columns()).
 
             THREAD SAFETY
                 The methods may be called from several threads at once.
@@ -207,6 +210,14 @@ namespace pseudalis
             it started with for the detectors it already made.
         */
         void set_terms(const std::vector<imposed_term>& terms);
+        /*
+            Replaces the imposed columns (common/imposed_columns.h), which every CSV file processed
+            afterwards reads: below the name of such a column in its header, each value takes its
+            substitute, listed in engine_result::substitutions with text true, once for each value,
+            and restore() gives it back from the substitutes of the text it is given.  A call in
+            progress keeps the columns it started with.
+        */
+        void set_columns(const std::vector<imposed_column>& columns);
 
         std::string key_fingerprint() const;
         // {"tagger", "span_model", "size"}

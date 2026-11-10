@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../common/engine_loader.h"
+#include "../common/imposed_columns.h"
 #include "../common/imposed_terms.h"
 #include "../common/json.h"
 #include "albireo_client.h"
@@ -116,6 +117,8 @@ namespace pseudalis
                 back their original, and a copy edited since, known by its NTFS identifier,
                 its values from those substitutes.  Once the record forgotten, its values
                 cannot come back, and a file protected without record never gives them back.
+                The values of the imposed columns of a CSV file take their substitutes so,
+                with or without tags for the rest of the file.
                 A protected file protected again, by a newer engine for instance, keeps the
                 values protected before as they are: its restoration gives back the original
                 of each record of the chain that still keeps it, and the values of the tags
@@ -150,9 +153,10 @@ namespace pseudalis
 
         /*
             Protects a file; with record, keeps its original (out.record), unless it is larger than
-            history_mb; without tags, its values take their substitutes, which the record keeps.
-            out.report["tags"] tells which, out.report["restorable"] whether the file can be restored.
-            A file protected without tags and protected again, a copy of its protected file or, previous,
+            history_mb; without tags, its values take their substitutes, which the record keeps, as the
+            values of the imposed columns of a CSV file do with tags too.  out.report["tags"] tells
+            which, out.report["restorable"] whether the file can be restored.  A file protected without
+            tags or with imposed columns and protected again, a copy of its protected file or, previous,
             the record of the version it replaces on the drive, keeps the substitutes of that record as
             they are, and its record inherits them, which give back the values of its original.
         */
@@ -229,6 +233,14 @@ namespace pseudalis
         !*/
         json terms();
         bool set_terms(const json& list, user_error& error);
+        /*!
+            The imposed columns (common/imposed_columns.h), kept in the database and given to the
+            engine: set_columns() takes a list [{"column", "type"}] whole, or refuses it with its
+            reason (codes columns_invalid, columns_too_many, columns_type, columns_duplicate,
+            with the position of the column at fault in "index").
+        !*/
+        json columns();
+        bool set_columns(const json& list, user_error& error);
 
         bool export_key(const std::string& passphrase, std::string& exported, user_error& error);
         // Allowed while the database records no file: the key of an earlier installation.
@@ -272,8 +284,10 @@ namespace pseudalis
         std::atomic<bool> cleanup_{false};
         // make_room() runs for one caller at a time.
         std::mutex room_m_;
+        // The imposed terms and columns.
         std::mutex terms_m_;
         std::vector<imposed_term> terms_;
+        std::vector<imposed_column> columns_;
         std::atomic<bool> stopping_{false};
         std::atomic<bool> restart_{false};
         std::atomic<bool> update_started_{false};

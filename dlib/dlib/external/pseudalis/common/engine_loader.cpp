@@ -172,6 +172,7 @@ namespace pseudalis
         process = psd_process;
         key_fingerprint = psd_key_fingerprint;
         set_terms = psd_set_terms;
+        set_columns = psd_set_columns;
         alloc = psd_alloc;
         free_buffer = psd_free;
         path_ = "(built in)";
@@ -225,11 +226,12 @@ namespace pseudalis
         PSD_RESOLVE(process, "psd_process");
         PSD_RESOLVE(key_fingerprint, "psd_key_fingerprint");
         PSD_RESOLVE(set_terms, "psd_set_terms");
+        PSD_RESOLVE(set_columns, "psd_set_columns");
         PSD_RESOLVE(alloc, "psd_alloc");
         PSD_RESOLVE(free_buffer, "psd_free");
 #undef PSD_RESOLVE
         if (!api_version || !variant || !build || !models || !create || !destroy || !process || !key_fingerprint ||
-            !set_terms || !alloc || !free_buffer || api_version() != PSEUDALIS_ENGINE_API_VERSION)
+            !set_terms || !set_columns || !alloc || !free_buffer || api_version() != PSEUDALIS_ENGINE_API_VERSION)
         {
             error = path_ + " is not an engine of this version of Pseudalis";
             create = nullptr;
@@ -319,6 +321,21 @@ namespace pseudalis
         psd_buffer err = { nullptr, 0 };
         const int ok = lib_->set_terms(e_, text.data(), text.size(), &err);
         if (ok != 1) error = err.data ? std::string(err.data, err.size) : std::string("the terms were refused");
+        lib_->free_buffer(&err);
+        return ok == 1;
+    }
+
+    bool engine_client::set_columns(const json& columns, std::string& error) const
+    {
+        if (!e_ || !lib_->set_columns)
+        {
+            error = "no engine";
+            return false;
+        }
+        const std::string text = columns.dump();
+        psd_buffer err = { nullptr, 0 };
+        const int ok = lib_->set_columns(e_, text.data(), text.size(), &err);
+        if (ok != 1) error = err.data ? std::string(err.data, err.size) : std::string("the columns were refused");
         lib_->free_buffer(&err);
         return ok == 1;
     }

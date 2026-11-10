@@ -579,6 +579,18 @@ namespace dlib
                 - error if a pattern fails while matching.
         !*/
 
+        void learn_value(const std::string& value, pii_type type);
+        /*!
+            ensures
+                - Records value, without the spaces at its ends, as a value of type found with
+                  strong evidence, as learn() records the values it finds, without reading it:
+                  a person name, a place or an organisation that detect() then finds bare in
+                  the document, or the domain and the fragments of an e-mail address. A value
+                  of another type, of a type left out of the options, or holding a tag teaches
+                  nothing. It serves the values whose type is known beforehand, the cells of an
+                  imposed column (document_anonymizer::set_imposed_columns()).
+        !*/
+
         std::vector<pii_entity> detect(
             const std::string& text,
             const detection_context& context = detection_context()

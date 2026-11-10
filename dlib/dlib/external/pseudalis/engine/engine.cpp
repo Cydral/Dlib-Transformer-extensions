@@ -970,6 +970,8 @@ namespace pseudalis
         {
             bool tags = true;
             pseudonymizer::substitute_resolver text;
+            // The imposed columns of the moment, which the whole call reads.
+            std::vector<pii_imposed_column> columns;
         };
 
         // The resolver of a list of substitutes: the tags of a substitute, in the order of the list.
@@ -1000,9 +1002,16 @@ namespace pseudalis
         model_set m;
         // The key of the identifiers of the pictures, derived from the key of the engine.
         std::string picture_key;
-        // The imposed terms, which set_terms() replaces while files are processed.
+        // The imposed terms and columns, which set_terms() and set_columns() replace while files are processed.
         mutable std::mutex terms_m;
         std::vector<pii_imposed_term> terms;
+        std::vector<pii_imposed_column> columns;
+
+        std::vector<pii_imposed_column> imposed_columns() const
+        {
+            std::lock_guard<std::mutex> lock(terms_m);
+            return columns;
+        }
 
         // The options of a detector: those of the engine, with the imposed terms of the moment.
         pii_detector_options options() const
@@ -1288,6 +1297,8 @@ namespace pseudalis
             // Without tags, the values of the text take substitutes too, which the caller keeps.
             a.set_untagged_text(!restoring && !c.tags);
             a.set_text_substitute_resolver(c.text);
+            // The values of the imposed columns of a CSV file take substitutes, with or without tags.
+            a.set_imposed_columns(c.columns);
             // A restoration cannot give a picture back into a document: its marker leaves.
             if (restoring) a.set_picture_text_finder(picture_markers);
             /*
@@ -1661,6 +1672,7 @@ namespace pseudalis
         call_options c;
         c.tags = tags;
         c.text = resolver_of_list(known);
+        c.columns = p_->imposed_columns();
         return p_->any(bytes, name, pictures, false, lookup, 0, budget, c);
     }
 
@@ -1670,6 +1682,7 @@ namespace pseudalis
         uint64_t budget = decompression_budget(bytes.size());
         call_options c;
         c.text = resolver_of_list(text);
+        c.columns = p_->imposed_columns();
         return p_->any(bytes, name, picture_handler(), true, lookup, 0, budget, c);
     }
 
@@ -1814,6 +1827,20 @@ namespace pseudalis
         }
         std::lock_guard<std::mutex> lock(p_->terms_m);
         p_->terms.swap(converted);
+    }
+
+    void engine::set_columns(const std::vector<imposed_column>& columns)
+    {
+        std::vector<pii_imposed_column> converted;
+        for (const imposed_column& c : columns)
+        {
+            pii_imposed_column one;
+            one.name = c.name;
+            one.type = pii_type_from_keyword(c.type);
+            if (one.type != pii_type::none && !one.name.empty()) converted.push_back(one);
+        }
+        std::lock_guard<std::mutex> lock(p_->terms_m);
+        p_->columns.swap(converted);
     }
 
     json engine::detect(const std::string& text) const

@@ -36,7 +36,8 @@
     (the identifiers of the pictures found) and, for "anonymize" and "anonymize_name",
     "substitutions" ([{"substitute", "tag"}]: the values written without their tags in the
     names and the properties, which the caller records for "restore", and, "text": true, in
-    the text without tags, once for each place); "substitutions" too for "anonymize_text"
+    the text without tags, once for each place, and in the imposed columns of a CSV file, once
+    for each value); "substitutions" too for "anonymize_text"
     without tags; "spans" for "detect".  output receives the bytes of the file written.  "anonymize_name" and
     "restore_name" take a name alone as data, a folder for instance, and give the new name
     as output and as "name".
@@ -81,7 +82,7 @@
 #define PSD_CALL
 #endif
 
-#define PSEUDALIS_ENGINE_API_VERSION 4
+#define PSEUDALIS_ENGINE_API_VERSION 5
 
 #ifdef __cplusplus
 extern "C" {
@@ -137,6 +138,15 @@ PSD_API int PSD_CALL psd_key_fingerprint(psd_engine* engine, psd_buffer* fingerp
     service does not take, the terms of the engine then unchanged.
 */
 PSD_API int PSD_CALL psd_set_terms(psd_engine* engine, const char* terms, size_t size, psd_buffer* error);
+/*
+    Replaces the imposed columns of the engine (common/imposed_columns.h): columns is a JSON list
+    [{"column", "type"}] of size bytes, which the calls that start afterwards read in the CSV
+    files: each value below the name of such a column in the header takes its substitute, listed
+    in "substitutions" with "text": true, once for each value, and "restore" gives it back from the
+    "substitutions" of its request.  0, with the reason in error, for a list the service does not
+    take, the columns of the engine then unchanged.
+*/
+PSD_API int PSD_CALL psd_set_columns(psd_engine* engine, const char* columns, size_t size, psd_buffer* error);
 
 PSD_API char* PSD_CALL psd_alloc(size_t size);
 PSD_API void PSD_CALL psd_free(psd_buffer* buffer);

@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.6",
+  "version": "1.0.8",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -90,7 +90,7 @@
      "Files"
     ],
     "summary": "Protect a file",
-    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have. A file of any other extension, or without extension, is protected as a text when its content is text through and through: no binary signature, the measures of a text, every character decoded with no control character but the tabulation, the ends of lines and the form feed, and no encoded part: a block of base64, base64url or hexadecimal digits (1024 characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or of a program too), data or JSON in base64, bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or marks among them), a message with parts in base64, quoted-printable or uuencode or with encoded words, an RTF document, a vCard or an iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a string too, uuencode or ASCII85, and, by its first line, a PostScript program or an export of the registry; without extension, a picture, an Office document, an archive or a PDF is also taken by its signature. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch), and so is a text of another extension that holds an encoded part (code encoded_content). Their content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed, its values replaced by tags as those of the text of its document; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. With tags=false, every value of the file takes its substitute in the same way, the descriptions of its pictures included, and the file holds no tag: its record keeps the substitutes of its text with their tags, and its values come back only while that record lasts (/v1/restore); without record, nothing gives them back, which the report tells (\"tags\": false, \"restorable\": false). Without the parameter, the setting tags decides. A protected file protected again, by a newer engine for instance, keeps the values protected before as they are, the substitutes that its record keeps included; with tags=false, its tags give way to the substitutes of their values, which its record keeps. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file; the originals first kept are forgotten when the originals would take more than history_mb of the settings, or leave less than 256 MB free on the disk when forgetting them gives that room; a file larger than history_mb is protected without keeping its original (record 0). The imposed terms (/v1/terms) are replaced before any other value is read. A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have. A file of any other extension, or without extension, is protected as a text when its content is text through and through: no binary signature, the measures of a text, every character decoded with no control character but the tabulation, the ends of lines and the form feed, and no encoded part: a block of base64, base64url or hexadecimal digits (1024 characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or of a program too), data or JSON in base64, bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or marks among them), a message with parts in base64, quoted-printable or uuencode or with encoded words, an RTF document, a vCard or an iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a string too, uuencode or ASCII85, and, by its first line, a PostScript program or an export of the registry; without extension, a picture, an Office document, an archive or a PDF is also taken by its signature. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch), and so is a text of another extension that holds an encoded part (code encoded_content). Their content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed, its values replaced by tags as those of the text of its document; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. With tags=false, every value of the file takes its substitute in the same way, the descriptions of its pictures included, and the file holds no tag: its record keeps the substitutes of its text with their tags, and its values come back only while that record lasts (/v1/restore); without record, nothing gives them back, which the report tells (\"tags\": false, \"restorable\": false). Without the parameter, the setting tags decides. A protected file protected again, by a newer engine for instance, keeps the values protected before as they are, the substitutes that its record keeps included; with tags=false, its tags give way to the substitutes of their values, which its record keeps. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file; the originals first kept are forgotten when the originals would take more than history_mb of the settings, or leave less than 256 MB free on the disk when forgetting them gives that room; a file larger than history_mb is protected without keeping its original (record 0). The imposed terms (/v1/terms) are replaced before any other value is read. In a CSV file, below the name of an imposed column (/v1/columns) in its header, every value takes its substitute, without detection and without tag, with or without tags for the rest of the file: the record keeps these substitutes with their tags, as it keeps those of a file protected without tags, and without record the report tells that they cannot come back (\"restorable\": false). A body that cannot be read is refused (400, code bad_request). A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -1196,6 +1196,99 @@
     }
    }
   },
+  "/v1/columns": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "The imposed columns",
+    "description": "The columns of the CSV files whose values are all personal data of one type: the names of the clients or their e-mail addresses in an export, for instance. The header of a file is the first of its first 16 rows that names an imposed column in a cell, without regard to case and accents, the spaces at its ends left out; a title may stand above it, and a first line \"sep=;\" of Excel gives the delimiter. A file of one column is read too. A text under another name is read as a CSV file when its header holds the delimiter and the two records that follow it hold it as many times. Below the name of an imposed column, each value takes its substitute, without detection and without tag, with or without tags for the rest of the file, an empty cell staying empty; the values are learned as values of their types, so that the other cells give them up too. The record of the file keeps the substitutes with their tags: the copies of the protected file give back their original, and a copy edited on the drive its values, while the record lasts, as for a file protected without tags. The sheets of the workbooks and the other formats are read as before. The columns are kept in the database of the service, which only SYSTEM and the administrators read.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The columns, with the limits and the types the service takes",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Columns"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Replace the imposed columns",
+    "description": "The list given replaces the imposed columns, whole, at once for the files processed afterwards; an empty list removes them. A list the service does not take changes nothing (400): columns_invalid (a name empty, longer than 200 characters, on several lines, with a control character or without a letter or a digit), columns_too_many (more than 100), columns_type (a type out of the list) or columns_duplicate (a name given twice, without regard to case and accents), the position of the column at fault in args.index; 500 (codes engine, database) when the engine or the database cannot take them.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "columns"
+        ],
+        "properties": {
+         "columns": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+           "$ref": "#/components/schemas/ImposedColumn"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"columns\"}: the columns kept, trimmed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "columns": {
+           "type": "array",
+           "maxItems": 100,
+           "items": {
+            "$ref": "#/components/schemas/ImposedColumn"
+           }
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
   "/v1/restart": {
    "post": {
     "tags": [
@@ -1645,6 +1738,76 @@
        "type": "string"
       },
       "description": "The types a term may take"
+     }
+    }
+   },
+   "ImposedColumn": {
+    "type": "object",
+    "required": [
+     "column"
+    ],
+    "properties": {
+     "column": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "example": "Nom",
+      "description": "The name of the column in the header of a CSV file, trimmed of its spaces: one line of 1 to 200 characters with a letter or a digit, compared without regard to case and accents, the spaces at its ends left out"
+     },
+     "type": {
+      "type": "string",
+      "enum": [
+       "PERSON",
+       "ORG",
+       "LOCATION",
+       "ADDRESS",
+       "EMAIL",
+       "PHONE",
+       "ID",
+       "DATE",
+       "IBAN",
+       "CARD",
+       "NIR",
+       "SIRET",
+       "URL",
+       "IPV4",
+       "IPV6",
+       "MAC",
+       "PLATE",
+       "GEO",
+       "TITLE",
+       "GENDER",
+       "NATIONALITY"
+      ],
+      "default": "PERSON",
+      "description": "The type of every value of the column"
+     }
+    }
+   },
+   "Columns": {
+    "type": "object",
+    "properties": {
+     "columns": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+       "$ref": "#/components/schemas/ImposedColumn"
+      }
+     },
+     "max": {
+      "type": "integer",
+      "description": "The most columns that may be imposed: 100"
+     },
+     "max_length": {
+      "type": "integer",
+      "description": "The longest name of a column, in characters: 200"
+     },
+     "types": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "The types a column may take"
      }
     }
    }
