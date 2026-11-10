@@ -16,7 +16,7 @@
 # drives working as folders without letters, for the tests (tools/test_linux.sh).
 
 cmake_minimum_required(VERSION 3.16)
-project(pseudalis VERSION 1.0.9 LANGUAGES C CXX)
+project(pseudalis VERSION 1.0.10 LANGUAGES C CXX)
 
 option(PSEUDALIS_TESTS "Build the test programs" ON)
 

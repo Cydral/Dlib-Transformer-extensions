@@ -230,12 +230,13 @@ int main()
                                     columns, message, code, index));
         for (const std::string& t : imposed_column_types())
             CHECK(t == "IP" || dlib::pii_type_from_keyword(t) != dlib::pii_type::none);
-        // The two forms of IP address make one type, which the former names give too.
-        CHECK(parse_imposed_columns(json::parse_or_null("[{\"column\": \"ip_address\", \"type\": \"IPV4\"}, "
-                                                        "{\"column\": \"ip6\", \"type\": \"IPV6\"}, "
-                                                        "{\"column\": \"ip\", \"type\": \"IP\"}]"),
+        // The two forms of IP address make one type, IP; the keywords of the forms are no types of column.
+        CHECK(parse_imposed_columns(json::parse_or_null("[{\"column\": \"ip_address\", \"type\": \"IP\"}]"),
                                     columns, message, code, index) &&
-              columns.size() == 3 && columns[0].type == "IP" && columns[1].type == "IP" && columns[2].type == "IP");
+              columns.size() == 1 && columns[0].type == "IP");
+        CHECK(refused("[{\"column\": \"ip_address\", \"type\": \"IPV4\"}]", "columns_type", 0));
+        CHECK(refused("[{\"column\": \"ip\", \"type\": \"IP\"}, {\"column\": \"ip6\", \"type\": \"IPV6\"}]",
+                      "columns_type", 1));
     }
 
     // The database: records, pictures and the tree of the drive.

@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
   "contact": {
    "name": "Cydral Technology",
@@ -1779,7 +1779,7 @@
        "NATIONALITY"
       ],
       "default": "PERSON",
-      "description": "The type of every value of the column. IP takes the IPv4 and the IPv6 addresses alike, each by its own form, keeping its prefix length (10.0.0.0/8), its brackets and its port ([2001:db8::1]:443) or its zone (fe80::1%eth0); IPV4 and IPV6 are taken for IP"
+      "description": "The type of every value of the column. IP takes the IPv4 and the IPv6 addresses alike, each by its own form, keeping its prefix length (10.0.0.0/8), its brackets and its port ([2001:db8::1]:443) or its zone (fe80::1%eth0)"
      }
     }
    },

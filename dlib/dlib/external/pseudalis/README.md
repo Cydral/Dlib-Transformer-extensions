@@ -305,8 +305,7 @@ the record gives the originals back.
 - An IP column takes the IPv4 and the IPv6 addresses alike, mixed in its rows as the source wrote them:
   each address takes the substitute of its own form, and what surrounds it stays, a prefix length
   (`10.0.0.0/8`), the brackets and the port (`[2001:db8::1]:443`, `192.0.2.1:8080`) or a zone
-  (`fe80::1%eth0`); the restoration gives each value back as it was written. The types IPV4 and IPV6 of
-  a list written before are read as IP.
+  (`fe80::1%eth0`); the restoration gives each value back as it was written.
 - The values of these columns are learned as values of their types: a client named in a comment of the
   same file takes the tag of the value of its column, whose body is that substitute. The other columns
   are read as before, their names typing them when they are labels (`ville`, `telephone`).

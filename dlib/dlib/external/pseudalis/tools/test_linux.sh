@@ -600,9 +600,11 @@ print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])
     record "Windows-1252 kept" PASS "protected in plain ASCII, edited on the drive: back in Windows-1252"
   else record "Windows-1252 kept" FAIL "$(od -An -c "$WORK/accents.back2.csv" | head -c 160)"
   fi
-  # An IP column, given as IPV4, takes both forms of address: each address takes the substitute of its form,
-  # its prefix length and its port kept; the original comes back, and from a file edited on the drive, both.
-  IP_COLS=$(admin_json PUT /v1/columns '{"columns": [{"column": "ip_address", "type": "IPV4"}]}')
+  # An IP column takes both forms of address, the keyword of a form being no type of column: each address
+  # takes the substitute of its form, its prefix length and its port kept; the original comes back, and from
+  # a file edited on the drive, both.
+  BAD_IP=$(admin_json PUT /v1/columns '{"columns": [{"column": "ip_address", "type": "IPV4"}]}')
+  IP_COLS=$(admin_json PUT /v1/columns '{"columns": [{"column": "ip_address", "type": "IP"}]}')
   printf 'host;ip_address\nweb;192.168.1.5\ndb;2001:db8::1\nnet;10.0.0.0/8\napi;[2001:db8::1]:443\n' \
     > "$WORK/hosts.csv"
   api -X POST --data-binary @"$WORK/hosts.csv" -D "$WORK/hosts.headers" -o "$WORK/hosts.anon.csv" \
@@ -623,7 +625,7 @@ print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])
   restore_to "$WORK/hosts.anon2.csv" "$WORK/hosts.back2.csv"
   { cat "$WORK/hosts.csv"; printf 'vpn;fe80::1%%eth0\n'; } > "$WORK/hosts.expected.csv"
   admin_json PUT /v1/columns '{"columns": []}' > /dev/null
-  if printf '%s' "$IP_COLS" | grep -q '"type":"IP"' &&
+  if printf '%s' "$BAD_IP" | grep -q '"code":"columns_type"' && printf '%s' "$IP_COLS" | grep -q '"type":"IP"' &&
      ! grep -q -F -e 192.168.1.5 -e 2001:db8::1 -e 10.0.0.0 "$WORK/hosts.anon.csv" &&
      grep -q '/8$' "$WORK/hosts.anon.csv" && grep -q ']:443$' "$WORK/hosts.anon.csv" &&
      ! grep -q -F '[[' "$WORK/hosts.anon.csv" && cmp -s "$WORK/hosts.csv" "$WORK/hosts.back.csv" &&
@@ -631,7 +633,7 @@ print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])
      cmp -s "$WORK/hosts.expected.csv" "$WORK/hosts.back2.csv"
   then
     record "IP column" PASS "IPv4 and IPv6 in one column, the original back, edited on the drive: both"
-  else record "IP column" FAIL "$(head -c 160 "$WORK/hosts.anon.csv") / $IP_COLS / \
+  else record "IP column" FAIL "$(head -c 160 "$WORK/hosts.anon.csv") / $BAD_IP / $IP_COLS / \
     $(tail -c 80 "$WORK/hosts.back2.csv")"
   fi
 else
