@@ -2,19 +2,19 @@
   "product": "Pseudalis",
   "channels": {
     "stable": {
-      "version": "1.0.8",
+      "version": "1.0.9",
       "date": "2026-11-10",
       "notes": {
-        "en": "In a CSV file with a header, the columns that the administrators impose by their names give each value below those names its protected form, without tag and without detection, which the record of the file gives back; the web application opens in the language of the browser and its options are switches.",
-        "fr": "Dans un fichier CSV à en-tête, les colonnes que les administrateurs imposent par leur nom donnent à chaque valeur placée dessous sa forme protégée, sans balise ni détection, que l'enregistrement du fichier rétablit ; l'application web s'ouvre dans la langue du navigateur et ses options sont des interrupteurs.",
-        "de": "In einer CSV-Datei mit Kopfzeile erhält jeder Wert unter den Namen der Spalten, die die Administratoren vorgeben, seine geschützte Form ohne Markierung und ohne Erkennung, die der Eintrag der Datei wiederherstellt; die Webanwendung öffnet sich in der Sprache des Browsers, und ihre Optionen sind Schalter.",
-        "it": "In un file CSV con intestazione, ogni valore sotto i nomi delle colonne che gli amministratori impongono prende la sua forma protetta, senza tag né rilevamento, che la registrazione del file ripristina; l'applicazione web si apre nella lingua del browser e le sue opzioni sono interruttori.",
-        "es": "En un archivo CSV con encabezado, cada valor bajo los nombres de las columnas que imponen los administradores toma su forma protegida, sin etiqueta ni detección, que el registro del archivo restablece; la aplicación web se abre en el idioma del navegador y sus opciones son interruptores."
+        "en": "In the imposed columns of the CSV files, a column of type IP takes the IPv4 and the IPv6 addresses alike, each keeping its form, its prefix length and its port, and gives them back as they were written; a file in Windows-1252 whose accented letters all stand in imposed columns comes back in Windows-1252 through its record.",
+        "fr": "Dans les colonnes imposées des fichiers CSV, une colonne de type IP prend indifféremment les adresses IPv4 et IPv6, chacune gardant sa forme, sa longueur de préfixe et son port, et les rétablit telles qu'elles étaient écrites ; un fichier Windows-1252 dont toutes les lettres accentuées se trouvent dans des colonnes imposées revient en Windows-1252 grâce à son enregistrement.",
+        "de": "In den vorgegebenen Spalten der CSV-Dateien nimmt eine Spalte vom Typ IP IPv4- und IPv6-Adressen gleichermaßen auf, jede mit ihrer Form, ihrer Präfixlänge und ihrem Port, und stellt sie so wieder her, wie sie geschrieben waren; eine Windows-1252-Datei, deren Buchstaben mit Akzent alle in vorgegebenen Spalten stehen, kommt über ihren Eintrag in Windows-1252 zurück.",
+        "it": "Nelle colonne imposte dei file CSV, una colonna di tipo IP accoglie indifferentemente gli indirizzi IPv4 e IPv6, ciascuno con la sua forma, la lunghezza del prefisso e la porta, e li ripristina come erano scritti; un file Windows-1252 le cui lettere accentate stanno tutte in colonne imposte torna in Windows-1252 grazie alla sua registrazione.",
+        "es": "En las columnas impuestas de los archivos CSV, una columna de tipo IP admite por igual las direcciones IPv4 e IPv6, cada una con su forma, su longitud de prefijo y su puerto, y las restablece tal como estaban escritas; un archivo Windows-1252 cuyas letras acentuadas están todas en columnas impuestas vuelve en Windows-1252 gracias a su registro."
       },
       "installer": {
-        "file": "pseudalis-setup-1.0.8.exe",
-        "size": 17226240,
-        "sha256": "91bbb6c3275b1ed56dcfbf4a85cc9a8f1d68bc623827573272ad5a1d1f303c83"
+        "file": "pseudalis-setup-1.0.9.exe",
+        "size": 17235456,
+        "sha256": "3e0471599c1fea043e272c5fce0692ac5f0a264f692d6025be3b6c450738cbd9"
       }
     }
   }
