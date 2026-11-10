@@ -2,19 +2,19 @@
   "product": "Pseudalis",
   "channels": {
     "stable": {
-      "version": "1.0.6",
-      "date": "2026-11-09",
+      "version": "1.0.8",
+      "date": "2026-11-10",
       "notes": {
-        "en": "A click on the icon opens the web application once, a double click included, and the icon shows its tooltip with the version, the drive and the originals kept, never an empty bubble; the web application opens in the language of the browser when Pseudalis speaks it, else in English, its menu showing another language until the page closes, and the documentation of the interface stays in English; Windows names the author of Pseudalis as the publisher of its programs.",
-        "fr": "Un clic sur l'icône ouvre l'application web une seule fois, double clic compris, et l'icône affiche son info-bulle avec la version, le lecteur et les originaux conservés, jamais une bulle vide ; l'application web s'ouvre dans la langue du navigateur quand Pseudalis la parle, sinon en anglais, son menu affichant une autre langue jusqu'à la fermeture de la page, et la documentation de l'interface reste en anglais ; Windows indique l'auteur de Pseudalis comme éditeur de ses programmes.",
-        "de": "Ein Klick auf das Symbol öffnet die Webanwendung einmal, auch bei einem Doppelklick, und das Symbol zeigt seine QuickInfo mit der Version, dem Laufwerk und den aufbewahrten Originalen, nie eine leere Blase; die Webanwendung öffnet sich in der Sprache des Browsers, wenn Pseudalis sie spricht, sonst auf Englisch, ihr Menü zeigt eine andere Sprache, bis die Seite geschlossen wird, und die Dokumentation der Schnittstelle bleibt auf Englisch; Windows nennt den Autor von Pseudalis als Herausgeber seiner Programme.",
-        "it": "Un clic sull'icona apre l'applicazione web una sola volta, anche con un doppio clic, e l'icona mostra il suo suggerimento con la versione, l'unità e gli originali conservati, mai un fumetto vuoto; l'applicazione web si apre nella lingua del browser quando Pseudalis la parla, altrimenti in inglese, il suo menu mostra un'altra lingua fino alla chiusura della pagina, e la documentazione dell'interfaccia resta in inglese; Windows indica l'autore di Pseudalis come editore dei suoi programmi.",
-        "es": "Un clic en el icono abre la aplicación web una sola vez, también con doble clic, y el icono muestra su información sobre herramientas con la versión, la unidad y los originales conservados, nunca un globo vacío; la aplicación web se abre en el idioma del navegador cuando Pseudalis lo habla, si no en inglés, su menú muestra otro idioma hasta que se cierra la página, y la documentación de la interfaz sigue en inglés; Windows indica al autor de Pseudalis como editor de sus programas."
+        "en": "In a CSV file with a header, the columns that the administrators impose by their names give each value below those names its protected form, without tag and without detection, which the record of the file gives back; the web application opens in the language of the browser and its options are switches.",
+        "fr": "Dans un fichier CSV à en-tête, les colonnes que les administrateurs imposent par leur nom donnent à chaque valeur placée dessous sa forme protégée, sans balise ni détection, que l'enregistrement du fichier rétablit ; l'application web s'ouvre dans la langue du navigateur et ses options sont des interrupteurs.",
+        "de": "In einer CSV-Datei mit Kopfzeile erhält jeder Wert unter den Namen der Spalten, die die Administratoren vorgeben, seine geschützte Form ohne Markierung und ohne Erkennung, die der Eintrag der Datei wiederherstellt; die Webanwendung öffnet sich in der Sprache des Browsers, und ihre Optionen sind Schalter.",
+        "it": "In un file CSV con intestazione, ogni valore sotto i nomi delle colonne che gli amministratori impongono prende la sua forma protetta, senza tag né rilevamento, che la registrazione del file ripristina; l'applicazione web si apre nella lingua del browser e le sue opzioni sono interruttori.",
+        "es": "En un archivo CSV con encabezado, cada valor bajo los nombres de las columnas que imponen los administradores toma su forma protegida, sin etiqueta ni detección, que el registro del archivo restablece; la aplicación web se abre en el idioma del navegador y sus opciones son interruptores."
       },
       "installer": {
-        "file": "pseudalis-setup-1.0.6.exe",
-        "size": 17190400,
-        "sha256": "1ea5d611f318f34e06c2ca27eec176085537cbb584479e7c05561869c68aca00"
+        "file": "pseudalis-setup-1.0.8.exe",
+        "size": 17226240,
+        "sha256": "91bbb6c3275b1ed56dcfbf4a85cc9a8f1d68bc623827573272ad5a1d1f303c83"
       }
     }
   }
