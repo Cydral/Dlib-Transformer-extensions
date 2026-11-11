@@ -145,7 +145,8 @@ const texts = {
     systemPromptHelp: 'Given to the model in every discussion, after the instructions of its project, for instance ' +
       'your role or the style you prefer. Markdown shows as you type and reaches the model as written.',
     exportAll: 'Export everything', importAll: 'Import', clearAll: 'Delete all discussions and projects',
-    clearAllText: 'Every discussion and every project stored in this browser will be deleted.',
+    clearAllText: 'Every discussion and every project stored in this browser will be deleted, with the memory, ' +
+      'your name and the global instructions.',
     storageUsage: 'Stored in this browser: {discussions}, {projects}, {images} ({size}).',
     imported: '{discussions} and {projects} imported.',
     discussionsCount_one: '{n} discussion', discussionsCount_other: '{n} discussions', projectsCount_one: '{n} project',
@@ -245,6 +246,10 @@ const texts = {
       'leave the context once the discussion summarizes them.',
     scanPageName: '{name}, page {n}', scanRendering: 'Drawing the pages of {name}…',
     agentLimit: 'The agent stopped after {n} steps.',
+    agentRepeats: 'The agent repeated its calls: its tools were stopped for it to answer with the results it had.',
+    agentSearchLimit: 'The agent reached its {n} searches: its tools were stopped for it to answer with the results ' +
+      'it had.',
+    toolSkipped: 'not run',
     aboutText: 'Albireo Community Edition runs language models locally, on the processor, the graphics processor or the neural processor of this computer, based on the open source Dlib-Transformer-extensions library.',
     createdBy: 'Created by {author}', 
     thirdParty: 'Third-party components', apiDocs: 'Interface documentation', close: 'Close', confirm: 'Confirm',
@@ -446,7 +451,8 @@ const texts = {
       'votre fonction ou le style que vous préférez. Le Markdown s\'affiche pendant la saisie et parvient tel quel ' +
       'au modèle.',
     exportAll: 'Tout exporter', importAll: 'Importer', clearAll: 'Supprimer toutes les discussions et tous les projets',
-    clearAllText: 'Toutes les discussions et tous les projets enregistrés dans ce navigateur seront supprimés.',
+    clearAllText: 'Toutes les discussions et tous les projets enregistrés dans ce navigateur seront supprimés, ' +
+      'avec la mémoire, votre nom et les instructions globales.',
     storageUsage: 'Enregistrés dans ce navigateur : {discussions}, {projects}, {images} ({size}).',
     imported: '{discussions} et {projects} importés.',
     discussionsCount_one: '{n} discussion', discussionsCount_other: '{n} discussions', projectsCount_one: '{n} projet',
@@ -551,6 +557,11 @@ const texts = {
       'des échanges les plus anciens quittent le contexte une fois que la discussion les résume.',
     scanPageName: '{name}, page {n}', scanRendering: 'Rendu des pages de {name}…',
     agentLimit: 'L\'agent s\'est arrêté après {n} étapes.',
+    agentRepeats: 'L\'agent répétait ses appels : ses outils ont été arrêtés pour qu\'il réponde avec les résultats ' +
+      'obtenus.',
+    agentSearchLimit: 'L\'agent a atteint ses {n} recherches : ses outils ont été arrêtés pour qu\'il réponde avec ' +
+      'les résultats obtenus.',
+    toolSkipped: 'non exécuté',
     aboutText: 'Albireo Community Edition exécute des modèles de langage localement, sur le processeur, le processeur graphique ou le processeur neuronal de cet ordinateur, en reposant sur la bibliothèque open source Dlib-Transformer-extensions.',
     createdBy: 'Créé par {author}', 
     thirdParty: 'Composants tiers', apiDocs: 'Documentation de l\'interface', close: 'Fermer', confirm: 'Confirmer',
@@ -752,7 +763,8 @@ const texts = {
       'Beispiel Ihre Rolle oder Ihr bevorzugter Stil. Markdown wird beim Schreiben dargestellt und erreicht das ' +
       'Modell unverändert.',
     exportAll: 'Alles exportieren', importAll: 'Importieren', clearAll: 'Alle Unterhaltungen und Projekte löschen',
-    clearAllText: 'Alle in diesem Browser gespeicherten Unterhaltungen und Projekte werden gelöscht.',
+    clearAllText: 'Alle in diesem Browser gespeicherten Unterhaltungen und Projekte werden gelöscht, mit dem ' +
+      'Gedächtnis, Ihrem Namen und den globalen Anweisungen.',
     storageUsage: 'In diesem Browser gespeichert: {discussions}, {projects}, {images} ({size}).',
     imported: '{discussions} und {projects} importiert.',
     discussionsCount_one: '{n} Unterhaltung', discussionsCount_other: '{n} Unterhaltungen', projectsCount_one: '{n} Projekt',
@@ -856,6 +868,11 @@ const texts = {
       'der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie zusammenfasst.',
     scanPageName: '{name}, Seite {n}', scanRendering: 'Die Seiten von {name} werden gezeichnet…',
     agentLimit: 'Der Agent hat nach {n} Schritten angehalten.',
+    agentRepeats: 'Der Agent wiederholte seine Aufrufe: Seine Werkzeuge wurden angehalten, damit er mit den ' +
+      'erhaltenen Ergebnissen antwortet.',
+    agentSearchLimit: 'Der Agent hat seine {n} Suchen ausgeschöpft: Seine Werkzeuge wurden angehalten, damit er ' +
+      'mit den erhaltenen Ergebnissen antwortet.',
+    toolSkipped: 'nicht ausgeführt',
     aboutText: 'Albireo Community Edition führt Sprachmodelle lokal aus, auf dem Prozessor, dem Grafikprozessor oder dem neuronalen Prozessor dieses Computers, auf Basis der Open-Source-Bibliothek Dlib-Transformer-extensions.',
     createdBy: 'Erstellt von {author}', 
     thirdParty: 'Komponenten von Drittanbietern', apiDocs: 'Dokumentation der Schnittstelle', close: 'Schließen', confirm: 'Bestätigen',
@@ -1053,7 +1070,8 @@ const texts = {
       'tuo ruolo o lo stile che preferisci. Il Markdown viene mostrato durante la digitazione e raggiunge il modello ' +
       'così com\'è.',
     exportAll: 'Esporta tutto', importAll: 'Importa', clearAll: 'Elimina tutte le conversazioni e tutti i progetti',
-    clearAllText: 'Tutte le conversazioni e tutti i progetti salvati in questo browser saranno eliminati.',
+    clearAllText: 'Tutte le conversazioni e tutti i progetti salvati in questo browser saranno eliminati, con ' +
+      'la memoria, il tuo nome e le istruzioni globali.',
     storageUsage: 'Salvati in questo browser: {discussions}, {projects}, {images} ({size}).',
     imported: '{discussions} e {projects} importati.',
     discussionsCount_one: '{n} conversazione', discussionsCount_other: '{n} conversazioni', projectsCount_one: '{n} progetto',
@@ -1157,6 +1175,11 @@ const texts = {
       'immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume.',
     scanPageName: '{name}, pagina {n}', scanRendering: 'Disegno delle pagine di {name}…',
     agentLimit: 'L\'agente si è fermato dopo {n} passaggi.',
+    agentRepeats: 'L\'agente ripeteva le sue chiamate: i suoi strumenti sono stati fermati perché risponda con i ' +
+      'risultati ottenuti.',
+    agentSearchLimit: 'L\'agente ha esaurito le sue {n} ricerche: i suoi strumenti sono stati fermati perché ' +
+      'risponda con i risultati ottenuti.',
+    toolSkipped: 'non eseguito',
     aboutText: 'Albireo Community Edition esegue modelli linguistici in locale, sul processore, sul processore grafico o sul processore neurale di questo computer, basandosi sulla libreria open source Dlib-Transformer-extensions.',
     createdBy: 'Creato da {author}', 
     thirdParty: 'Componenti di terze parti', apiDocs: 'Documentazione dell\'interfaccia', close: 'Chiudi', confirm: 'Conferma',
@@ -1354,7 +1377,8 @@ const texts = {
       'ejemplo su función o el estilo que prefiere. El Markdown se muestra al escribir y llega al modelo tal como ' +
       'está escrito.',
     exportAll: 'Exportar todo', importAll: 'Importar', clearAll: 'Eliminar todas las conversaciones y proyectos',
-    clearAllText: 'Se eliminarán todas las conversaciones y todos los proyectos guardados en este navegador.',
+    clearAllText: 'Se eliminarán todas las conversaciones y todos los proyectos guardados en este navegador, ' +
+      'con la memoria, su nombre y las instrucciones globales.',
     storageUsage: 'Guardado en este navegador: {discussions}, {projects}, {images} ({size}).',
     imported: '{discussions} y {projects} importados.',
     discussionsCount_one: '{n} conversación', discussionsCount_other: '{n} conversaciones', projectsCount_one: '{n} proyecto',
@@ -1457,6 +1481,11 @@ const texts = {
       'imágenes de los intercambios más antiguos salen del contexto cuando la conversación los resume.',
     scanPageName: '{name}, página {n}', scanRendering: 'Dibujando las páginas de {name}…',
     agentLimit: 'El agente se detuvo tras {n} pasos.',
+    agentRepeats: 'El agente repetía sus llamadas: sus herramientas se detuvieron para que responda con los ' +
+      'resultados obtenidos.',
+    agentSearchLimit: 'El agente agotó sus {n} búsquedas: sus herramientas se detuvieron para que responda con los ' +
+      'resultados obtenidos.',
+    toolSkipped: 'no ejecutado',
     aboutText: 'Albireo Community Edition ejecuta modelos de lenguaje localmente, en el procesador, el procesador gráfico o el procesador neuronal de este ordenador, basándose en la biblioteca de código abierto Dlib-Transformer-extensions.',
     createdBy: 'Creado por {author}', 
     thirdParty: 'Componentes de terceros', apiDocs: 'Documentación de la interfaz', close: 'Cerrar', confirm: 'Confirmar',

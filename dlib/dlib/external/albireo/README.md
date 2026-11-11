@@ -84,9 +84,20 @@ application, the description of the interface and the list of the programs of Wi
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
   sandboxed frame, outline, reading and search of the documents, search of the other
   discussions, date, files to download), up to 100 steps per answer, the context fitted before
-  each step. The help next to its button describes the tools; each step of an answer shows
-  its tool, its arguments, its result, its state and its duration. The calculator reads the
-  percentages ("17,5 % de 2 340"), the decimal commas and the thousands written with spaces.
+  each step. Small models go round in circles when the results lack what they look for, so some
+  calls are not run: a call that repeats an earlier call of the answer whose result the model
+  still reads whole (a failed call runs once more, and a call written twice in a step once), a
+  search whose words are those of two earlier searches with words added or taken away (common
+  words, elisions and placeholders such as `CVE-2026-XXXX` aside) and a search beyond eight of a
+  tool; a search that changes a word, as the same question about another city, another year or
+  another vitamin, runs. The result of a call not run asks the model to answer with the results
+  it has and to take its identifiers, names and dates from them, as a small model otherwise
+  invents some. A search beyond eight, a second call not run or the last step stops the tools:
+  the next step keeps them, so that the engine reuses the prompt it has read, but runs none of
+  its calls, and a last step without tools follows when the model only calls them. The help next
+  to its button describes the tools; each step of an answer shows its tool, its arguments, its
+  result, its state and its duration. The calculator reads the percentages ("17,5 % de 2 340"),
+  the decimal commas and the thousands written with spaces.
 - **Web access**: the Web button of the composer, off in each new discussion as the deep
   reasoning and the agent are, gives the model a search of Wikipedia and the reading of the pages and PDF files of public addresses, which the
   service fetches; the model reads only the addresses that the discussion holds (see
@@ -810,7 +821,11 @@ leave out sensitive information (health, finances, opinions, identifiers, other 
 the settings keep it, and the sentences that hold a password, a key or a payment number never enter
 the memory unless they do. A discussion receives the memory as it was when it started, so that its
 prompt keeps the same beginning; the private discussions neither read nor feed it. The settings
-show the memory, let the user edit it, turn it off and reset it. The background model also names
+show the memory, let the user edit it, turn it off and reset it; the deletion of every discussion
+and every project, in the Data tab, resets it too, with the name of the user and the global
+instructions. A reset stops the update in progress in every tab, and an update reads only the
+questions asked after the last reset, then checks and saves the memory in one transaction, so
+that it never writes back a memory learned before a reset. The background model also names
 each discussion from its first question, in the language of that question, unless the user
 renames it: the first words of the question stand for the title until it arrives, a title that
 repeats the question is asked again in other words, and a title that could not be written (a

@@ -137,6 +137,119 @@ export const agentInstructions = 'You can call tools. Call a tool when it gives 
   'After the tool results, answer the user directly.';
 
 /*
+    The guard of an answer against the calls that a model repeats, as a small model does when the results do not hold
+    what it looks for.  A call that gives a tool the arguments of an earlier call of the answer, whose result the model
+    still reads whole, is not run ('repeat'), a failed call being run once more.  A search is not run when its words,
+    common words, elisions and placeholders of identifiers (CVE-2026-XXXX) aside, hold those of sameSubject earlier
+    searches of its tool or are held by them, making half of them at least, as the same search with a word or a year
+    more does ('repeat'), nor beyond searchBudget searches of its tool in the answer ('budget').  A search that changes
+    a word for another, as the same question about another city, another year or another vitamin does, runs.  check()
+    tells why a call is not run, or '' when it runs; record() keeps a call that ran and whether it succeeded.
+*/
+export const searchBudget = 8;
+const sameSubject = 2;
+const searchTools = ['web_search', 'search_documents', 'search_discussions'];
+/*
+    The words that tell nothing of the subject of a search, in English and in the other languages of the interface.
+    The letters alone stay, since they name things (vitamin D, plan B), the elided articles and prepositions of French
+    and Italian (l', d', qu', dell') leaving with their apostrophe.
+*/
+const commonWords = new Set(('an and are as at be by for from how in is it of on the to what when where which '
+  + 'who why with au aux ce ces dans de des du en est et la le les ou par pour que quel quelle quels quelles qui sur '
+  + 'un une am auf das dem den der die ein eine einem einen einer fur im ist mit oder und vom von was wie zu zum zur '
+  + 'al alla che come con da dei del della delle di gli il lo nel nella per quale su uno como cual el las los para '
+  + 'por una unas unos').split(' '));
+const elision = /(^|[^a-z])(?:c|d|j|l|m|n|qu|s|t|all|dall|dell|nell|sull)['\u2019]/g;
+
+// The words of a search, in any script, without its common words, its elisions, its placeholders and its accents.
+function searchWords(query) {
+  return new Set(String(query || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(elision, '$1 ').split(/[^\p{L}\p{M}\p{N}]+/u)
+    .filter((w) => w && !commonWords.has(w) && !/^x{3,}$/.test(w)));
+}
+
+// The text of a call that compares it with the others, its tool and its arguments.
+export function callKey(name, argumentsText) {
+  return name + ' ' + argumentsKey(argumentsText);
+}
+
+// The result of a call that repeats an earlier call of its step, which runs once.
+export const duplicateText = 'Not run: this call is the same as an earlier call of this step, whose result is above.';
+
+// Whether two searches are on one subject: the words of one hold those of the other, half of its words at least.
+function sameWords(a, b) {
+  const small = a.size <= b.size ? a : b;
+  const large = small === a ? b : a;
+  for (const w of small) if (!large.has(w)) return false;
+  return 2 * small.size >= large.size;
+}
+
+// The arguments of a call as one text, their keys in order and a search query without its case and its spaces.
+function argumentsKey(argumentsText) {
+  let args;
+  try {
+    args = JSON.parse(argumentsText || '{}');
+  } catch (e) {
+    return String(argumentsText || '');
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return JSON.stringify(args);
+  const out = {};
+  for (const k of Object.keys(args).sort()) {
+    out[k] = k === 'query' && typeof args[k] === 'string' ? args[k].toLowerCase().replace(/\s+/g, ' ').trim() : args[k];
+  }
+  return JSON.stringify(out);
+}
+
+function queryOf(argumentsText) {
+  try {
+    const args = JSON.parse(argumentsText || '{}');
+    return args && typeof args.query === 'string' ? args.query : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+export function callGuard() {
+  // The calls that ran, by their tool and their arguments: {call, ok, retried}.
+  const calls = new Map();
+  const searches = new Map();
+  return {
+    // seen(call) tells whether the request of the model holds the whole result of an earlier call.
+    check(name, argumentsText, seen) {
+      const earlier = calls.get(callKey(name, argumentsText));
+      if (earlier && (earlier.ok || earlier.retried) && seen(earlier.call)) return 'repeat';
+      if (!searchTools.includes(name)) return '';
+      const done = searches.get(name) || [];
+      if (done.length >= searchBudget) return 'budget';
+      // A failed search run once more, or one whose result left the request, runs as it is.
+      if (earlier) return '';
+      const words = searchWords(queryOf(argumentsText));
+      return done.filter((w) => sameWords(w, words)).length >= sameSubject ? 'repeat' : '';
+    },
+    record(name, argumentsText, call, ok) {
+      const key = callKey(name, argumentsText);
+      calls.set(key, { call, ok, retried: calls.has(key) });
+      if (!searchTools.includes(name)) return;
+      const done = searches.get(name) || [];
+      done.push(searchWords(queryOf(argumentsText)));
+      searches.set(name, done);
+    }
+  };
+}
+
+/*
+    The result of a call that the guard does not run, which asks the model to answer with the results it has and to
+    take its identifiers from them, as a small model otherwise invents some (CVE numbers among others).
+*/
+export function refusalText(reason) {
+  return (reason === 'budget' ? 'Not run: this answer has run its ' + searchBudget + ' searches.'
+    : 'Not run: this call repeats earlier calls of this answer, whose results are above.')
+    + ' Answer the user now with the results above, and take from them the identifiers, names and dates you give. '
+    + 'When they do not hold what was asked, say so, then answer with what they hold that comes closest, and with '
+    + 'what you know only when you are sure of it, saying that it may be out of date.';
+}
+
+/*
     An expression in the notation the calculator reads.  The signs of multiplication, division and
     subtraction become *, / and -, the groups of thousands written with spaces join ("2 340"), a
     comma between two digits outside of the arguments of a function is a decimal comma ("17,5"),

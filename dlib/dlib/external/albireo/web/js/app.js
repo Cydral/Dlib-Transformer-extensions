@@ -225,7 +225,16 @@ const defaults = {
   theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null, topK: null,
   maxTokens: 0, sendOnEnter: true, systemPrompt: '', sidebar: true,
   memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', memoryPinned: '',
+  memoryReset: 0,
   storagePersisted: null
+};
+
+/*
+    The settings that the deletion of every discussion and every project resets with them, the memory, the name of the
+    user and the global instructions, since the discussions taught or gave them.
+*/
+const clearedSettings = {
+  memory: '', memoryPinned: '', memoryUpdated: 0, memoryLanguage: '', userName: '', systemPrompt: ''
 };
 
 /*
@@ -408,10 +417,35 @@ function applyLanguage() {
 
 // Saves a setting and tells the other tabs; a setting the database refuses stays for this visit.
 async function saveSetting(key, value) {
+  if (discardingSettings) return;
   state.settings[key] = value;
   await store.setSetting(key, value).catch(storageFailed);
   broadcast({ type: 'setting', key, value });
   if (/^memory/.test(key) && ui.memoryView) ui.memoryView();
+}
+
+/*
+    True while a dialog of the settings closes because another tab deleted everything: the fields it removes, which
+    save what they hold when they lose the focus, save nothing.
+*/
+let discardingSettings = false;
+
+/*
+    Saves the settings of values in one transaction, unless unless(settings), given the settings as stored, returns
+    true, then tells the other tabs; returns whether the settings were saved.
+*/
+async function saveSettings(values, unless) {
+  const saved = await store.setSettings(values, unless).catch((e) => {
+    storageFailed(e);
+    return false;
+  });
+  if (!saved) return false;
+  for (const key of Object.keys(values)) {
+    state.settings[key] = values[key];
+    broadcast({ type: 'setting', key, value: values[key] });
+  }
+  if (ui.memoryView && Object.keys(values).some((k) => /^memory/.test(k))) ui.memoryView();
+  return true;
 }
 
 /*
@@ -445,14 +479,40 @@ function broadcast(message) {
   }
 }
 
+/*
+    The settings of the memory as the database holds them, read again shortly after a message of another tab on them:
+    the messages of two tabs may arrive in another order than their changes of the database, as an update of the
+    memory saved just before a reset whose messages arrive first.
+*/
+let memorySync = null;
+function syncMemorySettings() {
+  clearTimeout(memorySync);
+  memorySync = setTimeout(async () => {
+    memorySync = null;
+    const stored = await store.getSettings().catch(() => null);
+    if (!stored) return;
+    for (const key of Object.keys(defaults)) {
+      if (!/^memory/.test(key)) continue;
+      const value = Object.prototype.hasOwnProperty.call(stored, key) ? stored[key] : defaults[key];
+      if (state.settings[key] === value) continue;
+      state.settings[key] = value;
+      settingChanged(key);
+    }
+  }, 200);
+}
+
 // A message of another tab.
 function receive(message) {
   if (!message || typeof message !== 'object') return;
   if (message.type === 'setting' && Object.prototype.hasOwnProperty.call(defaults, message.key)) {
     state.settings[message.key] = message.value;
     settingChanged(message.key);
+    if (/^memory/.test(message.key)) syncMemorySettings();
   } else if (message.type === 'memoryReset') {
+    // The update in progress stops, and the memory field shows the reset memory, even while it is being written.
+    if (memoryAbort) memoryAbort.abort();
     forgetMemory();
+    if (ui.memoryView) ui.memoryView(true);
   } else if (message.type === 'conversation' && typeof message.id === 'string') {
     syncConversation(message.id);
   } else if (message.type === 'deleted' && typeof message.id === 'string') {
@@ -600,6 +660,25 @@ function everythingDeleted() {
   unread.clear();
   cancelIndex();
   cancelBackground();
+  // An update of the memory in progress learns nothing more from the deleted discussions.
+  if (memoryAbort) memoryAbort.abort();
+  forgetMemory();
+  /*
+      The settings the deletion resets apply at once, before the messages of the tab that deletes confirm them, and an
+      open dialog of the settings closes, so that its fields do not save their old values again.
+  */
+  if (ui.closeSettings) {
+    discardingSettings = true;
+    try {
+      ui.closeSettings(null);
+    } finally {
+      discardingSettings = false;
+    }
+  }
+  for (const key of Object.keys(clearedSettings)) {
+    state.settings[key] = clearedSettings[key];
+    settingChanged(key);
+  }
   rag.removeAll();
   images.removeAll(waitingImages());
   forgetStoredDrafts();
@@ -1736,7 +1815,12 @@ function markdownOf(title, messages) {
       lines.push('## Albireo', '');
       for (const s of m.steps || []) {
         if (s.reasoning) lines.push('<details><summary>' + t('thinking') + '</summary>', '', s.reasoning, '', '</details>', '');
-        for (const tc of s.toolCalls || []) lines.push('> ' + tc.name + ' ' + (tc.arguments || ''), '', '```', tc.result || '', '```', '');
+        // A call that did not run, without a result, gives its state instead.
+        for (const tc of s.toolCalls || []) {
+          lines.push('> ' + tc.name + ' ' + (tc.arguments || ''), '');
+          if (tc.result != null) lines.push('```', tc.result, '```', '');
+          else lines.push('> ' + toolState(tc).label, '');
+        }
         if (s.content) lines.push(s.content);
       }
     }
@@ -3961,10 +4045,16 @@ function noteElements(m, live, steps) {
   if (m.error) out.push(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
   if (m.cancelled) note(t('cancelled'));
   if (m.repetition && !m.cancelled) note(h('span', { html: icon('info') }), t('answerRepeated'));
-  if (!live && !m.error && !m.cancelled && !steps.some((s) => s.content || (s.toolCalls || []).length)) {
+  // An answer without text, or whose agent stopped and whose last step wrote none.
+  const last = steps[steps.length - 1];
+  if (!live && !m.error && !m.cancelled && (!steps.some((s) => s.content || (s.toolCalls || []).length)
+    || ((m.toolsStopped || m.agentLimit) && !(last && last.content)))) {
     note(t('emptyAnswer'));
   }
   if (m.agentLimit) note(t('agentLimit', { n: maxAgentSteps }));
+  if (m.toolsStopped) {
+    note(m.toolsStopped === 'budget' ? t('agentSearchLimit', { n: tools.searchBudget }) : t('agentRepeats'));
+  }
   return out;
 }
 
@@ -4035,6 +4125,8 @@ function toolState(tc) {
   if (tc.status === 'running') return { cls: 'running', label: t('toolRunning'), spin: true };
   const time = tc.ms != null ? ' · ' + formatShortDuration(tc.ms) : '';
   if (tc.status === 'stopped') return { cls: 'stopped', label: t('toolStopped') + time };
+  // A call the guard of the answer did not run (tools.callGuard).
+  if (tc.status === 'skipped') return { cls: 'stopped', label: t('toolSkipped') };
   return tc.ok === false ? { cls: 'error', label: t('toolError') + time } : { cls: 'ok', label: t('toolDone') + time };
 }
 
@@ -4526,9 +4618,11 @@ function documentsOf(c) {
     come with the question, and their instructions close the message, those of the agent, then those of the web.  It
     holds what stays the same from one question to the next, so that the engine reads it once: the project and its
     documents first, which the discussions of the project share, then the day the discussion started, in English
-    whatever the language of the interface, and the memory as it was then.
+    whatever the language of the interface, and the memory as it was then.  The last step of an answer whose tools
+    stopped goes without them (set null) and keeps the rules on the citations and on the texts of the web when the
+    earlier steps had the web tools (stopped, their set).
 */
-function systemPrompt(c, caps, set) {
+function systemPrompt(c, caps, set, stopped) {
   const agent = !!(set && set.agent);
   const parts = [];
   const p = c.projectId ? projectById(c.projectId) : null;
@@ -4567,6 +4661,7 @@ function systemPrompt(c, caps, set) {
   }
   if (agent) parts.push(tools.agentInstructions);
   if (set && set.web) parts.push(web.instructions(set.search));
+  else if (stopped && stopped.web) parts.push(web.citationInstructions);
   return parts.join('\n\n');
 }
 
@@ -5344,15 +5439,27 @@ async function runTurn(c, abort, turn) {
     }
     // The cuts of the texts that the steps of the answer share (fitContext).
     const cuts = { summary: null, texts: new Map(), steps: 0 };
-    for (let step = 0; step < maxAgentSteps; ++step) {
+    /*
+        The calls a model repeats are not run (tools.callGuard).  A search beyond the budget, a second call not run or
+        the last step of the agent stops the tools: the next step keeps them, so that the engine reuses the prompt it
+        has read, but runs none of its calls, and a step that only calls them is followed by a last one without
+        tools, so that the model answers with the results it has instead of going round in circles.
+    */
+    const guard = tools.callGuard();
+    let refusals = 0;
+    // Why the tools stopped ('repeat', 'budget' or 'limit'), and whether the step goes without them.
+    let stopped = '';
+    let closing = false;
+    for (let step = 0; ; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
-      const system = systemPrompt(c, caps, set);
+      const stepTools = closing ? null : toolDefs;
+      const system = closing ? systemPrompt(c, caps, null, set) : systemPrompt(c, caps, set);
       // The conversation, with the steps of this answer already done (the agent's).
       const build = (x) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
       }), system, x, media);
-      const fitted = await fitContext(c, build, toolDefs, answerReserve(caps, reasoning), signal, () => {
+      const fitted = await fitContext(c, build, stepTools, answerReserve(caps, reasoning), signal, () => {
         turn.compacting = true;
         scheduleRender(c);
       }, 'albireo-' + role, cuts);
@@ -5381,7 +5488,7 @@ async function runTurn(c, abort, turn) {
         turn.promptTokens = fitted.tokens;
       }
       const body = { model: 'albireo-' + role, messages: fitted.messages, reasoning };
-      if (toolDefs) body.tools = toolDefs;
+      if (stepTools) body.tools = stepTools;
       if (state.settings.temperature != null) body.temperature = state.settings.temperature;
       if (state.settings.topP != null) body.top_p = state.settings.topP;
       if (state.settings.topK != null) body.top_k = state.settings.topK;
@@ -5431,6 +5538,17 @@ async function runTurn(c, abort, turn) {
       }
       if (s.reasoningStart && !s.reasoningMs) s.reasoningMs = Date.now() - s.reasoningStart;
       delete s.reasoningStart;
+      // The calls a model still writes once the tools stopped are not run.
+      if (stopped) {
+        for (const tc of s.toolCalls) {
+          tc.status = 'skipped';
+          delete tc.index;
+        }
+        // A step that only calls has the next one go without tools; a step that writes, or without tools, ends.
+        if (!s.toolCalls.length || s.content.trim() || closing) break;
+        closing = true;
+        continue;
+      }
       if (!(useTools && s.toolCalls.length && (finish === 'tool_calls' || finish === 'stop'))) break;
       // The tools of the step run, each timed, then the model continues with their results.
       for (const tc of s.toolCalls) {
@@ -5439,7 +5557,22 @@ async function runTurn(c, abort, turn) {
         tc.started = Date.now();
         scheduleRender(c);
         let r;
-        if (!offered.has(tc.name)) {
+        // Whether the request of this step holds the whole result of an earlier call of the answer.
+        const seen = (call) => turn.steps.findIndex((x) => (x.toolCalls || []).includes(call)) >= cuts.steps
+          && cuts.texts.get(call) == null;
+        // A call the model wrote twice in the step, before any result, runs once.
+        const key = tools.callKey(tc.name, tc.arguments);
+        const twin = s.toolCalls.slice(0, s.toolCalls.indexOf(tc))
+          .some((x) => tools.callKey(x.name, x.arguments) === key);
+        const refused = twin ? '' : guard.check(tc.name, tc.arguments, seen);
+        if (twin) {
+          r = { ok: false, text: tools.duplicateText };
+        } else if (refused) {
+          r = { ok: false, text: tools.refusalText(refused) };
+          // A search beyond the budget stops the tools at once, the other calls not run at the second of the answer.
+          ++refusals;
+          if (!stopped && (refused === 'budget' || refusals > 1)) stopped = refused;
+        } else if (!offered.has(tc.name)) {
           r = { ok: false, text: 'The tool ' + tc.name + ' is not available in this answer.' };
         } else if (web.isTool(tc.name)) {
           // fetch_page reads the addresses of the discussion as it is when the call runs, the results of the
@@ -5460,10 +5593,11 @@ async function runTurn(c, abort, turn) {
             signal
           });
         }
+        if (!refused && !twin) guard.record(tc.name, tc.arguments, tc, r.ok !== false);
         tc.ms = Date.now() - tc.started;
         delete tc.started;
         // A call the stop of the answer ended keeps what it returned, as stopped.
-        tc.status = signal.aborted ? 'stopped' : 'done';
+        tc.status = signal.aborted ? 'stopped' : refused || twin ? 'skipped' : 'done';
         tc.ok = r.ok;
         tc.result = r.text;
         if (r.file) tc.file = r.file;
@@ -5472,8 +5606,13 @@ async function runTurn(c, abort, turn) {
         delete tc.index;
         scheduleRender(c);
       }
-      if (step === maxAgentSteps - 1) turn.agentLimit = true;
+      // The last step of the agent stops the tools, so that the model answers with what its calls gave.
+      if (step >= maxAgentSteps - 1 && !stopped) {
+        turn.agentLimit = true;
+        stopped = 'limit';
+      }
     }
+    if (stopped && stopped !== 'limit') turn.toolsStopped = stopped;
   } catch (e) {
     if (e.name === 'AbortError') turn.cancelled = true;
     else turn.error = errorText(e);
@@ -5483,7 +5622,7 @@ async function runTurn(c, abort, turn) {
     for (const s of turn.steps) {
       delete s.reasoningStart;
       for (const tc of s.toolCalls || []) {
-        if (tc.status === 'done') continue;
+        if (tc.status === 'done' || tc.status === 'skipped') continue;
         tc.status = 'stopped';
         delete tc.started;
         delete tc.index;
@@ -5894,9 +6033,10 @@ function sameFact(a, b) {
 
 /*
     The questions the memory has not read yet, each discussion from its mark, the discussions changed least recently
-    first: [{id, to, asked: [{text, to}]}], to being the mark after the discussion or after the question.
+    first: [{id, to, asked: [{text, to}]}], to being the mark after the discussion or after the question.  Given the
+    time since of the last reset of the memory, the questions asked before it are left out.
 */
-function pendingMemory() {
+function pendingMemory(since) {
   const items = [];
   let questions = 0;
   let chars = 0;
@@ -5904,10 +6044,13 @@ function pendingMemory() {
   if (state.current && !state.current.incognito && !all.includes(state.current)) all.push(state.current);
   all.sort((a, b) => (a.updated || 0) - (b.updated || 0));
   for (const c of all) {
-    if (c.incognito || !Array.isArray(c.messages) || c.messages.length <= (c.memoryMark || 0)) continue;
+    if (c.incognito || deleted.has(c.id) || !Array.isArray(c.messages) || c.messages.length <= (c.memoryMark || 0)) {
+      continue;
+    }
     const asked = [];
     for (let i = c.memoryMark || 0; i < c.messages.length; ++i) {
       const m = c.messages[i];
+      if (since && (m.created || 0) <= since) continue;
       if (m.role === 'user' && (m.content || '').trim()) asked.push({ text: m.content, to: i + 1 });
     }
     items.push({ id: c.id, to: c.messages.length, asked });
@@ -5986,7 +6129,7 @@ async function storedMemory() {
   const s = Object.assign({}, defaults, await store.getSettings());
   return {
     enabled: !!s.memoryEnabled, sensitive: !!s.memorySensitive, memory: s.memory || '', language: s.memoryLanguage,
-    pinned: s.memoryPinned || ''
+    pinned: s.memoryPinned || '', reset: s.memoryReset || 0
   };
 }
 
@@ -6035,6 +6178,8 @@ async function updateMemory(force) {
     // The memory as stored: another tab may have reset or edited it.
     const stored = await storedMemory();
     if (!stored.enabled) return;
+    // The questions asked before the last reset stay out, whatever the marks of the discussions in this tab.
+    const fresh = pendingMemory(stored.reset);
     const sensitive = stored.sensitive;
     const context = backgroundContext();
     const words = memoryLimitWords(context);
@@ -6045,12 +6190,16 @@ async function updateMemory(force) {
     const renew = async () => {
       if (!(await takeMemoryLease())) throw new DOMException('The memory is updated by another tab.', 'AbortError');
     };
-    // True when the memory was reset, edited or turned off meanwhile, in this tab or in another
-    // one, as stored now: the update is then dropped.
-    const changed = async () => {
-      const now = await storedMemory();
-      return !now.enabled || now.memory !== current;
+    /*
+        True when the memory was reset, edited or turned off meanwhile, in this tab or in another one, as the settings
+        stored now say, or when the update was stopped: the update is then dropped.
+    */
+    const differs = (now) => {
+      const x = Object.assign({}, defaults, now);
+      return signal.aborted || !x.memoryEnabled || (x.memory || '') !== current
+        || (x.memoryReset || 0) !== stored.reset;
     };
+    const changed = async () => differs(await store.getSettings());
     // The notes written as a list by an earlier version become sentences, and are saved as such.
     let lines = memorySentences(current, true);
     let rewritten = false;
@@ -6081,11 +6230,11 @@ async function updateMemory(force) {
     let added = 0;
     let moved = 0;
     let marks = [];
-    if (enough && pending.chars >= 40) {
+    if (enough && fresh.chars >= 40) {
       // What the user wrote, oldest first, within the reading of the update: the memory is about the user, and the
       // answers would fill it with what the assistant said.
       const rates = backgroundRates();
-      const reading = memoryReading(pending.items,
+      const reading = memoryReading(fresh.items,
         Math.floor(Math.min(0.5 * context, Math.max(2048, memoryReadSeconds * rates.read)) * 3.6));
       const read = reading.read;
       marks = reading.marks;
@@ -6152,13 +6301,14 @@ async function updateMemory(force) {
     */
     if (added || moved || rewritten || listMemory(current)) {
       const limit = wordCount(pinned) + learnedRoom(words, pinned);
-      await saveSetting('memory', memoryParagraph(lines, added ? limit : Math.max(limit, words * 2), new Set(pinned)));
-      await saveSetting('memoryPinned', pinned.join(' '));
-      await saveSetting('memoryUpdated', Date.now());
-      await saveSetting('memoryLanguage', target);
+      // The check and the save in one transaction, so that a reset in another tab is never overwritten.
+      if (!(await saveSettings({
+        memory: memoryParagraph(lines, added ? limit : Math.max(limit, words * 2), new Set(pinned)),
+        memoryPinned: pinned.join(' '), memoryUpdated: Date.now(), memoryLanguage: target
+      }, differs))) return;
     }
     // Questions too short to say anything are read all the same.
-    if (enough && pending.chars < 40) marks = pending.items;
+    if (enough && fresh.chars < 40) marks = fresh.items;
     if (marks.length) await markRead(marks);
     if (added) toast(tn('memoryLearned', added), false, 4500);
     else if (rewritten) toast(t('memoryRewritten'), false, 4500);
@@ -6572,6 +6722,7 @@ function promptDialog(title, value) {
 
 function settingsDialog(initialTab) {
   dialog((box, close) => {
+    ui.closeSettings = close;
     const tabs = ['general', 'model', 'memoryTab', 'data', 'about'];
     const tabBar = h('div', { class: 'tabs' });
     const body = h('div');
@@ -6589,7 +6740,10 @@ function settingsDialog(initialTab) {
     box.append(h('h2', { html: icon('gear') + escapeHtml(t('settings')) }), tabBar, body,
       h('div', { class: 'actions' }, h('button', { class: 'button primary', type: 'button', onclick: () => close(true) }, t('close'))));
     show(initialTab || 'general');
-  }).then(() => { ui.memoryView = null; });
+  }).then(() => {
+    ui.memoryView = null;
+    ui.closeSettings = null;
+  });
 }
 
 function field(label, control, help) {
@@ -6701,11 +6855,14 @@ function memoryTab(body) {
     /*
         What the user writes stays, sensitive or not, within twice the size of the memory, as sentences one after
         the other: a line becomes a sentence.  The sentences the user adds or changes stay when the facts the model
-        learns fill the memory; those the model learned and the user left as they were may leave.
+        learns fill the memory; those the model learned and the user left as they were may leave.  A memory the
+        field leaves as it is stored, as after a reset shown while it was written, is not saved again.
     */
+    const next = memoryParagraph(memorySentences(text.value, true), words * 2);
+    if (discardingSettings || next === (state.settings.memory || '')) return;
     const before = new Set(memorySentences(state.settings.memory, true));
     const pinnedBefore = new Set(memorySentences(state.settings.memoryPinned, true));
-    await saveSetting('memory', memoryParagraph(memorySentences(text.value, true), words * 2));
+    await saveSetting('memory', next);
     // The sentences the user added or changed, and those the user wrote before, as the saved memory splits them.
     const saved = memorySentences(state.settings.memory, true);
     await saveSetting('memoryPinned', saved.filter((x) => pinnedBefore.has(x) || !before.has(x)).join(' '));
@@ -6714,13 +6871,13 @@ function memoryTab(body) {
     showSize();
   });
   sensitive.disabled = text.disabled = !enabled.checked;
-  // The memory as an update or another tab changes it, unless the user is writing in it.
-  ui.memoryView = () => {
+  // The memory as an update or another tab changes it, unless the user is writing in it and it was not reset.
+  ui.memoryView = (reset) => {
     if (!text.isConnected) return;
     enabled.checked = !!state.settings.memoryEnabled;
     sensitive.checked = !!state.settings.memorySensitive;
     sensitive.disabled = text.disabled = !enabled.checked;
-    if (document.activeElement !== text) text.value = state.settings.memory || '';
+    if (reset || document.activeElement !== text) text.value = state.settings.memory || '';
     showSize();
   };
   body.append(h('p', null, t('memoryIntro')),
@@ -6732,9 +6889,8 @@ function memoryTab(body) {
       class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('memoryReset')) + '</span>',
       onclick: async () => {
         if (!await confirmDialog(t('memoryReset'), t('memoryResetText'))) return;
-        await saveSetting('memory', '');
-        await saveSetting('memoryPinned', '');
-        await saveSetting('memoryUpdated', 0);
+        if (memoryAbort) memoryAbort.abort();
+        await saveSettings({ memory: '', memoryPinned: '', memoryUpdated: 0, memoryReset: Date.now() });
         // The discussions forget the memory they started with, and what they already said
         // stays out of the next updates: the stored discussions change in place, read again
         // from the database with the messages other tabs saved, and the copies of the tabs follow.
@@ -6822,12 +6978,21 @@ function dataTab(body, close) {
           unread.clear();
           cancelIndex();
           cancelBackground();
+          // The update of the memory in progress stops, and the one the end of an answer planned does not start.
+          if (memoryAbort) memoryAbort.abort();
+          forgetMemory();
           rag.removeAll();
           images.removeAll(waitingImages());
           forgetStoredDrafts();
           for (const id of deleted) web.forgetPages(id);
-          await store.clearAll().catch(storageFailed);
+          // The memory, the name and the global instructions go with the discussions that taught or gave them.
+          const reset = Object.assign({}, clearedSettings, { memoryReset: Date.now() });
+          await store.clearAll(reset).catch(storageFailed);
           broadcast({ type: 'cleared' });
+          for (const key of Object.keys(reset)) {
+            state.settings[key] = reset[key];
+            broadcast({ type: 'setting', key, value: reset[key] });
+          }
           await reloadLists().catch(storageFailed);
           close(true);
           go('#/');

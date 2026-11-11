@@ -394,6 +394,28 @@ export async function setSetting(key, value) {
 }
 
 /*
+    Puts the settings of values in one transaction, unless unless(settings), given the settings as the transaction
+    reads them, returns true, so that no other tab changes them between the check and the change.  Returns whether
+    the settings were put.
+*/
+export async function setSettings(values, unless) {
+  await open();
+  const tx = db.transaction('settings', 'readwrite');
+  const s = tx.objectStore('settings');
+  let put = false;
+  const r = s.getAll();
+  r.onsuccess = () => {
+    const now = {};
+    for (const row of r.result) now[row.key] = row.value;
+    if (unless && unless(now)) return;
+    for (const key of Object.keys(values)) s.put({ key, value: values[key] });
+    put = true;
+  };
+  await completed(tx);
+  return put;
+}
+
+/*
     Takes the lease of key for owner until the time until, in one transaction, so that two tabs
     never both take it.  Returns true when the lease was free, expired or already held by owner.
 */
@@ -550,11 +572,15 @@ export async function importAll(data) {
   return { conversations: n, projects: p, images: pictures.length, ids };
 }
 
-// Deletes every discussion, project, passage and image, in one transaction; the settings stay.
-export async function clearAll() {
+/*
+    Deletes every discussion, project, passage and image and puts the settings of reset, in one transaction; the other
+    settings stay.
+*/
+export async function clearAll(reset) {
   await open();
   const names = ['conversations', 'projects', 'chunks', 'images'];
-  const tx = db.transaction(names, 'readwrite');
+  const tx = db.transaction(names.concat(['settings']), 'readwrite');
   for (const name of names) tx.objectStore(name).clear();
+  for (const key of Object.keys(reset || {})) tx.objectStore('settings').put({ key, value: reset[key] });
   await completed(tx);
 }
