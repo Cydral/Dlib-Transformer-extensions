@@ -14,7 +14,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <type_traits>
+#include <vector>
+
+// The partial sums of the split attention rely on the order of the legacy default stream (partial_store).
+#if defined(CUDA_API_PER_THREAD_DEFAULT_STREAM)
+#error "cuda_gguf.cu requires the legacy default stream: build it without --default-stream per-thread"
+#endif
 
 namespace dlib
 {
@@ -23,11 +30,22 @@ namespace dlib
         namespace
         {
             // The rows a block of gguf_matvec_kernel computes, one warp each.
-            const int warps_per_block = 4;
+            const int warps_per_block = 8;
 
             // The rows of src a launch of gguf_matvec_kernel reads at most: the weights of a row
             // are decoded once for all of them.
             const int max_matvec_rows = 8;
+
+            // The groups of 32 columns of src a block copies to its shared memory at a time, one
+            // for each lane of a warp.
+            const int matvec_chunk = 32;
+
+            /*
+                The floats of a group of 32 columns in the shared memory of gguf_matvec_kernel: 4
+                floats after its values, so that the eight lanes of a quarter of a warp, which read
+                16 bytes each at the same place of eight neighbouring groups, use the 32 banks once.
+            */
+            const int matvec_stride = 36;
 
             __device__ __forceinline__ float warp_sum(float s)
             {
@@ -38,12 +56,15 @@ namespace dlib
             /*
                 y[t * rows + r] = sum over i of W[r][i] * x[t * cols + i], for t < n <= N and r < rows.
 
-                A warp computes a row: lane l decodes the groups l, l + 32, l + 64... of the row,
-                takes their products with the n rows of x, and the warp adds the sums of its lanes.
-                The lanes of a warp decode neighbouring groups, so that the warp reads a run of
-                contiguous blocks; every value of x a lane reads is read by the lanes of the other
-                rows of the launch too, from the caches.  When x starts on 16 bytes, which its rows
-                then do too since cols is a multiple of 32, a lane reads its values four at a time.
+                A warp computes a row, and the warps of a block neighbouring rows.  The block copies
+                the columns of the n rows of x to its shared memory by chunks of 32 groups of 32
+                columns, with loads of 16 bytes when x starts on 16 bytes, which its rows then do
+                too since cols is a multiple of 32.  Lane l of a warp decodes the group l of each
+                chunk of its row once and takes its products with the n rows of x from the shared
+                memory; the lanes of a warp decode neighbouring groups, so that the warp reads a run
+                of contiguous blocks, and the warp adds the sums of its lanes.  A lane adds the
+                products of a group in the same order for every token and every n, so that a token
+                gets the same result in any launch.
             */
             template <int TYPE, int N>
             __global__ void __launch_bounds__(32 * warps_per_block) gguf_matvec_kernel(
@@ -57,46 +78,72 @@ namespace dlib
                 float* __restrict__ y
             )
             {
-                const int row = blockIdx.x * warps_per_block + threadIdx.y;
-                // A warp leaves as a whole: its row is past the matrix for all its lanes.
-                if (row >= rows) return;
+                __shared__ __align__(16) float xs[N * matvec_chunk * matvec_stride];
                 const int lane = threadIdx.x;
-                const uint8_t* wr = w + static_cast<size_t>(row) * row_bytes;
+                const int thread = threadIdx.y * 32 + lane;
+                const int row = blockIdx.x * warps_per_block + threadIdx.y;
+                // A warp past the matrix copies its share of x and computes nothing.
+                const bool computes = row < rows;
+                const uint8_t* wr = w + static_cast<size_t>(computes ? row : 0) * row_bytes;
                 const int groups = cols / 32;
                 float acc[N];
 #pragma unroll
                 for (int t = 0; t < N; ++t) acc[t] = 0;
-                for (int g = lane; g < groups; g += 32)
+                for (int first = 0; first < groups; first += matvec_chunk)
                 {
-                    float v[32];
-                    gguf_blocks::decode_group<TYPE>(wr, g, v);
-                    const float* xg = x + static_cast<size_t>(g) * 32;
-#pragma unroll
-                    for (int t = 0; t < N; ++t)
+                    const int count = groups - first < matvec_chunk ? groups - first : matvec_chunk;
+                    const float* xc = x + static_cast<size_t>(first) * 32;
+                    // The warps have read the previous chunk.
+                    __syncthreads();
+                    if (aligned)
                     {
-                        if (t < n)
+                        const int quads = count * 8;
+                        for (int i = thread; i < n * quads; i += 32 * warps_per_block)
                         {
-                            const float* xt = xg + static_cast<size_t>(t) * cols;
-                            float s = 0;
-                            if (aligned)
+                            const int t = i / quads;
+                            const int q = i - t * quads;
+                            const float4 a = reinterpret_cast<const float4*>(xc + static_cast<size_t>(t) * cols)[q];
+                            *reinterpret_cast<float4*>(xs + (t * matvec_chunk + (q >> 3)) * matvec_stride
+                                + (q & 7) * 4) = a;
+                        }
+                    }
+                    else
+                    {
+                        const int values = count * 32;
+                        for (int i = thread; i < n * values; i += 32 * warps_per_block)
+                        {
+                            const int t = i / values;
+                            const int j = i - t * values;
+                            xs[(t * matvec_chunk + (j >> 5)) * matvec_stride + (j & 31)]
+                                = xc[static_cast<size_t>(t) * cols + j];
+                        }
+                    }
+                    __syncthreads();
+                    if (computes && lane < count)
+                    {
+                        float v[32];
+                        gguf_blocks::decode_group<TYPE>(wr, first + lane, v);
+#pragma unroll
+                        for (int t = 0; t < N; ++t)
+                        {
+                            if (t < n)
                             {
-                                const float4* x4 = reinterpret_cast<const float4*>(xt);
+                                const float4* x4 = reinterpret_cast<const float4*>(xs + (t * matvec_chunk + lane)
+                                    * matvec_stride);
+                                float s = 0;
 #pragma unroll
                                 for (int i = 0; i < 8; ++i)
                                 {
                                     const float4 a = x4[i];
                                     s += v[4 * i] * a.x + v[4 * i + 1] * a.y + v[4 * i + 2] * a.z + v[4 * i + 3] * a.w;
                                 }
+                                acc[t] += s;
                             }
-                            else
-                            {
-#pragma unroll
-                                for (int i = 0; i < 32; ++i) s += v[i] * xt[i];
-                            }
-                            acc[t] += s;
                         }
                     }
                 }
+                // A warp past the matrix leaves once the last barrier is behind it.
+                if (!computes) return;
 #pragma unroll
                 for (int t = 0; t < N; ++t)
                 {
@@ -626,14 +673,35 @@ namespace dlib
             }
 
             /*
-                The partial sums of the split attention: a buffer of the device kept from one call
-                to the next on each thread, which grows by half at least, so that the steps of a
-                generation neither allocate nor free memory of the device, whose release would
-                wait for the device.
+                The partial sums of the split attention: one buffer per card for the process, kept
+                from one call to the next and grown by half at least, so that the steps of a
+                generation neither allocate nor free memory of the device, whose release waits for
+                the device.  The buffers are never released, the driver taking their memory back
+                with the process: the storage of a thread is released on Windows under the lock of
+                the loader, where the calls of CUDA fail.  A caller holds the lock from the launch
+                of the attention to the launch of the merge, both on the default stream, so that
+                the kernels of another thread run before or after them.
             */
-            float* partial_sums(size_t bytes)
+            struct partial_store
             {
-                static thread_local cuda_data_void_ptr held;
+                std::mutex m;
+                std::vector<cuda_data_void_ptr> buffers;
+            };
+
+            partial_store& partial_buffers()
+            {
+                static partial_store* store = new partial_store();
+                return *store;
+            }
+
+            float* partial_sums(const std::unique_lock<std::mutex>& lock, size_t bytes)
+            {
+                DLIB_CASSERT(lock.owns_lock() && lock.mutex() == &partial_buffers().m);
+                int device = 0;
+                CHECK_CUDA(cudaGetDevice(&device));
+                std::vector<cuda_data_void_ptr>& buffers = partial_buffers().buffers;
+                if (buffers.size() <= static_cast<size_t>(device)) buffers.resize(static_cast<size_t>(device) + 1);
+                cuda_data_void_ptr& held = buffers[static_cast<size_t>(device)];
                 if (held.size() < bytes) held = cuda_data_void_ptr(std::max(bytes, held.size() + held.size() / 2));
                 return static_cast<float*>(held.data());
             }
@@ -877,8 +945,14 @@ namespace dlib
             const long target = 4L * multiprocessors();
             long parts = units >= target ? 1 : (target + units - 1) / units;
             parts = std::max(1L, std::min(parts, (span + 127) / 128));
-            float* partial = parts > 1 ? partial_sums(sizeof(float) * n * static_cast<size_t>(q_heads)
-                * static_cast<size_t>(parts) * static_cast<size_t>(hd + 2)) : nullptr;
+            std::unique_lock<std::mutex> lock;
+            float* partial = nullptr;
+            if (parts > 1)
+            {
+                lock = std::unique_lock<std::mutex>(partial_buffers().m);
+                partial = partial_sums(lock, sizeof(float) * n * static_cast<size_t>(q_heads)
+                    * static_cast<size_t>(parts) * static_cast<size_t>(hd + 2));
+            }
             const dim3 blocks(static_cast<unsigned>(parts), static_cast<unsigned>(layout.heads * groups),
                 static_cast<unsigned>(n));
             const uint8_t* p = reinterpret_cast<const uint8_t*>(pages.device());

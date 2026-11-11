@@ -112,7 +112,11 @@ namespace albireo
                   (Ministral 3, Mistral Small 3, Magistral): [SYSTEM_PROMPT], [INST],
                   [AVAILABLE_TOOLS], [TOOL_CALLS]name[ARGS]{...} (name[CALL_ID]id[ARGS]{...}
                   when the model gives the call an identifier), [TOOL_RESULTS] and [THINK] for
-                  reasoning.
+                  reasoning.  The tools come after the system prompt, or before the last
+                  question, as mistral-common writes them for version 11 of the tokenizer, when
+                  the template writes them in its loop over the messages, as that of Mistral
+                  Small 3.2 does; the calls and the results carry identifiers of 9 letters or
+                  digits when the template writes [CALL_ID] and [TOOL_CONTENT].
                 - llama3: Llama 3.x, with JSON tool calls: an answer that is a JSON object, or
                   a list of them, naming tools of the request; any other answer, JSON or not,
                   is the text of the answer.

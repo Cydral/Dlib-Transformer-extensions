@@ -1580,9 +1580,21 @@ namespace albireo
                         if (unloaded) log_info("models: " + id + " unloaded");
                         continue;
                     }
+                    /*
+                        The engine closed the files of the model; another program may still read
+                        them a moment (a scan), and Windows deletes no open file, so the deletion
+                        is tried again for 10 seconds.
+                    */
                     std::string error;
-                    std::lock_guard<std::mutex> server(server_m_);
-                    if (models_ && !models_->remove(id, error)) log_warning("models: " + error);
+                    bool removed = false;
+                    for (int attempt = 0; attempt < 20 && !removed && !stopping_; ++attempt)
+                    {
+                        if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        std::lock_guard<std::mutex> server(server_m_);
+                        installed_model left;
+                        removed = !models_ || !db_->find_model(id, left) || models_->remove(id, error);
+                    }
+                    if (!removed && !error.empty()) log_warning("models: " + error);
                 }
                 /*
                     A model that left to load again with its files: the activations that wait for

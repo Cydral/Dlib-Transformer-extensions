@@ -1880,9 +1880,13 @@ namespace albireo
             error = "cannot delete " + m.file + " (in use?)";
             return false;
         }
-        // The projector goes with its decoder.
+        // The projector goes with its decoder; the model stays listed until both left, so that a new
+        // deletion takes the projector again.
         if (!m.projector.empty() && file_exists(m.projector) && !remove_file(m.projector))
-            log_warning("models: the projector " + m.projector + " of " + id + " cannot be deleted");
+        {
+            error = "cannot delete the projector " + m.projector + " (in use?)";
+            return false;
+        }
         db_.remove_model(id);
         log_info("models: " + id + " removed");
         return true;

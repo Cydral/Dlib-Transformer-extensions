@@ -302,11 +302,28 @@ namespace dlib
         );
 
         void add_cv_to_all_columns(
-            float beta, 
-            tensor& dest, 
-            float alpha, 
+            float beta,
+            tensor& dest,
+            float alpha,
             const tensor& src
         );
+
+        void add_to_all_samples(
+            float beta,
+            tensor& dest,
+            float alpha,
+            const tensor& src
+        );
+        /*!
+            requires
+                - src.num_samples() == 1
+                - src.k() == dest.k() && src.nr() == dest.nr() && src.nc() == dest.nc()
+            ensures
+                - performs: dest = beta*dest + alpha*src, src added to each sample of dest, as
+                  the biases of a layer are.  With beta == 0, dest becomes alpha*src whatever
+                  it held.  The kernel is one of dlib, so that cuDNN need not load the
+                  libraries of its engines for this broadcast.
+        !*/
 
     // -----------------------------------------------------------------------------------
 

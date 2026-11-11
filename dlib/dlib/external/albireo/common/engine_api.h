@@ -165,8 +165,10 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
    "top_k" is limited to 1024, and the keys of "logit_bias" must be token identifiers of the
    vocabulary.  The sampling settings a request leaves out take the values the authors of the
    family of the model advise.  The engine ends a reasoning after "reasoning_budget" tokens
-   (-1 without limit) with a sentence that asks for the answer; without that member, the
-   effort "low" gives the reasoning 512 tokens, 256 with "priority":"background".  A model
+   (-1 or null without limit) with a sentence that asks for the answer; without that member,
+   the reasoning takes half of "max_tokens" at most (half of the room the context leaves to
+   the answer without it), 32768 tokens at most, the effort "high" setting no limit and the
+   effort "low" giving it 512 tokens, 256 with "priority":"background".  A model
    whose template opens the reasoning of every answer ("reasoning_always" in the "models"
    query) reasons whatever the request asks, with that short reasoning when the request asks
    for none; its answer then receives the "max_tokens" of the request once the reasoning

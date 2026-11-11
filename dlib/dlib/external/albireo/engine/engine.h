@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -154,6 +155,13 @@ namespace albireo
         std::condition_variable wake_;
         std::condition_variable unloaded_;
         std::map<std::string, std::shared_ptr<loaded_model>> models_;
+        /*
+            The unloads of each model the scheduler completed, the model destroyed and its files
+            closed: unload_model() returns once this count grows.
+        */
+        std::map<std::string, uint64_t> left_;
+        // The models the scheduler took out of models_ and destroys, until left_ counts them.
+        std::set<std::string> leaving_;
         std::map<uint64_t, std::shared_ptr<request_state>> requests_;
         std::map<uint64_t, std::shared_ptr<embedding_job>> jobs_;
         uint64_t next_id_ = 1;

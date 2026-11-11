@@ -479,11 +479,20 @@ int main(int argc, char** argv)
             "the effort low of the work in the background reasons for 256 tokens: "
             + std::to_string(low.reasoning.size()));
 
-        // A reasoning asked for has no budget by default, even for the work in the background.
+        /*
+            A reasoning asked for without a budget takes half of max_tokens at most, even for the work
+            in the background, and the answer the rest; a budget given as null sets no bound.
+        */
         collector deep;
         const json h = ask("t", ",\"reasoning\":true,\"priority\":\"background\",\"max_tokens\":300", deep);
-        expect(deep.reasoning == std::string(300, 'a') && deep.content.empty()
-            && h["finish_reason"].as_string() == "length", "a reasoning asked for has no budget by default");
+        expect(deep.reasoning == std::string(150, 'a')
+            && trimmed(deep.content) == std::string(static_cast<size_t>(150 - closing), 'a')
+            && h["finish_reason"].as_string() == "length", "a reasoning asked for takes half of max_tokens by default: "
+            + std::to_string(deep.reasoning.size()) + " " + std::to_string(deep.content.size()));
+        collector endless;
+        const json h2 = ask("t", ",\"reasoning\":true,\"reasoning_budget\":null,\"max_tokens\":300", endless);
+        expect(endless.reasoning == std::string(300, 'a') && endless.content.empty()
+            && h2["finish_reason"].as_string() == "length", "a reasoning with a budget given as null has no bound");
 
         // The repetitions of the reasoning and those of the answer are counted apart.
         collector parts;
@@ -553,6 +562,8 @@ int main(int argc, char** argv)
         expect(lib.unload_model(e, "u") == ALBIREO_OK, "the model without drafts unloads");
 
         expect(lib.unload_model(e, "t") == ALBIREO_OK, "the model that always reasons unloads");
+        // The files of a model close before its unloading returns, since Windows deletes no file a process holds open.
+        expect(std::remove(thinking_path.c_str()) == 0, "the file of a model unloaded is deleted at once");
         std::printf("  the answers that loop stopped, the reasoning of a model that always reasons bounded\n");
         std::printf("  drafts: %lld of %lld tokens kept, the answers those of the model without them\n", kept, drafted);
     }

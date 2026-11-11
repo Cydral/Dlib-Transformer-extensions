@@ -75,6 +75,7 @@ const texts = {
     storageHint: 'The browser may delete these data when the disk runs short of space. Export them regularly with ' +
       'the button below.',
     readingContext: 'Reading the context… {p}%', copy: 'Copy', copied: 'Copied',
+    contextLabel: 'Context', contextUse: 'Context of the model: {n} tokens of {total} ({p}%)',
     readAloud: 'Read aloud', stopReading: 'Stop reading',
     readAloudFailed: 'The answer cannot be read aloud: {reason}', regenerate: 'Regenerate',
     edit: 'Edit', delete: 'Delete', save: 'Save', cancel: 'Cancel', rename: 'Rename', pin: 'Pin', unpin: 'Unpin',
@@ -364,6 +365,7 @@ const texts = {
     storageHint: 'Le navigateur peut effacer ces données quand le disque manque de place. Exportez-les ' +
       'régulièrement avec le bouton ci-dessous.',
     readingContext: 'Lecture du contexte… {p} %', copy: 'Copier', copied: 'Copié',
+    contextLabel: 'Contexte', contextUse: 'Contexte du modèle : {n} jetons sur {total} ({p} %)',
     readAloud: 'Lire à voix haute', stopReading: 'Arrêter la lecture',
     readAloudFailed: 'La réponse ne peut pas être lue à voix haute : {reason}', regenerate: 'Régénérer',
     edit: 'Modifier', delete: 'Supprimer', save: 'Enregistrer', cancel: 'Annuler', rename: 'Renommer', pin: 'Épingler',
@@ -663,6 +665,7 @@ const texts = {
     storageHint: 'Der Browser kann diese Daten löschen, wenn der Speicherplatz knapp wird. Exportieren Sie sie ' +
       'regelmäßig mit der Schaltfläche unten.',
     readingContext: 'Kontext wird gelesen… {p} %', copy: 'Kopieren', copied: 'Kopiert',
+    contextLabel: 'Kontext', contextUse: 'Kontext des Modells: {n} von {total} Tokens ({p} %)',
     readAloud: 'Vorlesen', stopReading: 'Vorlesen beenden',
     readAloudFailed: 'Die Antwort kann nicht vorgelesen werden: {reason}', regenerate: 'Neu erzeugen',
     edit: 'Bearbeiten', delete: 'Löschen', save: 'Speichern', cancel: 'Abbrechen', rename: 'Umbenennen', pin: 'Anheften',
@@ -953,6 +956,7 @@ const texts = {
     storageHint: 'Il browser può cancellare questi dati quando il disco ha poco spazio. Esportali regolarmente con ' +
       'il pulsante qui sotto.',
     readingContext: 'Lettura del contesto… {p}%', copy: 'Copia', copied: 'Copiato',
+    contextLabel: 'Contesto', contextUse: 'Contesto del modello: {n} token su {total} ({p}%)',
     readAloud: 'Leggi ad alta voce', stopReading: 'Interrompi la lettura',
     readAloudFailed: 'La risposta non può essere letta ad alta voce: {reason}', regenerate: 'Rigenera',
     edit: 'Modifica', delete: 'Elimina', save: 'Salva', cancel: 'Annulla', rename: 'Rinomina', pin: 'Fissa', unpin: 'Sblocca',
@@ -1243,6 +1247,7 @@ const texts = {
     storageHint: 'El navegador puede borrar estos datos cuando falte espacio en el disco. Expórtelos con regularidad ' +
       'con el botón de abajo.',
     readingContext: 'Leyendo el contexto… {p} %', copy: 'Copiar', copied: 'Copiado',
+    contextLabel: 'Contexto', contextUse: 'Contexto del modelo: {n} tokens de {total} ({p} %)',
     readAloud: 'Leer en voz alta', stopReading: 'Detener la lectura',
     readAloudFailed: 'La respuesta no se puede leer en voz alta: {reason}', regenerate: 'Regenerar',
     edit: 'Editar', delete: 'Eliminar', save: 'Guardar', cancel: 'Cancelar', rename: 'Renombrar', pin: 'Fijar', unpin: 'Desfijar',

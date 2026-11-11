@@ -1050,6 +1050,52 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void _cuda_add_to_all_samples(
+            float beta, float* dest, float alpha, const float* src, size_t samples, size_t sample
+        )
+        {
+            for (auto n : grid_stride_range_y(0, samples))
+            {
+                float* d = dest + n*sample;
+                for (auto i : grid_stride_range(0, sample))
+                    d[i] = beta*d[i] + alpha*src[i];
+            }
+        }
+
+        __global__ void _cuda_add_to_all_samples_no_beta(
+            float* dest, float alpha, const float* src, size_t samples, size_t sample
+        )
+        {
+            for (auto n : grid_stride_range_y(0, samples))
+            {
+                float* d = dest + n*sample;
+                for (auto i : grid_stride_range(0, sample))
+                    d[i] = alpha*src[i];
+            }
+        }
+
+        void add_to_all_samples(
+            float beta,
+            tensor& dest,
+            float alpha,
+            const tensor& src
+        )
+        {
+            DLIB_CASSERT(src.num_samples() == 1 && src.k() == dest.k() && src.nr() == dest.nr()
+                && src.nc() == dest.nc());
+            if (dest.size() == 0)
+                return;
+            const size_t samples = dest.num_samples();
+            if (beta == 0)
+                launch_kernel(_cuda_add_to_all_samples_no_beta, max_jobs(src.size(), samples), dest.device(), alpha,
+                    src.device(), samples, src.size());
+            else
+                launch_kernel(_cuda_add_to_all_samples, max_jobs(src.size(), samples), beta, dest.device(), alpha,
+                    src.device(), samples, src.size());
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __global__ void _cuda_affine_transform5(
             float* d, const float* s1, const float* s2, const float* s3, size_t n, float A, float B, float C, float D
         )

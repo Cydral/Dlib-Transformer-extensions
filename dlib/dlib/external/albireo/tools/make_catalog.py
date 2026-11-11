@@ -516,6 +516,43 @@ MODELS = [
         },
     },
     {
+        "id": "mistral-small-3.2-24b",
+        "name": "Mistral Small 3.2 24B",
+        "publisher": "Mistral AI",
+        "hub": ("unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF", "Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf"),
+        "projector": ("unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF", "mmproj-F16.gguf", "F16"),
+        "quantization": "Q4_K_M",
+        "roles": ["general"],
+        "inputs": ["text", "image"],
+        "tools": True,
+        "reasoning": False,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "General assistant from Mistral AI with 24 billion parameters, trained on many languages, which "
+                  "follows instructions closely and falls into repetitions less often than Mistral Small 3.1, with a "
+                  "context of 128K tokens. It reads images and documents, uses tools and answers directly, without a "
+                  "reasoning phase, for computers with 32 GB of memory or a graphics processor of 16 GB.",
+            "fr": "Assistant généraliste de Mistral AI de 24 milliards de paramètres, entraîné sur de nombreuses "
+                  "langues, qui suit les consignes avec précision et tombe moins souvent dans les répétitions que "
+                  "Mistral Small 3.1, avec un contexte de 128K jetons. Il lit les images et les documents, utilise des "
+                  "outils et répond directement, sans phase de raisonnement, pour les ordinateurs dotés de 32 Go de "
+                  "mémoire ou d'un processeur graphique de 16 Go.",
+            "de": "Allgemeiner Assistent von Mistral AI mit 24 Milliarden Parametern, auf vielen Sprachen trainiert, "
+                  "der Anweisungen genau befolgt und seltener in Wiederholungen verfällt als Mistral Small 3.1, mit "
+                  "einem Kontext von 128K Token. Er liest Bilder und Dokumente, nutzt Werkzeuge und antwortet direkt, "
+                  "ohne Denkphase, für Computer mit 32 GB Arbeitsspeicher oder einem Grafikprozessor mit 16 GB.",
+            "it": "Assistente generale di Mistral AI da 24 miliardi di parametri, addestrato su molte lingue, che "
+                  "segue le istruzioni con precisione e cade nelle ripetizioni meno spesso di Mistral Small 3.1, con "
+                  "un contesto di 128K token. Legge le immagini e i documenti, usa strumenti e risponde direttamente, "
+                  "senza fase di ragionamento, per computer con 32 GB di memoria o un processore grafico da 16 GB.",
+            "es": "Asistente general de Mistral AI de 24.000 millones de parámetros, entrenado en muchas lenguas, que "
+                  "sigue las instrucciones con precisión y cae en repeticiones con menos frecuencia que Mistral Small "
+                  "3.1, con un contexto de 128K tokens. Lee imágenes y documentos, usa herramientas y responde "
+                  "directamente, sin fase de razonamiento, para ordenadores con 32 GB de memoria o un procesador "
+                  "gráfico de 16 GB.",
+        },
+    },
+    {
         "id": "qwen2.5-coder-1.5b",
         "name": "Qwen2.5 Coder 1.5B",
         "publisher": "Alibaba",

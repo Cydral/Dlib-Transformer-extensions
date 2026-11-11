@@ -411,8 +411,12 @@ namespace albireo
                         break;
                     }
             if (body["think"].is_bool()) out["reasoning"] = body["think"];
-            // The work in the background of the web application, whose answers leave the prompts their whole pass.
-            if (requested == "albireo-background") out["priority"] = "background";
+            /*
+                The work in the background of the web application, whose answers leave the prompts
+                their whole pass: the model albireo-background, or a request that asks for it.
+            */
+            if (requested == "albireo-background" || body["priority"].as_string() == "background")
+                out["priority"] = "background";
             return true;
         }
 

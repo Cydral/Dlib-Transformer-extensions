@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-11-06T07:21:41Z",
+  "updated": "2026-11-10T21:39:07Z",
   "models": [
     {
       "id": "qwen3-vl-4b-thinking",
@@ -674,6 +674,54 @@
             "url": "https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Thinking-GGUF/resolve/681477a4711f4bcefa0233abeb16a02abc74c14a/mmproj-Qwen3VL-30B-A3B-Thinking-Q8_0.gguf",
             "size": 712149024,
             "sha256": "7deaa9cef53579eaf2d49f101de3550ad90f41061128e087b8b8cde4a65d0735"
+          }
+        ]
+      }
+    },
+    {
+      "id": "mistral-small-3.2-24b",
+      "name": "Mistral Small 3.2 24B",
+      "publisher": "Mistral AI",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general"
+      ],
+      "inputs": [
+        "text",
+        "image"
+      ],
+      "tools": true,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "General assistant from Mistral AI with 24 billion parameters, trained on many languages, which follows instructions closely and falls into repetitions less often than Mistral Small 3.1, with a context of 128K tokens. It reads images and documents, uses tools and answers directly, without a reasoning phase, for computers with 32 GB of memory or a graphics processor of 16 GB.",
+        "fr": "Assistant généraliste de Mistral AI de 24 milliards de paramètres, entraîné sur de nombreuses langues, qui suit les consignes avec précision et tombe moins souvent dans les répétitions que Mistral Small 3.1, avec un contexte de 128K jetons. Il lit les images et les documents, utilise des outils et répond directement, sans phase de raisonnement, pour les ordinateurs dotés de 32 Go de mémoire ou d'un processeur graphique de 16 Go.",
+        "de": "Allgemeiner Assistent von Mistral AI mit 24 Milliarden Parametern, auf vielen Sprachen trainiert, der Anweisungen genau befolgt und seltener in Wiederholungen verfällt als Mistral Small 3.1, mit einem Kontext von 128K Token. Er liest Bilder und Dokumente, nutzt Werkzeuge und antwortet direkt, ohne Denkphase, für Computer mit 32 GB Arbeitsspeicher oder einem Grafikprozessor mit 16 GB.",
+        "it": "Assistente generale di Mistral AI da 24 miliardi di parametri, addestrato su molte lingue, che segue le istruzioni con precisione e cade nelle ripetizioni meno spesso di Mistral Small 3.1, con un contesto di 128K token. Legge le immagini e i documenti, usa strumenti e risponde direttamente, senza fase di ragionamento, per computer con 32 GB di memoria o un processore grafico da 16 GB.",
+        "es": "Asistente general de Mistral AI de 24.000 millones de parámetros, entrenado en muchas lenguas, que sigue las instrucciones con precisión y cae en repeticiones con menos frecuencia que Mistral Small 3.1, con un contexto de 128K tokens. Lee imágenes y documentos, usa herramientas y responde directamente, sin fase de razonamiento, para ordenadores con 32 GB de memoria o un procesador gráfico de 16 GB."
+      },
+      "arch": "llama",
+      "parameters": 23572403200,
+      "context": 131072,
+      "source": "https://huggingface.co/unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+      "size": 14333922848,
+      "sha256": "a3cc56310807ed0d145eaf9f018ccda9ae7ad8edb41ec870aa2454b0d4700b3c",
+      "files": [
+        {
+          "url": "https://huggingface.co/unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF/resolve/b750ec2299225e492f1bd27cab88a0a595fa848f/Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
+          "size": 14333922848,
+          "sha256": "a3cc56310807ed0d145eaf9f018ccda9ae7ad8edb41ec870aa2454b0d4700b3c"
+        }
+      ],
+      "projector": {
+        "quantization": "F16",
+        "size": 878053568,
+        "sha256": "d6af684ae9136398eaa0b59ea9e0b0b850bb6ac5084f1e8c5cb8f85251825eaf",
+        "files": [
+          {
+            "url": "https://huggingface.co/unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF/resolve/b750ec2299225e492f1bd27cab88a0a595fa848f/mmproj-F16.gguf",
+            "size": 878053568,
+            "sha256": "d6af684ae9136398eaa0b59ea9e0b0b850bb6ac5084f1e8c5cb8f85251825eaf"
           }
         ]
       }

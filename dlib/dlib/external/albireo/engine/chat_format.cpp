@@ -7,10 +7,16 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
+#include <iterator>
 #include <random>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 namespace albireo
 {
@@ -156,17 +162,15 @@ namespace albireo
         }
 
         /*
-            Parses the JSON of a tool call as a model writes it.  The models write the code
-            and the texts they pass to a tool with raw line breaks and tabs in its strings,
-            which the grammar forbids.  When the text does not parse as it is, these characters
-            are escaped and the result parsed again, and repaired receives it.
+            The text of a JSON value with the raw control characters of its strings escaped, as the
+            models write the code and the texts they pass to a tool with raw line breaks and tabs,
+            which the grammar forbids; each quote that no backslash escapes ends its string.  False
+            when the text holds no such character.
         */
-        bool parse_call_json(const std::string& text, json& out, std::string& repaired)
+        bool escape_controls(const std::string& text, std::string& fixed)
         {
-            repaired.clear();
-            if (json::parse(text, out)) return true;
             static const char hex[] = "0123456789abcdef";
-            std::string fixed;
+            fixed.clear();
             fixed.reserve(text.size() + 16);
             bool in_string = false, changed = false;
             for (size_t i = 0; i < text.size(); ++i)
@@ -205,7 +209,527 @@ namespace albireo
                 }
                 fixed += c;
             }
-            if (!changed || !json::parse(fixed, out)) return false;
+            return changed;
+        }
+
+        // The definitions of the tools of a request, as the repair of their calls reads them.
+        struct tool_schema
+        {
+            // Whether name is a parameter of the tool, of any tool when the tool is empty.
+            std::function<bool(const std::string& tool, const std::string& name)> parameter;
+            // Whether names hold every parameter the tool requires.
+            std::function<bool(const std::string& tool, const std::vector<std::string>& names)> complete;
+        };
+
+        /*
+            The repair of the JSON of tool calls that a model writes with the quotes of the code
+            it passes left unescaped, raw control characters in its strings, or backslashes that
+            begin no escape of the grammar.  A quote in a string either ends it or stays in it,
+            in that order, and a reading that completes the text is kept, its quotes, control
+            characters and backslashes escaped, when no other reading completes it with as many
+            values or more; a reading whose strings take in whole calls does not count.  The arguments
+            of a call, the value of its "arguments" or "parameters" member or the whole text when
+            it holds the arguments of one tool, are an object whose members are parameters of the
+            tool the call names, each once, with every parameter the tool requires, so that the
+            dictionaries of the code do not pass for members; a call has the members name, id,
+            type, function, arguments and parameters alone, each once, name alone after the
+            arguments, and its name holds letters, digits, '_', '-', '.' and ':' alone.  The
+            closing braces and brackets a model writes after a value of the text are left aside.
+            The search keeps the digests of the readings that failed, so that it reads each of
+            them once, and gives up after a bounded number of steps; the reading found is kept
+            when the search for another one gives up.
+        */
+        class stray_quotes
+        {
+        public:
+            /*
+                text: the JSON as the model wrote it; schema: the tools of the request, any name
+                and any set of arguments when its functions are empty; tool: the tool whose
+                arguments the text holds alone, empty when it holds calls; several: whether the
+                text holds several objects in a row.
+            */
+            stray_quotes(const std::string& text, tool_schema schema, std::string tool, bool several)
+                : t_(text), schema_(std::move(schema)), tool_(std::move(tool)), several_(several),
+                marks_(text.size(), none)
+            {
+            }
+
+            // The repaired text; false when no reading, or more than one, completes it.
+            bool repair(std::string& out)
+            {
+                mode at = mode::value;
+                size_t i = skip(0), start = 0, end = 0;
+                if (search(i, start, at, end) != outcome::complete) return false;
+                write(end, out);
+                /*
+                    The readings after the quotes of this reading complete the text: another path that
+                    reaches one of them with as many values before it, or the end with as many values, is
+                    another reading.
+                */
+                for (const choice& c : choices_) succeeded_[c.reading] = c.values;
+                found_ = values_;
+                again_ = true;
+                if (!backtrack(i, start, at)) return true;
+                return search(i, start, at, end) != outcome::complete;
+            }
+
+        private:
+            enum class mode { value, string, after };
+            enum class outcome { complete, none, spent };
+            enum : char { none = 0, quote = 1, control = 2, backslash = 3, dropped = 4 };
+            static const size_t max_steps = 1000000;
+            static const size_t max_depth = 32;
+            /*
+                The quotes that ended a string on the reading being tried, the members of an object of
+                arguments and the characters of their names, and the characters of the other names, at
+                most, so that the memory of the search stays bounded.
+            */
+            static const size_t max_choices = 1024;
+            static const size_t max_arguments = 64;
+            static const size_t max_name = 64;
+            static const size_t max_other_name = 256;
+
+            // An object or a list being read.
+            struct frame
+            {
+                char type = '{';
+                // An object of arguments, whose names are parameters of tool, and a value within one.
+                bool arguments = false;
+                bool inside = false;
+                std::string tool;
+                // The name of the member whose value is read, and the value of the "name" member of a call.
+                std::string key;
+                std::string name;
+                // The names of the members of an object of arguments or of a call.
+                std::vector<std::string> names;
+            };
+
+            // A quote that ended a string, and the reading as it was before, with its values begun.
+            struct choice
+            {
+                size_t position;
+                size_t start;
+                std::vector<frame> frames;
+                size_t marked;
+                uint64_t reading;
+                size_t values;
+            };
+
+            // Reads from i until a reading completes the text, end receiving its end.
+            outcome search(size_t& i, size_t& start, mode& at, size_t& end)
+            {
+                for (;;)
+                {
+                    if (++steps_ > max_steps) return outcome::spent;
+                    bool ok = false, done = false;
+                    if (at == mode::value) ok = read_value(i, at, start);
+                    else if (at == mode::string) ok = read_string(i, at, start);
+                    else ok = read_after(i, at, done);
+                    if (done && (!again_ || values_ >= found_))
+                    {
+                        end = i;
+                        return outcome::complete;
+                    }
+                    if (other_) return outcome::complete;
+                    if (ok && !done) continue;
+                    if (steps_ >= max_steps) return outcome::spent;
+                    if (!backtrack(i, start, at)) return outcome::none;
+                }
+            }
+
+            // The last quote that ended a string stays in it; false when no quote is left.
+            bool backtrack(size_t& i, size_t& start, mode& at)
+            {
+                if (choices_.empty()) return false;
+                choice c = std::move(choices_.back());
+                choices_.pop_back();
+                if (succeeded_.count(c.reading) == 0) failed_.insert(c.reading);
+                frames_ = std::move(c.frames);
+                values_ = c.values;
+                while (marked_.size() > c.marked)
+                {
+                    marks_[marked_.back()] = none;
+                    marked_.pop_back();
+                }
+                mark(c.position, quote);
+                i = c.position + 1;
+                start = c.start;
+                at = mode::string;
+                return true;
+            }
+
+            // The text up to end with the marks of the reading.
+            void write(size_t end, std::string& out) const
+            {
+                static const char hex[] = "0123456789abcdef";
+                out.clear();
+                out.reserve(end + 64);
+                for (size_t k = 0; k < end && k < t_.size(); ++k)
+                {
+                    const char c = t_[k];
+                    const char m = marks_[k];
+                    if (m == dropped) continue;
+                    if (m == quote || m == backslash) out += '\\';
+                    if (m != control)
+                    {
+                        out += c;
+                        continue;
+                    }
+                    if (c == '\n') out += "\\n";
+                    else if (c == '\r') out += "\\r";
+                    else if (c == '\t') out += "\\t";
+                    else
+                    {
+                        out += "\\u00";
+                        out += hex[(c >> 4) & 15];
+                        out += hex[c & 15];
+                    }
+                }
+            }
+
+            size_t skip(size_t i) const
+            {
+                while (i < t_.size() && std::isspace(static_cast<unsigned char>(t_[i]))) ++i;
+                return i;
+            }
+
+            void mark(size_t i, char kind)
+            {
+                marks_[i] = kind;
+                marked_.push_back(i);
+            }
+
+            // The beginning of a value at i.
+            bool read_value(size_t& i, mode& at, size_t& start)
+            {
+                if (i >= t_.size()) return false;
+                const char c = t_[i];
+                if (!frames_.empty())
+                {
+                    const frame& parent = frames_.back();
+                    if (c != '{' && parent.type == '{' && !parent.arguments && !parent.inside
+                        && (parent.key == "arguments" || parent.key == "parameters"))
+                        return false;
+                }
+                if (c == '{' || c == '[')
+                {
+                    if (frames_.size() >= max_depth) return false;
+                    frame f;
+                    f.type = c;
+                    if (frames_.empty())
+                    {
+                        f.arguments = c == '{' && !tool_.empty();
+                        f.tool = tool_;
+                    }
+                    else
+                    {
+                        const frame& parent = frames_.back();
+                        f.inside = parent.arguments || parent.inside;
+                        f.arguments = c == '{' && !f.inside && parent.type == '{'
+                            && (parent.key == "arguments" || parent.key == "parameters");
+                        if (f.arguments) f.tool = parent.name;
+                    }
+                    frames_.push_back(f);
+                    const size_t p = skip(i + 1);
+                    if (p < t_.size() && t_[p] == (c == '{' ? '}' : ']'))
+                    {
+                        if (!complete(frames_.back())) return false;
+                        frames_.pop_back();
+                        i = p + 1;
+                        at = mode::after;
+                        return true;
+                    }
+                    if (c == '{') return member(p, i, at);
+                    i = p;
+                    return true;
+                }
+                if (c == '"')
+                {
+                    start = i;
+                    ++i;
+                    at = mode::string;
+                    return true;
+                }
+                // A number, true, false or null, up to the next delimiter.
+                size_t j = i;
+                while (j < t_.size() && t_[j] != ',' && t_[j] != '}' && t_[j] != ']'
+                    && !std::isspace(static_cast<unsigned char>(t_[j])))
+                    ++j;
+                json scalar;
+                if (j == i || !json::parse(t_.substr(i, j - i), scalar)) return false;
+                i = j;
+                at = mode::after;
+                return true;
+            }
+
+            // Whether an object of arguments holds every parameter its tool requires.
+            bool complete(const frame& f) const
+            {
+                return !f.arguments || !schema_.complete || schema_.complete(f.tool, f.names);
+            }
+
+            // A member of the object being read, from its name at p, up to the beginning of its value.
+            bool member(size_t p, size_t& i, mode& at)
+            {
+                if (p >= t_.size() || t_[p] != '"') return false;
+                size_t e = p + 1;
+                while (e < t_.size() && t_[e] != '"' && static_cast<unsigned char>(t_[e]) >= 0x20)
+                    e += t_[e] == '\\' ? 2 : 1;
+                if (e >= t_.size() || t_[e] != '"') return false;
+                const std::string name = t_.substr(p + 1, e - p - 1);
+                frame& f = frames_.back();
+                if (name.size() > max_other_name) return false;
+                if (!f.arguments && !f.inside)
+                {
+                    // The members of a call, each once, the name alone after the arguments.
+                    static const char* const call_keys[] = { "name", "id", "type", "function", "arguments",
+                        "parameters" };
+                    const auto known = std::find(std::begin(call_keys), std::end(call_keys), name);
+                    if (known == std::end(call_keys)) return false;
+                    if (std::find(f.names.begin(), f.names.end(), name) != f.names.end()) return false;
+                    for (const std::string& k : f.names)
+                        if ((k == "function" || k == "arguments" || k == "parameters") && name != "name") return false;
+                    f.names.push_back(name);
+                }
+                if (f.arguments)
+                {
+                    if (name.size() > max_name || f.names.size() >= max_arguments) return false;
+                    if (std::find(f.names.begin(), f.names.end(), name) != f.names.end()) return false;
+                    if (schema_.parameter && !schema_.parameter(f.tool, name)) return false;
+                    f.names.push_back(name);
+                }
+                const size_t colon = skip(e + 1);
+                if (colon >= t_.size() || t_[colon] != ':') return false;
+                f.key = name;
+                i = skip(colon + 1);
+                at = mode::value;
+                return true;
+            }
+
+            static bool is_hex(char c)
+            {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            }
+
+            // Whether the backslash at j begins an escape of the grammar.
+            bool escape_at(size_t j) const
+            {
+                if (j + 1 >= t_.size()) return false;
+                const char e = t_[j + 1];
+                if (e != '\0' && std::strchr("\"\\/bfnrt", e) != nullptr) return true;
+                if (e != 'u' || j + 5 >= t_.size()) return false;
+                for (size_t h = j + 2; h < j + 6; ++h)
+                    if (!is_hex(t_[h])) return false;
+                return true;
+            }
+
+            // Whether name may name a function: 1 to 64 letters, digits, '_', '-', '.' or ':'.
+            static bool function_name(const std::string& name)
+            {
+                if (name.empty() || name.size() > 64) return false;
+                for (char c : name)
+                {
+                    const bool sign = c != '\0' && std::strchr("_-.:", c) != nullptr;
+                    if (!std::isalnum(static_cast<unsigned char>(c)) && !sign) return false;
+                }
+                return true;
+            }
+
+            // Whether the text may go on after a value that ends before p.
+            bool may_follow(size_t p) const
+            {
+                const size_t r = skip(p);
+                if (frames_.empty()) return true;
+                if (r >= t_.size()) return false;
+                return t_[r] == ',' || t_[r] == (frames_.back().type == '{' ? '}' : ']');
+            }
+
+            /*
+                The reading after a value that ends before p, as the frames being read tell it: a
+                digest (FNV-1a) of the position and of what the frames hold beyond the member being
+                read, which decide the rest of the search.
+            */
+            uint64_t reading(size_t p) const
+            {
+                uint64_t h = 14695981039346656037ull;
+                const auto add = [&h](const char* s, size_t n) {
+                    for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<unsigned char>(s[i])) * 1099511628211ull;
+                };
+                const auto mark_end = [&h]() { h = (h ^ 0x100u) * 1099511628211ull; };
+                const std::string at = std::to_string(p);
+                add(at.data(), at.size());
+                for (const frame& f : frames_)
+                {
+                    const char head[2] = { f.type, f.arguments ? 'a' : f.inside ? 'i' : '-' };
+                    add(head, 2);
+                    add(f.tool.data(), f.tool.size());
+                    mark_end();
+                    add(f.name.data(), f.name.size());
+                    mark_end();
+                    for (const std::string& k : f.names)
+                    {
+                        add(k.data(), k.size());
+                        mark_end();
+                    }
+                    mark_end();
+                }
+                return h;
+            }
+
+            // The rest of a string from i, its opening quote at start.
+            bool read_string(size_t& i, mode& at, size_t start)
+            {
+                for (size_t j = i; j < t_.size(); ++j)
+                {
+                    if (++steps_ > max_steps) return false;
+                    const char c = t_[j];
+                    if (c == '\\')
+                    {
+                        if (escape_at(j)) ++j;
+                        else mark(j, backslash);
+                        continue;
+                    }
+                    if (static_cast<unsigned char>(c) < 0x20)
+                    {
+                        mark(j, control);
+                        continue;
+                    }
+                    if (c != '"') continue;
+                    if (!may_follow(j + 1))
+                    {
+                        mark(j, quote);
+                        continue;
+                    }
+                    std::vector<frame> before = frames_;
+                    if (!frames_.empty() && frames_.back().type == '{' && frames_.back().key == "name"
+                        && !frames_.back().arguments && !frames_.back().inside)
+                    {
+                        // The name of a call, which names the tool of its arguments.
+                        const std::string name = t_.substr(start + 1, j - start - 1);
+                        if (!function_name(name))
+                        {
+                            mark(j, quote);
+                            continue;
+                        }
+                        frames_.back().name = name;
+                    }
+                    const uint64_t r = reading(j + 1);
+                    if (failed_.count(r) != 0)
+                    {
+                        frames_ = std::move(before);
+                        mark(j, quote);
+                        continue;
+                    }
+                    // Another path reaches a reading after which the text completes.
+                    const auto known = again_ ? succeeded_.find(r) : succeeded_.end();
+                    if (known != succeeded_.end())
+                    {
+                        if (values_ >= known->second)
+                        {
+                            other_ = true;
+                            return false;
+                        }
+                        frames_ = std::move(before);
+                        mark(j, quote);
+                        continue;
+                    }
+                    if (choices_.size() >= max_choices)
+                    {
+                        steps_ = max_steps;
+                        return false;
+                    }
+                    choices_.push_back(choice{ j, start, std::move(before), marked_.size(), r, values_ });
+                    i = j + 1;
+                    at = mode::after;
+                    return true;
+                }
+                return false;
+            }
+
+            // What follows a value that ends before i.
+            bool read_after(size_t& i, mode& at, bool& done)
+            {
+                const size_t r = skip(i);
+                if (frames_.empty())
+                {
+                    // The closing braces and brackets left after the value, then the end or another value.
+                    size_t k = r;
+                    std::vector<size_t> closing;
+                    for (; k < t_.size(); ++k)
+                    {
+                        if (t_[k] == '}' || t_[k] == ']') closing.push_back(k);
+                        else if (!std::isspace(static_cast<unsigned char>(t_[k]))) break;
+                    }
+                    if (k >= t_.size())
+                    {
+                        done = true;
+                        return true;
+                    }
+                    if (!several_ || t_[k] != '{') return false;
+                    for (size_t c : closing) mark(c, dropped);
+                    ++values_;
+                    i = k;
+                    at = mode::value;
+                    return true;
+                }
+                if (r >= t_.size()) return false;
+                const char type = frames_.back().type;
+                if (t_[r] == ',')
+                {
+                    const size_t p = skip(r + 1);
+                    if (type == '{') return member(p, i, at);
+                    i = p;
+                    at = mode::value;
+                    return true;
+                }
+                if (t_[r] != (type == '{' ? '}' : ']')) return false;
+                if (!complete(frames_.back())) return false;
+                frames_.pop_back();
+                i = r + 1;
+                return true;
+            }
+
+            const std::string& t_;
+            const tool_schema schema_;
+            const std::string tool_;
+            const bool several_;
+            std::vector<char> marks_;
+            std::vector<size_t> marked_;
+            std::vector<frame> frames_;
+            std::vector<choice> choices_;
+            std::unordered_set<uint64_t> failed_;
+            /*
+                The values begun on the reading being tried; the readings of the reading found with
+                the values begun before each, and its values, while the search looks for another
+                one, and whether it found one.
+            */
+            size_t values_ = 1;
+            std::unordered_map<uint64_t, size_t> succeeded_;
+            size_t found_ = 0;
+            bool again_ = false;
+            bool other_ = false;
+            size_t steps_ = 0;
+        };
+
+        /*
+            Parses the JSON of a tool call as a model writes it: as it is, else with the raw
+            control characters of its strings escaped, else repaired by stray_quotes, with the
+            tools of the request and the tool whose arguments the text holds alone, if any, for
+            the quotes of the code that a small model leaves unescaped.  repaired receives the
+            text that parsed when it is not the text given.
+        */
+        bool parse_call_json(const std::string& text, json& out, std::string& repaired,
+            const tool_schema& schema = tool_schema(), const std::string& tool = std::string())
+        {
+            repaired.clear();
+            if (json::parse(text, out)) return true;
+            std::string fixed;
+            if (escape_controls(text, fixed) && json::parse(fixed, out))
+            {
+                repaired.swap(fixed);
+                return true;
+            }
+            if (!stray_quotes(text, schema, tool, false).repair(fixed) || !json::parse(fixed, out)) return false;
             repaired.swap(fixed);
             return true;
         }
@@ -248,9 +772,13 @@ namespace albireo
             return std::string();
         }
 
-        /*  The string literal a template assigns to a variable, as in
-            {%- set default_system_message = '...' %}, with its escapes resolved; empty
-            when the template has no such assignment.  */
+        /*  The string a template assigns to a variable, as in
+            {%- set default_system_message = '...' %}: string literals with their escapes
+            resolved, joined by +, the variables of the date of the day and of the day before it
+            (today and yesterday, today_date and yesterday_date) standing as {today} and
+            {yesterday}, which the formats replace, as Unsloth writes the template of Mistral
+            Small 3.2.  Empty when the template has no such assignment or the value holds another
+            expression or another variable.  */
         std::string template_string(const std::string& tmpl, const std::string& variable)
         {
             size_t pos = tmpl.find("set " + variable);
@@ -258,23 +786,121 @@ namespace albireo
             pos = tmpl.find('=', pos);
             if (pos == std::string::npos) return std::string();
             ++pos;
-            while (pos < tmpl.size() && tmpl[pos] == ' ') ++pos;
-            if (pos >= tmpl.size() || (tmpl[pos] != '\'' && tmpl[pos] != '"')) return std::string();
-            const char quote = tmpl[pos++];
+            const auto skip_spaces = [&]() {
+                while (pos < tmpl.size() && std::isspace(static_cast<unsigned char>(tmpl[pos]))) ++pos;
+            };
             std::string out;
-            for (; pos < tmpl.size(); ++pos)
+            for (;;)
             {
+                skip_spaces();
+                if (pos >= tmpl.size()) return std::string();
                 const char c = tmpl[pos];
-                if (c == '\\' && pos + 1 < tmpl.size())
+                if (c == '\'' || c == '"')
                 {
-                    const char e = tmpl[++pos];
-                    out += e == 'n' ? '\n' : e == 't' ? '\t' : e;
+                    const char quote = tmpl[pos++];
+                    bool closed = false;
+                    for (; pos < tmpl.size() && !closed; ++pos)
+                    {
+                        const char d = tmpl[pos];
+                        if (d == '\\' && pos + 1 < tmpl.size())
+                        {
+                            const char e = tmpl[++pos];
+                            out += e == 'n' ? '\n' : e == 't' ? '\t' : e;
+                        }
+                        else if (d == quote)
+                            closed = true;
+                        else
+                            out += d;
+                    }
+                    if (!closed) return std::string();
+                }
+                else if (std::isalpha(static_cast<unsigned char>(c)) || c == '_')
+                {
+                    const size_t start = pos;
+                    while (pos < tmpl.size()
+                        && (std::isalnum(static_cast<unsigned char>(tmpl[pos])) || tmpl[pos] == '_'))
+                        ++pos;
+                    const std::string name = tmpl.substr(start, pos - start);
+                    if (name == "yesterday" || name == "yesterday_date") out += "{yesterday}";
+                    else if (name == "today" || name == "today_date") out += "{today}";
+                    else return std::string();
+                }
+                else
+                    return std::string();
+                skip_spaces();
+                if (pos < tmpl.size() && tmpl[pos] == '+')
+                {
+                    ++pos;
                     continue;
                 }
-                if (c == quote) return out;
-                out += c;
+                if (tmpl.compare(pos, 2, "%}") == 0 || tmpl.compare(pos, 3, "-%}") == 0) return out;
+                return std::string();
             }
-            return std::string();
+        }
+
+        /*  Whether a Mistral template writes the tools in its loop over the messages, as that of
+            the GGUF files of Mistral Small 3.2 does, rather than once after the system prompt, as
+            those of Ministral 3 and Devstral Small 2 do: the place where it writes the text of
+            [AVAILABLE_TOOLS], or the variable that holds it, against the first loop over the
+            messages.  */
+        bool tools_before_last_question(const std::string& tmpl)
+        {
+            const size_t loop = tmpl.find("for message in");
+            const size_t literal = tmpl.find("[AVAILABLE_TOOLS]");
+            if (loop == std::string::npos || literal == std::string::npos) return false;
+            size_t written = literal;
+            const size_t statement = tmpl.rfind("{%", literal);
+            const size_t expression = tmpl.rfind("{{", literal);
+            if (statement != std::string::npos && (expression == std::string::npos || statement > expression))
+            {
+                // For {%- set name = '[AVAILABLE_TOOLS]' ... %}, the first {{ name }} after it.
+                size_t at = tmpl.find("set ", statement);
+                if (at == std::string::npos || at > literal) return false;
+                at += 4;
+                const size_t start = at;
+                while (at < tmpl.size() && (std::isalnum(static_cast<unsigned char>(tmpl[at])) || tmpl[at] == '_'))
+                    ++at;
+                const std::string name = tmpl.substr(start, at - start);
+                if (name.empty()) return false;
+                written = std::string::npos;
+                for (size_t open = tmpl.find("{{", literal); open != std::string::npos && written == std::string::npos;
+                     open = tmpl.find("{{", open + 2))
+                {
+                    size_t i = open + 2;
+                    while (i < tmpl.size() && (tmpl[i] == '-' || tmpl[i] == ' ')) ++i;
+                    if (tmpl.compare(i, name.size(), name) != 0) continue;
+                    i += name.size();
+                    while (i < tmpl.size() && tmpl[i] == ' ') ++i;
+                    if (tmpl.compare(i, 2, "}}") == 0 || tmpl.compare(i, 3, "-}}") == 0) written = open;
+                }
+            }
+            return written != std::string::npos && written > loop;
+        }
+
+        /*  The identifier of a call as the templates of Mistral Small 3.2 write it, 9 letters or
+            digits: the identifier itself when it has this form, else 9 characters drawn from
+            it, the same for a call and for the result that names it.  */
+        std::string mistral_call_id(const std::string& id)
+        {
+            bool usable = id.size() == 9;
+            for (size_t i = 0; usable && i < id.size(); ++i)
+                usable = std::isalnum(static_cast<unsigned char>(id[i])) != 0;
+            if (usable) return id;
+            // FNV-1a over the bytes of the identifier, written in base 62.
+            unsigned long long h = 1469598103934665603ull;
+            for (char c : id)
+            {
+                h ^= static_cast<unsigned char>(c);
+                h *= 1099511628211ull;
+            }
+            static const char* alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            std::string out;
+            for (int i = 0; i < 9; ++i)
+            {
+                out += alphabet[h % 62];
+                h /= 62;
+            }
+            return out;
         }
 
         struct piece_writer
@@ -333,7 +959,8 @@ namespace albireo
             std::string call_open, call_close;
             std::string call_open_alt;   // a second spelling of the opening marker
             json tools;                  // the definitions of the tools: the types of the XML parameters, the
-                                         // names a whole JSON answer may call
+                                         // names a whole JSON answer may call, the parameters of the calls a
+                                         // repair reads (stray_quotes)
         };
 
         class tag_parser : public output_parser
@@ -461,6 +1088,13 @@ namespace albireo
                     json check;
                     if (!json::parse(written, check) || !(check == args)) written.clear();
                 }
+                else if (args.is_string())
+                {
+                    // Arguments given as the text of an object, with raw line breaks in its strings.
+                    std::string fixed;
+                    json check;
+                    if (escape_controls(args.as_string(), fixed) && json::parse(fixed, check)) written.swap(fixed);
+                }
                 emit_call(name, written.empty() ? arguments_text(args) : written, events);
                 return true;
             }
@@ -468,8 +1102,10 @@ namespace albireo
             /*
                 The calls of the text between two call markers, a JSON object or several in a
                 row, possibly in a fenced block.  The closing braces a model writes beyond its
-                last object, after code with braces of its own, are left aside.  False, emitting
-                nothing, when the text holds anything else.
+                last object, after code with braces of its own, are left aside.  The quotes of
+                code that a model leaves unescaped mislead the extent of each object, so a text
+                that does not read so is repaired whole (stray_quotes), then read again.  False,
+                emitting nothing, when the text holds anything else.
             */
             bool emit_calls(const std::string& body, std::vector<output_event>& events)
             {
@@ -482,6 +1118,23 @@ namespace albireo
                     if (ends_with(text, "```")) text = strip_spaces(text.substr(0, text.size() - 3));
                 }
                 std::vector<output_event> calls;
+                if (!call_objects(text, calls))
+                {
+                    std::string fixed;
+                    calls.clear();
+                    if (!stray_quotes(text, schema(), std::string(), true).repair(fixed) || !call_objects(fixed, calls))
+                        return false;
+                }
+                events.insert(events.end(), calls.begin(), calls.end());
+                return true;
+            }
+
+            /*
+                The calls of text, JSON objects in a row, the raw control characters of their
+                strings escaped; false when it holds anything else.
+            */
+            bool call_objects(const std::string& text, std::vector<output_event>& calls)
+            {
                 size_t pos = 0;
                 while (pos < text.size())
                 {
@@ -490,16 +1143,70 @@ namespace albireo
                     if (n == 0 || text[pos] != '{') return false;
                     std::string one = text.substr(pos, n);
                     json j;
-                    std::string repaired;
-                    if (!parse_call_json(one, j, repaired) || !j.is_object()) return false;
-                    if (!repaired.empty()) one.swap(repaired);
-                    if (!emit_call_object(j, calls, one)) return false;
+                    if (!json::parse(one, j))
+                    {
+                        std::string fixed;
+                        if (!escape_controls(one, fixed) || !json::parse(fixed, j)) return false;
+                        one.swap(fixed);
+                    }
+                    if (!j.is_object() || !emit_call_object(j, calls, one)) return false;
                     pos += n;
                     while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
                 }
-                if (calls.empty()) return false;
-                events.insert(events.end(), calls.begin(), calls.end());
+                return !calls.empty();
+            }
+
+            /*
+                Whether key is a parameter of the tool named function, of any tool of the request
+                when function is empty, as the definitions of the tools of the request declare
+                them; a tool without declared parameters, or that the request does not define,
+                takes any name.
+            */
+            bool is_parameter(const std::string& function, const std::string& key) const
+            {
+                bool declared = false;
+                for (const auto& t : c_.tools.elements())
+                {
+                    const json& fn = t.contains("function") ? t["function"] : t;
+                    if (!function.empty() && fn["name"].as_string() != function) continue;
+                    const json& properties = fn["parameters"]["properties"];
+                    if (!properties.is_object() || properties.contains(key)) return true;
+                    declared = true;
+                }
+                return !declared;
+            }
+
+            /*
+                Whether names hold every parameter that the tool named function requires, as the
+                definition of the tool in the request declares them; true for a tool the request
+                does not define and for an empty name.
+            */
+            bool has_required(const std::string& function, const std::vector<std::string>& names) const
+            {
+                if (function.empty()) return true;
+                for (const auto& t : c_.tools.elements())
+                {
+                    const json& fn = t.contains("function") ? t["function"] : t;
+                    if (fn["name"].as_string() != function) continue;
+                    for (const auto& r : fn["parameters"]["required"].elements())
+                        if (r.is_string() && std::find(names.begin(), names.end(), r.as_string()) == names.end())
+                            return false;
+                    return true;
+                }
                 return true;
+            }
+
+            // The tools of the request for the repair of the calls (stray_quotes).
+            tool_schema schema() const
+            {
+                tool_schema s;
+                s.parameter = [this](const std::string& function, const std::string& key) {
+                    return is_parameter(function, key);
+                };
+                s.complete = [this](const std::string& function, const std::vector<std::string>& names) {
+                    return has_required(function, names);
+                };
+                return s;
             }
 
             // The type the definition of a tool gives to one of its parameters, or "".
@@ -597,7 +1304,8 @@ namespace albireo
                 std::string t = strip_spaces(text);
                 if (starts_with(t, "<|python_tag|>")) t = strip_spaces(t.substr(14));
                 json j;
-                if (!json::parse(t, j)) return false;
+                std::string repaired;
+                if (!parse_call_json(t, j, repaired, schema())) return false;
                 std::vector<const json*> objects;
                 if (j.is_array())
                     for (const auto& e : j.elements()) objects.push_back(&e);
@@ -770,7 +1478,7 @@ namespace albireo
                     json j;
                     std::string repaired;
                     const std::string value = strip_spaces(buffer_.substr(0, n));
-                    if (parse_call_json(value, j, repaired) && (j.is_array() || j.is_object()))
+                    if (parse_call_json(value, j, repaired, schema()) && (j.is_array() || j.is_object()))
                     {
                         if (j.is_object()) emit_call_object(j, events);
                         else for (const auto& e : j.elements()) if (e.is_object()) emit_call_object(e, events);
@@ -797,17 +1505,6 @@ namespace albireo
                     }
                     return false;
                 }
-                const size_t n = value_extent(a + args_marker.size());
-                if (n == 0)
-                {
-                    if (final)
-                    {
-                        emit(output_kind::content, call_prefix_ + buffer_, events);
-                        buffer_.clear();
-                        reset_scans();
-                    }
-                    return false;
-                }
                 std::string name = strip_spaces(buffer_.substr(0, a)), id;
                 const size_t marked = name.find(id_marker);
                 if (marked != std::string::npos)
@@ -815,10 +1512,28 @@ namespace albireo
                     id = strip_spaces(name.substr(marked + id_marker.size()));
                     name = strip_spaces(name.substr(0, marked));
                 }
+                const size_t n = value_extent(a + args_marker.size());
+                if (n == 0)
+                {
+                    if (final)
+                    {
+                        // Quotes left unescaped in the code keep the extent open, so the rest is read whole.
+                        const std::string rest = strip_spaces(buffer_.substr(a + args_marker.size()));
+                        json j;
+                        std::string repaired;
+                        if (!name.empty() && parse_call_json(rest, j, repaired, schema(), name) && j.is_object())
+                            emit_call(name, repaired.empty() ? rest : repaired, events, id);
+                        else
+                            emit(output_kind::content, call_prefix_ + buffer_, events);
+                        buffer_.clear();
+                        reset_scans();
+                    }
+                    return false;
+                }
                 const std::string args = strip_spaces(buffer_.substr(a + args_marker.size(), n));
                 json j;
                 std::string repaired;
-                if (!name.empty() && parse_call_json(args, j, repaired) && j.is_object())
+                if (!name.empty() && parse_call_json(args, j, repaired, schema(), name) && j.is_object())
                     emit_call(name, repaired.empty() ? args : repaired, events, id);
                 else
                     emit(output_kind::content, call_prefix_ + buffer_.substr(0, a + args_marker.size() + n), events);
@@ -1113,6 +1828,7 @@ namespace albireo
                     c.calls = call_style::tagged_object;
                     c.call_open = "<tool_call>";
                     c.call_close = "</tool_call>";
+                    c.tools = opt.tools;
                 }
                 return std::unique_ptr<output_parser>(new tag_parser(c));
             }
@@ -1146,6 +1862,19 @@ namespace albireo
                 reasoning_ = tok.token_id("[THINK]") >= 0 && tmpl.find("[THINK]") != std::string::npos;
                 default_system_ = template_string(tmpl, "default_system_message");
                 add_markers(tok, { "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "[THINK]", "[/THINK]" });
+                /*
+                    The template of Mistral Small 3.2 writes the tools in its loop over the
+                    messages, the identifier of each call after [CALL_ID] and the identifier of the
+                    call a result answers before [TOOL_CONTENT], as version 11 of its tokenizer
+                    does; those of Ministral 3 and Devstral Small 2 write the tools after the system
+                    prompt, the calls and the results without identifiers.  The tools then come
+                    before the last question, where mistral-common, the reference encoding of these
+                    models, writes them, and where the template writes them for the conversations of
+                    questions, answers, calls and results that alternate.
+                */
+                tools_last_ = tools_before_last_question(tmpl);
+                call_ids_ = tok.token_id("[CALL_ID]") >= 0 && tmpl.find("[CALL_ID]") != std::string::npos;
+                result_ids_ = tok.token_id("[TOOL_CONTENT]") >= 0 && tmpl.find("[TOOL_CONTENT]") != std::string::npos;
             }
 
             const char* name() const override { return "mistral"; }
@@ -1179,17 +1908,28 @@ namespace albireo
                     w.text(s);
                     w.markup("[/SYSTEM_PROMPT]");
                 }
-                if (opt.tools.is_array() && !opt.tools.empty())
-                {
+                const bool tools = opt.tools.is_array() && !opt.tools.empty();
+                // The last question, before which version 11 of the tokenizer of Mistral writes the tools.
+                size_t last_question = messages.size();
+                if (tools && tools_last_)
+                    for (size_t i = messages.size(); i-- > first;)
+                        if (messages[i].role == "user")
+                        {
+                            last_question = i;
+                            break;
+                        }
+                const auto write_tools = [&]() {
                     w.markup("[AVAILABLE_TOOLS]");
                     w.text(opt.tools.dump_formatted());
                     w.markup("[/AVAILABLE_TOOLS]");
-                }
+                };
+                if (tools && last_question == messages.size()) write_tools();
                 for (size_t i = first; i < messages.size(); ++i)
                 {
                     const chat_message& m = messages[i];
                     if (m.role == "user")
                     {
+                        if (i == last_question) write_tools();
                         w.markup("[INST]");
                         w.text(m.content);
                         w.markup("[/INST]");
@@ -1213,6 +1953,11 @@ namespace albireo
                         {
                             w.markup("[TOOL_CALLS]");
                             w.text(call.name);
+                            if (call_ids_)
+                            {
+                                w.markup("[CALL_ID]");
+                                w.text(mistral_call_id(call.id));
+                            }
                             w.markup("[ARGS]");
                             w.text(call.arguments.empty() ? std::string("{}") : call.arguments);
                         }
@@ -1221,13 +1966,18 @@ namespace albireo
                     else if (m.role == "tool")
                     {
                         w.markup("[TOOL_RESULTS]");
+                        if (result_ids_)
+                        {
+                            w.text(mistral_call_id(m.tool_call_id));
+                            w.markup("[TOOL_CONTENT]");
+                        }
                         w.text(m.content);
                         w.markup("[/TOOL_RESULTS]");
                     }
                 }
             }
 
-            std::unique_ptr<output_parser> make_parser(const render_options&) const override
+            std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
             {
                 parser_config c;
                 if (reasoning_)
@@ -1237,6 +1987,7 @@ namespace albireo
                 }
                 c.calls = call_style::mistral;
                 c.call_open = "[TOOL_CALLS]";
+                c.tools = opt.tools;
                 return std::unique_ptr<output_parser>(new tag_parser(c));
             }
 
@@ -1244,6 +1995,9 @@ namespace albireo
             std::string bos_, eos_;
             bool reasoning_ = false;
             std::string default_system_;
+            bool tools_last_ = false;
+            bool call_ids_ = false;
+            bool result_ids_ = false;
         };
 
         // Llama 3
@@ -1430,6 +2184,7 @@ namespace albireo
                     c.call_open = "<|tool_call|>";
                     // The smaller models of the family write the marker as plain text.
                     c.call_open_alt = "<tool_call>";
+                    c.tools = opt.tools;
                 }
                 return std::unique_ptr<output_parser>(new tag_parser(c));
             }

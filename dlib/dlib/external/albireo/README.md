@@ -177,18 +177,20 @@ of a device takes seconds to start.
 
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
-quantize the activations to 8 bits per block, so that a generated token reads each weight once.
-When several answers are written together, the Q4_K and Q6_K kernels of AVX2 and AVX-VNNI compute
-two to four tokens for each weight they unpack, each token with the arithmetic it would get
-alone: with four answers at once, a step takes 32 to 40 % less time (Qwen3 0.6B and 1.7B, two
-cores). A pass of eight tokens or more computes on 8-bit integers for the weights in Q4_0, Q4_K,
-Q5_K and Q6_K, and in Q8_0 with VNNI (`integer_prompt`): the weights keep their exact values in
-panels whose lanes of 32 bits each hold four bytes of one group of 32 weights, the activations are
-rounded to 8 bits by groups of 32 values, and an instruction of VNNI computes 32 products where a
-vector of floats computes 8. On two cores, Qwen3 0.6B read a prompt of 512 tokens at 230 tokens per
-second with AVX-VNNI against 126 on floats, and at 154 against 125 with AVX2; a prompt of 2,048
-tokens at 164 against 102, and at 121 against 98. The rounding of the activations moved the logits
-of a text of 47 tokens from those of the reference by a mean divergence of 2.4e-3 (KL), the order of
+quantize the activations to 8 bits per block, so that a generated token reads each weight once. When
+several answers are written together, the Q4_K and Q6_K kernels of AVX2 and AVX-VNNI compute two to
+four tokens for each weight they unpack, each token with the arithmetic it would get alone: with
+four answers at once, a step takes 32 to 40 % less time (Qwen3 0.6B and 1.7B, two cores). A pass of
+eight tokens or more computes on 8-bit integers for the weights in Q4_0, Q4_K, Q5_K and Q6_K, and in
+Q8_0 with VNNI (`integer_prompt`): the weights keep their exact values in panels whose lanes of 32
+bits each hold four bytes of one group of 32 weights, the activations are rounded to 8 bits by
+groups of 32 values, and an instruction of VNNI computes 32 products where a vector of floats
+computes 8. On two cores, Qwen3 0.6B read a prompt of 512 tokens at 230 tokens per second with
+AVX-VNNI against 126 on floats, and at 154 against 125 with AVX2; a prompt of 2,048 tokens at 164
+against 102, and at 121 against 98. On 24 threads, Qwen3-VL 4B read a prompt of 2,048 tokens at 141
+tokens per second with AVX-VNNI against 95 on floats, and at 132 against 94 with AVX2, the attention
+of the prompt taking a larger share of its time. The rounding of the activations moved the logits of
+a text of 47 tokens from those of the reference by a mean divergence of 2.4e-3 (KL), the order of
 the integer kernels of the generation, against 5e-7 on floats, and the answers to 162 prompts of 50
 to 400 tokens drawn from this file began with the same token as on floats; each token of a pass gets
 the results it gets in any other pass. The other formats compute in single precision, with a packed
@@ -239,7 +241,12 @@ which moves its logits by the rounding of the floats. A draft takes the memory t
 once every answer holds the place of its next token, and an answer whose last two drafts kept
 nothing proposes none for 4 steps, then 8, up to 64. On two cores, Qwen3 0.6B rewrote a function of
 eight lines at 25.5 tokens per second against 19.7, keeping 16 of the 33 tokens of its drafts, and
-wrote prose at the speed of the steps one token at a time.
+wrote prose at the speed of the steps one token at a time; on 24 threads, Qwen3-VL 4B rewrote it at
+26.3 tokens per second against 23.6. On the card of the CUDA engine, where the products of a pass
+of eight tokens took four to six times those of one token, the same drafts left the speed of
+Qwen3-VL 4B unchanged, 56.9 tokens per second against 56.8: the kernels of dlib now copy the
+activations of a pass to the shared memory of each block of rows, as the description of the devices
+below gives.
 
 The context of a model is the one it was trained for, which the engine brings down only when the
 keys and values of a full context exceed the memory the system can commit, its physical memory and
@@ -283,21 +290,28 @@ in a budget:
   precision for the other formats. The kernels of dlib
   ([`dlib/cuda/cuda_gguf.cu`](../../cuda/cuda_gguf.cu)) read the blocks in place for a product of
   fewer than 64 tokens, a warp per row decoding each group of 32 weights once for up to eight
-  tokens, and expand them from 64 tokens on by tiles of 64 MB that cuBLAS multiplies. Before a new
-  copy serves, its first 64 rows multiply probe activations and are expanded on the card, against
-  the same work of the processor: a format whose results differ keeps its matrices in single
-  precision. The engine measures the
-  products of each shape on two matrices and on the processor, and checks its choice at growing
-  intervals. The blocks cross the bus from the mapping of the file, without an image in the memory
-  of the host, and the copies stay within the memory of the card that the extended device memory
-  of dlib (V²RAM) manages, less 1 GiB (a quarter of it on a smaller card) for the hidden states of
-  the passes, the tiles and cuBLAS. A matrix left out of the copies is computed by the processor
-  from its quantized weights for a product of fewer than 128 tokens, a generated token among them,
-  and crosses the bus in its format for that product alone from 128 tokens on. A size given to the
-  file of V²RAM (`v2ram_max_mb`) lets the copies go beyond the card into it, the blocks that do not
-  fit moving to the memory of the host or to that file and coming back ahead of their use; once
-  the copies exceed the memory of the card, the products of fewer than eight tokens stay on the
-  processor. Only the rows of a product cross the bus.
+  tokens, and expand them from 64 tokens on by tiles of 64 MB that cuBLAS multiplies. A block of
+  eight warps copies the activations of up to eight tokens to its shared memory by chunks of 1,024
+  columns, which its warps read 16 bytes at a time without conflicts of banks: each lane read its
+  own group of 32 activations from the caches before, 128 bytes away from those of the next lanes,
+  and the products of eight tokens took four to six times those of one token on a GeForce RTX 5070
+  Ti Laptop GPU (78 against 18 us for a matrix of 2,048 by 2,048 in Q4_K). A token adds the products
+  of each group in the same order in any pass; the attention of the card splits the positions of a
+  long context by the tokens and heads of the pass, so that a pass of several tokens moves the
+  logits of its tokens by the rounding of the floats, as on the processor. Before a new copy serves,
+  its first 64 rows multiply probe activations and are expanded on the card, against the same work
+  of the processor: a format whose results differ keeps its matrices in single precision. The engine
+  measures the products of each shape on two matrices and on the processor, and checks its choice at
+  growing intervals. The blocks cross the bus from the mapping of the file, without an image in the
+  memory of the host, and the copies stay within the memory of the card that the extended device
+  memory of dlib (V²RAM) manages, less 1 GiB (a quarter of it on a smaller card) for the hidden
+  states of the passes, the tiles and cuBLAS. A matrix left out of the copies is computed by the
+  processor from its quantized weights for a product of fewer than 128 tokens, a generated token
+  among them, and crosses the bus in its format for that product alone from 128 tokens on. A size
+  given to the file of V²RAM (`v2ram_max_mb`) lets the copies go beyond the card into it, the blocks
+  that do not fit moving to the memory of the host or to that file and coming back ahead of their
+  use; once the copies exceed the memory of the card, the products of fewer than eight tokens stay
+  on the processor. Only the rows of a product cross the bus.
 
 With CUDA, the layers of a dense model run on the card as a whole (`layer_pass`): the hidden states
 of a pass stay on the card from the first layer to the last, and the card computes the
@@ -381,26 +395,27 @@ choice then gives the processor engine the place of an accelerator measured slow
 the service restarts when its choice changes. The Accelerator menu and the window of the computer
 give the measures in the language of the interface ("23.5 tokens/s", "23,5 jetons/s").
 
-The CUDA engine keeps the weights on the card in their GGUF formats and computes there the layers
-of a dense model, the attention staying on the processor: a generated token crosses the bus once
-each way per layer and reads 1.1 GB of weights on the card for Qwen3-VL 2B in Q4_K_M, where it read
-them in single precision, six times as many bytes, and crossed the bus twice for each of the 197
-products of its pass. The products the card lacks room for run on the processor from their
-quantized weights.
+The CUDA engine keeps the weights on the card in their GGUF formats and computes there the layers of
+a dense model, the card attending the generated tokens from its copies of the keys and values: a
+generated token reads 1.1 GB of weights on the card for Qwen3-VL 2B in Q4_K_M, where it read them in
+single precision, six times as many bytes, and crossed the bus twice for each of the 197 products of
+its pass. With version 1.0.13, Qwen3-VL 4B in Q4_K_M generated 56.8 tokens per second on a GeForce
+RTX 5070 Ti Laptop GPU, against 23.6 on the 24 threads of its processor. The products the card lacks
+room for run on the processor from their quantized weights.
 
 The conversation formats are written natively ([`engine/chat_format.cpp`](engine/chat_format.cpp)),
 the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
-reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2), Llama 3,
-Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini,
-the format of Foundation-Sec-8B-Reasoning and that of Foundation-Sec 1.1 8B Instruct, whose role
-markers `<|system|>`, `<|user|>` and `<|assistant|>` are plain text of its vocabulary: its GGUF files
-carry no template, the engine takes the one of the repository of the model, and these markers end
-its answer as its end of text token does. The instructions of the tools of Qwen2.5 keep the doubled
-braces of the example of its template, and CyberSecQwen 4B receives a system message in the turn of
-the user, as the template of its training writes it. The tests compare the prompts with those of the reference
-templates rendered by Jinja, byte for byte, as the libraries that apply chat templates render them,
-the line break after each tag and the spaces before it removed: the template of
-Foundation-Sec-8B-Reasoning, written over several lines, gives its turns one after the other, the
+reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2, Mistral Small
+3.2), Llama 3, Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`),
+Phi-4-mini, the format of Foundation-Sec-8B-Reasoning and that of Foundation-Sec 1.1 8B Instruct,
+whose role markers `<|system|>`, `<|user|>` and `<|assistant|>` are plain text of its vocabulary:
+its GGUF files carry no template, the engine takes the one of the repository of the model, and these
+markers end its answer as its end of text token does. The instructions of the tools of Qwen2.5 keep
+the doubled braces of the example of its template, and CyberSecQwen 4B receives a system message in
+the turn of the user, as the template of its training writes it. The tests compare the prompts with
+those of the reference templates rendered by Jinja, byte for byte, as the libraries that apply chat
+templates render them, the line break after each tag and the spaces before it removed: the template
+of Foundation-Sec-8B-Reasoning, written over several lines, gives its turns one after the other, the
 answer right after `<|assistant|>`. The tokenizer of dlib reads the byte-level BPE vocabularies,
 with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and GPT-4o (Phi-4-mini) among others, and
 the SentencePiece ones (EuroLLM), whose leading space it puts after each control token as the
@@ -415,7 +430,11 @@ thinking directly now.") and the marker `</think>`; the model then answers direc
 staying within what it learned, where a reasoning closed empty before it starts led its answer to
 take up the corrections and returns of a reasoning, which could loop. With the effort `low`, the
 engine ends the reasoning after 512 tokens, 256 for the work in the background, and
-`reasoning_budget` sets that limit for any request, -1 lifting it. The end the engine writes counts
+`reasoning_budget` sets that limit for any request, -1 or null lifting it. Without it, the reasoning
+takes half of the tokens of the answer at most (`max_tokens`, or the room the context leaves after
+the prompt), 32,768 at most, the length of answer the authors of Qwen3 advise for most questions,
+unless the effort is `high`: a reasoning that goes on, as the small Thinking models do at times,
+ends then and the model answers in the room left. The end the engine writes counts
 among the tokens of the answer and stays out of the `reasoning_content` the client receives; the
 answer of a request that asked for no reasoning receives its `max_tokens` once the reasoning ends,
 and its stop sequences apply to that answer alone. The prompt of
@@ -450,15 +469,16 @@ that the engine loads with it (option `projector` of the model). The engine read
   those of the whole image, then the grid of the tiles without its black bands, each row ended by
   a newline embedding. The detail of an image gives the tiles it takes at most, and its tokens: 1
   tile and 1,485 tokens (`low`), 2 and 2,241 (`auto`) or 4 and 3,753 (`high`).
-- Pixtral (projector `pixtral`, Ministral 3 and Devstral Small 2): the image, its longest edge
-  brought within 1,540 pixels and its sides rounded up to multiples of 28 pixels, is cut into
-  patches of 14 pixels; each head of the attention rotates its pairs of consecutive dimensions by
-  the row and the column of its patch, the blocks normalize by their root mean square and use a
-  SiLU gate, and the projector merges the squares of four patches into the tokens of the decoder,
-  each row of tokens followed by the `[IMG_BREAK]` embedding and the image by the token
+- Pixtral (projector `pixtral`, Ministral 3, Devstral Small 2 and Mistral Small 3.2): the image, its
+  longest edge brought within 1,540 pixels and its sides rounded up to multiples of 28 pixels, is
+  cut into patches of 14 pixels; each head of the attention rotates its pairs of consecutive
+  dimensions by the row and the column of its patch, the blocks normalize by their root mean square
+  and use a SiLU gate, and the projector merges the squares of four patches into the tokens of the
+  decoder, each row of tokens followed by the `[IMG_BREAK]` embedding and the image by the token
   `[IMG_END]`. The detail of an image gives the merged tokens it takes at most: 256 (`low`), 576
-  (`auto`) or 1024 (`high`). A message of one text and one image puts the image first, as the
-  chat templates of these models do. The projectors stored in bfloat16 are converted to half
+  (`auto`) or 1024 (`high`). A message of one text and one image puts the image first, as
+  mistral-common, the reference encoding of these models, does, and as the chat templates of
+  Ministral 3 and Devstral Small 2 do. The projectors stored in bfloat16 are converted to half
   precision when they load, which keeps their values.
 
 The service reads nothing from the network or the disk for a request: an image comes as a data URL
@@ -699,13 +719,14 @@ question deleted from a discussion leaves with its answer and the documents atta
 it was already compressed, the summary is written again without it.
 
 A summary changes the beginning of the prompt, which the engine has not read yet. Once it applies
-and no answer is being written in the discussion, the tab that wrote it asks the background model
-for one token after that beginning (system message, summary and exchanges kept, built as the next
+and no answer is being written in the discussion, the tab that wrote it asks the model of the
+discussion for one token after that beginning (system message, summary and exchanges kept, built as the next
 question builds them), so that the engine reads it in the background and the next question
 computes its own tokens only; on the tests, the first question after a summary read 852 of its 869
-tokens from the cache, in 0.8 s instead of 13.8 s. The request is sent only when the background
-model is the model of the function of the discussion; a question, a deletion or a new compression
-of the discussion stops it, and its failure is silent.
+tokens from the cache, in 0.8 s instead of 13.8 s. The request goes to the model of the function
+of the discussion, whichever it is, with the priority of the work in the background (`priority`
+`background` of `/v1/chat/completions`); a question, a deletion or a new compression of the
+discussion stops it, and its failure is silent.
 
 The work the application does in the background, the titles, the summaries and the memory, goes
 to the background model: the model that comes with Albireo (`albireo-background`), which the
@@ -762,6 +783,14 @@ renames it: the first words of the question stand for the title until it arrives
 repeats the question is asked again in other words, and a title that could not be written (a
 model that loads, a service away, a page reloaded) is asked again for two minutes, then at the
 next opening of the application. One tab names a discussion at a time.
+
+Under the line of the model, at the bottom of the side panel, a bar shows the share of the context
+of the model that the discussion shown takes, with its tokens and those of the context ("Contexte
+3 681 / 32 768"): the history the next question carries, its system message and its tools
+included, as the service counts them, its images by their tokens, over the context the engine gives
+the model. The discussion is measured when it opens and again when it, its function, its model or
+its toggles change, once the answer being written ends; the bar turns orange from three quarters
+of the context and red from nine tenths.
 
 The lists of the side panel show the 20 most recent projects and discussions; the search window
 of each finds the others, the words in any case and accents, complete or not, in the titles first,
@@ -992,11 +1021,11 @@ cmake --build build-albireo-win -j
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor |
-| `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of a generated token on the matrices of a 2B model, and of its attention over 4,096 positions |
+| `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of one and of eight tokens on the matrices of a 2B model, and of the attention of a generated token over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
-| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
+| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
@@ -1242,7 +1271,13 @@ with `out_of_memory` and gives back the pages of the cache.
 With `tools`, the calls a model writes in the form of its template come back as `tool_calls`,
 whole, with the arguments as the model wrote them, a line break left raw in a string repaired;
 the parser of Qwen3 also takes a call between code fences, several objects in one call, a closing
-character in excess and a call left open at the end of the answer. The calls of Granite 4.2, in
+character in excess and a call left open at the end of the answer. The small models leave at times
+the quotes of the code they pass unescaped (`win_msg = ""`, `print("a", "b")`): a quote then ends
+its string when the rest of the call reads as JSON, the arguments being an object whose members are
+parameters of the tool the call names, each once, and the name of the call an identifier, so that
+the dictionaries of the code do not pass for arguments; the other quotes are escaped. A call that
+no such reading completes, within a million steps of the search, comes back as the text of the
+answer. The calls of Granite 4.2, in
 the XML form, come back as JSON arguments, each value typed by the definition of the tool. The
 calls of the Mistral models keep the identifier the model gives them (`[CALL_ID]`), and arguments
 that are not a JSON object leave the text as the model wrote it. A Llama 3 answer is a call only
@@ -1463,6 +1498,7 @@ and its projector.
 | Granite 4.2 3B                 | IBM                | general, code           | text          | 2.24 GB  | Apache-2.0 |
 | Granite 4.2 8B                 | IBM                | general, code           | text          | 5.35 GB  | Apache-2.0 |
 | Qwen3-VL 30B A3B Thinking      | Alibaba            | general, code, security | text, image   | 19.27 GB | Apache-2.0 |
+| Mistral Small 3.2 24B          | Mistral AI         | general                 | text, image   | 15.21 GB | Apache-2.0 |
 | Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | 1.12 GB  | Apache-2.0 |
 | Qwen2.5 Coder 7B               | Alibaba            | code                    | text          | 4.68 GB  | Apache-2.0 |
 | Devstral Small 2               | Mistral AI         | code                    | text, image   | 15.21 GB | Apache-2.0 |
@@ -1471,12 +1507,12 @@ and its projector.
 | Foundation-Sec 8B Reasoning    | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
 
 The list gives each function models that read images and models that read text, from 2 to 6 GB
-for the computers of 8 and 16 GB of memory, one mixture of experts for those of 24 GB and a
-programming agent for those of 32 GB:
+for the computers of 8 and 16 GB of memory, one mixture of experts for those of 24 GB and, for
+those of 32 GB, a general assistant and a programming agent:
 
 | Function | Text and images | Text |
 |----------|-----------------|------|
-| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B |
+| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, Mistral Small 3.2 24B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B |
 | Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking, Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B |
 | Security | Qwen3-VL 2B and 4B Thinking, Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking | CyberSecQwen 4B, Foundation-Sec 1.1 8B and 8B Reasoning |
 
@@ -1489,13 +1525,19 @@ Qwen3-4B-Instruct-2507, keeps 97 % of the score of Foundation-Sec 8B Instruct on
 its size (CTI-RCM 0.666) and exceeds it on the questions of threat intelligence (CTI-MCQ 0.587,
 measured by its authors under the protocol of Cisco). Qwen3-VL 30B A3B Thinking, a mixture of 128
 experts of which 8 compute each token, reads images and reasons as the other Qwen3-VL Thinking
-models do, at the pace of a model of 3B. Ministral 3,
-which Mistral AI trained in partnership with NVIDIA, reads images through its Pixtral encoder, as
-does Devstral Small 2, the programming agent of 24B of Mistral AI, which reads screenshots and
-diagrams; Phi-4-mini is the latest small model of Microsoft with a standard decoder. EuroLLM 9B
-Instruct translates and writes the 24 official languages of the European Union best of the list
-(FLORES 88.9), and EuroVLM 9B Preview, built on it, reads images in these languages; its
-publishers give it as a preview version.
+models do, at the pace of a model of 3B. Ministral 3, which Mistral AI trained in partnership with
+NVIDIA, reads images through its Pixtral encoder, as does Devstral Small 2, the programming agent of
+24B of Mistral AI, which reads screenshots and diagrams, and Mistral Small 3.2 24B, the general
+assistant of the same size, which follows instructions more closely than Mistral Small 3.1 (84.78 %
+of the instruction tests of its authors against 82.75 %), answers better in conversation (Wildbench
+v2 65.33 against 55.6, Arena Hard v2 43.1 against 19.56), falls into endless repetitions less often
+(1.29 % of the long and repetitive prompts of its authors against 2.11 %) and calls tools more
+reliably; its GGUF files by Unsloth keep the format of version 11 of its tokenizer, whose
+template writes the tools before the last question and an identifier with each call and each result.
+Phi-4-mini is the latest small model of Microsoft with a standard decoder. EuroLLM 9B Instruct
+translates and writes the 24 official languages of the European Union best of the list (FLORES
+88.9), and EuroVLM 9B Preview, built on it, reads images in these languages; its publishers give it
+as a preview version.
 
 Without the models that come with the complete installer, the service downloads the default
 language model at its first start, unless the installation said otherwise, and the default

@@ -9,7 +9,7 @@
   --accent: linear-gradient(135deg, #f2b544 0%, #e88f3c 38%, #6f8fff 70%, #3d6bff 100%);
   --radius: 14px;
   --radius-small: 9px;
-  --sidebar: 288px;
+  --sidebar: 328px;
   --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
   --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
   --mono: "Cascadia Code", "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, monospace;
@@ -150,6 +150,15 @@ a { color: var(--blue); }
 .status-line .led.busy { background: var(--gold); animation: pulse 1.2s infinite; }
 .status-line .led.error { background: var(--danger); }
 .status-line .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.context-line { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-faint); }
+.context-line.hidden { display: none; }
+.context-line .meter {
+  flex: 1; min-width: 40px; height: 5px; border-radius: 5px; background: var(--border); overflow: hidden;
+}
+.context-line .meter > div { height: 100%; background: var(--blue); }
+.context-line .meter.high > div { background: var(--gold-strong); }
+.context-line .meter.full > div { background: var(--danger); }
+.context-line .count { font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* The buttons take the width of their labels and pass to a second line rather than cut them. */
 .footer-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
 .footer-buttons button {

@@ -12,15 +12,16 @@
         - tt::gguf_matvec() for 1 to 20 tokens and for 130 tokens, against products in double
           precision with the rows qk_dequantize_row() expands, with activations that start on
           16 bytes and with activations that do not;
-    then tt::rms_norm_rows() and tt::silu_multiply() against their definitions;
+    then tt::rms_norm_rows() and tt::silu_multiply() against their definitions, and tt::add()
+    with one row added to each row of a pass, as the biases of the attention are;
     tt::rope_rows() against the rotation in double precision; tt::paged_kv_store() and
     tt::paged_kv_gather() against the rows the processor writes (qk_float_to_half_row(),
     qk_rotate_row() and qk_float_to_q8_row()), for heads of 32 to 256 values in half
     precision and in 8 bits; tt::paged_attention() against the attention in double precision
     over pages that hold the rows the processor wrote, for tokens near and far from the start
     of their sequences, with several query heads per key/value head.  The program ends with
-    the time of the products of a generated token with the matrices of a model of 2 billion
-    parameters, and the rate at which they read the weights, and with the time of the
+    the time of the products of one and of eight tokens with the matrices of a model of 2
+    billion parameters, and the rate at which they read the weights, and with the time of the
     attention of a generated token over 4,096 positions.
 */
 
@@ -271,6 +272,31 @@ namespace
                 / std::max(1.0f, std::fabs(want[static_cast<size_t>(i)])));
         expect(worst_silu <= 1e-5, "silu_multiply (relative error " + std::to_string(worst_silu) + ")");
         std::printf("  rms_norm_rows %.2g, in place %.2g, silu_multiply %.2g\n", worst, worst_in_place, worst_silu);
+
+        /*
+            The biases of the queries, keys and values added to each row of a pass, as the attention
+            of the device does: tt::add() with one row added to all, which dlib computes with a
+            kernel of its own rather than with cuDNN, whose engines the CUDA engine does not carry.
+        */
+        const long tokens = 5, dims = 160;
+        dlib::resizable_tensor bias(1, dims);
+        random_floats(bias.host_write_only(), bias.size(), 1.0f, rng);
+        double worst_bias = 0;
+        const float betas[] = { 1.0f, 0.0f, 0.5f };
+        for (float beta : betas)
+        {
+            dlib::resizable_tensor q(tokens, dims);
+            random_floats(q.host_write_only(), q.size(), 2.0f, rng);
+            std::vector<float> sum(q.size());
+            for (long t = 0; t < tokens; ++t)
+                for (long i = 0; i < dims; ++i)
+                    sum[static_cast<size_t>(t * dims + i)] = beta * q.host()[t * dims + i] + 0.75f * bias.host()[i];
+            dlib::tt::add(beta, q, 0.75f, bias);
+            for (size_t i = 0; i < q.size(); ++i)
+                worst_bias = std::max<double>(worst_bias, std::fabs(q.host()[i] - sum[i]));
+        }
+        expect(worst_bias <= 1e-6, "biases added to each row (error " + std::to_string(worst_bias) + ")");
+        std::printf("  biases added to each row %.2g\n", worst_bias);
     }
 
     void check_rope(std::mt19937& rng)
@@ -598,9 +624,10 @@ namespace
     }
 
     /*
-        The products of one generated token with the matrices of a layer of a model of 2
-        billion parameters in Q4_K and Q6_K, and with its output matrix: the time of each
-        and the rate at which they read the weights.
+        The products of one generated token, and of the eight tokens of a pass that checks a
+        draft, with the matrices of a layer of a model of 2 billion parameters in Q4_K and Q6_K,
+        and with its output matrix: the time of each and the rate at which they read the
+        weights.
     */
     void measure(std::mt19937& rng)
     {

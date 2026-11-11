@@ -4,12 +4,13 @@
     Checks the chat formats of the engine on the conversations of an agent: the prompt of a
     conversation with tools, tool calls and tool results, as the chat template of each model
     writes it (the expected prompts are those Jinja renders from the templates of Qwen3,
-    Qwen2.5-Coder, SmolLM2, Devstral Small 2 and Ministral 3), and the reading of the calls a
-    model writes, whole or token by token.
+    Qwen2.5-Coder, SmolLM2, Devstral Small 2, Ministral 3 and Mistral Small 3.2), and the
+    reading of the calls a model writes, whole or token by token.
 
         test_chat_format
 */
 
+#include <cctype>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -211,6 +212,86 @@ int main()
             expect(ok && args["code"].as_string() == "let a = 1;\n\tconsole.log(a);",
                 "arguments with escaped line breaks: " + p.calls[0].arguments);
         }
+    }
+
+    /*
+        Code whose quotes a small model leaves unescaped (Qwen3-VL 2B Instruct): the empty
+        string of Python, the arguments of a function, a dictionary whose names are not
+        parameters of the tool, and a quote alone between apostrophes, with raw line breaks;
+        then two calls in one block, the quotes of the first left unescaped.
+    */
+    {
+        render_options files = opt;
+        files.tools = json::parse_or_null("[{\"type\": \"function\", \"function\": {\"name\": \"create_file\", "
+            "\"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, "
+            "\"content\": {\"type\": \"string\"}}, \"required\": [\"name\", \"content\"]}}}, "
+            "{\"type\": \"function\", \"function\": {\"name\": \"calculator\", \"parameters\": {\"type\": "
+            "\"object\", \"properties\": {\"expression\": {\"type\": \"string\"}}}}}, "
+            "{\"type\": \"function\", \"function\": {\"name\": \"run_javascript\", \"parameters\": {\"type\": "
+            "\"object\", \"properties\": {\"code\": {\"type\": \"string\"}}, \"required\": [\"code\"]}}}, "
+            "{\"type\": \"function\", \"function\": {\"name\": \"http_request\", \"parameters\": {\"type\": "
+            "\"object\", \"properties\": {\"url\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, "
+            "\"method\": {\"type\": \"string\"}, \"headers\": {\"type\": \"string\"}}, \"required\": [\"url\"]}}}]");
+        const std::string code = "win_msg = \"\"\nprint(\"Turn of\", player)\n"
+            "names = {\"X\": \"Player 1\", \"O\": \"Player 2\"}\nquote = '\"'\nprint(f\"{names}\")\n";
+        const parsed p = read_all_ways(*f, files, "<tool_call>\n{\"name\": \"create_file\", \"arguments\": "
+            "{\"name\": \"game.py\", \"content\": \"" + code + "\"}}\n</tool_call>", "unescaped quotes");
+        expect(p.calls.size() == 1 && p.content.empty(), "a call with unescaped quotes is read");
+        if (p.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(p.calls[0].arguments, args);
+            expect(ok && args.items().size() == 2 && args["name"].as_string() == "game.py"
+                && args["content"].as_string() == code, "the code of a call with unescaped quotes: "
+                + p.calls[0].arguments);
+        }
+
+        const parsed two = read_all_ways(*f, files, "<tool_call>\n{\"name\": \"create_file\", \"arguments\": "
+            "{\"name\": \"a.py\", \"content\": \"print(\"a\", \"b\")\"}}\n{\"name\": \"calculator\", "
+            "\"arguments\": {\"expression\": \"1+1\"}}\n</tool_call>", "two calls, unescaped quotes");
+        expect(two.calls.size() == 2 && two.content.empty(), "two calls, the quotes of the first unescaped");
+        if (two.calls.size() == 2)
+        {
+            json first;
+            const bool ok = json::parse(two.calls[0].arguments, first);
+            expect(ok && first["content"].as_string() == "print(\"a\", \"b\")" && two.calls[1].name == "calculator"
+                && two.calls[1].arguments == "{\"expression\": \"1+1\"}", "the arguments of both calls: "
+                + two.calls[0].arguments + " " + two.calls[1].arguments);
+        }
+
+        /*
+            A call whose only fault is a raw line break keeps an argument its tool does not
+            declare; a member named id after the arguments stays in the code; a call that two
+            readings complete, the code holding a member of the tool, stays text.
+        */
+        const parsed extra = read_all_ways(*f, files, "<tool_call>\n{\"name\": \"run_javascript\", \"arguments\": "
+            "{\"code\": \"let a = 1;\nconsole.log(a);\", \"language\": \"javascript\"}}\n</tool_call>",
+            "an argument the tool does not declare");
+        expect(extra.calls.size() == 1 && extra.calls[0].arguments == "{\"code\": \"let a = 1;\\nconsole.log(a);\", "
+            "\"language\": \"javascript\"}", "an argument the tool does not declare is kept: "
+            + (extra.calls.empty() ? extra.content : extra.calls[0].arguments));
+        const std::string json_text = "{\"user\": {\"name\": \"a\"}, \"id\": \"42\"}";
+        const parsed member_id = read_all_ways(*f, files, "<tool_call>\n{\"name\": \"create_file\", \"arguments\": "
+            "{\"name\": \"u.json\", \"content\": \"" + json_text + "\"}}\n</tool_call>", "a member id in the code");
+        if (member_id.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(member_id.calls[0].arguments, args);
+            expect(ok && args["content"].as_string() == json_text, "a member id in the code stays in it: "
+                + member_id.calls[0].arguments);
+        }
+        expect(member_id.calls.size() == 1, "a call with a member id in its code is read");
+        const std::string twice = "<tool_call>\n{\"name\": \"http_request\", \"arguments\": {\"url\": \"https://x\", "
+            "\"body\": \"{\"method\": \"POST\", \"headers\": \"y\"}\", \"method\": \"POST\"}}\n</tool_call>";
+        const parsed ambiguous = read_all_ways(*f, files, twice, "two readings");
+        expect(ambiguous.calls.empty() && ambiguous.content == twice, "a call that two readings complete stays text: "
+            + (ambiguous.calls.empty() ? std::string() : ambiguous.calls[0].arguments));
+
+        // A text that only looks like a call stays the text of the answer.
+        const std::string broken = "<tool_call>\n{\"name\": \"create_file\", \"arguments\": {\"name\": "
+            "\"a.py\", \"content\": \"x\" \"y\"}\n</tool_call>";
+        const parsed q = read_all_ways(*f, files, broken, "an object that no reading completes");
+        expect(q.calls.empty() && q.content == broken, "an object that no reading completes stays text: " + q.content);
     }
 
     // Reasoning, a sentence, then two calls in one block; a call left open at the end.
@@ -596,6 +677,31 @@ int main()
                 + r.calls[0].arguments + " " + r.calls[0].id);
         }
 
+        // A quote alone between apostrophes keeps the extent of the arguments open to the end.
+        const parsed odd = read_all_ways(*d, mopt,
+            "[TOOL_CALLS]run_python[ARGS]{\"code\": \"q = '\"'\nprint(q)\"}", "a Mistral call with a quote alone");
+        expect(odd.content.empty() && odd.calls.size() == 1, "a Mistral call with a quote alone is read: "
+            + odd.content);
+        if (odd.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(odd.calls[0].arguments, args);
+            expect(ok && args["code"].as_string() == "q = '\"'\nprint(q)", "the code of the Mistral call with a quote "
+                "alone: " + odd.calls[0].arguments);
+        }
+
+        // The quotes of code left unescaped in the arguments of a Mistral call.
+        const parsed u = read_all_ways(*d, mopt, "[TOOL_CALLS]run_python[ARGS]{\"code\": \"print(\"hi\")\"}",
+            "a Mistral call with unescaped quotes");
+        expect(u.content.empty() && u.calls.size() == 1, "a Mistral call with unescaped quotes is read");
+        if (u.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(u.calls[0].arguments, args);
+            expect(ok && args["code"].as_string() == "print(\"hi\")", "the code of the Mistral call: "
+                + u.calls[0].arguments);
+        }
+
         const parsed l = read_all_ways(*d, mopt, "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": "
             "{\"city\": \"Oslo\"}}]", "a list of Mistral calls");
         expect(l.calls.size() == 1 && l.content.empty(), "a call in the list form");
@@ -606,6 +712,83 @@ int main()
         {
             const parsed n = read_all_ways(*d, mopt, answer, "no Mistral call");
             expect(n.calls.empty() && n.content == answer, "text kept: " + n.content);
+        }
+
+        /*
+            Mistral Small 3.2, as the template of its GGUF files by Unsloth writes it: a default
+            system prompt joined with the variables of the dates, the tools before the last
+            question, the identifier of each call after [CALL_ID] and that of the call a result
+            answers before [TOOL_CONTENT].
+        */
+        const dlib::hf_tokenizer stok = tokenizer({ "<s>", "</s>", "[INST]", "[/INST]", "[SYSTEM_PROMPT]",
+            "[/SYSTEM_PROMPT]", "[AVAILABLE_TOOLS]", "[/AVAILABLE_TOOLS]", "[TOOL_RESULTS]", "[/TOOL_RESULTS]",
+            "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "[TOOL_CONTENT]" }, {});
+        const std::string small_template =
+            "{%- set today_date = strftime_now('%Y-%m-%d') %}"
+            "{%- set default_system_message = \"You are Mistral Small.\\nThe current date is \" + today_date + "
+            "\".\\nYou resolve dates (e.g. \\\"yesterday\\\" is \" + yesterday_date + \").\" %}"
+            "{{- bos_token }}{{- '[SYSTEM_PROMPT]' + system_message + '[/SYSTEM_PROMPT]' }}"
+            "{%- set tools_description = \"[AVAILABLE_TOOLS]\" + (tools | tojson) + \"[/AVAILABLE_TOOLS]\" %}"
+            "{%- for message in loop_messages %}{%- if message['role'] == 'assistant' %}"
+            "{%- set ns.append_tools_index = loop.index0 %}{%- endif %}{%- endfor %}"
+            "{%- for message in loop_messages %}{%- if message['role'] == 'user' %}"
+            "{%- if has_tools and loop.last %}{{- tools_description }}{%- endif %}"
+            "{{- '[INST]' + message['content'] + '[/INST]' }}{%- elif message['role'] == 'assistant' %}"
+            "{{- \"[TOOL_CALLS]\" + tool['function']['name'] + \"[CALL_ID]\" + tool_call_id + \"[ARGS]\" + arguments }}"
+            "{%- else %}{{- \"[TOOL_RESULTS]\" + tool_call_id + \"[TOOL_CONTENT]\" + content|string "
+            "+ \"[/TOOL_RESULTS]\" }}{%- endif %}{%- endfor %}";
+        const std::unique_ptr<chat_format> small = chat_format::detect(stok, small_template);
+        expect(std::string(small->name()) == "mistral" && small->supports_tools() && !small->supports_reasoning(),
+            "Mistral Small 3.2 detected");
+        render_options vopt;
+        vopt.tools = weather;
+        vopt.today = "2026-10-29";
+        vopt.yesterday = "2026-10-28";
+        const std::string tools_text = "[AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": "
+            "\"get_weather\", \"description\": \"Weather of a city.\", \"parameters\": {\"type\": \"object\", "
+            "\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS]";
+        const std::string system_text = "<s>[SYSTEM_PROMPT]You are Mistral Small.\nThe current date is "
+            "2026-10-29.\nYou resolve dates (e.g. \"yesterday\" is 2026-10-28).[/SYSTEM_PROMPT]";
+        // As Jinja renders the template of Mistral Small 3.2 for this conversation.
+        const std::string small_expected = system_text + "[INST]What is the weather in Paris?[/INST]"
+            "[TOOL_CALLS]get_weather[CALL_ID]a1B2c3D4e[ARGS]{\"city\": \"Paris\"}</s>[TOOL_RESULTS]a1B2c3D4e"
+            "[TOOL_CONTENT]Sunny, 21 C[/TOOL_RESULTS]It is sunny in Paris.</s>" + tools_text
+            + "[INST]And in Rome?[/INST]";
+        const std::string got_small = render(*small, m, vopt);
+        expect(got_small == small_expected, "Mistral Small 3.2 prompt:\n" + got_small);
+
+        // A conversation that ends with the result of a call: the tools come before its only question.
+        std::vector<chat_message> r3(m.begin(), m.begin() + 3);
+        const std::string ending = system_text + tools_text + "[INST]What is the weather in Paris?[/INST]"
+            "[TOOL_CALLS]get_weather[CALL_ID]a1B2c3D4e[ARGS]{\"city\": \"Paris\"}</s>[TOOL_RESULTS]a1B2c3D4e"
+            "[TOOL_CONTENT]Sunny, 21 C[/TOOL_RESULTS]";
+        const std::string got_ending = render(*small, r3, vopt);
+        expect(got_ending == ending, "Mistral Small 3.2 prompt after a result:\n" + got_ending);
+
+        // An identifier of another form, the same 9 letters or digits for the call and for its result.
+        r3[1].tool_calls[0].id = "call_TUSKiBwtfNWMfq43Fz1Xb6BT";
+        r3[2].tool_call_id = r3[1].tool_calls[0].id;
+        const std::string drawn = render(*small, r3, vopt);
+        const size_t at = drawn.find("[CALL_ID]"), result = drawn.find("[TOOL_RESULTS]");
+        const std::string call_id = at == std::string::npos ? std::string() : drawn.substr(at + 9, 9);
+        bool alnum = call_id.size() == 9;
+        for (char c : call_id) alnum = alnum && std::isalnum(static_cast<unsigned char>(c));
+        expect(alnum && drawn.compare(at + 18, 6, "[ARGS]") == 0 && result != std::string::npos
+            && drawn.compare(result + 14, 9 + 14, call_id + "[TOOL_CONTENT]") == 0,
+            "identifiers of 9 characters for the call and its result:\n" + drawn);
+
+        // A default system prompt joined with a variable other than the dates, a part of a date among
+        // them, is left out.
+        std::vector<chat_message> hello(1);
+        hello[0].role = "user";
+        hello[0].content = "Hello";
+        for (const char* variable : { "model_name", "yesterday_year" })
+        {
+            const std::unique_ptr<chat_format> unknown = chat_format::detect(stok,
+                std::string("{%- set default_system_message = \"You are \" + ") + variable
+                    + " + \".\" %}[INST][CALL_ID]");
+            expect(render(*unknown, hello, vopt) == "<s>" + tools_text + "[INST]Hello[/INST]",
+                std::string("no default system prompt with ") + variable + ":\n" + render(*unknown, hello, vopt));
         }
     }
 

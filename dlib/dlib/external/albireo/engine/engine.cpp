@@ -476,6 +476,13 @@ namespace albireo
         */
         const long low_effort_budget = 512;
         const long background_low_effort_budget = 256;
+        /*
+            The reasoning of a request that gives no budget and no high effort takes half of the
+            tokens of its answer at most, and reasoning_most at most, the length of answer the
+            authors of Qwen3 advise for most questions, so that the answer keeps its room after a
+            reasoning that goes on.
+        */
+        const long reasoning_most = 32768;
 
         /*
             The sampling the authors of a family of models advise on the cards of their models,
@@ -859,9 +866,10 @@ namespace albireo
         }
 
         /*
-            The chat templates of the Mistral models sort the two parts of a message of one text
-            and one image by their type, which puts the image first; the other messages keep the
-            order of their parts.
+            The image of a message of text followed by one image comes first, as mistral-common, the
+            reference encoding of the Mistral models, puts it from version 3 of their tokenizers on,
+            and as the chat templates of Ministral 3 and Devstral Small 2 put it by sorting the two
+            parts of such a message by their type; the other messages keep the order of their parts.
         */
         void mistral_images(std::vector<chat_message>& messages)
         {
@@ -1433,12 +1441,31 @@ namespace albireo
 
     void engine::unload_model(const std::string& id)
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        auto it = models_.find(id);
-        if (it == models_.end()) return;
-        it->second->unloading = true;
-        wake_.notify_all();
-        unloaded_.wait(lock, [&]() { return models_.find(id) == models_.end() || stop_; });
+        std::weak_ptr<loaded_model> held;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            auto it = models_.find(id);
+            if (it == models_.end())
+            {
+                // A model that the scheduler is destroying ends its unloading with that destruction.
+                if (leaving_.count(id) == 0) return;
+                const uint64_t before = left_[id];
+                unloaded_.wait(lock, [&]() { return left_[id] != before || stop_; });
+                return;
+            }
+            held = it->second;
+            const uint64_t before = left_[id];
+            it->second->unloading = true;
+            wake_.notify_all();
+            unloaded_.wait(lock, [&]() { return left_[id] != before || stop_; });
+            if (stop_) return;
+        }
+        /*
+            The scheduler destroyed the model, which closed its files, unless a query that read it
+            then holds it a moment longer: its end is awaited, 30 seconds at most, so that the
+            files of the model may be deleted or replaced once this returns.
+        */
+        for (int i = 0; i < 3000 && !held.expired(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     json engine::model_info(const loaded_model& m) const
@@ -1527,9 +1554,12 @@ namespace albireo
             its authors give for a budget, so that the model answers without reasoning and without
             a prompt outside what it learned, the tokens of that end not taking from those of the
             answer; a request that asks for a low effort receives a short reasoning, within its
-            max_tokens.  A budget given as null is no budget.
+            max_tokens.  Without a budget, the reasoning takes half of the tokens of the answer at
+            most (reasoning_most), unless the effort is high; a budget given as null, as -1, sets no
+            bound.
         */
         const bool budget_given = req["reasoning_budget"].is_number();
+        const bool unbounded = req.contains("reasoning_budget") && !budget_given;
         long budget = budget_given ? static_cast<long>(bounded(req["reasoning_budget"], -1, -1, 1 << 24)) : -1;
         bool brief = false;
         if (m->format->always_reasons() && !opt.reasoning)
@@ -1652,6 +1682,8 @@ namespace albireo
             r->closing = chat_format::tokenize(m->tok, m->format->reasoning_close());
             if (!r->closing.empty())
             {
+                if (budget < 0 && !budget_given && !unbounded && effort != "high")
+                    budget = std::min<long>(reasoning_most, r->max_tokens / 2);
                 r->reasoning_budget = budget;
                 // The short reasoning of a request that asked for none comes on top of its answer.
                 if (brief && asked > 0 && budget >= 0)
@@ -1932,7 +1964,7 @@ namespace albireo
             // The device keeps the copies of the models with requests, and may give the
             // room of the others to them (tensor_backend.h).
             for (size_t i = 0; i < models.size(); ++i) models[i]->runtime->set_busy(busy[i]);
-            for (const auto& m : models)
+            for (auto& m : models)
             {
                 if (m->unloading)
                 {
@@ -1954,8 +1986,21 @@ namespace albireo
                         }
                     }
                     abandon(*m, "unloaded", "the model was unloaded");
+                    const std::string id = m->id;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        models_.erase(id);
+                        leaving_.insert(id);
+                    }
+                    /*
+                        The last reference destroys the model here, on the thread of its card,
+                        which closes its files before unload_model() returns, since Windows
+                        deletes no file that a process holds open.
+                    */
+                    m.reset();
                     std::lock_guard<std::mutex> lock(mutex_);
-                    models_.erase(m->id);
+                    leaving_.erase(id);
+                    ++left_[id];
                     unloaded_.notify_all();
                     continue;
                 }
@@ -2002,6 +2047,7 @@ namespace albireo
                 }
             }
             // The models without requests for a while give back their free blocks, whatever the others compute.
+            models.erase(std::remove(models.begin(), models.end(), nullptr), models.end());
             trim_idle(models);
         }
     }

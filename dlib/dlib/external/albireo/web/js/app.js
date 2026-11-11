@@ -974,6 +974,71 @@ function renderStatusLine() {
     }
   }
   ui.statusLine.replaceChildren(h('span', { class: 'led ' + led }), h('span', { class: 'grow', title: text }, text));
+  renderContextLine();
+}
+
+/*
+    The share of the context of its model that the discussion shown takes, under the status line: the tokens of the
+    history the next question carries, its system message and its tools included, as the service counts them, its
+    images by their tokens (tokenEstimate), over the context the engine gives the model.  The discussion is measured
+    again when it, its function, its model or its toggles change, once the answer being written ends; the line keeps
+    the last measure of the discussion meanwhile.  A measure that fails, the service away or the model loading, is
+    tried again for that discussion 30 seconds later at the earliest.
+*/
+const contextUse = { id: '', key: '', tokens: 0, context: 0, pending: false, failed: 0 };
+const contextRetry = 30000;
+
+function contextKey(c) {
+  const last = c.messages[c.messages.length - 1];
+  return [c.id, c.role, roleModel(c.role), c.messages.length, last ? last.id : '',
+    last && last.steps ? last.steps.length : 0, c.contextStart || 0, c.agent ? 1 : 0, c.web ? 1 : 0,
+    c.reasoning ? 1 : 0, c.updated || 0].join('|');
+}
+
+async function measureContext(c, key) {
+  contextUse.pending = true;
+  let tokens = 0, context = 0;
+  try {
+    const caps = roleCapabilities(c.role);
+    const set = toolSet(c, caps);
+    const system = systemPrompt(c, caps, set);
+    const model = 'albireo-' + c.role;
+    const text = apiMessages(c, system, null, { read: false, url: () => null });
+    const r = await api.count(model, text, set.definitions);
+    if (r && typeof r.tokens === 'number' && r.context) {
+      tokens = Math.round(tokenEstimate(text, r.tokens, model).of(apiMessages(c, system, null, estimateMedia(c.role))));
+      context = r.context;
+    }
+  } catch (e) {
+    // A service out of reach: the line stays empty until the next measure.
+  } finally {
+    Object.assign(contextUse, { id: c.id, key: context ? key : '', tokens, context, pending: false,
+      failed: context ? 0 : Date.now() });
+  }
+  renderContextLine();
+}
+
+function renderContextLine() {
+  if (!ui.contextLine) return;
+  const c = state.view === 'chat' ? state.current : null;
+  const ready = !!(c && serviceReady() && roleModel(c.role));
+  const waiting = ready && contextUse.id === c.id && Date.now() - contextUse.failed < contextRetry;
+  if (ready && !contextUse.pending && !generations.has(c.id) && !waiting) {
+    const key = contextKey(c);
+    if (key !== contextUse.key) measureContext(c, key);
+  }
+  const shown = ready && contextUse.id === c.id && contextUse.context > 0;
+  ui.contextLine.classList.toggle('hidden', !shown);
+  if (!shown) return;
+  const share = Math.min(1, contextUse.tokens / contextUse.context);
+  const level = share >= 0.9 ? ' full' : share >= 0.75 ? ' high' : '';
+  const label = formatNumber(contextUse.tokens) + ' / ' + formatNumber(contextUse.context);
+  ui.contextLine.title = t('contextUse', { n: formatNumber(contextUse.tokens), total: formatNumber(contextUse.context),
+    p: Math.round(100 * share) });
+  ui.contextLine.replaceChildren(h('span', { class: 'label' }, t('contextLabel')),
+    h('div', { class: 'meter' + level, role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': contextUse.context,
+      'aria-valuenow': contextUse.tokens, 'aria-valuetext': ui.contextLine.title, 'aria-label': t('contextLabel') },
+    h('div', { style: { width: (100 * share).toFixed(1) + '%' } })), h('span', { class: 'count' }, label));
 }
 
 // Lists.
@@ -6371,18 +6436,16 @@ function cancelWarmup(id) {
     Reads ahead, in the background, the beginning of the prompt of the next question of c once a summary changed it:
     the system message, the summary and the exchanges kept, as the code of a question builds them (apiMessages),
     followed by a question of one character, so that the engine renders the last answer as a turn of the history, as
-    the next question will.  The request goes to the background model, which the service serves behind the answers,
+    the next question will.  The request goes to the model of the function of c, whose keys and values the next
+    question reads, with the priority of the work in the background, which the service serves behind the answers,
     without reasoning and for one token; the engine keeps the keys and values it read, which the next question takes
     over, and computes then its own tokens only.  The engine reads the history of each answer ahead by itself; the
-    page asks it only after a summary, which changes the beginning.  The request is sent when the background model is
-    the model of the function of c, whose keys and values the next question reads, by the tab that applied the summary,
-    while no answer is written in c.  Its failure is told in the console only.
+    page asks it only after a summary, which changes the beginning, by the tab that applied the summary, while no
+    answer is written in c.  Its failure is told in the console only.
 */
 async function warmBeginning(c) {
   if (!c || deleted.has(c.id) || generations.has(c.id) || !c.messages.length || !serviceReady()) return;
-  const model = roleModel(c.role);
-  const s = state.status;
-  if (!model || ((s && s.background) || roleModel('general')) !== model) return;
+  if (!roleModel(c.role)) return;
   cancelWarmup(c.id);
   const abort = new AbortController();
   warmups.set(c.id, abort);
@@ -6393,7 +6456,7 @@ async function warmBeginning(c) {
     const media = await requestMedia(c, c.role);
     if (abort.signal.aborted) return;
     const next = Object.assign({}, c, { messages: c.messages.concat([{ id: 'next', role: 'user', content: '.' }]) });
-    const body = { model: backgroundModel, reasoning: false, max_tokens: 1, stream: false,
+    const body = { model: 'albireo-' + c.role, priority: 'background', reasoning: false, max_tokens: 1, stream: false,
       messages: apiMessages(next, systemPrompt(c, caps, set), null, media) };
     if (set.definitions) body.tools = set.definitions;
     limit = api.limitedSignal(abort.signal, backgroundTimeout);
@@ -6977,6 +7040,7 @@ function buildLayout() {
   ui.sidebar = h('aside', { class: 'sidebar' + (state.settings.sidebar === false ? ' collapsed' : '') });
   ui.sideScroll = h('div', { class: 'side-scroll' });
   ui.statusLine = h('div', { class: 'status-line' });
+  ui.contextLine = h('div', { class: 'context-line hidden' });
   const search = h('input', { type: 'search', placeholder: t('search'), value: state.search });
   let searchTimer = 0;
   search.addEventListener('input', () => {
@@ -7009,7 +7073,7 @@ function buildLayout() {
       }), ui.incognitoButton),
     h('div', { class: 'search' }, h('span', { html: icon('search') }), search),
     ui.sideScroll,
-    h('div', { class: 'sidebar-footer' }, ui.statusLine, h('div', { class: 'footer-buttons' },
+    h('div', { class: 'sidebar-footer' }, ui.statusLine, ui.contextLine, h('div', { class: 'footer-buttons' },
       h('button', { type: 'button', onclick: () => settingsDialog('general'), html: icon('gear') + '<span>' + escapeHtml(t('settings')) + '</span>' }),
       h('button', { type: 'button', onclick: () => window.open('/docs/', '_blank'), html: icon('book') + '<span>' + escapeHtml(t('api')) + '</span>' }),
       h('button', { type: 'button', onclick: () => settingsDialog('about'), html: icon('info') + '<span>' + escapeHtml(t('about')) + '</span>' }))));

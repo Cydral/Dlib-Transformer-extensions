@@ -292,6 +292,14 @@ namespace dlib
                 add_cv_to_all_columns(beta, dest, alpha, src);
                 return;
             }
+            else if (src.num_samples()==1 && src.k()==dest.k() && src.nr()==dest.nr() && src.nc()==dest.nc())
+            {
+                // One sample added to each sample of dest, as the biases of a layer are.  cuDNN 9
+                // computes this broadcast with the library of its precompiled engines, which a
+                // program may not carry.
+                add_to_all_samples(beta, dest, alpha, src);
+                return;
+            }
 
             CHECK_CUDNN(cudnnAddTensor(context(),
                                     &alpha,
