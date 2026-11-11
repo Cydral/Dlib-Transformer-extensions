@@ -2,19 +2,19 @@
   "product": "Pseudalis",
   "channels": {
     "stable": {
-      "version": "1.0.10",
-      "date": "2026-11-10",
+      "version": "1.0.11",
+      "date": "2026-11-11",
       "notes": {
-        "en": "In the imposed columns, the IP addresses of both forms take the type IP alone: the interface refuses IPV4 and IPV6, and a list saved with them under 1.0.8 and not saved since is set aside at start, until it is saved again with IP.",
-        "fr": "Dans les colonnes imposées, les adresses IP des deux formes ne prennent plus que le type IP : l'interface refuse IPV4 et IPV6, et une liste enregistrée avec eux sous la 1.0.8, sans l'être depuis, est mise de côté au démarrage jusqu'à ce qu'elle soit enregistrée de nouveau avec IP.",
-        "de": "In den vorgegebenen Spalten nehmen IP-Adressen beider Formen nur noch den Typ IP an: Die Schnittstelle lehnt IPV4 und IPV6 ab, und eine damit unter 1.0.8 gespeicherte und seitdem nicht erneut gespeicherte Liste wird beim Start beiseitegelegt, bis sie mit IP erneut gespeichert wird.",
-        "it": "Nelle colonne imposte, gli indirizzi IP delle due forme prendono ormai soltanto il tipo IP: l'interfaccia rifiuta IPV4 e IPV6, e un elenco salvato con questi tipi nella 1.0.8, senza esserlo più da allora, viene messo da parte all'avvio finché non viene salvato di nuovo con IP.",
-        "es": "En las columnas impuestas, las direcciones IP de ambas formas solo admiten ya el tipo IP: la interfaz rechaza IPV4 e IPV6, y una lista guardada con ellos en la 1.0.8, sin volver a guardarse desde entonces, se deja de lado al iniciar hasta que se guarde de nuevo con IP."
+        "en": "The recognizers are trained again with exports without header, title pages, health letters, economic reports and source files: names and towns alone in their cells, a town after a date, health funds and practices are found more often, and the words of code, medicine and statistics stay readable. A CSV file without header takes its column of sexes as such; nationalities after Italian, Spanish and German cues, doctors' numbers, the Spanish social security number and card expiry dates are protected.",
+        "fr": "Les modèles de détection sont réentraînés avec des exports sans entête, des pages de titre, des courriers médicaux, des rapports économiques et des fichiers de code : noms et villes seuls dans leur cellule, ville après une date, caisses d'assurance maladie et cabinets sont mieux trouvés, et les mots du code, de la médecine et des statistiques restent lisibles. Un fichier CSV sans entête reconnaît sa colonne de sexe ; les nationalités après leurs indices italiens, espagnols et allemands, les numéros des médecins, le numéro de sécurité sociale espagnol et les dates d'expiration des cartes sont protégés.",
+        "de": "Die Erkennungsmodelle sind neu trainiert, mit Exporten ohne Kopfzeile, Titelseiten, Arztbriefen, Wirtschaftsberichten und Quelltexten: Namen und Orte allein in ihrer Zelle, ein Ort nach einem Datum, Krankenkassen und Praxen werden häufiger erkannt, und die Wörter von Code, Medizin und Statistik bleiben lesbar. Eine CSV-Datei ohne Kopfzeile erkennt ihre Spalte des Geschlechts; Staatsangehörigkeiten nach italienischen, spanischen und deutschen Hinweisen, Arztnummern, die spanische Sozialversicherungsnummer und Ablaufdaten von Karten werden geschützt.",
+        "it": "I modelli di riconoscimento sono addestrati di nuovo con esportazioni senza intestazione, frontespizi, lettere mediche, rapporti economici e file sorgente: nomi e città soli nella loro cella, una città dopo una data, casse sanitarie e studi medici sono trovati più spesso, e le parole del codice, della medicina e della statistica restano leggibili. Un file CSV senza intestazione riconosce la sua colonna del sesso; le nazionalità dopo indizi italiani, spagnoli e tedeschi, i numeri dei medici, il numero di previdenza sociale spagnolo e le scadenze delle carte sono protetti.",
+        "es": "Los modelos de reconocimiento se entrenan de nuevo con exportaciones sin cabecera, portadas, informes médicos, informes económicos y archivos de código: nombres y localidades solos en su celda, una localidad tras una fecha, mutuas y consultas se encuentran más a menudo, y las palabras del código, la medicina y la estadística siguen legibles. Un archivo CSV sin cabecera reconoce su columna de sexo; las nacionalidades tras indicios italianos, españoles y alemanes, los números de los médicos, el número de la Seguridad Social española y la caducidad de las tarjetas quedan protegidos."
       },
       "installer": {
-        "file": "pseudalis-setup-1.0.10.exe",
-        "size": 17234944,
-        "sha256": "75e885734f8d8d3a595326cf952ccc1a2254f62269a1909e52deffcf51b20138"
+        "file": "pseudalis-setup-1.0.11.exe",
+        "size": 17434112,
+        "sha256": "cc4fe08df42c1f765fd8de1e2244cfea6eaa4fdaa2397da2a7286c376e8ec2c1"
       }
     }
   }
