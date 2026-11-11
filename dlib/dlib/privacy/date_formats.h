@@ -587,6 +587,37 @@ namespace dlib
                    w == "pratica" || w == "fattura" || w == "factura" || w == "expediente" || w == "rechnung" ||
                    w == "az" || w == "aktenzeichen" || w == "nummer";
         }
+
+        /* The words of the end of validity of a card or a document before code point i: "expiry
+           date, 07/29", "exp. 07/29", "valid thru 07/29", "scadenza 07/29", "caducidad: 07/29",
+           "gültig bis 07/29", "date d'expiration : 07/29". */
+        inline bool expiry_before(const utf8_text& t, std::size_t i)
+        {
+            static const std::vector<std::string> alone = {
+                "expiry", "expiration", "expires", "expire", "exp", "expira", "expiracion", "scadenza", "scad",
+                "caducidad", "caduca", "vencimiento", "vence", "ablaufdatum", "verfallsdatum", "ablauf", "validite" };
+            static const std::vector<std::string> dates = { "date", "datum", "data", "fecha" };
+            static const std::vector<std::string> until = { "thru", "through", "until", "bis", "hasta", "fino" };
+            static const std::vector<std::string> valid = { "valid", "good", "gultig", "valida", "valido", "valable" };
+            auto in = [](const std::vector<std::string>& words, const std::string& w) {
+                for (const std::string& x : words)
+                    if (x == w) return true;
+                return false;
+            };
+            std::size_t k = i;
+            while (k > 0 && i - k < 4 && (t.cps[k - 1] == ' ' || t.cps[k - 1] == ':' || t.cps[k - 1] == '.' ||
+                                          t.cps[k - 1] == ',' || t.cps[k - 1] == 0xA0))
+                --k;
+            std::size_t b;
+            const std::string w = fold_key(letters_before(t, k, b));
+            if (in(alone, w)) return true;
+            if (!in(dates, w) && !in(until, w)) return false;
+            std::size_t q = b;
+            while (q > 0 && b - q < 3 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0)) --q;
+            std::size_t b2;
+            const std::string w2 = fold_key(letters_before(t, q, b2));
+            return in(dates, w) ? in(alone, w2) : in(valid, w2);
+        }
     }
 
 // ----------------------------------------------------------------------------------------
@@ -777,14 +808,19 @@ namespace dlib
                         const char32_t sep = t.cps[j];
                         std::size_t y = j + 1;
                         int year, ly;
-                        if (read_digits(t, y, 4, year, ly) && ly == 4 && plausible_partial_year(year) &&
-                            year_ends(t, y) && !reference_before(t, i))
+                        const bool read = read_digits(t, y, 4, year, ly);
+                        // The end of validity of a card in two figures: "expiry date, 07/29".
+                        const bool expiry = read && ly == 2 && sep == '/' && year_ends(t, y) && expiry_before(t, i);
+                        if (expiry) year += 2000;
+                        if (read && (ly == 4 || expiry) && plausible_partial_year(year) && year_ends(t, y) &&
+                            !reference_before(t, i))
                         {
                             date_format f;
                             f.layout = 6;
                             f.separator = static_cast<std::uint8_t>(sep == '/' ? 0 : 2);
                             f.day_style = 0;
                             f.month_style = 1;
+                            f.two_digit_year = expiry ? 1 : 0;
                             m.begin = t.offsets[i];
                             m.end = t.offsets[y];
                             m.date.year = year; m.date.month = month; m.date.day = 0;
@@ -1055,6 +1091,23 @@ namespace dlib
             format.separator = 0;
             format.day_style = 0;
             format.month_style = 0;
+            return true;
+        }
+        // The end of validity of a card, "07/29": the words that made it a date are outside the value.
+        if (text.size() == 5 && text[2] == '/' && text.find_first_not_of("0123456789", 3) == std::string::npos &&
+            text.find_first_not_of("0123456789") == 2)
+        {
+            const int month = std::stoi(text.substr(0, 2));
+            if (month < 1 || month > 12) return false;
+            date = civil_date();
+            date.year = 2000 + std::stoi(text.substr(3));
+            date.month = month;
+            format = date_format();
+            format.layout = 6;
+            format.separator = 0;
+            format.day_style = 0;
+            format.month_style = 1;
+            format.two_digit_year = 1;
             return true;
         }
         return false;

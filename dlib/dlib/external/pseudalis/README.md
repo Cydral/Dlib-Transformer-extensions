@@ -26,7 +26,11 @@ bank details, dates and the rest of the types of `dlib/privacy`) is replaced by 
 `[[PERSON:Xoydoeh Nuggwdfsorn#EKR]]`, which carries the value encrypted with FF1 over AES-256 and a
 check. The key of the computer alone restores the document, or any text derived from it. Word, Excel,
 PowerPoint, PDF, text, CSV, Markdown, HTML, XML, JSON and YAML files keep their layout; a PDF keeps its
-pages, its text drawn again in place.
+pages, its text drawn again in place. A CSV file is read cell by cell, after its whole rows have taught
+the names, the places and the organisations of the file: without a header, a column whose cells hold the
+sexes of one usage (`M` and `F`, `m`, `w` and `d`) takes them as sexes, as a header naming it would, and
+a column whose cells are mostly names or towns found whole gives that type to its other cells of the form
+of a name.
 
 The places that a tag would spoil take the value in its protected form without the tag, its
 substitute: `Xoydoeh Nuggwdfsorn` for `Jean Dupont`, a date shifted in the form of the original. They

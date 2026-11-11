@@ -617,11 +617,6 @@ namespace dlib
             return type == pii_type::date && options_.dates == date_policy::keep;
         }
 
-        double shift_date_serial(double serial, bool forward) const
-        {
-            return serial + (forward ? shift_days_ : -shift_days_);
-        }
-
         std::string key_fingerprint() const
         {
             const std::array<unsigned char,32> h = hmac_sha256_digest(check_key_, "dlib.privacy.fingerprint");

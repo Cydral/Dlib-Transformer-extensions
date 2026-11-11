@@ -3469,6 +3469,141 @@ namespace
                   utf8_text && ua.encoding == "utf-8" && ur.encoding == "utf-8");
     }
 
+    void test_health_and_exports()
+    {
+        pii_detector detector;
+        auto entities = [&](const string& text) {
+            detector.begin_document();
+            detector.learn(text);
+            return detector.detect(text);
+        };
+        // Nationalities after the cues of Italian, Spanish and German, a German adjective with its ending.
+        string text = "Su socio, Andrés Ocaña Prieto, de nacionalidad mexicana, abre una oficina. "
+                      "Il socio Marco Rossi, di nazionalità messicana, segue la sede. "
+                      "Ihr Disponent Mehmet Yılmaz, türkischer Staatsangehöriger, plant die Touren; "
+                      "Frau Nowak lebt mit polnischer Staatsangehörigkeit in Köln.";
+        std::vector<pii_entity> e = entities(text);
+        for (const char* v : { "mexicana", "messicana", "türkischer", "polnischer" })
+            DLIB_TEST_MSG(found(e, text, pii_type::nationality, v), v);
+
+        // The numbers of doctors after their labels and after the board that holds them.
+        text = "Dr. med. Anna Vogt, Fachärztin für Allgemeinmedizin\nLANR 384712903 · BSNR 563910482\n"
+               "Dr Eleanor Fitzgerald, General Practitioner, GMC 7419286\n"
+               "Iscrizione Ordine dei Medici di Bologna n. 15873\n"
+               "Colegio Oficial de Médicos de Valladolid, n.º de colegiado 474712345\n"
+               "Inscrite à l'Ordre des médecins de la Gironde sous le n° 33/12345\n"
+               "Ordine del giorno n. 3: bilancio.";
+        e = entities(text);
+        for (const char* v : { "384712903", "563910482", "7419286", "15873", "474712345", "33/12345" })
+            DLIB_TEST_MSG(found(e, text, pii_type::identifier, v), v);
+        DLIB_TEST(!covered(e, text, "3: bilancio"));
+
+        // The Spanish social security number, its groups separated or after its label, its control checked.
+        text = "N.º Seguridad Social\n47/01838264/00\nNUSS: 281234567840\nOtro número: 47/01838264/41";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::identifier, "47/01838264/00"));
+        DLIB_TEST(found(e, text, pii_type::identifier, "281234567840"));
+        DLIB_TEST(!found(e, text, pii_type::identifier, "47/01838264/41"));
+        // An NHS number after "patient number", its check verified.
+        text = "Her NHS letter lay on the bedside table, patient number 745 275 9125.";
+        DLIB_TEST(found(entities(text), text, pii_type::identifier, "745 275 9125"));
+
+        // The end of validity of a card is a month with its year, after its words only.
+        text = "Card number 4012 8888 8888 1881, expiry date, 07/29. Valid thru 11/27. Ablaufdatum: 03/28.";
+        e = entities(text);
+        for (const char* v : { "07/29", "11/27", "03/28" })
+            DLIB_TEST_MSG(found(e, text, pii_type::date, v), v);
+        text = "Room 07/29 of building 11/27.";
+        e = entities(text);
+        DLIB_TEST(!covered(e, text, "07/29") && !covered(e, text, "11/27"));
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x43')));
+        const string moved = p.substitute(pii_type::date, "07/29");
+        DLIB_TEST(moved.size() == 5 && moved[2] == '/' && moved != "07/29");
+        DLIB_TEST(p.restore(p.tag(pii_type::date, "07/29")) == "07/29");
+
+        // What a recognizer reads in a unit, a literal of code or a code of capitals names nothing.
+        pii_detector read;
+        read.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            auto add = [&](const string& value, const string& label, size_t from) {
+                const size_t p = t.find(value, from);
+                if (p == string::npos) return;
+                pii_span s;
+                s.begin = p;
+                s.end = p + value.size();
+                s.label = label;
+                s.confidence = 0.9;
+                spans.push_back(s);
+            };
+            add("Prozent", "CITY", 0);
+            add("False", "CITY", 0);
+            add("REQ_SEC", "USERNAME", 0);
+            add("Leipzig", "CITY", 0);
+            return spans;
+        });
+        text = "Das Wachstum liegt bei 1,3 Prozent. joueurs = {'O': ('Ordinateur', False)}\n"
+               "| Anforderung | REQ_SEC_B2 |\nPraxis: Kurt-Eisner-Straße 4, 04275 Leipzig";
+        read.begin_document();
+        read.learn(text);
+        e = read.detect(text);
+        DLIB_TEST(!covered(e, text, "Prozent") && !covered(e, text, "False") && !covered(e, text, "REQ_SEC"));
+        DLIB_TEST(found(e, text, pii_type::location, "Leipzig") || found(e, text, pii_type::location, "04275 Leipzig"));
+
+        // A file without header: its column of sexes is typed by its values, protected and restored.
+        const string csv = "giulia.romano@example.org;Giulia;Romano;F;1987-03-12;Bergamo\n"
+                           "marco.ferrara@example.net;Marco;Ferrara;M;1971-06-05;Perugia\n"
+                           "sara.galli@example.net;Sara;Galli;F;1986-09-11;Napoli\n"
+                           "luca.conti@example.com;Luca;Conti;M;1990-01-20;Roma\n";
+        document_anonymizer a(p, detector);
+        document_report r;
+        const string out = a.anonymize(csv, document_format::delimited, r, "export.csv");
+        DLIB_TEST(r.entities["GENDER"] == 4);
+        document_report rr;
+        DLIB_TEST(a.restore(out, document_format::delimited, rr, "export.csv") == csv);
+        // A column of letters of no single usage, or of one letter, stays as it is.
+        const string sizes = "Giulia;Romano;M;S\nMarco;Ferrara;M;XL\nSara;Galli;M;L\nLuca;Conti;M;M\n";
+        document_report rs;
+        a.anonymize(sizes, document_format::delimited, rs, "sizes.csv");
+        DLIB_TEST(rs.entities.count("GENDER") == 0);
+
+        /* Without a header, the cells of a column of names or of towns that the rows did not teach
+           take the type of the others; a column of codes stays as it is. */
+        pii_detector rows;
+        rows.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            for (const char* v : { "Romano", "Ferrara", "Conti", "Bergamo", "Perugia", "Roma" })
+            {
+                const string value = v;
+                for (size_t p = t.find(value); p != string::npos; p = t.find(value, p + 1))
+                {
+                    if ((p > 0 && std::isalpha(static_cast<unsigned char>(t[p - 1]))) ||
+                        (p + value.size() < t.size() && std::isalpha(static_cast<unsigned char>(t[p + value.size()]))))
+                        continue;
+                    pii_span s;
+                    s.begin = p;
+                    s.end = p + value.size();
+                    s.label = value == "Bergamo" || value == "Perugia" || value == "Roma" ? "CITY" : "FAMILY_NAME";
+                    s.confidence = 0.95;
+                    spans.push_back(s);
+                }
+            }
+            return spans;
+        });
+        const string export_rows = "giulia@example.org;Romano;Bergamo;B2C\nmarco@example.org;Ferrara;Perugia;B2B\n"
+                                   "sara@example.org;Galli;Napoli;B2C\nluca@example.org;Conti;Roma;B2B\n";
+        document_anonymizer b(p, rows);
+        document_report rb;
+        const string bout = b.anonymize(export_rows, document_format::delimited, rb, "export.csv");
+        DLIB_TEST(bout.find("Galli") == string::npos && bout.find("Napoli") == string::npos);
+        DLIB_TEST(bout.find(";B2C\n") != string::npos && bout.find(";B2B\n") != string::npos);
+        document_report rbr;
+        DLIB_TEST(b.restore(bout, document_format::delimited, rbr, "export.csv") == export_rows);
+        // A given name that is also a word of code stays a name in its column: "Elif".
+        const string named = "Anrede;Vorname;Nachname\nFrau;Elif;Weber\nHerr;Jonas;Krause\n";
+        document_report rn;
+        DLIB_TEST(a.anonymize(named, document_format::delimited, rn, "kunden.csv").find("Elif") == string::npos);
+    }
+
     std::vector<string> lines_of(const string& text)
     {
         std::vector<string> lines;
@@ -4115,6 +4250,7 @@ namespace
             test_imposed_columns();
             test_ip_columns();
             test_ascii_windows_1252();
+            test_health_and_exports();
             print_spinner();
             test_dataset();
             print_spinner();

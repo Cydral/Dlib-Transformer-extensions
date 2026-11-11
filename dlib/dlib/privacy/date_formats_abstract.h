@@ -203,7 +203,11 @@ namespace dlib
                 - a month name and its year, with an optional comma after the month and
                   one or two spaces before the year (layout 5);
                 - a month of two digits, '/' or '.', and the year (layout 6), unless a
-                  number sign or a reference word comes before ("n° 03/2022");
+                  number sign or a reference word comes before ("n° 03/2022"); after the
+                  words of the end of validity of a card ("expiry date", "exp.", "valid
+                  thru", "date d'expiration", "scadenza", "caducidad", "vencimiento",
+                  "gültig bis", "Ablaufdatum"), a month, '/' and a year of two digits that
+                  reads 20YY ("07/29");
                 - a year alone (layout 7) after a word of time: en, depuis, dès, avant,
                   après, fin, début, courant, vers, année, l'an, mi-, printemps, été,
                   automne, hiver, session, promotion, in, since, until, till, before, after,
@@ -249,8 +253,10 @@ namespace dlib
         ensures
             - Returns true if the whole of text is one date as find_dates() reads it, and
               sets #date and #format accordingly.
-            - Four digits alone from 1900 to 2099 read as a year alone (layout 7): the words
-              that made them a date are outside the text.
+            - Four digits alone from 1900 to 2099 read as a year alone (layout 7), and a
+              month of two digits, '/' and two digits ("07/29") as the end of validity of a
+              card (layout 6, year 20YY): the words that made them a date are outside the
+              text.
     !*/
 
 // ----------------------------------------------------------------------------------------

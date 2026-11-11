@@ -809,6 +809,7 @@ namespace dlib
             scan_terms(t, words, c);
             scan_doc_acronyms(t, words, c);
             scan_cued_references(t, words, c);
+            scan_board_numbers(t, words, c);
             scan_year_references(t, c);
             scan_logins(t, words, c);
             scan_patterns(text, t, c);
@@ -957,7 +958,7 @@ namespace dlib
                 return gender_values().count(k) != 0;
             }
             if (type == pii_type::nationality)
-                return nationality_words().count(folded) != 0 || country_names().count(folded) != 0;
+                return nationality_word(folded) || country_names().count(folded) != 0;
             return false;
         }
 
@@ -1866,7 +1867,7 @@ namespace dlib
             auto cell_type = [&](std::size_t b, std::size_t e, bool titles) {
                 const std::string key = fold_key(cp_substr(t, text, b, e));
                 if (key.empty() || e - b > 40) return pii_type::none;
-                if (nationality && nationality_words().count(key)) return pii_type::nationality;
+                if (nationality && nationality_word(key)) return pii_type::nationality;
                 if (gender && (sexes.count(key) ||
                                (e - b == 1 && (t.cps[b] == 'M' || t.cps[b] == 'F' || t.cps[b] == 'H'))))
                     return pii_type::gender;
@@ -1885,7 +1886,7 @@ namespace dlib
                     while (e < n && (is_letter(t.cps[e]) || (is_hyphen(t.cps[e]) && is_letter(t.at(e + 1))))) ++e;
                     const char32_t c = t.at(e);
                     if (e > b && (c == 0 || c == ',' || c == ' ' || c == '.' || c == ';' || c == ')' || is_line_break(c)) &&
-                        nationality_words().count(fold_key(cp_substr(t, text, b, e))))
+                        nationality_word(fold_key(cp_substr(t, text, b, e))))
                         take(b, e, pii_type::nationality);
                 }
                 // "Monsieur Matteo Lombardi (3323086)", "Mr. Carter (2024-97993)": a reference after the name.
@@ -1962,11 +1963,17 @@ namespace dlib
             using namespace privacy_impl;
             const bool nationality = enabled(pii_type::nationality), gender = enabled(pii_type::gender);
             if (!nationality && !gender) return;
+            /* "di nazionalità messicana", "de nacionalidad mexicana", "cittadino rumeno", "türkischer
+               Staatsangehöriger", "mit polnischer Staatsangehörigkeit". */
             static const std::unordered_set<std::string> nationality_before = make_word_set(
                 "nationalite nationalites citoyen citoyenne citoyens citoyennes ressortissant ressortissante "
-                "ressortissants ressortissantes nationality citizenship passeport passeports identite");
+                "ressortissants ressortissantes nationality citizenship passeport passeports identite "
+                "nazionalita cittadinanza cittadino cittadina cittadini cittadine passaporto "
+                "nacionalidad ciudadano ciudadana ciudadanos ciudadanas pasaporte");
             static const std::unordered_set<std::string> nationality_after = make_word_set(
-                "national nationals citizen citizens nationality passport passports identity id age agee ages agees");
+                "national nationals citizen citizens nationality passport passports identity id age agee ages agees "
+                "staatsangehoriger staatsangehorige staatsangehorigen staatsangehorigkeit staatsburger staatsburgerin "
+                "staatsburgerschaft reisepass");
             static const std::unordered_set<std::string> gender_before = make_word_set("sexe sex");
             auto close = [&](std::size_t a, std::size_t b) {
                 if (b < a || b - a > 3 || !same_line(t, a, b)) return false;
@@ -2005,7 +2012,7 @@ namespace dlib
                                       (t.cps[words[k].e] == ' ' || is_hyphen(t.cps[words[k].e]))))
                         continue;
                     const std::string key = len == 1 ? words[k].key : fold_key(cp_substr(t, text, b, e));
-                    if (nationality && nationality_words().count(key))
+                    if (nationality && nationality_word(key))
                     {
                         const bool cued =
                             (k > 0 && nationality_before.count(words[k - 1].key) && close(words[k - 1].e, b)) ||
@@ -3691,7 +3698,9 @@ namespace dlib
                                                               "personal identification code" };
             static const std::vector<std::string> si_cues = { "emso" };
             static const std::vector<std::string> gr_cues = { "amka" };
-            static const std::vector<std::string> nhs_cues = { "nhs" };
+            static const std::vector<std::string> nhs_cues = { "nhs", "patient number", "patient no" };
+            static const std::vector<std::string> es_ss_cues = { "seguridad social", "seg. social", "nuss", "naf",
+                                                                 "afiliacion" };
             static const std::vector<std::string> sin_cues = { "sin", "nas", "social insurance", "assurance sociale" };
             static const std::vector<std::string> cpf_cues = { "cpf" };
             static const std::vector<std::string> aadhaar_cues = { "aadhaar", "aadhar", "uidai" };
@@ -3770,6 +3779,11 @@ namespace dlib
                      shape_at(t, i, "dddddddd A", end, a)) && es_dni_ok(a))
                 { take(0.9, 12); continue; }
                 if (shape_at(t, i, "dd.dd.dd-ddd.dd", end, a) && be_national_number_ok(a)) { take(0.95, 12); continue; }
+                // Spanish social security number, its groups separated: "47/01838264/00".
+                if ((shape_at(t, i, "dd/dddddddd/dd", end, a) || shape_at(t, i, "dd/dddddddd-dd", end, a) ||
+                     shape_at(t, i, "dd-dddddddd-dd", end, a) || shape_at(t, i, "dd dddddddd dd", end, a)) &&
+                    es_nuss_ok(a))
+                { take(0.9, 12); continue; }
                 if (shape_at(t, i, "ddd.dddd.dddd.dd", end, a) && ch_avs_ok(a)) { take(0.95, 12); continue; }
                 if (shape_at(t, i, "ddd-dd-dddd", end, a) && (us_ssn_ok(a) || us_itin_ok(a))) { take(0.8, 8); continue; }
                 if ((shape_at(t, i, "ddddd ddddd XXXXXXXXXXX dd", end, a) ||
@@ -3876,7 +3890,7 @@ namespace dlib
                             break;
                         case 12:
                             if (cued(aadhaar_cues, in_aadhaar_ok) || cued(jp_cues, jp_my_number_ok) ||
-                                cued(se_cues, se_personnummer_ok))
+                                cued(se_cues, se_personnummer_ok) || cued(es_ss_cues, es_nuss_ok))
                             { take(0.9, 12); done = true; }
                             break;
                         case 18:
@@ -4727,7 +4741,9 @@ namespace dlib
                 "bestellnr rechnungsnr kundennr vertragsnr auftragsnr mitgliedsnr personalnr versicherungsnr "
                 "versichertennummer versicherungsschein versicherungsscheinnummer policennummer fuhrerschein "
                 "fuhrerscheinnummer nosologico procedimiento autos recurso colegiado colegiada paciente empleada "
-                "contrato mieternummer versichertennr mandatsreferenz");
+                "contrato mieternummer versichertennr mandatsreferenz "
+                // The numbers of doctors and of their practices: "LANR 384712903", "GMC 7419286".
+                "lanr bsnr arztnummer betriebsstattennummer gmc nuss");
             return s;
         }
 
@@ -4835,6 +4851,66 @@ namespace dlib
                                             (q + 2 < n && t.cps[q] == 'E' && t.cps[q + 1] == 'U' && t.cps[q + 2] == 'R')))
                         continue;
                 }
+                add(out, p, e, pii_type::identifier, 0.85, 2);
+            }
+        }
+
+        /* The registration number of a member of a regulated profession after the board that
+           holds it, the name of the board between them: "Iscrizione Ordine dei Medici di Bologna
+           n. 15873", "Colegio Oficial de Médicos de Valladolid, n.º de colegiado 474712345",
+           "inscrit à l'Ordre des médecins de la Gironde sous le n° 33/12345". */
+        void scan_board_numbers(const utf8_text& t, const std::vector<word_token>& words,
+                                std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            if (!enabled(pii_type::identifier)) return;
+            static const std::unordered_set<std::string> boards = make_word_set("ordine albo collegio colegio ordre");
+            static const std::unordered_set<std::string> markers = make_word_set("n no nr num numero number");
+            static const std::unordered_set<std::string> fillers = make_word_set(
+                "o de di del du d colegiado colegiada iscrizione iscritto iscritta inscription");
+            const std::size_t n = t.size();
+            for (std::size_t k = 0; k < words.size(); ++k)
+            {
+                if (!boards.count(words[k].key)) continue;
+                // The words of the board, on the same line and without figures, up to the marker.
+                std::size_t w = k + 1;
+                while (w < words.size() && w - k <= 10 && same_line(t, words[k].e, words[w].b) &&
+                       words[w].b - words[w - 1].e <= 3 && !markers.count(words[w].key))
+                    ++w;
+                if (w >= words.size() || w - k > 10 || !markers.count(words[w].key) ||
+                    !same_line(t, words[k].e, words[w].b) || words[w].b - words[w - 1].e > 3)
+                    continue;
+                // Punctuation and fillers between the marker and the number: "n.º de colegiado".
+                std::size_t p = words[w].e, v = w + 1;
+                int skipped = 0;
+                while (p < n && p - words[w].e <= 24)
+                {
+                    const char32_t ch = t.cps[p];
+                    if (ch == ' ' || ch == '.' || ch == ':' || ch == 0xB0 || ch == 0xBA || ch == 0xA0 || ch == '#')
+                    { ++p; continue; }
+                    if (v < words.size() && words[v].b == p && fillers.count(words[v].key) && skipped < 3 &&
+                        !is_ascii_digit(t.at(words[v].e)))
+                    {
+                        p = words[v].e;
+                        ++v;
+                        ++skipped;
+                        continue;
+                    }
+                    break;
+                }
+                if (p >= n || !is_ascii_digit(t.cps[p]) || !same_line(t, words[k].e, p)) continue;
+                std::size_t e = p, digits = 0;
+                while (e < n && digits <= 14)
+                {
+                    if (is_ascii_digit(t.cps[e])) { ++digits; ++e; continue; }
+                    if ((t.cps[e] == '/' || t.cps[e] == '-') && e + 1 < n && is_ascii_digit(t.cps[e + 1]))
+                    {
+                        ++e;
+                        continue;
+                    }
+                    break;
+                }
+                if (digits < 3 || digits > 14 || is_word_char(t.at(e))) continue;
                 add(out, p, e, pii_type::identifier, 0.85, 2);
             }
         }
@@ -5944,7 +6020,26 @@ namespace dlib
             if (type == pii_type::identifier)
             {
                 if (b > 0 && (is_word_char(t.cps[b - 1]) || t.cps[b - 1] == '_')) return true;
+                // A piece of a longer word or code: "REQ_SEC" in "REQ_SEC_B2".
+                if (e < n && (is_word_char(t.cps[e]) || (t.cps[e] == '_' && e + 1 < n && is_word_char(t.cps[e + 1]))))
+                    return true;
                 if (e == b + 1) return true;
+                /* A code of capitals and digits joined by underscores, each part of three at most:
+                   "REQ_SEC_B2", the reference of a requirement in a table. */
+                {
+                    bool code = false, parts = true;
+                    std::size_t pb = b;
+                    for (std::size_t q = b; q <= e && parts; ++q)
+                    {
+                        if (q < e && t.cps[q] != '_') continue;
+                        if (q < e) code = true;
+                        if (q == pb || q - pb > 3) parts = false;
+                        for (std::size_t r = pb; r < q && parts; ++r)
+                            parts = is_upper(t.cps[r]) || is_ascii_digit(t.cps[r]);
+                        pb = q + 1;
+                    }
+                    if (code && parts) return true;
+                }
                 // The scheme or the namespace of an identifier: "pkg" in "pkg:maven/org.acme/tool@2.1".
                 if (e + 1 < n && t.cps[e] == ':' && (is_letter(t.cps[e + 1]) || t.cps[e + 1] == '/')) return true;
                 const std::string key = fold_key(cp_substr(t, text, b, e));
@@ -6034,7 +6129,22 @@ namespace dlib
             }
             if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
                 return false;
+            // A literal of source code, which a common word would not stop as a town: "('Ordinateur', False)".
+            {
+                static const std::unordered_set<std::string> literals = make_word_set(
+                    "true false none null nullptr undefined");
+                if (literals.count(fold_key(cp_substr(t, text, b, e)))) return true;
+            }
             if (type == pii_type::location && standard_number(text, t, b, e)) return true;
+            /* A word after a number with decimals, which no postal code has: the unit of a quantity
+               ("1,3 Prozent", "2.5 Millionen"), never the town of an address. */
+            if (type == pii_type::location && b >= 4 && (t.cps[b - 1] == ' ' || t.cps[b - 1] == 0xA0) &&
+                is_ascii_digit(t.cps[b - 2]))
+            {
+                std::size_t q = b - 2;
+                while (q > 0 && is_ascii_digit(t.cps[q - 1])) --q;
+                if (q >= 2 && (t.cps[q - 1] == ',' || t.cps[q - 1] == '.') && is_ascii_digit(t.cps[q - 2])) return true;
+            }
             /* A code of one or two capitals and up to three digits read as a person or a place ("W8",
                "M14", "H12"), and a piece of a token of capitals, digits and hyphens: "DOC-ARC" in
                "NRV-DOC-ARC-2025-031". A name damaged by a scanner ("Mi1let") and a postal code of
@@ -9056,7 +9166,7 @@ namespace dlib
                         const word_token& x = words[first - 1];
                         if (x.shape != 1 && !(metropole && capital(x))) break;
                         if (modifiers.count(x.key) || heads.count(x.key) || person_titles().count(x.key) ||
-                            forms.count(x.key) || nationality_words().count(x.key) || particles.count(x.key) ||
+                            forms.count(x.key) || nationality_word(x.key) || particles.count(x.key) ||
                             articles.count(x.key) || descriptors.count(x.key))
                             break;
                         if (sectors.count(x.key)) { --first; continue; }
@@ -9350,7 +9460,7 @@ namespace dlib
                 };
                 if (lexicon == 0 && saint(words[k].key)) continue;
                 // "ANDREWS Brandon, M, Italian, carpenter": a nationality alone is not a name.
-                if (name_words == 1 && lexicon == 0 && !strong && nationality_words().count(words[k].key)) continue;
+                if (name_words == 1 && lexicon == 0 && !strong && nationality_word(words[k].key)) continue;
                 // "Saint-Jean-de-Luz" is a place, even when Jean is a known name.
                 if (k > 0 && saint(words[k - 1].key) && words[k - 1].e + 1 == b && is_hyphen(t.cps[words[k - 1].e]))
                     continue;

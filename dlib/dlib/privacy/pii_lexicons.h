@@ -2103,7 +2103,12 @@ namespace dlib
                     "schwachstelle schwachstellen erkennung komponente komponenten modul laufzeit "
                     "paket pakete abhangigkeit abhangigkeiten konfiguration umgebung umgebungen "
                     "plattform schnittstelle schnittstellen befund befunde minderung aktualisierung "
-                    "aktualisierungen versionen sicherheitslucke sicherheitslucken"
+                    "aktualisierungen versionen sicherheitslucke sicherheitslucken",
+                    // The units of the figures of a report: "1,3 Prozent".
+                    "prozent prozentpunkt prozentpunkte",
+                    // The literals and keywords of source code: "('Ordinateur', False)" names no place.
+                    "true false none null nullptr undefined args kwargs def lambda constexpr typename "
+                    "namespace typedef"
                 };
                 for (const char* part : frequent)
                 {
@@ -2331,6 +2336,25 @@ namespace dlib
                 "pakistanisch|ivorisch|kamerunisch|senegalesisch|slowenisch|litauisch|lettisch|estnisch|"
                 "moldauisch");
             return s;
+        }
+
+        /* Whether folded, a word folded with fold_key(), is a nationality adjective of
+           nationality_words(), a German one with the ending of its case and gender included
+           ("turkischer", "polnische", "deutschen"). */
+        inline bool nationality_word(const std::string& folded)
+        {
+            const std::unordered_set<std::string>& s = nationality_words();
+            if (s.count(folded)) return true;
+            static const std::string endings[] = { "e", "er", "es", "en", "em" };
+            for (const std::string& ending : endings)
+            {
+                if (folded.size() <= ending.size() + 4 ||
+                    folded.compare(folded.size() - ending.size(), ending.size(), ending) != 0)
+                    continue;
+                const std::string stem = folded.substr(0, folded.size() - ending.size());
+                if ((stem == "deutsch" || stem.compare(stem.size() - 4, 4, "isch") == 0) && s.count(stem)) return true;
+            }
+            return false;
         }
 
         inline const std::unordered_set<std::string>& country_names()

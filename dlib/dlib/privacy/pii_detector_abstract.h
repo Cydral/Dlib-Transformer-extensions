@@ -162,8 +162,10 @@ namespace dlib
                    coordinates (decimal or degrees, minutes and seconds), IMEI, ICCID
                    and IMSI numbers, UUIDs, vehicle identification numbers, French bank
                    details (RIB key), tax and passport numbers, and the national numbers
-                   of about forty countries: Belgium, Spain (DNI, NIE), Italy (codice
-                   fiscale), the United Kingdom (NINO, NHS), the United States (SSN,
+                   of about forty countries: Belgium, Spain (DNI, NIE, the social
+                   security number NUSS written in its groups, "47/01838264/00", or after
+                   its label), Italy (codice fiscale), the United Kingdom (NINO, NHS after
+                   its label or "patient number"), the United States (SSN,
                    ITIN), Switzerland (AVS), Luxembourg, the Netherlands (BSN), Germany
                    (Steuer-IdNr), Austria, Poland (PESEL), Portugal (NIF), Czechia,
                    Denmark, Finland, Sweden, Norway, Iceland, Ireland (PPSN), Romania,
@@ -184,7 +186,12 @@ namespace dlib
                    and the references of files, customers, contracts, claims, invoices,
                    requests, applications, permits or asset tags ("dossier n° 2024-00123",
                    reference "B4694342", "Ref: 2476486", "pratica n. 2025/0041736",
-                   "expediente 2024-0871", "Aktenzeichen 2511-004712"), a file name
+                   "expediente 2024-0871", "Aktenzeichen 2511-004712"), the numbers of doctors
+                   and of their practices after their labels ("LANR 384712903", "BSNR
+                   563910482", "GMC 7419286", "RPPS", "ADELI", "colegiado") and the number of
+                   a member of a regulated profession after its board ("Iscrizione Ordine dei
+                   Medici di Bologna n. 15873", "Colegio Oficial de Médicos de Valladolid,
+                   n.º de colegiado 474712345"), a file name
                    excepted, a value after such a cue or a number sign being no phone
                    number ("Polizza n. 0471/882331"); a reference
                    that carries a year between capitals and digits needs none, since its
@@ -194,7 +201,9 @@ namespace dlib
                    "téléphone"). These scanners work in time linear in the length of the
                    text. Dates are those of find_dates(): complete dates in the five
                    languages ("3 aprile 2024", "5 de mayo de 2024", "12. März 2024"), a
-                   month with its year ("mars 2022", "03/2022", "marzo de 2022") and a
+                   month with its year ("mars 2022", "03/2022", "marzo de 2022", the end
+                   of validity of a card in two figures after its words, "expiry date
+                   07/29", "scadenza 07/29", "gültig bis 07/29") and a
                    year that dates a fact ("en 2019",
                    "depuis 2021", the years of a CV line), since a month or a year left in
                    clear would tell how far the protected dates moved; a date that names a
@@ -288,7 +297,9 @@ namespace dlib
                    Sexes and nationalities are reported as gender and nationality in
                    labelled fields, after a cue ("de nationalité française", "passeport
                    algérien", "a British citizen", "an 82 year old American", "française
-                   de 73 ans"), in apposition to a name ("Louis Patel, American,") and in
+                   de 73 ans", "di nazionalità messicana", "de nacionalidad mexicana",
+                   "türkischer Staatsangehöriger", a German adjective with the ending of
+                   its case), in apposition to a name ("Louis Patel, American,") and in
                    the cells of a row that holds a name ("PEREIRA Awa – F – belge").
 
                    Tables written as text are read like spreadsheets: a header line of

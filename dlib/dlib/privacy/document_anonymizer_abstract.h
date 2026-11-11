@@ -115,7 +115,13 @@ namespace dlib
                     delimited - each cell is a unit. A header row made of field labels
                                 ("nom", "email", "telephone") types its columns, and a
                                 label cell types the cell on its right, as in key and
-                                value files; the labels themselves stay readable. Whole
+                                value files; the labels themselves stay readable. In a
+                                file without header, a column whose cells hold the sexes
+                                of one usage ("M" and "F", "m", "w" and "d") is typed as
+                                gender, as a header would have typed it, and a column whose
+                                cells mostly hold a name or a town found whole, three at
+                                least, gives that type to its other cells of the form of a
+                                name ("Galli" among family names found). Whole
                                 rows feed the learning pass, so that a name established in
                                 one row is replaced in every cell, and detection runs cell
                                 by cell, so that a value never spills over a column.

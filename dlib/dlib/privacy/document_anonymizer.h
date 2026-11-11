@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1056,6 +1057,87 @@ namespace dlib
             return std::make_pair(b, v.find_last_not_of(" \t\r\n") + 1);
         }
 
+        /* Whether a value of a cell has the form of a name or of a town: one to four words of
+           letters joined by spaces, hyphens or apostrophes, the first opened by a capital, and no
+           common word alone ("Galli", "De Luca", "Forlì", "Saint-Malo", "D'Amico"). */
+        static bool name_form(const std::string& value)
+        {
+            using namespace privacy_impl;
+            const utf8_text t(value, true);
+            if (t.size() == 0 || t.size() > 40 || !is_upper(t.cps[0])) return false;
+            std::size_t words = 1;
+            for (std::size_t q = 0; q < t.size(); ++q)
+            {
+                const char32_t c = t.cps[q];
+                if (is_letter(c)) continue;
+                const bool joint = c == ' ' || is_hyphen(c) || c == '\'' || c == 0x2019;
+                if (!joint || q == 0 || q + 1 == t.size() || !is_letter(t.cps[q - 1]) || !is_letter(t.cps[q + 1]))
+                    return false;
+                if (c == ' ') ++words;
+            }
+            return words <= 4 && !(words == 1 && common_words().count(fold_key(value)));
+        }
+
+        /* Without a header, a column whose cells mostly hold a name or a town found whole, three
+           at least, is a column of names or of towns: its other cells of the form of a name take
+           that type ("Galli" among the family names the rows taught, "Verona" among the towns). */
+        static void complete_columns(const std::vector<cell>& cells, const std::vector<bool>& read,
+                                     std::vector<std::vector<pii_entity>>& found)
+        {
+            struct tally { std::size_t values = 0, person = 0, location = 0; };
+            std::map<std::size_t, tally> columns;
+            auto whole = [&](std::size_t k, const std::pair<std::size_t, std::size_t>& r) {
+                for (const pii_entity& e : found[k])
+                    if (e.begin <= r.first && e.end >= r.second) return e.type;
+                return pii_type::none;
+            };
+            for (std::size_t k = 0; k < cells.size(); ++k)
+            {
+                const std::pair<std::size_t, std::size_t> r = value_bounds(cells[k].value);
+                if (!read[k] || r.first >= r.second) continue;
+                tally& t = columns[cells[k].col];
+                ++t.values;
+                const pii_type type = whole(k, r);
+                if (type == pii_type::person) ++t.person;
+                else if (type == pii_type::location) ++t.location;
+            }
+            for (std::size_t k = 0; k < cells.size(); ++k)
+            {
+                const std::pair<std::size_t, std::size_t> r = value_bounds(cells[k].value);
+                if (!read[k] || r.first >= r.second || !found[k].empty()) continue;
+                const tally& t = columns[cells[k].col];
+                pii_type type = pii_type::none;
+                if (t.person >= 3 && 2 * t.person >= t.values) type = pii_type::person;
+                else if (t.location >= 3 && 2 * t.location >= t.values) type = pii_type::location;
+                if (type == pii_type::none || !name_form(cells[k].value.substr(r.first, r.second - r.first))) continue;
+                pii_entity e;
+                e.begin = r.first;
+                e.end = r.second;
+                e.type = type;
+                e.confidence = 0.8;
+                found[k].push_back(e);
+            }
+        }
+
+        /* Whether the distinct values of a column, folded sexes of privacy_impl::gender_values(),
+           are those of one usage: two of them at least, and letters alone of a single usage
+           ("m f", "h f", "m w d", "h m", each with "x"). */
+        static bool sex_column(const std::set<std::string>& values)
+        {
+            if (values.size() < 2) return false;
+            static const char* const usages[] = { "mfx", "hfx", "mwdx", "hmx" };
+            bool letters = true;
+            for (const std::string& v : values) letters = letters && v.size() == 1;
+            if (!letters) return true;
+            for (const char* usage : usages)
+            {
+                bool all = true;
+                for (const std::string& v : values) all = all && std::strchr(usage, v[0]) != nullptr;
+                if (all) return true;
+            }
+            return false;
+        }
+
         // Whether a value of type known stands in a column of type: an IP column takes both forms.
         static bool column_family(pii_type known, pii_type type)
         {
@@ -1244,6 +1326,28 @@ namespace dlib
                     if (labels[k] != pii_type::none) { columns[cells[k].col] = labels[k]; ++header_labels; }
                 }
                 const bool header = named || header_labels >= 2 || (header_labels == 1 && header_cells == 1);
+                /* Without a header, a column whose cells hold the sexes of one usage ("M" and "F",
+                   "m", "w" and "d", "Hombre" and "Mujer") is read as a header naming it would have
+                   it read: a letter alone says nothing out of its column. */
+                std::map<std::size_t, pii_type> inferred;
+                if (!header)
+                {
+                    std::map<std::size_t, std::set<std::string>> sexes;
+                    std::map<std::size_t, std::size_t> found, others;
+                    for (const cell& c : cells)
+                    {
+                        const std::pair<std::size_t, std::size_t> r = value_bounds(c.value);
+                        if (r.first >= r.second) continue;
+                        std::string key;
+                        for (char ch : privacy_impl::fold_key(c.value.substr(r.first, r.second - r.first)))
+                            if (ch != ' ' && ch != '-' && ch != '.') key.push_back(ch);
+                        if (privacy_impl::gender_values().count(key)) { sexes[c.col].insert(key); ++found[c.col]; }
+                        else ++others[c.col];
+                    }
+                    for (const auto& s : sexes)
+                        if (found[s.first] >= 3 && others[s.first] * 10 <= found[s.first] && sex_column(s.second))
+                            inferred[s.first] = pii_type::gender;
+                }
                 // A name of a header is no value of the label on its left.
                 auto context_of = [&](std::size_t k) {
                     detection_context ctx;
@@ -1255,6 +1359,11 @@ namespace dlib
                     {
                         const auto it = columns.find(c.col);
                         if (it != columns.end()) ctx.label = it->second;
+                    }
+                    else if (!header)
+                    {
+                        const auto it = inferred.find(c.col);
+                        if (it != inferred.end()) ctx.label = it->second;
                     }
                     return ctx;
                 };
@@ -1284,6 +1393,8 @@ namespace dlib
                 }
                 detector_.learn(row_text);
                 std::unordered_map<std::string, std::string> made;
+                std::vector<std::vector<pii_entity>> found(cells.size());
+                std::vector<bool> read(cells.size(), false);
                 for (std::size_t k = 0; k < cells.size(); ++k)
                 {
                     const cell& c = cells[k];
@@ -1304,11 +1415,16 @@ namespace dlib
                         values[k] = c.value;
                         continue;
                     }
-                    const std::vector<pii_entity> entities =
-                        to_write(c.value, detector_.detect(c.value, context_of(k)));
-                    for (const pii_entity& e : entities)
+                    found[k] = to_write(c.value, detector_.detect(c.value, context_of(k)));
+                    read[k] = true;
+                }
+                if (!header) complete_columns(cells, read, found);
+                for (std::size_t k = 0; k < cells.size(); ++k)
+                {
+                    if (!read[k]) continue;
+                    for (const pii_entity& e : found[k])
                         if (!p_.keeps_in_clear(e.type)) report.count(e.type);
-                    values[k] = text_values(c.value, entities, report);
+                    values[k] = text_values(cells[k].value, found[k], report);
                 }
             }
             report.text_units += cells.size();

@@ -440,14 +440,6 @@ namespace dlib
                   of 365.2425 days, rounded to the nearest, and -1 when that gives 0.
         !*/
 
-        double shift_date_serial(double serial, bool forward) const;
-        /*!
-            ensures
-                - Returns a spreadsheet date serial number shifted by date_shift_days()
-                  (forward) or back. Used for date-typed spreadsheet cells, which stay
-                  dates and keep working in formulas.
-        !*/
-
         std::string key_fingerprint() const;
         /*!
             ensures

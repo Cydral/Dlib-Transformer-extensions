@@ -557,6 +557,19 @@ namespace dlib
             return sum % 11 == 0;
         }
 
+        /* Spanish social security number (NUSS, número de afiliación): the province in two
+           digits, a number in eight and two control digits, the remainder by 97 of the province
+           followed by the number, read without its leading zero below 10000000. */
+        inline bool es_nuss_ok(const std::string& d)
+        {
+            if (d.size() != 12 || !id_all_digits(d)) return false;
+            const long long province = id_number(d, 0, 2), number = id_number(d, 2, 10);
+            if (province == 0 || number == 0) return false;
+            const long long base =
+                number < 10000000LL ? province * 10000000LL + number : province * 100000000LL + number;
+            return base % 97 == id_number(d, 10, 12);
+        }
+
         // Canadian social insurance number (SIN, NAS): Luhn, not starting with 0 or 8.
         inline bool ca_sin_ok(const std::string& d)
         {
