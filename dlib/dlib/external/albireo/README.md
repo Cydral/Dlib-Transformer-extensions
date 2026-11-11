@@ -1481,16 +1481,26 @@ the agent and of the web are off in every new discussion, in a project or not, w
 ones chose: their state belongs to their discussion, which keeps it with its messages, after an
 answer, a regeneration, an edit and a reload and in the other tabs, so that another discussion may
 show another state. With a model that can reason, Agent and Web come with the deep reasoning, so
-that the model reasons before each call of a tool: they are disabled while it is off, and turning
-it off turns them off; a model that calls tools without reasoning (Qwen3-VL Instruct, Ministral 3,
-Devstral Small 2, Qwen2.5 Coder) takes them alone. The Web button is disabled, with the reason as
-its title, while the model of the function calls no tools, while it lacks the deep reasoning it
-needs, while the service works offline and once the administrator turned the web access off. With Web on, each question carries `web_search`, when the service offers the search of
-Wikipedia, and `fetch_page`, after the tools of the agent while Agent is on, and the answer runs the
-calls of the tools even with Agent off. The tools and the system message stay the same from one
-question to the next while the buttons and the provider do not change, so that the beginning of
-the prompt stays in the cache of the engine. The help next to the buttons describes the web tools
-with those of the agent.
+that the model reasons before each call of a tool: they are disabled while it is off, and turning it
+off turns them off; a model that calls tools without reasoning (Qwen3-VL Instruct, Ministral 3,
+Mistral Small 3.2, Devstral Small 2) takes them alone. The capabilities of the model of the function
+decide which of the three buttons are enabled: those that its format gives it in the engine,
+narrowed by its entry in the catalog or among the models that come with Albireo, which gives what
+the model does, verified model by model (see the [table of the catalog](#models)). Qwen2.5 Coder
+1.5B and 7B, whose template describes tools, write their calls as JSON blocks, without the tags of
+the template, that the engine does not read as calls, so that Agent and Web stay disabled with them,
+as the deep reasoning does with a model that does not reason; an imported file takes the entry of
+the catalog whose SHA-256 it has, and keeps the capabilities of its format without one. The
+application reads the list of the models at its opening and again when the service adopts a newer
+catalog, so that the buttons follow it before the first discussion and without a reload. The Web
+button is disabled, with the reason as its title, while the model of the function calls no tools,
+while it lacks the deep reasoning it needs, while the service works offline and once the
+administrator turned the web access off. With Web on, each question carries `web_search`, when the
+service offers the search of Wikipedia, and `fetch_page`, after the tools of the agent while Agent
+is on, and the answer runs the calls of the tools even with Agent off. The tools and the system
+message stay the same from one question to the next while the buttons and the provider do not
+change, so that the beginning of the prompt stays in the cache of the engine. The help next to the
+buttons describes the web tools with those of the agent.
 
 `fetch_page` reads only an address of the discussion: one that a question of the user holds
 (`http://`, `https://`, or `www.` for both schemes), an address of a result of `web_search`, or a
@@ -1568,30 +1578,46 @@ tells which source served it; the updates come from the link alone (see [Updates
 signature and the hashes check the bytes, whatever their source. The sizes below count the decoder
 and its projector.
 
-| Model                          | Publisher          | Functions               | Inputs        | Size     | License |
-|--------------------------------|--------------------|-------------------------|---------------|----------|---------|
-| Qwen3-VL 4B Instruct (default) | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
-| Qwen3-VL 4B Thinking           | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
-| Qwen3 Embedding 0.6B (default) | Alibaba            | embedding               | text          | 0.64 GB  | Apache-2.0 |
-| Qwen3-VL 2B Thinking           | Alibaba            | general, code, security | text, image   | 1.55 GB  | Apache-2.0 |
-| Qwen3-VL 2B Instruct           | Alibaba            | general                 | text, image   | 1.55 GB  | Apache-2.0 |
-| Qwen3-VL 8B Instruct           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
-| Qwen3-VL 8B Thinking           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
-| EuroVLM 9B Preview             | EuroLLM consortium | general                 | text, image   | 6.42 GB  | Apache-2.0 |
-| Phi-4-mini                     | Microsoft          | general                 | text          | 2.49 GB  | MIT |
-| Ministral 3 3B                 | Mistral AI         | general                 | text, image   | 2.99 GB  | Apache-2.0 |
-| Ministral 3 8B                 | Mistral AI         | general                 | text, image   | 6.06 GB  | Apache-2.0 |
-| EuroLLM 9B Instruct            | EuroLLM consortium | general                 | text          | 5.58 GB  | Apache-2.0 |
-| Granite 4.2 3B                 | IBM                | general, code           | text          | 2.24 GB  | Apache-2.0 |
-| Granite 4.2 8B                 | IBM                | general, code           | text          | 5.35 GB  | Apache-2.0 |
-| Qwen3-VL 30B A3B Thinking      | Alibaba            | general, code, security | text, image   | 19.27 GB | Apache-2.0 |
-| Mistral Small 3.2 24B          | Mistral AI         | general                 | text, image   | 15.21 GB | Apache-2.0 |
-| Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | 1.12 GB  | Apache-2.0 |
-| Qwen2.5 Coder 7B               | Alibaba            | code                    | text          | 4.68 GB  | Apache-2.0 |
-| Devstral Small 2               | Mistral AI         | code                    | text, image   | 15.21 GB | Apache-2.0 |
-| CyberSecQwen 4B                | athena129 (lablab.ai) | security             | text          | 2.50 GB  | Apache-2.0 |
-| Foundation-Sec 1.1 8B          | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
-| Foundation-Sec 8B Reasoning    | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
+| Model                          | Publisher          | Functions               | Inputs        | Agent and web  | Deep reasoning | Size     | License |
+|--------------------------------|--------------------|-------------------------|---------------|----------------|----------------|----------|---------|
+| Qwen3-VL 4B Instruct (default) | Alibaba            | general, code, security | text, image   | yes            | no             | 2.95 GB  | Apache-2.0 |
+| Qwen3-VL 4B Thinking           | Alibaba            | general, code, security | text, image   | with reasoning | yes            | 2.95 GB  | Apache-2.0 |
+| Qwen3 Embedding 0.6B (default) | Alibaba            | embedding               | text          | -              | -              | 0.64 GB  | Apache-2.0 |
+| Qwen3-VL 2B Thinking           | Alibaba            | general, code, security | text, image   | with reasoning | yes            | 1.55 GB  | Apache-2.0 |
+| Qwen3-VL 2B Instruct           | Alibaba            | general                 | text, image   | yes            | no             | 1.55 GB  | Apache-2.0 |
+| Qwen3-VL 8B Instruct           | Alibaba            | general, code, security | text, image   | yes            | no             | 5.78 GB  | Apache-2.0 |
+| Qwen3-VL 8B Thinking           | Alibaba            | general, code, security | text, image   | with reasoning | yes            | 5.78 GB  | Apache-2.0 |
+| EuroVLM 9B Preview             | EuroLLM consortium | general                 | text, image   | no             | no             | 6.42 GB  | Apache-2.0 |
+| Phi-4-mini                     | Microsoft          | general                 | text          | no             | no             | 2.49 GB  | MIT |
+| Ministral 3 3B                 | Mistral AI         | general                 | text, image   | yes            | no             | 2.99 GB  | Apache-2.0 |
+| Ministral 3 8B                 | Mistral AI         | general                 | text, image   | yes            | no             | 6.06 GB  | Apache-2.0 |
+| EuroLLM 9B Instruct            | EuroLLM consortium | general                 | text          | no             | no             | 5.58 GB  | Apache-2.0 |
+| Granite 4.2 3B                 | IBM                | general, code           | text          | with reasoning | yes            | 2.24 GB  | Apache-2.0 |
+| Granite 4.2 8B                 | IBM                | general, code           | text          | with reasoning | yes            | 5.35 GB  | Apache-2.0 |
+| Qwen3-VL 30B A3B Thinking      | Alibaba            | general, code, security | text, image   | with reasoning | yes            | 19.27 GB | Apache-2.0 |
+| Mistral Small 3.2 24B          | Mistral AI         | general                 | text, image   | yes            | no             | 15.21 GB | Apache-2.0 |
+| Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | no             | no             | 1.12 GB  | Apache-2.0 |
+| Qwen2.5 Coder 7B               | Alibaba            | code                    | text          | no             | no             | 4.68 GB  | Apache-2.0 |
+| Devstral Small 2               | Mistral AI         | code                    | text, image   | yes            | no             | 15.21 GB | Apache-2.0 |
+| CyberSecQwen 4B                | athena129 (lablab.ai) | security             | text          | no             | no             | 2.50 GB  | Apache-2.0 |
+| Foundation-Sec 1.1 8B          | Cisco              | security                | text          | no             | no             | 4.92 GB  | Llama 3.1 Community License |
+| Foundation-Sec 8B Reasoning    | Cisco              | security                | text          | no             | yes            | 4.92 GB  | Llama 3.1 Community License |
+
+The columns Agent and web and Deep reasoning give the buttons of the web application that each model
+enables, from the capabilities of its entry (`tools`, `reasoning`, `reasoning_always`): with "with
+reasoning", Agent and Web come with the deep reasoning, and the models trained to reason before each
+answer, the Thinking models and Foundation-Sec 8B Reasoning, answer directly while it is off, the
+engine ending their reasoning at once. These capabilities were verified model by model. The template
+of each file gives those of its format in the engine. Then the models of 8B at most whose format
+gives tools or reasoning, served by the service built for Linux with the system message and the
+tools of the web application, answered two requests that ask for a web search, a question that calls
+for one and a calculation, with the deep reasoning when they reason, and a question with the deep
+reasoning on and off, the only one Foundation-Sec 8B Reasoning answered since it calls no tools.
+Qwen2.5 Coder 1.5B and 7B made no call that the engine reads in their 8 answers each, 13 of the 16
+writing their call as a JSON block, between code fences or the double braces of the example of their
+template, or as an empty tag, so that their entries give no tools. Mistral Small 3.2 24B, Devstral
+Small 2 and Qwen3-VL 30B A3B Thinking keep the capabilities that their format gives and that their
+authors document.
 
 The list gives each function models that read images and models that read text, from 2 to 6 GB
 for the computers of 8 and 16 GB of memory, one mixture of experts for those of 24 GB and, for

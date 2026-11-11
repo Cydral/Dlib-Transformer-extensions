@@ -545,7 +545,7 @@ async function languageChanged(force) {
   const before = language();
   applyLanguage();
   if (language() === before && !force) return;
-  state.catalog = await api.models(language()).catch(() => state.catalog);
+  await readCatalog();
   buildLayout();
   renderAll();
   if (language() !== before) rememberLater();
@@ -811,6 +811,22 @@ function modelInfo(id) {
   return (state.catalog.models || []).find(same) || (state.catalog.embedding_models || []).find(same) || null;
 }
 
+// Whether the last reading of the list of the models failed, so that the next reading of the status asks for it again.
+let catalogMissed = false;
+
+/*
+    Reads the list of the models of the service in the language of the interface (state.catalog), whose entries give
+    the names, the inputs and the capabilities of the models; a failure keeps the list read before.
+*/
+async function readCatalog() {
+  try {
+    state.catalog = await api.models(language());
+    catalogMissed = false;
+  } catch (e) {
+    catalogMissed = true;
+  }
+}
+
 function modelName(id) {
   const m = modelInfo(id);
   return m && m.name ? m.name : id;
@@ -859,20 +875,29 @@ function acceptFor(role, room) {
     The capabilities of the model of a function: reasoning, reasoningAlways for a model trained to reason before
     every answer (without Deep reasoning, the engine ends its reasoning at once), tools, its context, its working
     context (workingContext) and the largest window of a discussion (largestContext), 0 while it is not loaded, and
-    its speeds of reading and writing (readRate, writeRate).
+    its speeds of reading and writing (readRate, writeRate).  The format of a loaded model in the engine gives its
+    reasoning and its tools, and the entry of the model in the list of the service narrows them: the entries of the
+    catalog and of the models that come with Albireo give what each model does, verified model by model, so that a
+    model whose format offers tools it does not call (Qwen2.5 Coder) has the buttons of the agent and of the web
+    disabled, as a model without reasoning has the one of the deep reasoning.  A model imported without entry keeps
+    the capabilities of its format, which the engine also reads from the vocabulary of a file without template, and
+    a model that reasons before every answer keeps its deep reasoning, which its tools wait for.
 */
 function roleCapabilities(role) {
   const id = roleModel(role);
   const loaded = loadedModel(id);
+  const m = modelInfo(id);
   const read = readRate(id);
   const write = writeRate(id);
   if (loaded) {
     const context = loaded.context || 0;
-    return { reasoning: loaded.reasoning !== false, reasoningAlways: loaded.reasoning_always === true,
-      tools: loaded.tools !== false, context, working: context ? workingContext(id, context) : 0,
-      largest: context ? largestContext(id, context) : 0, read, write };
+    const entry = m && m.source !== 'import' ? m : null;
+    const always = loaded.reasoning_always === true;
+    return { reasoning: loaded.reasoning !== false && (always || !(entry && entry.reasoning === false)),
+      reasoningAlways: always, tools: loaded.tools !== false && !(entry && entry.tools === false),
+      context, working: context ? workingContext(id, context) : 0, largest: context ? largestContext(id, context) : 0,
+      read, write };
   }
-  const m = modelInfo(id);
   return { reasoning: m ? m.reasoning !== false : true, reasoningAlways: !!(m && m.reasoning_always === true),
     tools: m ? m.tools !== false : true, context: 0, working: 0, largest: 0, read, write };
 }
@@ -1012,15 +1037,23 @@ async function pollStatus() {
   let changed = false;
   let back = false;
   let voices = false;
+  let listed = false;
   try {
     const s = await api.status();
-    // The web access and the offline mode change the Web button of the composer and the tools of the next question.
-    const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background, x.web, x.offline]);
+    /*
+        The web access and the offline mode change the Web button of the composer and the tools of the next question,
+        and a newer catalog of the service the capabilities that the list of the models gives the models.
+    */
+    const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background, x.web, x.offline,
+      x.catalog ? x.catalog.updated : null]);
     changed = !state.status || key(state.status) !== key(s);
     back = state.statusError;
     state.status = s;
     state.statusError = false;
-    if (changed || !state.catalog) state.catalog = await api.models(language()).catch(() => state.catalog);
+    if (changed || !state.catalog || catalogMissed) {
+      await readCatalog();
+      listed = true;
+    }
     // The tokens of the images were measured for the models of the functions as they were.
     if (changed) imageTokenCache.clear();
     // A language chosen in Albireo meanwhile, which this interface follows.
@@ -1051,6 +1084,9 @@ async function pollStatus() {
     lockThread();
   } else {
     renderStatusLine();
+    // The buttons of the composer follow the model of the function and its entry in the list of the models, before
+    // the first discussion as well.
+    if (changed || listed) renderComposerState();
   }
   // The answers drawn before the voices came receive their buttons, unless a question is being edited.
   if (voices && state.view === 'chat' && ui.thread && ui.thread.isConnected && !ui.thread.querySelector('.md-field')
@@ -1109,9 +1145,11 @@ const contextRetry = 30000;
 
 function contextKey(c) {
   const last = c.messages[c.messages.length - 1];
+  // The tools and the reasoning that the capabilities of the model allow change the prompt, as the buttons do.
+  const caps = roleCapabilities(c.role);
   return [c.id, c.role, roleModel(c.role), c.messages.length, last ? last.id : '',
     last && last.steps ? last.steps.length : 0, c.contextStart || 0, c.agent ? 1 : 0, c.web ? 1 : 0,
-    c.reasoning ? 1 : 0, c.updated || 0].join('|');
+    c.reasoning ? 1 : 0, caps.tools ? 1 : 0, caps.reasoning ? 1 : 0, c.updated || 0].join('|');
 }
 
 async function measureContext(c, key) {
@@ -7445,6 +7483,8 @@ async function init() {
   // The language of Albireo, when this interface follows it, before the first texts.
   state.status = await api.status().catch(() => null);
   applyLanguage();
+  // The list of the models, whose entries narrow the capabilities that the buttons of the composer follow.
+  if (state.status) await readCatalog();
   applyTheme();
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
   // The documents that have passages, listed before the lists are read (pruneIndex), which

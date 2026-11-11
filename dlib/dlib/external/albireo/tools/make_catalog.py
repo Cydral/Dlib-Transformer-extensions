@@ -15,9 +15,13 @@ A model that reads images names its projector, the image encoder published besid
 decoder ("projector": repository, file and quantization of the mmproj GGUF file); its entry
 then carries the files, the size and the SHA-256 of the projector, which the service
 downloads with the decoder.  "inputs" gives what a model reads, text and images; "tools",
-"reasoning" and "reasoning_always" what its chat format gives it in the engine (a model that
-reasons before every answer, whatever the request asks), which the web application follows
-while the model is not loaded.
+"reasoning" and "reasoning_always" what the model does, verified model by model within what
+its chat format gives it in the engine: "tools" when it calls the tools of the agent and of
+the web in the form of its format, "reasoning" when it reasons on request, "reasoning_always"
+when it reasons before every answer, whatever the request asks.  The web application follows
+them while the model is not loaded, and they narrow those of the format of a loaded model, so
+that the buttons of the deep reasoning, of the agent and of the web are enabled only for a
+model that does what they ask.
 
 The catalog names one default language model, which the service downloads when no language
 model is installed, and one default embedding model, which it downloads in every case: the
@@ -560,7 +564,9 @@ MODELS = [
         "quantization": "Q4_K_M",
         "roles": ["code"],
         "inputs": ["text"],
-        "tools": True,
+        # Its format describes tools, but the model writes its calls as JSON blocks between code fences, which the
+        # engine does not read as calls.
+        "tools": False,
         "reasoning": False,
         "license": "Apache-2.0",
         "description": {
@@ -584,7 +590,9 @@ MODELS = [
         "quantization": "Q4_K_M",
         "roles": ["code"],
         "inputs": ["text"],
-        "tools": True,
+        # Its format describes tools, but the model writes its calls without the <tool_call> tags, between the
+        # double braces of the example of its template or between code fences, which the engine does not read.
+        "tools": False,
         "reasoning": False,
         "license": "Apache-2.0",
         "description": {

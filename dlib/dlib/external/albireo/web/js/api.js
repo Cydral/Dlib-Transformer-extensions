@@ -135,8 +135,10 @@ export function status() {
   return getJSON('/albireo/v1/status', timeout(8000));
 }
 
+// The models of the service and of its catalog, in the language lang, read within the time given to the status, so
+// that the opening of the application and the readings of the status end when the service does not answer.
 export function models(lang) {
-  return getJSON('/albireo/v1/models?lang=' + encodeURIComponent(lang || 'en'));
+  return getJSON('/albireo/v1/models?lang=' + encodeURIComponent(lang || 'en'), timeout(8000));
 }
 
 export function usage() {

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-11-11T06:49:52Z",
+  "updated": "2026-11-11T15:46:16Z",
   "models": [
     {
       "id": "qwen3-vl-4b-instruct",
@@ -738,7 +738,7 @@
       "inputs": [
         "text"
       ],
-      "tools": true,
+      "tools": false,
       "reasoning": false,
       "license": "Apache-2.0",
       "description": {
@@ -773,7 +773,7 @@
       "inputs": [
         "text"
       ],
-      "tools": true,
+      "tools": false,
       "reasoning": false,
       "license": "Apache-2.0",
       "description": {
