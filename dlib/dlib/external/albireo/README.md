@@ -264,20 +264,21 @@ its paging file or swap together, less a reserve left to the system (an eighth o
 memory, 1 GB at least) and the weights of the model, which a generation reads at every token; the
 setting `context` chooses another one. The pages are allocated as the sequences grow, within a
 budget of two full contexts in that memory, and beyond the pages of the first 4,096 positions a
-guard refuses a new page once the memory the system can still commit comes down to that reserve,
-the request then waiting or ending as when the budget runs out. The memory of the keys and values follows the text actually
-held: the 262,144 positions of Qwen3-VL 4B take 20.5 GB in 8 bits (38.6 GB in half precision), which
-only a conversation of that length reaches, the paging file or the swap holding what the physical
-memory does not. The keys and values stay in the memory of the computer with every engine; the
-engines of CUDA also keep copies of the pages that the steps of the generation read on the card,
-which attends these steps itself (see below), and V²RAM extends the memory of the card for the
-weights. The web application sizes its own choices within that context (see the prompt of a
-question below). The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from
-the next token of every request being generated and a slice of the prompts being read, and draws
-the next tokens of the pass in parallel. When the pages run out, a prompt being read gives its
-pages back to the answers being written and is read again once there is room; the context of a
-model never exceeds the positions its pages can hold, so a prompt the engine accepts can always
-be read to its end.
+guard refuses a new page once the memory the system can still commit comes down to the reserve left
+to the system and to the weights the processor reads, those whose products a card does not compute
+from its copies, the request then waiting or ending as when the budget runs out. The memory of the
+keys and values follows the text actually held: the 262,144 positions of Qwen3-VL 4B take 20.5 GB in
+8 bits (38.6 GB in half precision), which only a conversation of that length reaches, the paging
+file or the swap holding what the physical memory does not. The keys and values stay in the memory
+of the computer with every engine; the engines of CUDA also keep copies of the pages that the steps
+of the generation read on the card, which attends these steps itself (see below), and V²RAM extends
+the memory of the card for the weights. The web application gives a discussion that context whatever
+the speed of the computer, and sizes its own choices within it (see the prompt of a question below).
+The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from the next token of
+every request being generated and a slice of the prompts being read, and draws the next tokens of
+the pass in parallel. When the pages run out, a prompt being read gives its pages back to the
+answers being written and is read again once there is room; the context of a model never exceeds the
+positions its pages can hold, so a prompt the engine accepts can always be read to its end.
 
 The processor engines take no BLAS: their products start from the quantized weights of the mapped
 file, and the packed kernel of the prompt passes reaches 66 to 77 % of the peak of the AVX2 units
@@ -684,30 +685,27 @@ The prompt of a question is built for the cache of the engine, which keeps the k
 each conversation and computes again only the tokens that differ from what it already read
 ([`web/js/app.js`](web/js/app.js)):
 
-The application sizes its choices from the working context of the model: its context, as the
-engine gives it, within what the computer reads in four minutes at the speed the engine measured
+The application sizes its automatic choices from the working context of the model: its context, as
+the engine gives it, within what the computer reads in four minutes at the speed the engine measured
 on the answers of the model (`prompt_tokens_per_second` of the loaded models, rounded down to a
 power of two, 128 tokens per second for the processor engines until the model answered), 16,384
-tokens at least, rounded to a power of two, so that a new measure changes the choices only when
-the speed doubles or halves: 32,768 tokens at 128 tokens per second, 65,536 at 256, and the
-262,144 of Qwen3-VL 4B from 1,024. The engine keeps the keys and values of the discussions read,
-so that a discussion reads its whole context again only when they left the memory; the documents
-read whole and the excerpts have times of reading of their own, since a question waits for them.
-A document can still be longer than these shares: the context of the model stays the limit of
-what a question holds.
+tokens at least, rounded to a power of two, so that a new measure changes the choices only when the
+speed doubles or halves: 32,768 tokens at 128 tokens per second, 65,536 at 256, and the 262,144 of
+Qwen3-VL 4B from 1,024. The documents read whole and the excerpts have times of reading of their
+own, since a question waits for them. A document can still be longer than these shares: the context
+of the model stays the limit of what a question holds.
 
-The window of a discussion grows with it: the working context, then twice as much each time its
-prompt takes half of the room the window leaves beside the answer, twice at most, within the
-context of the model and within the window whose keys and values a generated token reads in eight
-times the bytes of the weights of the model, so that the generation slows down by a bounded factor
-at the end of a long discussion (a mixture of experts reads a part of its weights for each token,
-so its bound is looser): for
-Qwen3-VL 4B, whose keys and values take 78 KB a token in 8-bit integers and whose weights take
-2.5 GB, 32,768 tokens become 65,536 then 131,072 at 128 tokens per second, and 65,536 become
-131,072 from 256. The discussions keep their exchanges whole up to half of the room of their
-largest window. While the next question of a discussion of 4,096 tokens or more is written, the
-application asks the engine to read the beginning of its prompt ahead in the background, once for
-each state of the discussion, so that the question finds it in the cache even when its keys and
+The window of a discussion is the context of its model, the one the model was trained for unless the
+memory of the computer brought it down, whatever the speed of the computer: 131,072 tokens for
+Mistral Small 3.2 24B and 262,144 for Qwen3-VL 4B. The engine keeps the keys and values of the
+discussions read, so that a discussion reads its whole context again only when they left the memory;
+a generated token reads the keys and values of the whole discussion, so that the generation slows
+down as the discussion grows, and a long discussion reads a larger part of its context again after a
+compression, which keeps 30% of its room (about 39,000 tokens of 131,072), or once its keys and
+values left the memory. The discussions keep their exchanges whole up to half of the room of the
+context of their model. While the next question of a discussion of 4,096 tokens or more is written,
+the application asks the engine to read the beginning of its prompt ahead in the background, once
+for each state of the discussion, so that the question finds it in the cache even when its keys and
 values left the memory since the last answer.
 
 | Part of the prompt | Content | Share of the working context |
@@ -717,7 +715,7 @@ values left the memory since the last answer.
 | Summary | the exchanges that left the context, compressed by the background model | 15% and 60 s of writing at most |
 | Attached document | read whole | 25% and 40 s of reading at most, else indexed and searched |
 | Excerpts of a question | the passages found for it, kept with the message once sent | 20% and 20 s of reading, 2,000 to 12,000 tokens, 4 to 24 passages |
-| Exchanges | the conversation, a question asked on a later day with its date | the rest, in the window of the discussion; the oldest leave in one step once they take half of the room of its largest window, down to 30% of that room, the system message and the tools aside |
+| Exchanges | the conversation, a question asked on a later day with its date | the rest, in the context of the model; the oldest leave in one step once they take half of its room, down to 30% of that room, the system message and the tools aside |
 | Answer | the room kept for it | the longest answer of the settings, else 8,192 tokens with the deep reasoning and 2,048 without, a quarter of the context at most |
 
 The tokens of a document are estimated from its characters: 3.6 characters a token in the
@@ -739,28 +737,28 @@ against 6.4 s for the first question. The service serves several sessions at onc
 each with its own context: the requests of every session are computed together, one forward pass
 serving the next token of each.
 
-A discussion has no length limit. Once its exchanges take half of the room that the system
-message and the tools leave in the largest window, as the service counts them after each answer
-and when the discussion is opened, the oldest exchanges are compressed in the background, down to
-30% of that room, the last question staying with its answer: the background model rewrites the
-summary of the discussion with them, in parts that fit its working context, oldest first, keeping
-the facts, figures, names, decisions, requests and open questions, and the discussion then starts
-with the summary, given with its first remaining question. The documents read whole of the
-questions that left the context are indexed, so that the excerpts of the next questions can come
-from them, and an answer written in another tab keeps the beginning of its prompt. A question that
-comes before the summary waits for it only when it does not fit without it, and a summary written
-while an answer is being written in the discussion applies once that answer ends; a summary that
-cannot be written lets the exchanges leave without it. One tab compresses a discussion at a time.
-When the last question alone does not fit, the oldest texts lose their beginnings, at the end of a
-sentence: the summary first, then the documents and the texts of the earlier questions with the
-results of the tools of their answers, then the reasoning and the results of the tools of the steps
-of the answer being written, then these steps whole, the oldest first and the last one staying,
-and the documents and the text of the question last. An answer of the agent fits its context
-before each of its steps, and a compression of the oldest exchanges happens there when it is
-needed; the cuts stay from one step to the next, and a quarter of the room is freed beyond what is
-needed once its steps are cut, so that the next steps keep the beginning of their prompt. A
-question deleted from a discussion leaves with its answer and the documents attached to it; when
-it was already compressed, the summary is written again without it.
+A discussion has no length limit. Once its exchanges take half of the room that the system message
+and the tools leave in the context of the model, as the service counts them after each answer and
+when the discussion is opened, the oldest exchanges are compressed in the background, down to 30% of
+that room, the last question staying with its answer: the background model rewrites the summary of
+the discussion with them, in parts that fit its working context, oldest first, keeping the facts,
+figures, names, decisions, requests and open questions, and the discussion then starts with the
+summary, given with its first remaining question. The documents read whole of the questions that
+left the context are indexed, so that the excerpts of the next questions can come from them, and an
+answer written in another tab keeps the beginning of its prompt. A question that comes before the
+summary waits for it only when it does not fit without it, and a summary written while an answer is
+being written in the discussion applies once that answer ends; a summary that cannot be written lets
+the exchanges leave without it. One tab compresses a discussion at a time. When the last question
+alone does not fit, the oldest texts lose their beginnings, at the end of a sentence: the summary
+first, then the documents and the texts of the earlier questions with the results of the tools of
+their answers, then the reasoning and the results of the tools of the steps of the answer being
+written, then these steps whole, the oldest first and the last one staying, and the documents and
+the text of the question last. An answer of the agent fits its context before each of its steps, and
+a compression of the oldest exchanges happens there when it is needed; the cuts stay from one step
+to the next, and a quarter of the room is freed beyond what is needed once its steps are cut, so
+that the next steps keep the beginning of their prompt. A question deleted from a discussion leaves
+with its answer and the documents attached to it; when it was already compressed, the summary is
+written again without it.
 
 A summary changes the beginning of the prompt, which the engine has not read yet. Once it applies
 and no answer is being written in the discussion, the tab that wrote it asks the model of the
@@ -832,15 +830,15 @@ repeats the question is asked again in other words, and a title that could not b
 model that loads, a service away, a page reloaded) is asked again for two minutes, then at the
 next opening of the application. One tab names a discussion at a time.
 
-Under the line of the model, at the bottom of the side panel, a bar shows the share of its window
-that the discussion shown takes, with its tokens and those of the window ("Contexte 3 681 /
-32 768"): the history the next question carries, its system message and its tools included, as
-the service counts them, its images by their tokens, over the window of the discussion, which
-doubles as the discussion grows ("Contexte 40 120 / 131 072"), up to its largest window within the
-context the engine gives the model; its help gives the largest window and that context. The
-discussion is measured when it opens and again when it, its function, its model or its toggles
-change, once the answer being written ends; the bar turns orange from three quarters of the window
-and red from nine tenths.
+Under the line of the model, at the bottom of the side panel, a bar shows the share of the context
+of its model that the discussion shown takes, with its tokens and those of that context
+("Contexte 3 198 / 131 072" with Mistral Small 3.2 24B): the history the next question carries,
+its system message and its tools included, as the service counts them, its images by their tokens,
+over the context the engine gives the model; its help adds that the oldest exchanges are
+summarized beyond half of it. The discussion is measured when it opens and again when it, its
+function, its model or its toggles change, once the answer being written ends; the bar turns
+orange from three quarters of the context and red from nine tenths, which only a large document
+or a compression that failed reaches, since a compression starts at half of it.
 
 The lists of the side panel show the 20 most recent projects and discussions; the search window
 of each finds the others, the words in any case and accents, complete or not, in the titles first,

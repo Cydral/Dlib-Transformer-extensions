@@ -1331,13 +1331,14 @@ namespace albireo
             * kv_row_bytes(m->kv_type, m->cfg.head_dim);
         const memory_info mem = read_memory_info();
         /*
-            The memory the keys and values leave to the system and to the other programs, and to the
-            weights of the model, which a generation reads at every token and which have to stay
+            The memory the keys and values leave to the system and to the other programs (margin), and
+            to the weights of the model, which a generation reads at every token and which have to stay
             in the physical memory.
         */
         const uint64_t weights = static_cast<uint64_t>(m->file->size())
             + (m->projector && m->projector != m->file ? static_cast<uint64_t>(m->projector->size()) : 0);
-        const uint64_t reserve = std::max<uint64_t>(uint64_t(1) << 30, mem.total / 8) + weights;
+        const uint64_t margin = std::max<uint64_t>(uint64_t(1) << 30, mem.total / 8);
+        const uint64_t reserve = margin + weights;
         // The memory the keys and values can take, when the system tells it.
         const bool known = mem.commit_total > 0;
         const uint64_t room_bytes = mem.commit_total > reserve ? mem.commit_total - reserve : 0;
@@ -1376,20 +1377,31 @@ namespace albireo
         }
         std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, block_positions,
             m->kv_type));
+        cpu_runtime* const processor = runtime.get();
         /*
-            A new block of keys and values leaves the reserve to the system, beyond the blocks of
-            the first 4096 positions, which the model always has.
+            A new block of keys and values, beyond the blocks of the first 4096 positions, which the
+            model always has, leaves in the memory the system can still commit the margin of the system
+            and of the other programs and the weights the processor reads.  The weights, mapped
+            read-only from their file, take no commit charge, so that the memory their pages hold
+            counts in the commit left on Windows (the commit limit less the charge) as in the memory
+            Linux can give back (MemAvailable).  The weights whose products the device computes from
+            its copies are left out, since the processor no longer reads their pages; the guard
+            counted them too, and asked the commit left for the 8.2 GB a card of 12 GB held of the
+            15.2 GB of Mistral Small 3.2 24B when a prompt of 5,530 tokens was refused.  The copies
+            come and go with the passes, so that the guard reads them at each block; the budget above
+            still leaves room to all the weights, the copies being made after it.
         */
         const size_t floor_bytes = bytes_for(std::min<long>(m->context, 4096));
-        runtime->set_kv_guard([reserve, floor_bytes](size_t bytes, size_t allocated) {
+        runtime->set_kv_guard([margin, weights, floor_bytes, processor](size_t bytes, size_t allocated) {
             if (allocated + bytes <= floor_bytes) return true;
             const memory_info now = read_memory_info();
-            return now.commit_available == 0 || now.commit_available >= bytes + reserve;
+            if (now.commit_available == 0) return true;
+            const uint64_t read = weights - std::min<uint64_t>(weights, processor->offloaded_bytes());
+            return now.commit_available >= bytes + margin + read;
         });
 #ifdef ALBIREO_TENSOR_BACKEND
         runtime->set_offload(device_->make_offload(id));
 #endif
-        cpu_runtime* const processor = runtime.get();
         m->runtime = std::move(runtime);
 
         // The context never exceeds what the keys and values can hold: a prompt the engine

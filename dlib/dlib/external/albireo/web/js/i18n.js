@@ -76,10 +76,8 @@ const texts = {
       'the button below.',
     readingContext: 'Reading the context… {p}%', copy: 'Copy', copied: 'Copied',
     contextLabel: 'Context',
-    contextUse: 'Context of the discussion: {n} tokens of {total} ({p}%), a window that doubles as the discussion ' +
-      'grows, up to {largest} tokens (context of the model: {context})',
-    contextUseLargest: 'Context of the discussion: {n} tokens of {total} ({p}%), its largest window, beyond half of ' +
-      'which the oldest exchanges are summarized (context of the model: {context})',
+    contextUse: 'Context of the discussion: {n} tokens of {total} ({p}%), the context of the model, beyond half of ' +
+      'which the oldest exchanges are summarized',
     readAloud: 'Read aloud', stopReading: 'Stop reading',
     readAloudFailed: 'The answer cannot be read aloud: {reason}', regenerate: 'Regenerate',
     edit: 'Edit', delete: 'Delete', save: 'Save', cancel: 'Cancel', rename: 'Rename', pin: 'Pin', unpin: 'Unpin',
@@ -378,10 +376,8 @@ const texts = {
       'régulièrement avec le bouton ci-dessous.',
     readingContext: 'Lecture du contexte… {p} %', copy: 'Copier', copied: 'Copié',
     contextLabel: 'Contexte',
-    contextUse: 'Contexte de la discussion : {n} jetons sur {total} ({p} %), une fenêtre qui double à mesure que la ' +
-      'discussion grandit, jusqu\'à {largest} jetons (contexte du modèle : {context})',
-    contextUseLargest: 'Contexte de la discussion : {n} jetons sur {total} ({p} %), sa plus grande fenêtre, au-delà ' +
-      'de la moitié de laquelle les échanges les plus anciens sont résumés (contexte du modèle : {context})',
+    contextUse: 'Contexte de la discussion : {n} jetons sur {total} ({p} %), le contexte du modèle, au-delà de la ' +
+      'moitié duquel les échanges les plus anciens sont résumés',
     readAloud: 'Lire à voix haute', stopReading: 'Arrêter la lecture',
     readAloudFailed: 'La réponse ne peut pas être lue à voix haute : {reason}', regenerate: 'Régénérer',
     edit: 'Modifier', delete: 'Supprimer', save: 'Enregistrer', cancel: 'Annuler', rename: 'Renommer', pin: 'Épingler',
@@ -693,10 +689,8 @@ const texts = {
       'regelmäßig mit der Schaltfläche unten.',
     readingContext: 'Kontext wird gelesen… {p} %', copy: 'Kopieren', copied: 'Kopiert',
     contextLabel: 'Kontext',
-    contextUse: 'Kontext der Unterhaltung: {n} von {total} Tokens ({p} %), ein Fenster, das sich verdoppelt, während ' +
-      'die Unterhaltung wächst, bis zu {largest} Tokens (Kontext des Modells: {context})',
-    contextUseLargest: 'Kontext der Unterhaltung: {n} von {total} Tokens ({p} %), ihr größtes Fenster, jenseits ' +
-      'dessen Hälfte die ältesten Wortwechsel zusammengefasst werden (Kontext des Modells: {context})',
+    contextUse: 'Kontext der Unterhaltung: {n} von {total} Tokens ({p} %), der Kontext des Modells, jenseits ' +
+      'dessen Hälfte die ältesten Wortwechsel zusammengefasst werden',
     readAloud: 'Vorlesen', stopReading: 'Vorlesen beenden',
     readAloudFailed: 'Die Antwort kann nicht vorgelesen werden: {reason}', regenerate: 'Neu erzeugen',
     edit: 'Bearbeiten', delete: 'Löschen', save: 'Speichern', cancel: 'Abbrechen', rename: 'Umbenennen', pin: 'Anheften',
@@ -999,10 +993,8 @@ const texts = {
       'il pulsante qui sotto.',
     readingContext: 'Lettura del contesto… {p}%', copy: 'Copia', copied: 'Copiato',
     contextLabel: 'Contesto',
-    contextUse: 'Contesto della conversazione: {n} token su {total} ({p}%), una finestra che raddoppia man mano che ' +
-      'la conversazione cresce, fino a {largest} token (contesto del modello: {context})',
-    contextUseLargest: 'Contesto della conversazione: {n} token su {total} ({p}%), la sua finestra più grande, oltre ' +
-      'la cui metà gli scambi più vecchi vengono riassunti (contesto del modello: {context})',
+    contextUse: 'Contesto della conversazione: {n} token su {total} ({p}%), il contesto del modello, oltre la cui ' +
+      'metà gli scambi più vecchi vengono riassunti',
     readAloud: 'Leggi ad alta voce', stopReading: 'Interrompi la lettura',
     readAloudFailed: 'La risposta non può essere letta ad alta voce: {reason}', regenerate: 'Rigenera',
     edit: 'Modifica', delete: 'Elimina', save: 'Salva', cancel: 'Annulla', rename: 'Rinomina', pin: 'Fissa', unpin: 'Sblocca',
@@ -1305,10 +1297,8 @@ const texts = {
       'con el botón de abajo.',
     readingContext: 'Leyendo el contexto… {p} %', copy: 'Copiar', copied: 'Copiado',
     contextLabel: 'Contexto',
-    contextUse: 'Contexto de la conversación: {n} tokens de {total} ({p} %), una ventana que se duplica a medida que ' +
-      'la conversación crece, hasta {largest} tokens (contexto del modelo: {context})',
-    contextUseLargest: 'Contexto de la conversación: {n} tokens de {total} ({p} %), su ventana más grande, más allá ' +
-      'de cuya mitad se resumen los intercambios más antiguos (contexto del modelo: {context})',
+    contextUse: 'Contexto de la conversación: {n} tokens de {total} ({p} %), el contexto del modelo, más allá de ' +
+      'cuya mitad se resumen los intercambios más antiguos',
     readAloud: 'Leer en voz alta', stopReading: 'Detener la lectura',
     readAloudFailed: 'La respuesta no se puede leer en voz alta: {reason}', regenerate: 'Regenerar',
     edit: 'Editar', delete: 'Eliminar', save: 'Guardar', cancel: 'Cancelar', rename: 'Renombrar', pin: 'Fijar', unpin: 'Desfijar',

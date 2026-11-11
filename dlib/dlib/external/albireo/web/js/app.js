@@ -53,28 +53,22 @@ const projectColors = ['#5b8cff', '#f2b544', '#3fb68b', '#e5534b', '#a371f7', '#
 const maxAgentSteps = 100;
 
 /*
-    The working context of a discussion (workingContext): the context the engine gives the model, which it already
+    The working context of a model (workingContext): the context the engine gives the model, which it already
     brought down to what the memory of the computer holds (its physical memory and its paging file or swap), within
     what the computer reads in workingSeconds at the speed measured for the model (readRate), minWorkingContext
     tokens at least, rounded to a power of two, so that a new measure changes the choices that follow only when the
-    speed doubles or halves.  The engine keeps the keys and values of the discussions read, so that a discussion
-    reads its whole context again only in the rare cases where they left the memory.  The automatic choices of a
-    discussion take their shares of it: the documents of a project read whole, an attached document read whole, and
-    the excerpts given with a question, each within a time of reading too, since a question waits for them; beyond
-    the first two, the documents are searched.  The context of the model stays the limit of what a question holds.
+    speed doubles or halves.  The automatic choices of a discussion take their shares of it: the documents of a
+    project read whole, an attached document read whole, and the excerpts given with a question, each within a time
+    of reading too, since a question waits for them; beyond the first two, the documents are searched.
+
+    The window of a discussion is the context of its model, the one the model was trained for unless the memory of
+    the computer brought it down, whatever the speed of the computer: the engine keeps the keys and values of the
+    discussions read, so that a discussion reads its whole context again only in the rare cases where they left the
+    memory, and the oldest exchanges are compressed once they take compactShare of the room the context leaves beside
+    the answer.
 */
 const workingSeconds = 240;
 const minWorkingContext = 16384;
-/*
-    The window of a discussion grows with it, from the working context to twice as much each time its prompt takes
-    compactShare of the room the window leaves beside the answer, growthSteps times at most (largestContext), within
-    the context of the model and within the window whose keys and values a generated token reads in growthWeights
-    times the bytes of the weights of the model, so that the generation slows down by a bounded factor at the end of a
-    long discussion.  The oldest exchanges are compressed once they take compactShare of the room of the largest
-    window.
-*/
-const growthSteps = 2;
-const growthWeights = 8;
 const knowledgeShare = 0.3;
 const knowledgeSeconds = 60;
 const attachmentShare = 0.25;
@@ -87,12 +81,12 @@ const leastExcerptTokens = 2000;
 const mostExcerptTokens = 12000;
 const passageTokens = 330;
 /*
-    The room of the exchanges is the room of the working context less the system message and the tools.  When the
-    oldest exchanges leave, the exchanges kept, with the summary of those that left, take keptShare of that room, so
-    that they grow again for several questions before the next cut.  Once an answer ends, or a discussion is opened,
-    with the exchanges taking compactShare of their room, their oldest part is compressed in the background: the
-    next questions still fit meanwhile, and find the summary written.  A conversation that outgrows the room of the
-    context of the model loses its oldest exchanges at once (fitContext).
+    The room of the exchanges is the room the context of the model leaves beside the answer, less the system message
+    and the tools.  When the oldest exchanges leave, the exchanges kept, with the summary of those that left, take
+    keptShare of that room, so that they grow again for several questions before the next cut.  Once an answer ends,
+    or a discussion is opened, with the exchanges taking compactShare of their room, their oldest part is compressed
+    in the background: the next questions still fit meanwhile, and find the summary written.  A conversation that
+    outgrows that room at once loses its oldest exchanges then (fitContext).
 */
 const keptShare = 0.3;
 const compactShare = 0.5;
@@ -180,32 +174,6 @@ function writeRate(id) {
 function workingContext(id, context) {
   const wanted = Math.max(minWorkingContext, workingSeconds * readRate(id));
   return Math.min(context || 8192, Math.pow(2, Math.round(Math.log2(wanted))));
-}
-
-// The largest window of a discussion with a model of context tokens (see growthSteps).
-function largestContext(id, context) {
-  const working = workingContext(id, context);
-  let largest = working * Math.pow(2, growthSteps);
-  const loaded = loadedModel(id);
-  if (loaded && loaded.kv_bytes_per_token > 0 && loaded.bytes > 0) {
-    const bound = growthWeights * loaded.bytes / loaded.kv_bytes_per_token;
-    while (largest > working && largest > bound) largest /= 2;
-  }
-  return Math.min(context || 8192, largest);
-}
-
-/*
-    The window of a discussion of tokens with a model of the capabilities caps, within the context of the model: the
-    working context, doubled while the tokens take compactShare of the room it leaves beside the answer, up to the
-    largest window (see growthSteps).
-*/
-function discussionWindow(caps, tokens, reserve, context) {
-  const largest = Math.min(caps.largest || context, context);
-  let window = Math.min(caps.working || largest, largest);
-  while (window < largest && tokens >= compactShare * (window - Math.min(reserve, Math.floor(window / 2)))) {
-    window = Math.min(largest, 2 * window);
-  }
-  return { window, largest };
 }
 
 // The tokens of the documents that a model of the capabilities caps reads whole: those of a project, or those of
@@ -873,15 +841,15 @@ function acceptFor(role, room) {
 
 /*
     The capabilities of the model of a function: reasoning, reasoningAlways for a model trained to reason before
-    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, its context, its working
-    context (workingContext) and the largest window of a discussion (largestContext), 0 while it is not loaded, and
-    its speeds of reading and writing (readRate, writeRate).  The format of a loaded model in the engine gives its
-    reasoning and its tools, and the entry of the model in the list of the service narrows them: the entries of the
-    catalog and of the models that come with Albireo give what each model does, verified model by model, so that a
-    model whose format offers tools it does not call (Qwen2.5 Coder) has the buttons of the agent and of the web
-    disabled, as a model without reasoning has the one of the deep reasoning.  A model imported without entry keeps
-    the capabilities of its format, which the engine also reads from the vocabulary of a file without template, and
-    a model that reasons before every answer keeps its deep reasoning, which its tools wait for.
+    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, its context and its working
+    context (workingContext), 0 while it is not loaded, and its speeds of reading and writing (readRate, writeRate).
+    The format of a loaded model in the engine gives its reasoning and its tools, and the entry of the model in the
+    list of the service narrows them: the entries of the catalog and of the models that come with Albireo give what
+    each model does, verified model by model, so that a model whose format offers tools it does not call (Qwen2.5
+    Coder) has the buttons of the agent and of the web disabled, as a model without reasoning has the one of the
+    deep reasoning.  A model imported without entry keeps the capabilities of its format, which the engine also
+    reads from the vocabulary of a file without template, and a model that reasons before every answer keeps its
+    deep reasoning, which its tools wait for.
 */
 function roleCapabilities(role) {
   const id = roleModel(role);
@@ -895,11 +863,10 @@ function roleCapabilities(role) {
     const always = loaded.reasoning_always === true;
     return { reasoning: loaded.reasoning !== false && (always || !(entry && entry.reasoning === false)),
       reasoningAlways: always, tools: loaded.tools !== false && !(entry && entry.tools === false),
-      context, working: context ? workingContext(id, context) : 0, largest: context ? largestContext(id, context) : 0,
-      read, write };
+      context, working: context ? workingContext(id, context) : 0, read, write };
   }
   return { reasoning: m ? m.reasoning !== false : true, reasoningAlways: !!(m && m.reasoning_always === true),
-    tools: m ? m.tools !== false : true, context: 0, working: 0, largest: 0, read, write };
+    tools: m ? m.tools !== false : true, context: 0, working: 0, read, write };
 }
 
 /*
@@ -1132,15 +1099,14 @@ function renderStatusLine() {
 }
 
 /*
-    The share of its window that the discussion shown takes, under the status line: the tokens of the history the
-    next question carries, its system message and its tools included, as the service counts them, its images by their
-    tokens (tokenEstimate), over the window of the discussion (discussionWindow), which doubles as the discussion
-    grows, up to its largest window, within the context the engine gives the model.  The discussion is measured again
-    when it, its function, its model or its toggles change, once the answer being written ends; the line keeps the
-    last measure of the discussion meanwhile.  A measure that fails, the service away or the model loading, is tried
-    again for that discussion 30 seconds later at the earliest.
+    The share of the context of its model that the discussion shown takes, under the status line: the tokens of the
+    history the next question carries, its system message and its tools included, as the service counts them, its
+    images by their tokens (tokenEstimate), over the context the engine gives the model, which is the window of the
+    discussion.  The discussion is measured again when it, its function, its model or its toggles change, once the
+    answer being written ends; the line keeps the last measure of the discussion meanwhile.  A measure that fails, the
+    service away or the model loading, is tried again for that discussion 30 seconds later at the earliest.
 */
-const contextUse = { id: '', key: '', tokens: 0, context: 0, window: 0, largest: 0, pending: false, failed: 0 };
+const contextUse = { id: '', key: '', tokens: 0, context: 0, pending: false, failed: 0 };
 const contextRetry = 30000;
 
 function contextKey(c) {
@@ -1154,7 +1120,7 @@ function contextKey(c) {
 
 async function measureContext(c, key) {
   contextUse.pending = true;
-  let tokens = 0, context = 0, window = 0, largest = 0;
+  let tokens = 0, context = 0;
   try {
     const caps = roleCapabilities(c.role);
     const set = toolSet(c, caps);
@@ -1165,13 +1131,11 @@ async function measureContext(c, key) {
     if (r && typeof r.tokens === 'number' && r.context) {
       tokens = Math.round(tokenEstimate(text, r.tokens, model).of(apiMessages(c, system, null, estimateMedia(c.role))));
       context = r.context;
-      ({ window, largest } = discussionWindow(caps, tokens, answerReserve(caps, !!(c.reasoning && caps.reasoning)),
-        context));
     }
   } catch (e) {
     // A service out of reach: the line stays empty until the next measure.
   } finally {
-    Object.assign(contextUse, { id: c.id, key: context ? key : '', tokens, context, window, largest, pending: false,
+    Object.assign(contextUse, { id: c.id, key: context ? key : '', tokens, context, pending: false,
       failed: context ? 0 : Date.now() });
   }
   renderContextLine();
@@ -1186,17 +1150,16 @@ function renderContextLine() {
     const key = contextKey(c);
     if (key !== contextUse.key) measureContext(c, key);
   }
-  const shown = ready && contextUse.id === c.id && contextUse.window > 0;
+  const shown = ready && contextUse.id === c.id && contextUse.context > 0;
   ui.contextLine.classList.toggle('hidden', !shown);
   if (!shown) return;
-  const share = Math.min(1, contextUse.tokens / contextUse.window);
+  const share = Math.min(1, contextUse.tokens / contextUse.context);
   const level = share >= 0.9 ? ' full' : share >= 0.75 ? ' high' : '';
-  const label = formatNumber(contextUse.tokens) + ' / ' + formatNumber(contextUse.window);
-  ui.contextLine.title = t(contextUse.window < contextUse.largest ? 'contextUse' : 'contextUseLargest', {
-    n: formatNumber(contextUse.tokens), total: formatNumber(contextUse.window), p: Math.round(100 * share),
-    largest: formatNumber(contextUse.largest), context: formatNumber(contextUse.context) });
+  const label = formatNumber(contextUse.tokens) + ' / ' + formatNumber(contextUse.context);
+  ui.contextLine.title = t('contextUse', { n: formatNumber(contextUse.tokens), total: formatNumber(contextUse.context),
+    p: Math.round(100 * share) });
   ui.contextLine.replaceChildren(h('span', { class: 'label' }, t('contextLabel')),
-    h('div', { class: 'meter' + level, role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': contextUse.window,
+    h('div', { class: 'meter' + level, role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': contextUse.context,
       'aria-valuenow': contextUse.tokens, 'aria-valuetext': ui.contextLine.title, 'aria-label': t('contextLabel') },
     h('div', { style: { width: (100 * share).toFixed(1) + '%' } })), h('span', { class: 'count' }, label));
 }
@@ -1946,7 +1909,7 @@ async function rewriteSummary(c) {
   c.summary = null;
   if (start === 0 || !roleModel(c.role)) return;
   const caps = roleCapabilities(c.role);
-  const context = caps.largest || caps.working || caps.context || 8192;
+  const context = caps.context || caps.working || 8192;
   const room = context - Math.min(answerReserve(caps, !!(c.reasoning && caps.reasoning)), Math.floor(context / 2));
   toast(t('compacting'));
   cancelWarmup(c.id);
@@ -6581,8 +6544,8 @@ async function namePending() {
 
 /*
     Compresses the oldest exchanges of a discussion in the background once they take compactShare of the room the
-    system message and the tools leave them in the largest window, as the next question will receive them, after an
-    answer and when the discussion is opened.  The job takes its place in compactions at once, with its own
+    system message and the tools leave them in the context of the model, as the next question will receive them,
+    after an answer and when the discussion is opened.  The job takes its place in compactions at once, with its own
     AbortController, which the deletion of the discussion uses (cancelCompaction); a question that comes before the
     summary is written waits for it only when it does not fit without it (fitContext).  One tab compresses a
     discussion at a time.
@@ -6618,8 +6581,8 @@ async function compactInBackground(c, signal) {
     api.count(model, text.slice(0, 1), toolDefs).catch(() => null)]);
   if (signal.aborted || !all || typeof all.tokens !== 'number' || !all.context) return;
   const reserve = answerReserve(caps, !!(view.reasoning && caps.reasoning));
-  // The room of the largest window of the discussion, within that of the context of the model.
-  const context = Math.min(all.context, caps.largest || caps.working || all.context);
+  // The room of the context of the model, the window of the discussion.
+  const context = all.context;
   const room = context - Math.min(reserve, Math.floor(context / 2));
   const estimate = tokenEstimate(text, all.tokens, model);
   const media = estimateMedia(role);

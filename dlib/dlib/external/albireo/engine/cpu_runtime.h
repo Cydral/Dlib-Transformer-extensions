@@ -103,6 +103,10 @@ namespace albireo
         // Hands the products, or the layers, of the following passes to a device.
         void set_offload(std::unique_ptr<matmul_offload> offload);
 
+        // The bytes of the file of the model whose products the device computes from its copies
+        // (matmul_offload::mapped_bytes()), 0 without a device.
+        size_t offloaded_bytes() const { return offload_ ? offload_->mapped_bytes() : 0; }
+
         /*!
             requires
                 - no forward pass has run, or the rotary divisors stay the same.

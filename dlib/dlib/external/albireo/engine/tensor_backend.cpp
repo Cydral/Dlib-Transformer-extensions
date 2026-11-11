@@ -578,6 +578,37 @@ namespace albireo
             return d_.name;
         }
 
+        /*
+            The bytes of the file of the model whose matrices the device holds and computes for the
+            products of few tokens, as those of a generated token, so that the processor no longer
+            reads their pages; it reads those of the others at every token.  A device disabled, a
+            routing that keeps the products on the processor, products of a single token left to it
+            (offload_min_tokens) or copies beyond the memory of the card, whose products of few tokens
+            the processor computes, count none, and nor does a shape whose products of one token or of
+            two to four the processor computes.  The copies of the other backends live in the memory
+            of the host, and their products of few tokens mostly stay on the processor, so that none
+            count.
+            Read on the thread of the forward passes, which makes and frees the copies and settles the
+            routes.
+        */
+        size_t mapped_bytes() const override
+        {
+#if defined(DLIB_USE_CUDA)
+            if (d_.disabled.load(std::memory_order_relaxed) || d_.forced < 0 || d_.min_tokens > 1
+                || d_.resident.load(std::memory_order_relaxed) > d_.card_bytes)
+                return 0;
+            size_t total = 0;
+            for (const auto& kv : weights_)
+            {
+                const copy& c = kv.second;
+                if (serves_few(c.rows, c.cols, 0) && serves_few(c.rows, c.cols, 1)) total += c.mapped;
+            }
+            return total;
+#else
+            return 0;
+#endif
+        }
+
         std::unique_ptr<layer_pass> make_layer_pass(const dense_model& model) override;
 
     private:
@@ -591,6 +622,10 @@ namespace albireo
         {
             std::unique_ptr<dlib::resizable_tensor> t;
             size_t bytes = 0;
+            // The bytes of the matrix in the file of the model, and its shape (mapped_bytes()).
+            size_t mapped = 0;
+            long rows = 0;
+            long cols = 0;
             // The blocks of the GGUF format of the matrix, which the kernels of dlib read in
             // place, or false for a copy in single precision.
             bool quantized = false;
@@ -821,6 +856,9 @@ namespace albireo
             }
             copy c;
             c.bytes = bytes;
+            c.mapped = static_cast<size_t>(W.rows) * W.row_bytes;
+            c.rows = W.rows;
+            c.cols = W.cols;
             c.quantized = quantized;
             bool same = true;
             try
@@ -1073,6 +1111,15 @@ namespace albireo
 #endif
             device_gemm(W, staged, false, X, n, x_stride, Y, y_stride);
             return placed::steady;
+        }
+
+        // Whether the device computes, or still measures, the products of a shape for a class of tokens.
+        bool serves_few(long rows, long cols, int tokens) const
+        {
+            const auto it = routes_.find(std::make_tuple(rows, cols, tokens));
+            if (it == routes_.end()) return true;
+            const route& r = it->second;
+            return !r.failed && !r.no_room && (!r.decided || r.on_device);
         }
 
         void decide(route& r, const std::tuple<long, long, int>& key)

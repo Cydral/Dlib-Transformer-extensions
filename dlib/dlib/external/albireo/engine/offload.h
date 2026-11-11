@@ -302,6 +302,14 @@ namespace albireo
         // A short description, such as "NVIDIA GeForce RTX 4070 through CUDA".
         virtual std::string description() const = 0;
 
+        /*
+            The bytes of the weights of the model, as its file holds them, whose products of few
+            tokens, as those of a generated token, the device computes from its own copies, so that the
+            processor no longer reads their pages; 0 for a device that keeps no copies or leaves these
+            products to the processor.  Read on the thread of the forward passes.
+        */
+        virtual size_t mapped_bytes() const { return 0; }
+
         /*!
             ensures
                 - Returns an object that computes the layers of model on the device, or null
