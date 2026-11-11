@@ -715,11 +715,11 @@ namespace albireo
             Parses the JSON of a tool call as a model writes it: as it is, else with the raw
             control characters of its strings escaped, else repaired by stray_quotes, with the
             tools of the request and the tool whose arguments the text holds alone, if any, for
-            the quotes of the code that a small model leaves unescaped.  repaired receives the
-            text that parsed when it is not the text given.
+            the quotes of the code that a small model leaves unescaped, unless repair is false.
+            repaired receives the text that parsed when it is not the text given.
         */
         bool parse_call_json(const std::string& text, json& out, std::string& repaired,
-            const tool_schema& schema = tool_schema(), const std::string& tool = std::string())
+            const tool_schema& schema = tool_schema(), const std::string& tool = std::string(), bool repair = true)
         {
             repaired.clear();
             if (json::parse(text, out)) return true;
@@ -729,7 +729,8 @@ namespace albireo
                 repaired.swap(fixed);
                 return true;
             }
-            if (!stray_quotes(text, schema, tool, false).repair(fixed) || !json::parse(fixed, out)) return false;
+            if (!repair || !stray_quotes(text, schema, tool, false).repair(fixed) || !json::parse(fixed, out))
+                return false;
             repaired.swap(fixed);
             return true;
         }
@@ -962,6 +963,14 @@ namespace albireo
                                          // names a whole JSON answer may call, the parameters of the calls a
                                          // repair reads (stray_quotes)
         };
+
+        /*
+            The markers after a call, in the formats without a closing marker, before which the
+            text of the call is read whole with its repair, and as many again among those that a
+            bracket closing a value precedes, so that a long string that writes markers costs a
+            scan of each one beyond them (call_reads).
+        */
+        const size_t call_repairs = 16;
 
         class tag_parser : public output_parser
         {
@@ -1209,6 +1218,18 @@ namespace albireo
                 return s;
             }
 
+            // Whether the definition of the tool named function lists key among its parameters.
+            bool declares(const std::string& function, const std::string& key) const
+            {
+                if (key.empty()) return false;
+                for (const auto& t : c_.tools.elements())
+                {
+                    const json& fn = t.contains("function") ? t["function"] : t;
+                    if (fn["name"].as_string() == function) return fn["parameters"]["properties"].contains(key);
+                }
+                return false;
+            }
+
             // The type the definition of a tool gives to one of its parameters, or "".
             std::string parameter_type(const std::string& function, const std::string& key) const
             {
@@ -1240,18 +1261,75 @@ namespace albireo
             }
 
             /*
+                The end of the value of the parameter key of the function name in the XML form, a
+                value without its closing marker, which begins at from in body: the next parameter
+                of the function that the call has not given yet (args), at the start of a line when
+                lines is true, else closed, its closing marker, when that marker comes before stop,
+                the end of the function; npos when neither comes before stop.
+            */
+            size_t loose_value_end(const std::string& body, size_t from, size_t closed, size_t stop,
+                const std::string& name, const std::string& key, const json& args, bool lines) const
+            {
+                static const std::string par_open = "<parameter=";
+                const size_t limit = std::min(closed, stop);
+                for (size_t n = body.find(par_open, from); n < limit; n = body.find(par_open, n + 1))
+                {
+                    if (lines && body[n - 1] != '\n') continue;
+                    const size_t e = body.find('>', n);
+                    if (e == std::string::npos || e >= limit) break;
+                    const size_t k_at = n + par_open.size();
+                    const std::string k = strip_spaces(body.substr(k_at, e - k_at));
+                    if (k.empty() || k == key || k.find_first_of("<\n") != std::string::npos || args.contains(k)
+                        || !is_parameter(name, k))
+                        continue;
+                    return n;
+                }
+                return closed < stop ? closed : std::string::npos;
+            }
+
+            /*
                 The calls of the text between two call markers in the XML form of Granite 4.2
                 and Qwen3-Coder: <function=name> elements that hold <parameter=key> elements,
                 whose value is the text between their markers, less the line break after the
                 opening marker and the one before the closing marker.  A model may stop before
-                the closing marker of its last function.  False, emitting nothing, when the text
-                holds anything else.
+                the closing marker of its last function.  The text is read first with the closing
+                marker of each parameter, which keeps in a value the parameters it writes, such as
+                code that writes this format.  A model may leave out these markers, so a text that
+                this reading does not complete is read again with the value of a parameter ending
+                at the next parameter of its function, or at the end of the function when the
+                function has its closing marker; a text whose values hold a parameter the tool
+                declares and the call lacks is read again so at the parameters that start a line
+                alone, a value naming a parameter within a line keeping it, and the first reading
+                stays when the second fails.  False, emitting nothing, when the text holds anything
+                else.
             */
             bool emit_xml_calls(const std::string& body, std::vector<output_event>& events)
             {
+                std::vector<std::pair<std::string, std::string>> strict, loose;
+                bool lacks = false, ignored = false;
+                const bool read = read_xml_calls(body, false, false, strict, lacks);
+                const std::vector<std::pair<std::string, std::string>>* calls = &strict;
+                if (!read && read_xml_calls(body, true, false, loose, ignored)) calls = &loose;
+                else if (!read) return false;
+                else if (lacks && read_xml_calls(body, true, true, loose, ignored)) calls = &loose;
+                for (const auto& c : *calls) emit_call(c.first, c.second, events);
+                return true;
+            }
+
+            /*
+                The names and the arguments of the calls of emit_xml_calls(), each value ending at
+                its closing marker or, when loose, as a model may leave it, at the parameters that
+                start a line alone when lines is true; lacks tells whether a value holds a parameter
+                that the tool declares and the call lacks, which a value that runs over a parameter
+                left without its closing marker does.
+            */
+            bool read_xml_calls(const std::string& body, bool loose, bool lines,
+                std::vector<std::pair<std::string, std::string>>& calls, bool& lacks) const
+            {
                 static const std::string fn_open = "<function=", fn_close = "</function>";
                 static const std::string par_open = "<parameter=", par_close = "</parameter>";
-                std::vector<output_event> calls;
+                calls.clear();
+                lacks = false;
                 size_t pos = 0;
                 while (pos < body.size())
                 {
@@ -1265,6 +1343,7 @@ namespace albireo
                     const size_t close = body.find(fn_close, name_end);
                     const size_t stop = close == std::string::npos ? body.size() : close;
                     json args = json::object();
+                    std::vector<std::string> values;
                     size_t q = name_end + 1;
                     for (;;)
                     {
@@ -1276,22 +1355,45 @@ namespace albireo
                         }
                         if (!strip_spaces(body.substr(q, a - q)).empty()) return false;
                         const size_t key_end = body.find('>', a);
-                        const size_t b = key_end == std::string::npos ? key_end : body.find(par_close, key_end);
-                        if (b == std::string::npos || b > stop) return false;
+                        if (key_end == std::string::npos || key_end >= stop) return false;
                         const size_t key_at = a + par_open.size();
                         const std::string key = strip_spaces(body.substr(key_at, key_end - key_at));
+                        if (key.empty() || key.find_first_of("<\n") != std::string::npos) return false;
+                        const size_t closed = body.find(par_close, key_end);
+                        size_t b = closed < stop ? closed : std::string::npos;
+                        if (loose)
+                        {
+                            b = loose_value_end(body, key_end + 1, closed, stop, name, key, args, lines);
+                            // A value without its closing marker, nor a parameter after it, ends with its
+                            // function, and a function without its closing marker is an answer cut before the
+                            // end of its call.
+                            if (b == std::string::npos && close != std::string::npos) b = stop;
+                        }
+                        if (b == std::string::npos) return false;
                         std::string value = body.substr(key_end + 1, b - key_end - 1);
-                        if (!value.empty() && value[0] == '\n') value.erase(0, 1);
-                        if (!value.empty() && value.back() == '\n') value.pop_back();
+                        if (starts_with(value, "\r\n")) value.erase(0, 2);
+                        else if (!value.empty() && value[0] == '\n') value.erase(0, 1);
+                        if (!value.empty() && value.back() == '\n')
+                        {
+                            value.pop_back();
+                            if (!value.empty() && value.back() == '\r') value.pop_back();
+                        }
                         args[key] = xml_value(name, key, value);
-                        q = b + par_close.size();
+                        values.push_back(value);
+                        q = b == closed ? b + par_close.size() : b;
                     }
-                    emit_call(name, args.dump_formatted(), calls);
+                    for (const auto& v : values)
+                        for (size_t n = v.find(par_open); n != std::string::npos; n = v.find(par_open, n + 1))
+                        {
+                            const size_t e = v.find('>', n);
+                            if (e == std::string::npos) break;
+                            const std::string k = strip_spaces(v.substr(n + par_open.size(), e - n - par_open.size()));
+                            lacks = lacks || (!args.contains(k) && declares(name, k));
+                        }
+                    calls.emplace_back(name, args.dump_formatted());
                     pos = close == std::string::npos ? body.size() : close + fn_close.size();
                 }
-                if (calls.empty() || !strip_spaces(body.substr(std::min(pos, body.size()))).empty()) return false;
-                events.insert(events.end(), calls.begin(), calls.end());
-                return true;
+                return !calls.empty() && strip_spaces(body.substr(std::min(pos, body.size()))).empty();
             }
 
             /*
@@ -1462,34 +1564,12 @@ namespace albireo
                     reset_scans();
                     return true;
                 }
+                // In the formats without a closing marker, the text of a call runs to its boundary.
                 if (c_.calls == call_style::json_list || (c_.calls == call_style::mistral && starts_json_list()))
                 {
-                    const size_t n = value_extent(0);
-                    if (n == 0)
-                    {
-                        if (final)
-                        {
-                            emit(output_kind::content, call_prefix_ + buffer_, events);
-                            buffer_.clear();
-                            reset_scans();
-                        }
-                        return false;
-                    }
-                    json j;
-                    std::string repaired;
-                    const std::string value = strip_spaces(buffer_.substr(0, n));
-                    if (parse_call_json(value, j, repaired, schema()) && (j.is_array() || j.is_object()))
-                    {
-                        if (j.is_object()) emit_call_object(j, events);
-                        else for (const auto& e : j.elements()) if (e.is_object()) emit_call_object(e, events);
-                    }
-                    else
-                    {
-                        emit(output_kind::content, call_prefix_ + buffer_.substr(0, n), events);
-                    }
-                    buffer_.erase(0, n);
-                    state_ = state::content;
-                    reset_scans();
+                    const size_t end = call_end(0, final, std::string());
+                    if (end == std::string::npos) return false;
+                    finish_unclosed(read_unclosed(0, end, std::string(), std::string(), events));
                     return true;
                 }
                 // mistral: name[ARGS]{...}, or name[CALL_ID]id[ARGS]{...} with the identifier of the call
@@ -1505,6 +1585,16 @@ namespace albireo
                     }
                     return false;
                 }
+                // An opening marker before [ARGS] ends a call without arguments, which is text.
+                const std::string head = buffer_.substr(0, a);
+                size_t early = std::string::npos;
+                for (const auto& m : opens_) early = std::min(early, head.find(m));
+                if (early != std::string::npos)
+                {
+                    emit(output_kind::content, call_prefix_ + buffer_.substr(0, early), events);
+                    finish_unclosed(early);
+                    return true;
+                }
                 std::string name = strip_spaces(buffer_.substr(0, a)), id;
                 const size_t marked = name.find(id_marker);
                 if (marked != std::string::npos)
@@ -1512,35 +1602,258 @@ namespace albireo
                     id = strip_spaces(name.substr(marked + id_marker.size()));
                     name = strip_spaces(name.substr(0, marked));
                 }
-                const size_t n = value_extent(a + args_marker.size());
-                if (n == 0)
+                const size_t end = call_end(a + args_marker.size(), final, name);
+                if (end == std::string::npos) return false;
+                // A call without a name is the text of the answer.
+                if (name.empty())
                 {
-                    if (final)
-                    {
-                        // Quotes left unescaped in the code keep the extent open, so the rest is read whole.
-                        const std::string rest = strip_spaces(buffer_.substr(a + args_marker.size()));
-                        json j;
-                        std::string repaired;
-                        if (!name.empty() && parse_call_json(rest, j, repaired, schema(), name) && j.is_object())
-                            emit_call(name, repaired.empty() ? rest : repaired, events, id);
-                        else
-                            emit(output_kind::content, call_prefix_ + buffer_, events);
-                        buffer_.clear();
-                        reset_scans();
-                    }
-                    return false;
+                    emit(output_kind::content, call_prefix_ + buffer_.substr(0, end), events);
+                    finish_unclosed(end);
+                    return true;
                 }
-                const std::string args = strip_spaces(buffer_.substr(a + args_marker.size(), n));
+                finish_unclosed(read_unclosed(a + args_marker.size(), end, name, id, events));
+                return true;
+            }
+
+            /*
+                The end of the text of a call in the formats without a closing marker (Mistral,
+                Granite 3): the next opening marker after from, of a call or of a reasoning, before
+                which the text of the call reads, else the end of the answer once final; npos while
+                the answer goes on without one.  A marker that a string of the arguments holds
+                leaves their JSON open, and the search goes on after it, so that the calls a string
+                writes as examples stay in it, the end of the answer ending the call when nothing
+                reads before.  The search resumes where the previous one ended, since a call grows
+                by a token at a time.
+            */
+            size_t call_end(size_t from, bool final, const std::string& name)
+            {
+                size_t longest = 0;
+                for (const auto& m : opens_) longest = std::max(longest, m.size());
+                size_t at = std::max(from, bounded_);
+                for (;;)
+                {
+                    size_t p = std::string::npos;
+                    for (const auto& m : opens_) p = std::min(p, buffer_.find(m, at));
+                    if (p == std::string::npos) break;
+                    if (call_reads(from, p, name)) return p;
+                    at = p + 1;
+                }
+                // The next search starts where a marker begins that this one did not see whole.
+                bounded_ = std::max(at, buffer_.size() >= longest ? buffer_.size() - longest + 1 : size_t(0));
+                return final ? buffer_.size() : std::string::npos;
+            }
+
+            /*
+                Whether the text of a call between from and end in buffer_ may end there: a text
+                that opens no JSON object or list, one whose JSON value reads as written and stands
+                apart from what follows it or precedes a text without a quote, or one that reads
+                whole as parse_call_json() reads it.  The JSON value is scanned once as the answer
+                grows (scan_call), and the reading of the whole text, which repairs it, is tried for
+                the first call_repairs markers of a call, then for as many markers that a bracket
+                closing a value precedes, so that the markers a long string writes cost a scan each.
+            */
+            bool call_reads(size_t from, size_t end, const std::string& name)
+            {
+                scan_call(from, end);
+                if (scan_first_ == std::string::npos || scan_first_ >= end) return true;
+                const char c = buffer_[scan_first_];
+                if (c != '{' && c != '[') return true;
+                if (scan_closed_ != std::string::npos && scan_closed_ <= end)
+                {
+                    if (written_ < 0) written_ = reads_as_written(buffer_.substr(scan_first_,
+                        scan_closed_ - scan_first_)) ? 1 : 0;
+                    if (written_ == 1 && apart_near(buffer_, scan_closed_, end)) return true;
+                    /*
+                        A text without a quote between the value and the marker continues none of its
+                        strings, since a string that a model continues past a quote it left unescaped
+                        holds the quote that closes it, so that text goes back to the answer.
+                    */
+                    if (written_ == 1 && quote_at_ == std::string::npos)
+                    {
+                        const size_t q = std::max(quote_from_, scan_closed_);
+                        if (q < end)
+                        {
+                            const auto found = std::find(buffer_.begin() + static_cast<std::ptrdiff_t>(q),
+                                buffer_.begin() + static_cast<std::ptrdiff_t>(end), '"');
+                            if (found != buffer_.begin() + static_cast<std::ptrdiff_t>(end))
+                                quote_at_ = static_cast<size_t>(found - buffer_.begin());
+                        }
+                        quote_from_ = std::max(quote_from_, end);
+                    }
+                    if (written_ == 1 && quote_at_ == std::string::npos) return true;
+                }
+                // The repair, for the first markers of a call, then for those that a bracket closing a value precedes.
+                if (repairs_ > 0)
+                {
+                    --repairs_;
+                }
+                else
+                {
+                    size_t k = end;
+                    while (k > from && std::isspace(static_cast<unsigned char>(buffer_[k - 1]))) --k;
+                    if (closing_repairs_ == 0 || k == from || (buffer_[k - 1] != '}' && buffer_[k - 1] != ']'))
+                        return false;
+                    --closing_repairs_;
+                }
+                if (written_ == 1 && apart(buffer_, scan_closed_, end)) return true;
                 json j;
                 std::string repaired;
-                if (!name.empty() && parse_call_json(args, j, repaired, schema(), name) && j.is_object())
-                    emit_call(name, repaired.empty() ? args : repaired, events, id);
-                else
-                    emit(output_kind::content, call_prefix_ + buffer_.substr(0, a + args_marker.size() + n), events);
-                buffer_.erase(0, a + args_marker.size() + n);
+                return parse_call_json(strip_spaces(buffer_.substr(from, end - from)), j, repaired, schema(), name);
+            }
+
+            /*
+                Scans buffer_ from from up to end for the JSON value of the text of a call, as
+                json_extent() does, resuming where the previous scan ended: the position of its
+                first character, and the end of the value once it closes.
+            */
+            void scan_call(size_t from, size_t end)
+            {
+                if (scan_at_ < from) scan_at_ = from;
+                for (; scan_at_ < end && scan_closed_ == std::string::npos; ++scan_at_)
+                {
+                    const char c = buffer_[scan_at_];
+                    if (scan_first_ == std::string::npos)
+                    {
+                        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+                        scan_first_ = scan_at_;
+                    }
+                    // A text that opens no JSON value has no extent to scan.
+                    if (buffer_[scan_first_] != '{' && buffer_[scan_first_] != '[') return;
+                    if (scan_escaped_)
+                    {
+                        scan_escaped_ = false;
+                    }
+                    else if (scan_string_)
+                    {
+                        if (c == '\\') scan_escaped_ = true;
+                        else if (c == '"') scan_string_ = false;
+                    }
+                    else if (c == '"')
+                    {
+                        scan_string_ = true;
+                    }
+                    else if (c == '{' || c == '[')
+                    {
+                        ++scan_depth_;
+                    }
+                    else if ((c == '}' || c == ']') && --scan_depth_ == 0)
+                    {
+                        scan_closed_ = scan_at_ + 1;
+                    }
+                }
+            }
+
+            /*
+                Reads the call whose text lies between from and end in buffer_, the arguments of
+                the tool name, or calls as JSON objects in a list when name is empty, and returns
+                the end of what was read.  A JSON value that reads as written, or with its control
+                characters escaped, and that stands apart from what follows it is the call, the
+                text after it going back to the answer once the calls of the values that follow it
+                are read, in the forms without a name.  Otherwise the text is read whole, as
+                parse_call_json() reads it, since the quotes of code that a model leaves unescaped
+                mislead the extent of its JSON ("}" after an odd number of them closes the object
+                early).  A text that no reading completes holds a call followed by text, which ends
+                where the JSON value ends.
+            */
+            size_t read_unclosed(size_t from, size_t end, const std::string& name, const std::string& id,
+                std::vector<output_event>& events)
+            {
+                const std::string text = buffer_.substr(from, end - from);
+                const size_t n = json_extent(text, 0);
+                if (n != 0 && apart(text, n, text.size())
+                    && emit_unclosed(strip_spaces(text.substr(0, n)), name, id, events, false))
+                {
+                    size_t at = n;
+                    while (name.empty())
+                    {
+                        const size_t m = json_extent(text, at);
+                        if (m == 0 || !apart(text, at + m, text.size())
+                            || !emit_unclosed(strip_spaces(text.substr(at, m)), name, id, events, false))
+                            break;
+                        at += m;
+                    }
+                    // Spaces alone after the calls belong to them.
+                    if (text.find_first_not_of(" \n\r\t", at) == std::string::npos) at = text.size();
+                    return from + at;
+                }
+                if (emit_unclosed(strip_spaces(text), name, id, events, true)) return end;
+                if (n == 0)
+                {
+                    emit(output_kind::content, call_prefix_ + buffer_.substr(0, end), events);
+                    return end;
+                }
+                if (!emit_unclosed(strip_spaces(text.substr(0, n)), name, id, events, true))
+                    emit(output_kind::content, call_prefix_ + buffer_.substr(0, from + n), events);
+                return from + n;
+            }
+
+            // Whether text parses as JSON as it is written, or with its control characters escaped.
+            static bool reads_as_written(const std::string& text)
+            {
+                json j;
+                std::string fixed;
+                return json::parse(text, j) || (escape_controls(text, fixed) && json::parse(fixed, j));
+            }
+
+            /*
+                Whether the JSON value that ends at n in text stands apart from what follows it up
+                to end, as the end of the text does, spaces up to a line break or to the end, and
+                another JSON value that reads as written.  A text on the same line, or a quote
+                glued to the value, continues a string whose quotes a model left unescaped, as in
+                out += "} else {"; written as code.
+            */
+            static bool apart(const std::string& text, size_t n, size_t end)
+            {
+                if (apart_near(text, n, end)) return true;
+                size_t m = n;
+                while (m < end && (text[m] == ' ' || text[m] == '\t')) ++m;
+                if (m >= end || (text[m] != '{' && text[m] != '[')) return false;
+                const std::string rest = text.substr(m, end - m);
+                const size_t k = json_extent(rest, 0);
+                return k != 0 && reads_as_written(rest.substr(0, k));
+            }
+
+            // The part of apart() that reads no more than the spaces after the value.
+            static bool apart_near(const std::string& text, size_t n, size_t end)
+            {
+                size_t m = n;
+                while (m < end && (text[m] == ' ' || text[m] == '\t')) ++m;
+                return m >= end || text[m] == '\n' || text[m] == '\r';
+            }
+
+            /*
+                The call of read_unclosed(), when text reads as one, as written or else repaired
+                when repair is true; false, emitting nothing, otherwise.
+            */
+            bool emit_unclosed(const std::string& text, const std::string& name, const std::string& id,
+                std::vector<output_event>& events, bool repair)
+            {
+                json j;
+                std::string repaired;
+                if (!parse_call_json(text, j, repaired, schema(), name, repair)) return false;
+                if (!name.empty())
+                {
+                    if (!j.is_object()) return false;
+                    emit_call(name, repaired.empty() ? text : repaired, events, id);
+                    return true;
+                }
+                if (j.is_object()) return emit_call_object(j, events);
+                if (!j.is_array()) return false;
+                // The elements of the list that are calls, one at least.
+                std::vector<output_event> calls;
+                for (const auto& e : j.elements())
+                    if (e.is_object()) emit_call_object(e, calls);
+                if (calls.empty()) return false;
+                events.insert(events.end(), calls.begin(), calls.end());
+                return true;
+            }
+
+            // Leaves the text of a call read up to end, the answer going on after it.
+            void finish_unclosed(size_t end)
+            {
+                buffer_.erase(0, end);
                 state_ = state::content;
                 reset_scans();
-                return true;
             }
 
             bool starts_json_list() const
@@ -1561,69 +1874,23 @@ namespace albireo
                 return p;
             }
 
-            /*
-                Length of the complete JSON value at start in buffer_, as json_extent() gives
-                it.  The scan of an object or a list resumes where the previous call left it.
-            */
-            size_t value_extent(size_t start)
-            {
-                if (extent_.start != start)
-                {
-                    extent_ = extent_state();
-                    extent_.start = start;
-                    extent_.pos = start;
-                }
-                if (!extent_.begun)
-                {
-                    size_t i = extent_.pos;
-                    while (i < buffer_.size() && (buffer_[i] == ' ' || buffer_[i] == '\n' || buffer_[i] == '\r'
-                        || buffer_[i] == '\t'))
-                        ++i;
-                    extent_.pos = i;
-                    if (i >= buffer_.size()) return 0;
-                    if (buffer_[i] != '{' && buffer_[i] != '[') return json_extent(buffer_, start);
-                    extent_.begun = true;
-                }
-                for (size_t j = extent_.pos; j < buffer_.size(); ++j)
-                {
-                    const char c = buffer_[j];
-                    if (extent_.escape)
-                    {
-                        extent_.escape = false;
-                        continue;
-                    }
-                    if (extent_.in_string)
-                    {
-                        if (c == '\\') extent_.escape = true;
-                        else if (c == '"') extent_.in_string = false;
-                        continue;
-                    }
-                    if (c == '"') extent_.in_string = true;
-                    else if (c == '{' || c == '[') ++extent_.depth;
-                    else if ((c == '}' || c == ']') && --extent_.depth == 0) return j + 1 - start;
-                }
-                extent_.pos = buffer_.size();
-                return 0;
-            }
-
             // Forgets the scans of buffer_, whose text changed at its start.
             void reset_scans()
             {
                 scanned_ = 0;
-                extent_ = extent_state();
+                bounded_ = 0;
+                scan_at_ = 0;
+                scan_first_ = std::string::npos;
+                scan_closed_ = std::string::npos;
+                scan_depth_ = 0;
+                scan_string_ = false;
+                scan_escaped_ = false;
+                written_ = -1;
+                quote_at_ = std::string::npos;
+                quote_from_ = 0;
+                repairs_ = call_repairs;
+                closing_repairs_ = call_repairs;
             }
-
-            // Where the scan of a JSON value at start stopped: its depth, inside a string or after
-            // a backslash of one.
-            struct extent_state
-            {
-                size_t start = std::string::npos;
-                size_t pos = 0;
-                int depth = 0;
-                bool begun = false;
-                bool in_string = false;
-                bool escape = false;
-            };
 
             parser_config c_;
             std::vector<std::string> opens_;
@@ -1635,9 +1902,21 @@ namespace albireo
             bool strip_leading_ = false;
             bool reopen_ = false;
             bool skip_content_newlines_ = false;
-            // The bytes of buffer_ searched for a marker of the call without finding it.
+            // The bytes of buffer_ searched for a marker of the call, or for its end, without finding it.
             size_t scanned_ = 0;
-            extent_state extent_;
+            size_t bounded_ = 0;
+            // The scan of the JSON value of the text of a call (scan_call), and the readings it allows.
+            size_t scan_at_ = 0;
+            size_t scan_first_ = std::string::npos;
+            size_t scan_closed_ = std::string::npos;
+            int scan_depth_ = 0;
+            bool scan_string_ = false;
+            bool scan_escaped_ = false;
+            int written_ = -1;
+            size_t quote_at_ = std::string::npos;
+            size_t quote_from_ = 0;
+            size_t repairs_ = call_repairs;
+            size_t closing_repairs_ = call_repairs;
         };
     }
 

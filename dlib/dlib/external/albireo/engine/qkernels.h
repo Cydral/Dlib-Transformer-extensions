@@ -258,8 +258,6 @@ namespace albireo
 
     // Vector helpers of the attention and normalization code.
     float qk_dot_f32(const float* a, const float* b, long n);
-    float qk_dot_f32_f16(const float* a, const uint16_t* b, long n);
-    void qk_axpy_f16(float alpha, const uint16_t* x, float* y, long n);   // y += alpha * x
     void qk_scale(float* x, float s, long n);
     float qk_max(const float* x, long n);
     // x[i] = exp(x[i] - m), returns the sum of the results.

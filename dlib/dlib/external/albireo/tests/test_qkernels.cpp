@@ -411,30 +411,18 @@ namespace
         for (long n : { 1L, 7L, 8L, 33L, 128L, 1000L })
         {
             std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
-            std::vector<uint16_t> bh(static_cast<size_t>(n));
             for (long i = 0; i < n; ++i)
             {
                 a[static_cast<size_t>(i)] = bounded(rng);
                 b[static_cast<size_t>(i)] = bounded(rng);
-                bh[static_cast<size_t>(i)] = qk_float_to_half(b[static_cast<size_t>(i)]);
             }
-            double ref = 0, ref_h = 0, mag = 0;
+            double ref = 0, mag = 0;
             for (long i = 0; i < n; ++i)
             {
                 ref += static_cast<double>(a[static_cast<size_t>(i)]) * b[static_cast<size_t>(i)];
-                ref_h += static_cast<double>(a[static_cast<size_t>(i)]) * qk_half_to_float(bh[static_cast<size_t>(i)]);
                 mag += std::fabs(static_cast<double>(a[static_cast<size_t>(i)]) * b[static_cast<size_t>(i)]);
             }
             check(std::fabs(qk_dot_f32(a.data(), b.data(), n) - ref) <= 1e-5 * (mag + 1), "dot f32");
-            check(std::fabs(qk_dot_f32_f16(a.data(), bh.data(), n) - ref_h) <= 1e-5 * (mag + 1), "dot f32 f16");
-
-            std::vector<float> y = a;
-            qk_axpy_f16(0.75f, bh.data(), y.data(), n);
-            for (long i = 0; i < n; ++i)
-            {
-                const float e = a[static_cast<size_t>(i)] + 0.75f * qk_half_to_float(bh[static_cast<size_t>(i)]);
-                check(std::fabs(y[static_cast<size_t>(i)] - e) <= 1e-6f * (std::fabs(e) + 1), "axpy f16");
-            }
 
             std::vector<float> s = a;
             qk_scale(s.data(), -1.5f, n);

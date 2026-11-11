@@ -76,10 +76,10 @@ application, the description of the interface and the list of the programs of Wi
 - **Three functions**, general, code and security, each served by a language model of the
   catalog, chosen in the Models window or by the service when a model arrives, and an embedding
   model for the search in documents, which the service installs in every case.
-- **Models that come with Albireo**: the complete installer carries Qwen3-VL-4B-Thinking-albireo,
-  which reads images and text, reasons before its answer when deep reasoning is on and answers
-  directly otherwise, and serves the three functions as soon as Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the
-  search, both retrieved and checked by the build (see
+- **Models that come with Albireo**: the complete installer carries Qwen3-VL-4B-Instruct-albireo,
+  which reads images and text, answers directly and serves the three functions as soon as Albireo
+  is installed, and Qwen3-Embedding-0.6B-albireo for the search, both retrieved and checked by the
+  build (see
   [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
   sandboxed frame, outline, reading and search of the documents, search of the other
@@ -118,7 +118,7 @@ application, the description of the interface and the list of the programs of Wi
 ## Screenshots
 
 The web application served by the service, the windows of the icon and the installer, with the
-model that comes with Albireo (Qwen3-VL-4B-Thinking-albireo) on a processor of two cores.
+model Qwen3-VL-4B-Thinking-albireo on a processor of two cores.
 
 | | |
 |---|---|
@@ -150,8 +150,7 @@ models). Every variant is built from the same sources:
 | `cuda`        | NVIDIA graphics processors, AVX2 kernels                              | `ALBIREO_ENGINE_CUDA=ON`     |
 
 A processor with AVX-512 and without AVX-VNNI (Intel Core Ice Lake, Tiger Lake and Rocket Lake,
-Intel Xeon of Cascade Lake and Ice Lake, AMD Zen 4) runs `cpu-avx2`; an update removes from the
-installation the libraries of the engines of AVX-512 that earlier versions installed.
+Intel Xeon of Cascade Lake and Ice Lake, AMD Zen 4) runs `cpu-avx2`.
 
 The half precision conversions of F16C belong to `cpu-avx2`: every processor with AVX2 has them,
 and the scales of the keys and values of the attention, and these keys and values themselves when
@@ -584,6 +583,24 @@ its own until its first question creates the discussion: the texts stay across a
 in the storage of the browser (`localStorage`, one key per discussion, removed once its question is
 sent or the discussion deleted), the files for the tab, and an incognito discussion keeps none.
 
+The fields where the user writes for the model, the composer, a question being edited, the global
+instructions of the settings, the instructions of a project and the memory, draw their markdown as
+it is written, as the answers draw it ([`web/js/mdfield.js`](web/js/mdfield.js)): bold, italic,
+struck and highlighted text (`==text==`, which the answers show highlighted too), code, headings,
+lists with their bullets and their indentation, quotes, code blocks and links, their marks shown
+faint, while the text stays the markdown the user writes and reaches the model as it is; the
+questions of the thread show as the composer drew them. A field is an element whose text can be
+edited, drawn again from its text after each change with the selection on the same characters,
+and it keeps its own history of edits (Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z); Enter in a list item
+starts the next item, numbered after it, and ends the list after an empty item, Tab and Shift+Tab
+indent the items of the selection, Ctrl+B and Ctrl+I put the marks of bold and italic around the
+selection or take them away, a paste inserts plain text, and a selection dragged within the field
+moves there. Beyond 4,000 characters the field draws its marks again once the typing pauses, the
+browser showing the characters typed meanwhile, and a text beyond 30,000 characters is drawn
+without its marks, so that typing stays immediate. The global instructions, which the
+settings called personal instructions, come after the instructions of the project in the system
+message of each discussion.
+
 ### Documents and context
 
 The text of a document is extracted in the browser ([`web/js/documents.js`](web/js/documents.js)):
@@ -645,10 +662,12 @@ passes and keeps these passes short while a conversation is answered, so that in
 never delays an answer. The page of a project lists each document with its format, the estimate of
 its tokens and the number of its passages ("MD · ≈ 265 tokens · 3 passages", "(by words)" while
 they have no vectors of the embedding model), and its card of the knowledge takes the files dropped
-on it as its button does; a file dropped where nothing takes it is refused instead of being opened
-by the browser. The counts of the interface take their singular and their plural in each language
-(`tn()` of [`web/js/i18n.js`](web/js/i18n.js), through `Intl.PluralRules`), and its decimals and its
-sizes the forms of the language ("23,5 jetons/s", "2,4 Mo").
+on it as its button does, with the tokens of the documents and how the model reads them: whole in
+each discussion while they are short enough, else searched for each question, so that the context
+of the model does not limit their size; a file dropped where nothing takes it is refused instead
+of being opened by the browser. The counts of the interface take their singular and their plural
+in each language (`tn()` of [`web/js/i18n.js`](web/js/i18n.js), through `Intl.PluralRules`), and
+its decimals and its sizes the forms of the language ("23,5 jetons/s", "2,4 Mo").
 
 The prompt of a question is built for the cache of the engine, which keeps the keys and values of
 each conversation and computes again only the tokens that differ from what it already read
@@ -666,6 +685,20 @@ read whole and the excerpts have times of reading of their own, since a question
 A document can still be longer than these shares: the context of the model stays the limit of
 what a question holds.
 
+The window of a discussion grows with it: the working context, then twice as much each time its
+prompt takes half of the room the window leaves beside the answer, twice at most, within the
+context of the model and within the window whose keys and values a generated token reads in eight
+times the bytes of the weights of the model, so that the generation slows down by a bounded factor
+at the end of a long discussion (a mixture of experts reads a part of its weights for each token,
+so its bound is looser): for
+Qwen3-VL 4B, whose keys and values take 78 KB a token in 8-bit integers and whose weights take
+2.5 GB, 32,768 tokens become 65,536 then 131,072 at 128 tokens per second, and 65,536 become
+131,072 from 256. The discussions keep their exchanges whole up to half of the room of their
+largest window. While the next question of a discussion of 4,096 tokens or more is written, the
+application asks the engine to read the beginning of its prompt ahead in the background, once for
+each state of the discussion, so that the question finds it in the cache even when its keys and
+values left the memory since the last answer.
+
 | Part of the prompt | Content | Share of the working context |
 |---|---|---|
 | System message | documents of the project read whole, the day the discussion started, instructions, memory | 30% and 60 s of reading at most, else the project is searched |
@@ -673,7 +706,7 @@ what a question holds.
 | Summary | the exchanges that left the context, compressed by the background model | 15% and 60 s of writing at most |
 | Attached document | read whole | 25% and 40 s of reading at most, else indexed and searched |
 | Excerpts of a question | the passages found for it, kept with the message once sent | 20% and 20 s of reading, 2,000 to 12,000 tokens, 4 to 24 passages |
-| Exchanges | the conversation, a question asked on a later day with its date | the rest; the oldest leave in one step, down to 30% of the room left by the system message and the tools |
+| Exchanges | the conversation, a question asked on a later day with its date | the rest, in the window of the discussion; the oldest leave in one step once they take half of the room of its largest window, down to 30% of that room, the system message and the tools aside |
 | Answer | the room kept for it | the longest answer of the settings, else 8,192 tokens with the deep reasoning and 2,048 without, a quarter of the context at most |
 
 The tokens of a document are estimated from its characters: 3.6 characters a token in the
@@ -696,7 +729,7 @@ each with its own context: the requests of every session are computed together, 
 serving the next token of each.
 
 A discussion has no length limit. Once its exchanges take half of the room that the system
-message and the tools leave in the working context, as the service counts them after each answer
+message and the tools leave in the largest window, as the service counts them after each answer
 and when the discussion is opened, the oldest exchanges are compressed in the background, down to
 30% of that room, the last question staying with its answer: the background model rewrites the
 summary of the discussion with them, in parts that fit its working context, oldest first, keeping
@@ -784,13 +817,15 @@ repeats the question is asked again in other words, and a title that could not b
 model that loads, a service away, a page reloaded) is asked again for two minutes, then at the
 next opening of the application. One tab names a discussion at a time.
 
-Under the line of the model, at the bottom of the side panel, a bar shows the share of the context
-of the model that the discussion shown takes, with its tokens and those of the context ("Contexte
-3 681 / 32 768"): the history the next question carries, its system message and its tools
-included, as the service counts them, its images by their tokens, over the context the engine gives
-the model. The discussion is measured when it opens and again when it, its function, its model or
-its toggles change, once the answer being written ends; the bar turns orange from three quarters
-of the context and red from nine tenths.
+Under the line of the model, at the bottom of the side panel, a bar shows the share of its window
+that the discussion shown takes, with its tokens and those of the window ("Contexte 3 681 /
+32 768"): the history the next question carries, its system message and its tools included, as
+the service counts them, its images by their tokens, over the window of the discussion, which
+doubles as the discussion grows ("Contexte 40 120 / 131 072"), up to its largest window within the
+context the engine gives the model; its help gives the largest window and that context. The
+discussion is measured when it opens and again when it, its function, its model or its toggles
+change, once the answer being written ends; the bar turns orange from three quarters of the window
+and red from nine tenths.
 
 The lists of the side panel show the 20 most recent projects and discussions; the search window
 of each finds the others, the words in any case and accents, complete or not, in the titles first,
@@ -904,7 +939,10 @@ its automatic choice, since the card takes every product. The engines of CUDA, w
 cuDNN, add several hundred megabytes to the installers. A build tree
 configured by a Visual Studio installation removed since, such as Visual Studio Community
 replaced by the Build Tools, is deleted and configured again, as is the CUDA tree configured for
-another CUDA integration (an installed toolkit, then the archives). `-NoBuiltinModels` builds without
+another CUDA integration (an installed toolkit, then the archives). The `bin\engines` folder of
+each tree is emptied before its build, so that the installer carries the engines of this version
+alone, with the libraries of the current runtimes; a build run with CMake alone packs that folder
+as it is, with the engines an earlier build left there. `-NoBuiltinModels` builds without
 the models that come with Albireo and `-ModelCache <folder>` puts their cache on another drive.
 `-Tests` adds the test programs, `-Jobs <n>` bounds the compilations run at once on a machine with
 little memory, `-CudaVersion 12.9` picks one of several installed CUDA toolkits (the archives serve
@@ -1017,7 +1055,7 @@ cmake --build build-albireo-win -j
 
 | Program          | Checks                                                                               |
 |------------------|--------------------------------------------------------------------------------------|
-| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
+| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor |
@@ -1025,16 +1063,16 @@ cmake --build build-albireo-win -j
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
-| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
+| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
-| `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
+| `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
 runs the layers of a dense model as the card does. A fourth argument gives the megabytes of the
 copies of its first pass, so that the layers of a larger model run there on a computer whose
-automatic budget does not hold them: `test_offload qwen3-vl-4b-thinking-albireo.gguf "" 2 2400`.
+automatic budget does not hold them: `test_offload qwen3-vl-4b-instruct-albireo.gguf "" 2 2400`.
 
 Two scripts run these programs and the service, then print one line per step with its result:
 
@@ -1047,8 +1085,11 @@ They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q
 default and skip the steps whose model or build tree is missing. The Linux script runs a service
 offline in a data folder of its own, on the port `ALBIREO_TEST_PORT` (18443 by default), sends it
 the model through the upload route, checks that the route of the paths refuses a plain file, runs
-the tests of the service (`test_host`), asks a question through the OpenAI interface and has a
-sentence read aloud; the Windows script asks the installed service a question, the vectors of two
+the tests of the service (`test_host`), asks a question through the OpenAI interface, gives the code
+function to the model and takes it back, the model keeping its general function, checks the
+refusal of a function the model does not serve, of an unknown function and of a function that is
+no text, asks the question again and has a sentence read aloud; the Windows script asks the
+installed service a question, the vectors of two
 texts and a sentence read aloud, and tests the OpenVINO and CUDA engines when their trees exist
 (`-Device GPU` or `-Device NPU` for `test_offload`, CPU by default). Both have a sentence read by
 `albireo-speech` of the build tree. The engine steps of the Windows script run with the `PATH` of
@@ -1277,12 +1318,43 @@ its string when the rest of the call reads as JSON, the arguments being an objec
 parameters of the tool the call names, each once, and the name of the call an identifier, so that
 the dictionaries of the code do not pass for arguments; the other quotes are escaped. A call that
 no such reading completes, within a million steps of the search, comes back as the text of the
-answer. The calls of Granite 4.2, in
-the XML form, come back as JSON arguments, each value typed by the definition of the tool. The
-calls of the Mistral models keep the identifier the model gives them (`[CALL_ID]`), and arguments
-that are not a JSON object leave the text as the model wrote it. A Llama 3 answer is a call only
-when it is a JSON object, or a list of them, naming tools of the request; any other answer, JSON or
-not, comes back as its text, as the model wrote it.
+answer. The calls of Granite 4.2, in the XML form, come back as JSON arguments, each value typed by
+the definition of the tool. The calls of the Mistral models keep the identifier the model gives
+them (`[CALL_ID]`), and arguments that are not a JSON object leave the text as the model wrote it.
+A Llama 3 answer is a call only when it is a JSON object, or a list of them, naming tools of the
+request; any other answer, JSON or not, comes back as its text, as the model wrote it.
+
+Each form of the calls has its end, up to which the text of a call is read whole as above, so that
+the quotes a model leaves unescaped never decide where a call ends. The forms without a closing
+marker run to the next marker before which the JSON of the call reads, or to the end of the answer:
+a `"}"` in code after an odd number of unescaped quotes no longer ends the arguments of a Mistral
+call early, and a marker that a string of the arguments writes leaves the call whole, the calls that
+an answer cut short writes as examples staying in its text. A JSON value that reads as written and
+that the end of its line or another value that reads follows ends the call there, the text after it
+going back to the answer, after the calls of the values that follow it in the list forms. A text on
+the same line that holds a quote continues the code, as in `out += "} else {";`, so a text that the
+model writes after a call on its line, and that ends as JSON does, is read with the call; a text
+without a quote between a call and the next marker goes back to the answer. The text of a call that
+no reading of the whole completes goes back to the answer from the end of its JSON:
+
+| Format                         | Calls                                                        | End of a call                       |
+|--------------------------------|--------------------------------------------------------------|-------------------------------------|
+| ChatML (Qwen3, Qwen3-VL, Qwen2.5) | `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` | `</tool_call>`, else the end of the answer |
+| Granite 4.2, Qwen3-Coder       | `<tool_call><function=name><parameter=key>...` (XML)         | `</tool_call>`, else the end of the answer; a function at `</function>`, a parameter at `</parameter>`, else at the next parameter of its function or at `</function>` |
+| Mistral                        | `[TOOL_CALLS]name[ARGS]{...}`, `[TOOL_CALLS][{...}]`         | the next marker, else the end of the answer |
+| Granite 3                      | `<\|tool_call\|>[{...}]`                                     | the next marker, else the end of the answer |
+| Llama 3                        | the whole answer, a JSON object or a list of them            | the end of the answer               |
+
+The XML form is read first with the closing marker of each parameter, so that a parameter that a
+value writes, such as code that writes this format, stays in the value; a text that this reading
+does not complete is read with each value ending at the next parameter of its function or at
+`</function>`, and a text whose values hold a parameter that the tool declares and the call lacks is
+read so at the parameters that start a line; a value left without its closing marker in a function
+without `</function>` is an answer cut before the end of its call, whose text comes back as written.
+The other treatments serve every model: the guard against loops ends a reasoning that repeats itself
+and stops an answer that does, a reasoning without a budget takes half of the tokens of the answer
+at most (see [Engines](#engines)), and the sampling follows the family of the model (see the table
+of `temperature`, `top_p` and `top_k` above).
 
 A message of a model that reads images (`inputs` of `/v1/models`) takes parts `image_url`, whose
 `url` is a data URL of a PNG or JPEG file and whose `detail` is `low`, `auto` or `high`. The
@@ -1299,8 +1371,8 @@ engines runs alone: `/engines/benchmark` answers 409 `benchmark_running` meanwhi
 deactivated, replaced or deleted while it answers leaves the engine once its requests are served:
 `/albireo/v1/models` lists it under `leaving` (`unloading` or `removing`) meanwhile, and the
 deletion answers `"pending": true`. The errors these routes return carry a `code` with its `args`
-and `sizes` (`disk_space`, `not_installed`, `being_deleted`, `embedding_needed`, `load_failed`...),
-which the windows explain in the language of the user.
+and `sizes` (`disk_space`, `not_installed`, `being_deleted`, `embedding_needed`, `role_not_served`,
+`load_failed`...), which the windows explain in the language of the user.
 
 ## Web access
 
@@ -1483,11 +1555,11 @@ and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------|---------|
-| Qwen3-VL 4B Thinking (default) | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
+| Qwen3-VL 4B Instruct (default) | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
+| Qwen3-VL 4B Thinking           | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
 | Qwen3 Embedding 0.6B (default) | Alibaba            | embedding               | text          | 0.64 GB  | Apache-2.0 |
 | Qwen3-VL 2B Thinking           | Alibaba            | general, code, security | text, image   | 1.55 GB  | Apache-2.0 |
 | Qwen3-VL 2B Instruct           | Alibaba            | general                 | text, image   | 1.55 GB  | Apache-2.0 |
-| Qwen3-VL 4B Instruct           | Alibaba            | general, code           | text, image   | 2.95 GB  | Apache-2.0 |
 | Qwen3-VL 8B Instruct           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
 | Qwen3-VL 8B Thinking           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
 | EuroVLM 9B Preview             | EuroLLM consortium | general                 | text, image   | 6.42 GB  | Apache-2.0 |
@@ -1514,7 +1586,7 @@ those of 32 GB, a general assistant and a programming agent:
 |----------|-----------------|------|
 | General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, Mistral Small 3.2 24B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B |
 | Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking, Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B |
-| Security | Qwen3-VL 2B and 4B Thinking, Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking | CyberSecQwen 4B, Foundation-Sec 1.1 8B and 8B Reasoning |
+| Security | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Instruct and Thinking), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking | CyberSecQwen 4B, Foundation-Sec 1.1 8B and 8B Reasoning |
 
 The choices follow the published measures: Qwen3-VL gives the best scores of the models that read
 images and that the engine runs (MMMU 67.4 for the 4B Instruct, 74.1 for the 8B Thinking, OCRBench
@@ -1544,9 +1616,18 @@ language model at its first start, unless the installation said otherwise, and t
 embedding model in every case, since the search in documents relies on it. A language model that
 arrives takes the functions its entry names that no model holds; an embedding model serves the
 `embedding` function alone. A function without a model chosen for it is served by the general
-model, else by the model that comes with Albireo: once every choice is undone in the Models window,
-that model serves the three functions again, and the status gives the model each function uses
-(`active`) apart from the ones chosen (`selected`). The engine computes an embedding model as
+model, else by the model that comes with Albireo. In the Models window, Deactivate gives every
+function of the selected model to the model that comes with Albireo, as its deletion does, so that
+these functions stay with it after a restart of the service, and "Activate for…" checks
+the functions it serves: a function not checked is taken from the model that serves it, and a
+function checked goes back to the model that comes with Albireo, which keeps it after a restart;
+the functions of that model stay checked and greyed, with the work in the background it keeps, as
+does the document search of an embedding model (`role` of `/albireo/v1/models/<id>/deactivate`
+for one function). The functions a model serves through its general function stay with it when
+its general function alone goes back, and a function it no longer serves, after a change made
+elsewhere, is refused with the code `role_not_served`, the list then showing its functions as they
+are. The status gives the model each function uses (`active`) apart from the ones chosen
+(`selected`). The engine computes an embedding model as
 it computes a language model, then takes the hidden state of the last token of each text,
 normalized, as its vector (`pooling_type` 3 of the GGUF file); its keys and values are given back
 as soon as each text is read.
@@ -1590,7 +1671,7 @@ and the quantization Albireo ships:
 
 | Model                        | From                                                     | Shipped         | Functions               |
 |------------------------------|----------------------------------------------------------|-----------------|-------------------------|
-| Qwen3-VL-4B-Thinking-albireo | Qwen3VL-4B-Thinking-Q4_K_M.gguf of Qwen, 2.50 GB, and its projector mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 2.95 GB | general, code, security |
+| Qwen3-VL-4B-Instruct-albireo | Qwen3VL-4B-Instruct-Q4_K_M.gguf of Qwen, 2.50 GB, and its projector mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 2.95 GB | general, code, security |
 | Qwen3-Embedding-0.6B-albireo | Qwen3-Embedding-0.6B-Q8_0.gguf, 0.64 GB                  | Q8_0, 0.64 GB   | document search         |
 
 The build retrieves and converts them as the import example of dlib reads a GGUF file
@@ -1613,7 +1694,7 @@ of the engine:
    down projections of the first and last eighths of the layers and of one layer in three between
    them), with the search and the mix of the reference quantizer of the format, whose output it
    matches byte for byte, and the first and last rows of each matrix are checked against their
-   source; a model published in Q4_K_M, as Qwen3-VL-4B-Thinking is, keeps its weights. The
+   source; a model published in Q4_K_M, as Qwen3-VL-4B-Instruct is, keeps its weights. The
    metadata receive the identity of the model in Albireo. The projector of a model that reads
    images is checked against its SHA-256, read by the image encoder of the engine and installed
    beside its model (`<id>.mmproj.gguf`);
@@ -1637,7 +1718,9 @@ cannot be deleted (code `builtin_model`). The catalog entry of the file it was m
 (`source_sha256` of the manifest) leaves the Models window and its download is refused
 (`builtin_installed`): the model that comes with Albireo stands for it. The language model among
 them serves the work in the background (`albireo-background`) and stays loaded whatever the
-functions. Albireo runs these models with its own engine, the
+functions. The complete installer removes the models an earlier version brought and this one no
+longer carries, whose functions go to the new model of the same kind; the installer of the updates
+leaves the models in place. Albireo runs these models with its own engine, the
 quantized kernels over the mapped file, as every other model: the compiled networks of dlib
 (`slm_gguf_import_ex --convert`) compute in single precision and remain the tool of training and
 fine tuning.

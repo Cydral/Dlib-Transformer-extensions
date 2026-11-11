@@ -21,15 +21,10 @@
 /*
     The instructions beyond AVX2, the kernels of the processor engine cpu-avxvnni:
         ALBIREO_QK_VNNI     the dot products of bytes and of 16-bit integers in one
-                            instruction, on 256-bit vectors: AVX-VNNI (cpu-avxvnni), or its
-                            AVX-512 form (ALBIREO_QK_VNNI_EVEX, which tests these kernels on
-                            the processors that have AVX-512 VNNI and lack AVX-VNNI).
-    MSVC defines no macro for VNNI: the build names it (ALBIREO_AVX_VNNI).
+                            instruction, on 256-bit vectors (AVX-VNNI).
+    MSVC defines no macro for VNNI, so the build names it (ALBIREO_AVX_VNNI).
 */
-#if ALBIREO_QK_AVX2 && defined(ALBIREO_QK_VNNI_EVEX) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
-#define ALBIREO_QK_VNNI 1
-#define ALBIREO_QK_VNNI_FORM_EVEX 1
-#elif ALBIREO_QK_AVX2 && (defined(__AVXVNNI__) || defined(ALBIREO_AVX_VNNI))
+#if ALBIREO_QK_AVX2 && (defined(__AVXVNNI__) || defined(ALBIREO_AVX_VNNI))
 #define ALBIREO_QK_VNNI 1
 #endif
 
@@ -238,9 +233,7 @@ namespace albireo
 
     const char* qk_isa()
     {
-#if ALBIREO_QK_VNNI && ALBIREO_QK_VNNI_FORM_EVEX
-        return "AVX2+FMA+F16C+VNNI (AVX-512 form)";
-#elif ALBIREO_QK_VNNI
+#if ALBIREO_QK_VNNI
         return "AVX2+FMA+F16C+AVX-VNNI";
 #elif ALBIREO_QK_AVX2
         return "AVX2+FMA+F16C";
@@ -257,9 +250,7 @@ namespace albireo
 #if ALBIREO_QK_AVX2
         isa |= qk_isa_avx2;
 #endif
-#if ALBIREO_QK_VNNI_FORM_EVEX
-        isa |= qk_isa_avx512;
-#elif ALBIREO_QK_VNNI
+#if ALBIREO_QK_VNNI
         isa |= qk_isa_avx_vnni;
 #endif
         return isa;
@@ -1257,21 +1248,13 @@ namespace albireo
         // of s at the same places.
         inline __m256i dpbusd(__m256i acc, __m256i u, __m256i s)
         {
-#if ALBIREO_QK_VNNI_FORM_EVEX
-            return _mm256_dpbusd_epi32(acc, u, s);
-#else
             return _mm256_dpbusd_avx_epi32(acc, u, s);
-#endif
         }
 
         // acc + the sums of the products of two signed 16-bit integers of a by those of b.
         inline __m256i dpwssd(__m256i acc, __m256i a, __m256i b)
         {
-#if ALBIREO_QK_VNNI_FORM_EVEX
-            return _mm256_dpwssd_epi32(acc, a, b);
-#else
             return _mm256_dpwssd_avx_epi32(acc, a, b);
-#endif
         }
 
         /*
@@ -2554,15 +2537,8 @@ namespace albireo
             }
         }
 
-        /*
-            The tokens of a block of the kernels: 4 when the 32 vector registers of AVX-512 hold
-            the 16 accumulators of 2 rows and 4 tokens, 3 in the 16 registers of AVX2.
-        */
-#if ALBIREO_QK_VNNI_FORM_EVEX
-        const long panel_tokens = 4;
-#else
+        // The tokens of a block of the kernels, whose accumulators the 16 vector registers of AVX2 hold.
         const long panel_tokens = 3;
-#endif
         const long panel_tile = 32;    // rows of weights per task
         const long panel_slice = 8;    // groups of 256 features per slice of the weights of a task
         // The bytes of the panels of the tokens a thread keeps from one product to the next (16 MB).
@@ -2830,29 +2806,6 @@ namespace albireo
 #else
         return dot_f32_ref(a, b, n);
 #endif
-    }
-
-    float qk_dot_f32_f16(const float* a, const uint16_t* b, long n)
-    {
-#if ALBIREO_QK_AVX2
-        return dot_f16_avx2(reinterpret_cast<const uint8_t*>(b), a, n);
-#else
-        return dot_f16_ref(reinterpret_cast<const uint8_t*>(b), a, n);
-#endif
-    }
-
-    void qk_axpy_f16(float alpha, const uint16_t* x, float* y, long n)
-    {
-        long i = 0;
-#if ALBIREO_QK_AVX2
-        const __m256 a = _mm256_set1_ps(alpha);
-        for (; i + 8 <= n; i += 8)
-        {
-            const __m256 xv = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i)));
-            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(a, xv, _mm256_loadu_ps(y + i)));
-        }
-#endif
-        for (; i < n; ++i) y[i] += alpha * h2f(x[i]);
     }
 
     void qk_scale(float* x, float s, long n)

@@ -30,18 +30,11 @@ set(processor_engines albireo-engine-cpu albireo-engine-cpu-avx2)
 if (TARGET albireo-engine-cpu-avxvnni)
    list(APPEND processor_engines albireo-engine-cpu-avxvnni)
 endif()
-# The file names of the processor engines of this build, separated by commas, a character the shells of
-# the build tools pass on unchanged: the payload leaves out those an earlier build left in the engines folder.
-set(processor_engine_names)
-foreach (e ${processor_engines})
-   list(APPEND processor_engine_names "$<TARGET_FILE_NAME:${e}>")
-endforeach()
-string(REPLACE ";" "," processor_engine_names "${processor_engine_names}")
 add_custom_command(OUTPUT ${ALBIREO_PAYLOAD}
    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/payload/stage
    COMMAND ${CMAKE_COMMAND} -DBIN_DIR=${CMAKE_BINARY_DIR}/bin -DSTAGE=${CMAKE_BINARY_DIR}/payload/stage
       -DOUTPUT=${ALBIREO_PAYLOAD} -DSOURCE_DIR=${ALBIREO_SOURCE_DIR} -DDLIB_DIR=${ALBIREO_DLIB_DIR}
-      "-DEXTRA_ENGINE_DIRS=${ALBIREO_EXTRA_ENGINE_DIRS}" "-DPROCESSOR_ENGINES=${processor_engine_names}"
+      "-DEXTRA_ENGINE_DIRS=${ALBIREO_EXTRA_ENGINE_DIRS}"
       -P ${ALBIREO_SOURCE_DIR}/cmake/payload.cmake
    DEPENDS albireo-service albireo-tray albireo-speech ${processor_engines} ${web_files}
       ${ALBIREO_SOURCE_DIR}/cmake/payload.cmake ${ALBIREO_SOURCE_DIR}/resources/license.txt

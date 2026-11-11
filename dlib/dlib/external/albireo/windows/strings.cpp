@@ -191,7 +191,6 @@ namespace albireo
             { "state_verifying", { "Checking", "Vérification", "Prüfung", "Verifica", "Comprobando" } },
             { "state_queued", { "Waiting", "En attente", "Wartet", "In attesa", "En espera" } },
             { "state_error", { "Error", "Erreur", "Fehler", "Errore", "Error" } },
-            { "state_cancelled", { "Cancelled", "Annulé", "Abgebrochen", "Annullato", "Cancelado" } },
             { "state_unloading", { "Unloading", "Déchargement", "Wird entladen", "Rilascio in corso",
                 "Liberando memoria" } },
             { "state_removing", { "Deleting", "Suppression", "Wird gelöscht", "Eliminazione", "Eliminando" } },
@@ -242,6 +241,12 @@ namespace albireo
                 "o elija una carpeta de modelos en otra unidad en Este equipo." } },
             { "err_unknown_role", { "Unknown function: {role}.", "Fonction inconnue : {role}.",
                 "Unbekannte Funktion: {role}.", "Funzione sconosciuta: {role}.", "Función desconocida: {role}." } },
+            { "err_role_not_served", { "{m} does not answer for this function any more: the list shows its "
+                "functions as they are now.", "{m} ne répond plus pour cette fonction : la liste montre ses "
+                "fonctions telles qu'elles sont à présent.", "{m} antwortet nicht mehr für diese Funktion: Die Liste "
+                "zeigt seine Funktionen, wie sie jetzt sind.", "{m} non risponde più per questa funzione: l'elenco "
+                "mostra le sue funzioni come sono ora.", "{m} ya no responde para esta función: la lista muestra "
+                "sus funciones tal como son ahora." } },
             { "err_not_installed", { "{m} is not installed.", "{m} n'est pas installé.", "{m} ist nicht installiert.",
                 "{m} non è installato.", "{m} no está instalado." } },
             { "err_being_deleted", { "{m} is being deleted, once its requests in progress are served.",
@@ -596,7 +601,6 @@ namespace albireo
             { "lbl_free", { "free", "libre", "frei", "libera", "libre" } },
             { "lbl_engine", { "Engine in use", "Moteur utilisé", "Verwendete Engine", "Motore in uso",
                 "Motor en uso" } },
-            { "lbl_speed", { "Speed", "Vitesse", "Geschwindigkeit", "Velocità", "Velocidad" } },
             { "col_engine", { "Engine", "Moteur", "Engine", "Motore", "Motor" } },
             { "col_version", { "Version", "Version", "Version", "Versione", "Versión" } },
             { "col_devices", { "Devices", "Périphériques", "Geräte", "Dispositivi", "Dispositivos" } },
@@ -632,7 +636,6 @@ namespace albireo
                 "Il motore in uso tiene i suoi dati nella memoria di sistema.",
                 "El motor en uso mantiene sus datos en la memoria del sistema." } },
             { "lbl_port", { "Port", "Port", "Port", "Porta", "Puerto" } },
-            { "lbl_url", { "Address", "Adresse", "Adresse", "Indirizzo", "Dirección" } },
             { "lbl_language", { "Language", "Langue", "Sprache", "Lingua", "Idioma" } },
             { "lbl_proxy", { "Proxy server", "Serveur proxy", "Proxyserver", "Server proxy", "Servidor proxy" } },
             { "proxy_hint", { "Empty: settings of the system; none: direct connection; or http://host:port",
@@ -994,9 +997,6 @@ namespace albireo
                 "La carpeta {d} se mantiene, con los modelos y los datos que conserva en ella." } },
             { "uninstall_progress", { "Removing Albireo", "Suppression d'Albireo", "Albireo wird entfernt",
                 "Rimozione di Albireo", "Eliminando Albireo" } },
-            { "admin_required", { "Administrator rights are required.", "Les droits d'administrateur sont nécessaires.",
-                "Administratorrechte sind erforderlich.", "Sono necessari i diritti di amministratore.",
-                "Se necesitan derechos de administrador." } },
             { "not_installed", { "Albireo is not installed on this computer.",
                 "Albireo n'est pas installé sur cet ordinateur.", "Albireo ist auf diesem Computer nicht installiert.",
                 "Albireo non è installato su questo computer.", "Albireo no está instalado en este equipo." } },

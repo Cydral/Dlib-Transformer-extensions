@@ -479,6 +479,57 @@ int main()
         const parsed open = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
             "</parameter>\n", "an XML call left open");
         expect(open.calls.size() == 1 && open.content.empty(), "an XML call without its closing markers");
+        // A parameter without its closing marker ends at the next parameter or at the end of its function.
+        const parsed loose = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
+            "<parameter=days>\n3\n</function>\n</tool_call>",
+            "an XML call without the closing markers of its parameters");
+        expect(loose.calls.size() == 1 && loose.content.empty(), "the XML call without the closing markers of its "
+            "parameters: " + loose.content);
+        if (loose.calls.size() == 1)
+            expect(loose.calls[0].arguments == "{\"city\": \"Rome\", \"days\": 3}", "its arguments: "
+                + loose.calls[0].arguments);
+        // A parameter that the tool does not declare, written in a value, stays in the value.
+        const parsed written = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n<parameter=city>\n"
+            "Rome\n<parameter=unit>\nC\n</parameter>\n</function>\n</tool_call>",
+            "an XML value that writes a parameter");
+        expect(written.calls.size() == 1 && written.content.empty(), "the XML value that writes a parameter: "
+            + written.content);
+        if (written.calls.size() == 1)
+            expect(written.calls[0].arguments == "{\"city\": \"Rome\\n<parameter=unit>\\nC\"}", "its value: "
+                + written.calls[0].arguments);
+        // A parameter that the tool declares and the call gives later, written in a value, stays in the value.
+        const parsed given = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n<parameter=city>\n"
+            "Example:\n<parameter=days>\n2\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+            "an XML value that writes a parameter the call gives");
+        expect(given.calls.size() == 1 && given.content.empty(), "the XML value that writes a parameter the call "
+            "gives: " + given.content);
+        if (given.calls.size() == 1)
+            expect(given.calls[0].arguments == "{\"city\": \"Example:\\n<parameter=days>\\n2\", \"days\": 3}",
+                "its values: " + given.calls[0].arguments);
+        // A parameter that the tool declares, named within a line of a value the call closes, stays in the value.
+        const parsed named = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n<parameter=city>\n"
+            "The tag <parameter=days> is optional\n</parameter>\n</function>\n</tool_call>",
+            "an XML value that names a parameter within a line");
+        expect(named.calls.size() == 1 && named.calls[0].arguments == "{\"city\": \"The tag <parameter=days> is "
+            "optional\"}", "the XML value that names a parameter: " + (named.calls.empty() ? named.content
+            : named.calls[0].arguments));
+        // A parameter left open before a closed one, and parameters on one line without their closing markers.
+        for (const std::string& body : { std::string("<parameter=city>\nRome\n<parameter=days>\n3\n</parameter>\n"),
+                 std::string("<parameter=city>Rome<parameter=days>3") })
+        {
+            const parsed open_one = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n" + body
+                + "</function>\n</tool_call>", "an XML parameter left open");
+            expect(open_one.calls.size() == 1 && open_one.content.empty(), "an XML parameter left open: "
+                + open_one.content);
+            if (open_one.calls.size() == 1)
+                expect(open_one.calls[0].arguments == "{\"city\": \"Rome\", \"days\": 3}", "its arguments: "
+                    + open_one.calls[0].arguments);
+        }
+        // An answer cut inside a value, without the closing markers of its function, is text.
+        const std::string cut = "<tool_call>\n<function=get_weather>\n<parameter=city>\nRo";
+        const parsed cut_value = read_all_ways(*g, gopt, cut, "an XML call cut inside a value");
+        expect(cut_value.calls.empty() && cut_value.content == cut, "the XML call cut inside a value kept as text: "
+            + cut_value.content);
         const std::string text = "Use <tool_call>no function</tool_call> here.";
         const parsed none = read_all_ways(*g, gopt, text, "no XML call");
         expect(none.calls.empty() && none.content == text, "text kept: " + none.content);
@@ -706,6 +757,105 @@ int main()
             "{\"city\": \"Oslo\"}}]", "a list of Mistral calls");
         expect(l.calls.size() == 1 && l.content.empty(), "a call in the list form");
 
+        /*
+            "}" after an odd number of unescaped quotes closes the JSON of the arguments early: the
+            text of a Mistral call runs to the next marker or to the end of the answer.
+        */
+        const std::string early = "const close = \"}\"; console.log(close);";
+        const parsed e = read_all_ways(*d, mopt, "[TOOL_CALLS]run_javascript[ARGS]{\"code\": \"" + early + "\"}"
+            "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Rome\"}", "a Mistral call with \"}\" in its code");
+        expect(e.content.empty() && e.calls.size() == 2, "two Mistral calls, the first with \"}\" in its code: "
+            + e.content);
+        if (e.calls.size() == 2)
+        {
+            json args;
+            const bool ok = json::parse(e.calls[0].arguments, args);
+            expect(ok && args["code"].as_string() == early && e.calls[1].name == "get_weather"
+                && e.calls[1].arguments == "{\"city\": \"Rome\"}", "the code of the first call read to its end: "
+                + e.calls[0].arguments);
+        }
+        const parsed le = read_all_ways(*d, mopt, "[TOOL_CALLS][{\"name\": \"run_javascript\", \"arguments\": "
+            "{\"code\": \"" + early + "\"}}]", "a list of Mistral calls with \"}\" in its code");
+        expect(le.content.empty() && le.calls.size() == 1, "the list form read to its end: " + le.content);
+        if (le.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(le.calls[0].arguments, args);
+            expect(ok && args["code"].as_string() == early, "the code of the list form: " + le.calls[0].arguments);
+        }
+
+        // A marker before [ARGS] leaves the call without arguments as text, the next call being read.
+        const parsed cut = read_all_ways(*d, mopt, "[TOOL_CALLS]get_weather[TOOL_CALLS]get_weather[ARGS]"
+            "{\"city\": \"Rome\"}", "a Mistral call without arguments before another one");
+        expect(cut.calls.size() == 1 && cut.content == "[TOOL_CALLS]get_weather", "the call without arguments "
+            "kept as text: " + cut.content);
+
+        // Text after a call, which ends where its JSON ends.
+        const parsed after = read_all_ways(*d, mopt, "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Rome\"} Done.",
+            "a Mistral call followed by text");
+        expect(after.calls.size() == 1 && after.content == " Done.", "a call, then text: " + after.content);
+        if (after.calls.size() == 1)
+            expect(after.calls[0].arguments == "{\"city\": \"Rome\"}", "the call before the text: "
+                + after.calls[0].arguments);
+        // A text that ends as the JSON of a call does, and a second object, after the JSON of a call.
+        for (const std::string& rest : { std::string("\nResult: {\"city\": \"Rome\"}"),
+                 std::string("{\"city\": \"Paris\"}") })
+        {
+            const parsed r = read_all_ways(*d, mopt, "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Rome\"}" + rest,
+                "a Mistral call followed by JSON");
+            expect(r.calls.size() == 1 && r.content == rest, "the text after the JSON of the call: " + r.content);
+            if (r.calls.size() == 1)
+                expect(r.calls[0].arguments == "{\"city\": \"Rome\"}", "the call before the JSON: "
+                    + r.calls[0].arguments);
+        }
+
+        // Two calls with a text between them on the same line, which goes back to the answer.
+        const parsed between = read_all_ways(*d, mopt, "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Rome\"} then "
+            "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Oslo\"}", "two Mistral calls with a text between them");
+        expect(between.calls.size() == 2 && between.content == " then ", "a text between two calls: "
+            + between.content);
+        if (between.calls.size() == 2)
+            expect(between.calls[0].arguments == "{\"city\": \"Rome\"}"
+                && between.calls[1].arguments == "{\"city\": \"Oslo\"}", "the two calls around the text: "
+                + between.calls[0].arguments + " " + between.calls[1].arguments);
+
+        // A marker that a string of the arguments writes leaves the call whole.
+        const std::string quoted = "Mistral writes [TOOL_CALLS]name[ARGS]{...}";
+        const parsed inside = read_all_ways(*d, mopt, "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"" + quoted + "\"}",
+            "a marker in the arguments of a Mistral call");
+        expect(inside.calls.size() == 1 && inside.content.empty(), "a marker in the arguments of a call: "
+            + inside.content);
+        if (inside.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(inside.calls[0].arguments, args);
+            expect(ok && args["city"].as_string() == quoted, "the arguments that write a marker: "
+                + inside.calls[0].arguments);
+        }
+
+        // The calls that the string of a call cut short writes as examples stay in its text.
+        const std::string examples = "[TOOL_CALLS]write_file[ARGS]{\"path\": \"a.md\", \"content\": \"Run "
+            "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"} first, then [TOOL_CALLS]get_weather[ARGS]"
+            "{\"city\": \"R";
+        const parsed shown = read_all_ways(*d, mopt, examples, "examples of calls in a call cut short");
+        expect(shown.calls.empty() && shown.content == examples, "the examples of a call cut short kept as text: "
+            + shown.content);
+
+        // Code whose quote before "}" a model left unescaped, a space and code after it on the same line.
+        for (const std::string& code : { std::string("out += \"} else {\"; f();"), std::string("printf(\"} %d\", x);"),
+                 std::string("const parts = s.split(\"}{\");") })
+        {
+            const parsed c = read_all_ways(*d, mopt, "[TOOL_CALLS]run_javascript[ARGS]{\"code\": \"" + code + "\"}",
+                "code with \"} \" in a Mistral call");
+            expect(c.calls.size() == 1 && c.content.empty(), "code with \"} \" read to its end: " + c.content);
+            if (c.calls.size() == 1)
+            {
+                json args;
+                const bool ok = json::parse(c.calls[0].arguments, args);
+                expect(ok && args["code"].as_string() == code, "the code with \"} \": " + c.calls[0].arguments);
+            }
+        }
+
         // Arguments that are no object, or a call cut short: the text of the answer, as written.
         for (const std::string& answer : { std::string("[TOOL_CALLS]get_weather[ARGS]5 days"),
                  std::string("[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Ro") })
@@ -915,6 +1065,57 @@ int main()
         long starts = 0;
         for (int id : chat_format::tokenize(stok, pieces)) starts += id == stok.token_id("<|im_start|>");
         expect(starts == 3, "turns opened by the prompt: " + std::to_string(starts));
+    }
+
+    // Granite 3: the list of calls after <|tool_call|>, read to the end of the answer.
+    {
+        const dlib::hf_tokenizer gtok = tokenizer({ "<|start_of_role|>", "<|end_of_role|>", "<|end_of_text|>",
+            "<|tool_call|>" }, {});
+        const std::unique_ptr<chat_format> g = chat_format::detect(gtok, "<|start_of_role|>");
+        expect(std::string(g->name()) == "granite", "Granite 3 detected");
+        render_options gopt;
+        gopt.tools = weather;
+        const std::string early = "const close = \"}\"; console.log(close);";
+        const parsed p = read_all_ways(*g, gopt, "<|tool_call|>[{\"name\": \"run_javascript\", \"arguments\": "
+            "{\"code\": \"" + early + "\"}}]", "a Granite 3 call with \"}\" in its code");
+        expect(p.content.empty() && p.calls.size() == 1, "a Granite 3 call read to its end: " + p.content);
+        if (p.calls.size() == 1)
+        {
+            json args;
+            const bool ok = json::parse(p.calls[0].arguments, args);
+            expect(ok && p.calls[0].name == "run_javascript" && args["code"].as_string() == early,
+                "the code of the Granite 3 call: " + p.calls[0].arguments);
+        }
+        const parsed q = read_all_ways(*g, gopt, "Checking.<|tool_call|>[{\"name\": \"get_weather\", "
+            "\"arguments\": {\"city\": \"Oslo\"}}]\nDone.", "a Granite 3 call followed by text");
+        expect(q.calls.size() == 1 && q.content == "Checking.\nDone.", "text around a Granite 3 call: " + q.content);
+        // The elements of a list that are no call are left aside; a list without a call is the text of the answer.
+        const parsed some = read_all_ways(*g, gopt, "<|tool_call|>[{\"name\": \"get_weather\", \"arguments\": "
+            "{\"city\": \"Oslo\"}}, 3]", "a Granite 3 list with an element that is no call");
+        expect(some.calls.size() == 1 && some.content.empty(), "the call of a list with another element: "
+            + some.content);
+        const std::string none = "<|tool_call|>[3, {\"city\": \"Oslo\"}]";
+        const parsed n = read_all_ways(*g, gopt, none, "a Granite 3 list with no call");
+        expect(n.calls.empty() && n.content == none, "a list with no call kept as text: " + n.content);
+        // Two lists, or two objects, one after the other: two calls.
+        const std::string oslo = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}";
+        const std::string rome = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}";
+        for (const std::string& two : { "[" + oslo + "][" + rome + "]", oslo + rome })
+        {
+            const parsed t = read_all_ways(*g, gopt, "<|tool_call|>" + two, "two Granite 3 calls without a marker");
+            expect(t.calls.size() == 2 && t.content.empty(), "two calls one after the other: " + t.content);
+            if (t.calls.size() == 2)
+                expect(t.calls[0].arguments == "{\"city\": \"Oslo\"}" && t.calls[1].arguments == "{\"city\": \"Rome\"}",
+                    "the two calls in their order: " + t.calls[1].arguments);
+        }
+        // The other marker of a call, written in a string of the arguments.
+        const parsed w = read_all_ways(*g, gopt, "<|tool_call|>[{\"name\": \"get_weather\", \"arguments\": {\"city\": "
+            "\"Wrap calls in <tool_call> tags\"}}]", "a marker in the arguments of a Granite 3 call");
+        expect(w.calls.size() == 1 && w.content.empty(), "a marker in the arguments of a Granite 3 call: "
+            + w.content);
+        if (w.calls.size() == 1)
+            expect(w.calls[0].arguments == "{\"city\": \"Wrap calls in <tool_call> tags\"}", "the arguments that "
+                "write a marker: " + w.calls[0].arguments);
     }
 
     // A long argument written a character at a time, in the ChatML and the Mistral forms.

@@ -7,8 +7,9 @@
             [-EmbeddingModel <model.gguf>] [-Device CPU|GPU|NPU] [-NoService]
 
     Run from the root of the repository after build_windows.ps1 -Tests.  Defaults:
-    $HOME\models\Qwen3-0.6B-Q4_K_M.gguf and $HOME\models\Qwen3-Embedding-0.6B-Q8_0.gguf; the
-    steps whose model or build tree is missing are skipped.
+    $HOME\models\Qwen3-0.6B-Q4_K_M.gguf and $HOME\models\Qwen3-Embedding-0.6B-Q8_0.gguf, else the
+    embedding model the build prepares for the installer; the steps whose model or build tree is
+    missing are skipped.
 
     Steps: the quantized kernels; the loading of damaged model files and of a file of more
     than 2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on
@@ -184,6 +185,15 @@ try {
     }
 
     $avx2 = Join-Path $main "bin\engines\albireo-engine-cpu-avx2.dll"
+    # Without the file of -EmbeddingModel, the embedding model that the build prepares for the installer.
+    if (-not (Test-Path $EmbeddingModel) -and -not $PSBoundParameters.ContainsKey("EmbeddingModel")) {
+        $prepared = Join-Path $main "bin\models\builtin.json"
+        if (Test-Path $prepared) {
+            $listed = Get-Content -Raw -Path $prepared | ConvertFrom-Json
+            $embedder = @($listed.models | Where-Object { $_.embedding } | Select-Object -First 1)
+            if ($embedder.Count -gt 0) { $EmbeddingModel = Join-Path $main ("bin\models\" + $embedder[0].file) }
+        }
+    }
     if (Test-Path $EmbeddingModel) {
         Invoke-Check "embedding model" "cosine" $chat @($avx2, $EmbeddingModel, "--parallel",
             "The service runs on this computer.", "Where does the service run?",

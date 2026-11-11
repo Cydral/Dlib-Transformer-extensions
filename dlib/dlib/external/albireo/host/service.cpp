@@ -1713,41 +1713,98 @@ namespace albireo
         retire_cv_.wait(lock, [&]() { return stopping_.load() || retiring_.count(id) == 0; });
     }
 
-    bool service::deactivate(const std::string& id, user_error& error)
+    std::string service::successor_of(const std::string& id)
     {
+        installed_model b;
+        if (background_model_.empty() || background_model_ == id || !db_->find_model(background_model_, b)
+            || !file_exists(b.file))
+            return std::string();
+        return background_model_;
+    }
+
+    bool service::deactivate(const std::string& id, const std::string& role, user_error& error)
+    {
+        if (!role.empty() && !is_role(role))
+        {
+            error.set("unknown role '" + role + "' (general, code, security or embedding)", "unknown_role")
+                .arg("role", role);
+            return false;
+        }
         std::lock_guard<std::mutex> serial(models_m_);
+        /*
+            The functions taken from the model go to the model that comes with Albireo, chosen for
+            them, so that the general model of another choice does not take them; without it, they
+            are served as no choice is made for them.
+        */
+        const std::string builtin = successor_of(id);
         bool refused = false;
         bool changed = false;
+        bool used = false;
+        bool implicit = false;
         settings_->update([&](host_settings& st) {
             const auto embedding = st.active.find(embedding_role);
-            if (embedding != st.active.end() && embedding->second == id)
+            if (embedding != st.active.end() && embedding->second == id && (role.empty() || role == embedding_role))
             {
                 refused = true;
                 return;
             }
+            /*
+                A function the model serves through its general function, without a choice of its
+                own, goes to the model that comes with Albireo when it is taken alone, and stays
+                with the model when the general function alone is taken.
+            */
+            const auto general = st.active.find("general");
+            const bool serves_general = general != st.active.end() && general->second == id;
+            implicit = !role.empty() && role != "general" && role != embedding_role && st.active.count(role) == 0
+                && serves_general;
+            if (implicit && !builtin.empty())
+            {
+                st.active[role] = builtin;
+                changed = true;
+            }
+            if (role == "general" && serves_general)
+                for (const char* r : model_roles)
+                    if (st.active.count(r) == 0) st.active[r] = id;
             for (auto it = st.active.begin(); it != st.active.end();)
             {
-                if (it->second == id)
+                if (it->second == id && (role.empty() || it->first == role))
                 {
-                    it = st.active.erase(it);
                     changed = true;
+                    if (!builtin.empty() && it->first != embedding_role)
+                    {
+                        it->second = builtin;
+                        ++it;
+                    }
+                    else
+                    {
+                        it = st.active.erase(it);
+                    }
                 }
                 else
                 {
+                    used = used || it->second == id;
                     ++it;
                 }
             }
         });
-        if (refused)
+        // A function the model does not serve is refused, so that the windows show the functions as they are.
+        if (refused || (!changed && !implicit && !role.empty()))
         {
             installed_model m;
             const std::string name = db_->find_model(id, m) && !m.name.empty() ? m.name : id;
-            error.set("the document search needs an embedding model: activate another one to replace " + id,
-                "embedding_needed").arg("m", name);
+            if (refused)
+                error.set("the document search needs an embedding model: activate another one to replace " + id,
+                    "embedding_needed").arg("m", name);
+            else
+                error.set(id + " does not answer for the " + role + " function", "role_not_served").arg("m", name)
+                    .arg("role", role);
             return false;
         }
-        if (changed) log_info("models: " + id + " deactivated");
-        retire(id);
+        if (changed)
+            log_info("models: " + id + (role.empty() ? std::string(" deactivated") : " no longer active for " + role)
+                + (builtin.empty() ? std::string() : ", " + builtin + " takes its place"));
+        // A model that keeps other functions stays loaded.
+        if (!used) retire(id);
         return true;
     }
 
@@ -1768,22 +1825,32 @@ namespace albireo
                 "cannot be deleted", "builtin_model").arg("m", name);
             return false;
         }
+        // Its language functions go to the model that comes with Albireo, as a deactivation gives them.
+        const std::string builtin = successor_of(id);
         bool changed = false;
         settings_->update([&](host_settings& st) {
             for (auto it = st.active.begin(); it != st.active.end();)
             {
-                if (it->second == id)
+                if (it->second != id)
                 {
-                    it = st.active.erase(it);
-                    changed = true;
+                    ++it;
+                    continue;
+                }
+                changed = true;
+                if (!builtin.empty() && it->first != embedding_role)
+                {
+                    it->second = builtin;
+                    ++it;
                 }
                 else
                 {
-                    ++it;
+                    it = st.active.erase(it);
                 }
             }
         });
-        if (changed) log_info("models: " + id + " deactivated");
+        if (changed)
+            log_info("models: " + id + " deactivated" + (builtin.empty() ? std::string() : ", " + builtin
+                + " takes its place"));
         const std::vector<std::string> loaded = engine_.loaded_models();
         const bool in_engine = std::find(loaded.begin(), loaded.end(), id) != loaded.end();
         {

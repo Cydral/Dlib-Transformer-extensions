@@ -174,12 +174,15 @@ namespace albireo
         bool activate(const std::string& id, const std::string& role, user_error& error);
         /*!
             ensures
-                - Takes every function from the model id and unloads it once its requests
-                  are served.  The model of the document search keeps its function: the
-                  search always has its embedding model, which another embedding model
-                  replaces through activate().
+                - Takes the function role from the model id, or every function when role
+                  is empty, and gives it to the model that comes with Albireo, which then
+                  serves it, else leaves it without a model chosen for it; unloads the
+                  model once its requests are served when no function uses it any more.
+                  The model of the document search keeps its function: the search always
+                  has its embedding model, which another embedding model replaces through
+                  activate().
         !*/
-        bool deactivate(const std::string& id, user_error& error);
+        bool deactivate(const std::string& id, const std::string& role, user_error& error);
         /*!
             ensures
                 - Takes every function from the model id, the document search included,
@@ -288,6 +291,12 @@ namespace albireo
         !*/
         void on_installed(const installed_model& m);
         static bool is_embedding(const installed_model& m);
+        /*
+            The model that comes with Albireo, which takes the language functions a deactivation
+            or a deletion takes from the model id: empty when there is none, when its file is
+            missing or when it is id itself.
+        */
+        std::string successor_of(const std::string& id);
         // Loads a model into the engine, with its projector when it has one (options "projector").
         bool load_model(const installed_model& m, std::string& error);
         /*!

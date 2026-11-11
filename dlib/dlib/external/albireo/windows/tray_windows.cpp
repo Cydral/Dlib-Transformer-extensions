@@ -1157,20 +1157,36 @@ namespace albireo
                 return false;
             }
 
+            /*
+                The functions of the selected model, those it serves checked.  A function not
+                checked is taken from the model that serves it, and a checked function goes back
+                to the model that comes with Albireo, which keeps the work in the background and
+                whose own functions stay checked and greyed, as the document search of an
+                embedding model does.
+            */
             void role_menu()
             {
                 HMENU m = CreatePopupMenu();
                 const auto act = active_roles(selected);
+                const bool builtin = selected == overview["background"].as_string();
                 // An embedding model serves the document search only; the language models
                 // answer for the other functions.
                 const char* roles[] = { "general", "code", "security", "embedding" };
                 const bool embedding = embedding_model(selected);
+                bool on[4] = { false, false, false, false };
                 for (int i = 0; i < 4; ++i)
                 {
                     if ((i == 3) != embedding) continue;
-                    const bool on = std::find(act.begin(), act.end(), roles[i]) != act.end();
-                    const UINT flags = MF_STRING | (on ? MF_CHECKED : 0);
+                    on[i] = std::find(act.begin(), act.end(), roles[i]) != act.end();
+                    // The document search keeps its model until another embedding model takes it.
+                    const bool kept = on[i] && (builtin || i == 3);
+                    const UINT flags = MF_STRING | (on[i] ? MF_CHECKED : 0) | (kept ? MF_GRAYED : 0);
                     AppendMenuW(m, flags, IDM_ROLE_GENERAL + i, role_name(roles[i]).c_str());
+                }
+                if (builtin)
+                {
+                    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(m, MF_STRING | MF_CHECKED | MF_GRAYED, 0, tr("role_background").c_str());
                 }
                 RECT r;
                 GetWindowRect(activate, &r);
@@ -1179,9 +1195,10 @@ namespace albireo
                 DestroyMenu(m);
                 if (cmd >= IDM_ROLE_GENERAL && cmd <= IDM_ROLE_EMBEDDING)
                 {
+                    const int i = static_cast<int>(cmd - IDM_ROLE_GENERAL);
                     json body = json::object();
-                    body["role"] = roles[cmd - IDM_ROLE_GENERAL];
-                    action("POST", "/albireo/v1/models/" + selected + "/activate", body);
+                    body["role"] = roles[i];
+                    action("POST", "/albireo/v1/models/" + selected + (on[i] ? "/deactivate" : "/activate"), body);
                 }
             }
 

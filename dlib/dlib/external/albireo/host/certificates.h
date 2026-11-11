@@ -59,9 +59,6 @@ namespace albireo
     // Deletes the certificates and the keys of dir; false when one of them remains.
     bool remove_certificate_files(const std::string& dir);
 
-    // SHA-256 of the DER form of a PEM certificate, in lower case hexadecimal.
-    std::string certificate_thumbprint(const std::string& pem_path);
-
     // DER bytes of the first certificate of a PEM file, empty on failure.
     std::string certificate_der(const std::string& pem_path);
 

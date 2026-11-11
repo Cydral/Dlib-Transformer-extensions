@@ -56,8 +56,6 @@ namespace albireo
         // is tried once more on a new connection.
         bool poll(const std::string& path, json& out, std::string& error, int timeout_seconds = 10) const;
         void own_connection();
-        // The connections poll() opened since the creation of the kept connection.
-        unsigned long long poll_connections() const;
 
     private:
         struct kept_connection;

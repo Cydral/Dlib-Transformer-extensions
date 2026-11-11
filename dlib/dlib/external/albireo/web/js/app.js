@@ -36,6 +36,7 @@ import { t, tn, setLanguage, language, languages } from './i18n.js';
 import { icon } from './icons.js';
 import * as store from './store.js';
 import { renderMarkdown, attachCodeButtons, escapeHtml } from './markdown.js';
+import { markdownField, drawMarkdown } from './mdfield.js';
 import * as api from './api.js';
 import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind, pdfPages, terms }
   from './documents.js';
@@ -64,6 +65,16 @@ const maxAgentSteps = 100;
 */
 const workingSeconds = 240;
 const minWorkingContext = 16384;
+/*
+    The window of a discussion grows with it, from the working context to twice as much each time its prompt takes
+    compactShare of the room the window leaves beside the answer, growthSteps times at most (largestContext), within
+    the context of the model and within the window whose keys and values a generated token reads in growthWeights
+    times the bytes of the weights of the model, so that the generation slows down by a bounded factor at the end of a
+    long discussion.  The oldest exchanges are compressed once they take compactShare of the room of the largest
+    window.
+*/
+const growthSteps = 2;
+const growthWeights = 8;
 const knowledgeShare = 0.3;
 const knowledgeSeconds = 60;
 const attachmentShare = 0.25;
@@ -169,6 +180,32 @@ function writeRate(id) {
 function workingContext(id, context) {
   const wanted = Math.max(minWorkingContext, workingSeconds * readRate(id));
   return Math.min(context || 8192, Math.pow(2, Math.round(Math.log2(wanted))));
+}
+
+// The largest window of a discussion with a model of context tokens (see growthSteps).
+function largestContext(id, context) {
+  const working = workingContext(id, context);
+  let largest = working * Math.pow(2, growthSteps);
+  const loaded = loadedModel(id);
+  if (loaded && loaded.kv_bytes_per_token > 0 && loaded.bytes > 0) {
+    const bound = growthWeights * loaded.bytes / loaded.kv_bytes_per_token;
+    while (largest > working && largest > bound) largest /= 2;
+  }
+  return Math.min(context || 8192, largest);
+}
+
+/*
+    The window of a discussion of tokens with a model of the capabilities caps, within the context of the model: the
+    working context, doubled while the tokens take compactShare of the room it leaves beside the answer, up to the
+    largest window (see growthSteps).
+*/
+function discussionWindow(caps, tokens, reserve, context) {
+  const largest = Math.min(caps.largest || context, context);
+  let window = Math.min(caps.working || largest, largest);
+  while (window < largest && tokens >= compactShare * (window - Math.min(reserve, Math.floor(window / 2)))) {
+    window = Math.min(largest, 2 * window);
+  }
+  return { window, largest };
 }
 
 // The tokens of the documents that a model of the capabilities caps reads whole: those of a project, or those of
@@ -521,7 +558,7 @@ async function applyStored(id) {
   const live = generations.get(id);
   let redraw = false;
   // A question being edited keeps the copy it belongs to.
-  if (live || (shown && (editingIn(ui.content) || (ui.thread && ui.thread.querySelector('textarea'))))) {
+  if (live || (shown && (editingIn(ui.content) || (ui.thread && ui.thread.querySelector('.md-field'))))) {
     copy = live ? live.c : shown;
     for (const k of sharedFields) copy[k] = stored[k];
   } else if (shown) {
@@ -741,8 +778,9 @@ function acceptFor(role, room) {
 
 /*
     The capabilities of the model of a function: reasoning, reasoningAlways for a model trained to reason before
-    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, its context and its working
-    context (workingContext), 0 while it is not loaded, and its speeds of reading and writing (readRate, writeRate).
+    every answer (without Deep reasoning, the engine ends its reasoning at once), tools, its context, its working
+    context (workingContext) and the largest window of a discussion (largestContext), 0 while it is not loaded, and
+    its speeds of reading and writing (readRate, writeRate).
 */
 function roleCapabilities(role) {
   const id = roleModel(role);
@@ -752,11 +790,12 @@ function roleCapabilities(role) {
   if (loaded) {
     const context = loaded.context || 0;
     return { reasoning: loaded.reasoning !== false, reasoningAlways: loaded.reasoning_always === true,
-      tools: loaded.tools !== false, context, working: context ? workingContext(id, context) : 0, read, write };
+      tools: loaded.tools !== false, context, working: context ? workingContext(id, context) : 0,
+      largest: context ? largestContext(id, context) : 0, read, write };
   }
   const m = modelInfo(id);
   return { reasoning: m ? m.reasoning !== false : true, reasoningAlways: !!(m && m.reasoning_always === true),
-    tools: m ? m.tools !== false : true, context: 0, working: 0, read, write };
+    tools: m ? m.tools !== false : true, context: 0, working: 0, largest: 0, read, write };
 }
 
 /*
@@ -935,7 +974,7 @@ async function pollStatus() {
     renderStatusLine();
   }
   // The answers drawn before the voices came receive their buttons, unless a question is being edited.
-  if (voices && state.view === 'chat' && ui.thread && ui.thread.isConnected && !ui.thread.querySelector('textarea')
+  if (voices && state.view === 'chat' && ui.thread && ui.thread.isConnected && !ui.thread.querySelector('.md-field')
     && !editingIn(ui.content)) {
     renderMain();
   }
@@ -978,14 +1017,15 @@ function renderStatusLine() {
 }
 
 /*
-    The share of the context of its model that the discussion shown takes, under the status line: the tokens of the
-    history the next question carries, its system message and its tools included, as the service counts them, its
-    images by their tokens (tokenEstimate), over the context the engine gives the model.  The discussion is measured
-    again when it, its function, its model or its toggles change, once the answer being written ends; the line keeps
-    the last measure of the discussion meanwhile.  A measure that fails, the service away or the model loading, is
-    tried again for that discussion 30 seconds later at the earliest.
+    The share of its window that the discussion shown takes, under the status line: the tokens of the history the
+    next question carries, its system message and its tools included, as the service counts them, its images by their
+    tokens (tokenEstimate), over the window of the discussion (discussionWindow), which doubles as the discussion
+    grows, up to its largest window, within the context the engine gives the model.  The discussion is measured again
+    when it, its function, its model or its toggles change, once the answer being written ends; the line keeps the
+    last measure of the discussion meanwhile.  A measure that fails, the service away or the model loading, is tried
+    again for that discussion 30 seconds later at the earliest.
 */
-const contextUse = { id: '', key: '', tokens: 0, context: 0, pending: false, failed: 0 };
+const contextUse = { id: '', key: '', tokens: 0, context: 0, window: 0, largest: 0, pending: false, failed: 0 };
 const contextRetry = 30000;
 
 function contextKey(c) {
@@ -997,7 +1037,7 @@ function contextKey(c) {
 
 async function measureContext(c, key) {
   contextUse.pending = true;
-  let tokens = 0, context = 0;
+  let tokens = 0, context = 0, window = 0, largest = 0;
   try {
     const caps = roleCapabilities(c.role);
     const set = toolSet(c, caps);
@@ -1008,11 +1048,13 @@ async function measureContext(c, key) {
     if (r && typeof r.tokens === 'number' && r.context) {
       tokens = Math.round(tokenEstimate(text, r.tokens, model).of(apiMessages(c, system, null, estimateMedia(c.role))));
       context = r.context;
+      ({ window, largest } = discussionWindow(caps, tokens, answerReserve(caps, !!(c.reasoning && caps.reasoning)),
+        context));
     }
   } catch (e) {
     // A service out of reach: the line stays empty until the next measure.
   } finally {
-    Object.assign(contextUse, { id: c.id, key: context ? key : '', tokens, context, pending: false,
+    Object.assign(contextUse, { id: c.id, key: context ? key : '', tokens, context, window, largest, pending: false,
       failed: context ? 0 : Date.now() });
   }
   renderContextLine();
@@ -1027,16 +1069,17 @@ function renderContextLine() {
     const key = contextKey(c);
     if (key !== contextUse.key) measureContext(c, key);
   }
-  const shown = ready && contextUse.id === c.id && contextUse.context > 0;
+  const shown = ready && contextUse.id === c.id && contextUse.window > 0;
   ui.contextLine.classList.toggle('hidden', !shown);
   if (!shown) return;
-  const share = Math.min(1, contextUse.tokens / contextUse.context);
+  const share = Math.min(1, contextUse.tokens / contextUse.window);
   const level = share >= 0.9 ? ' full' : share >= 0.75 ? ' high' : '';
-  const label = formatNumber(contextUse.tokens) + ' / ' + formatNumber(contextUse.context);
-  ui.contextLine.title = t('contextUse', { n: formatNumber(contextUse.tokens), total: formatNumber(contextUse.context),
-    p: Math.round(100 * share) });
+  const label = formatNumber(contextUse.tokens) + ' / ' + formatNumber(contextUse.window);
+  ui.contextLine.title = t(contextUse.window < contextUse.largest ? 'contextUse' : 'contextUseLargest', {
+    n: formatNumber(contextUse.tokens), total: formatNumber(contextUse.window), p: Math.round(100 * share),
+    largest: formatNumber(contextUse.largest), context: formatNumber(contextUse.context) });
   ui.contextLine.replaceChildren(h('span', { class: 'label' }, t('contextLabel')),
-    h('div', { class: 'meter' + level, role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': contextUse.context,
+    h('div', { class: 'meter' + level, role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': contextUse.window,
       'aria-valuenow': contextUse.tokens, 'aria-valuetext': ui.contextLine.title, 'aria-label': t('contextLabel') },
     h('div', { style: { width: (100 * share).toFixed(1) + '%' } })), h('span', { class: 'count' }, label));
 }
@@ -1781,7 +1824,7 @@ async function rewriteSummary(c) {
   c.summary = null;
   if (start === 0 || !roleModel(c.role)) return;
   const caps = roleCapabilities(c.role);
-  const context = caps.working || caps.context || 8192;
+  const context = caps.largest || caps.working || caps.context || 8192;
   const room = context - Math.min(answerReserve(caps, !!(c.reasoning && caps.reasoning)), Math.floor(context / 2));
   toast(t('compacting'));
   cancelWarmup(c.id);
@@ -2205,7 +2248,7 @@ function renderProject(p) {
   const convs = state.conversations.filter((c) => c.projectId === p.id);
   const name = h('input', { value: p.name });
   const description = h('input', { value: p.description || '' });
-  const instructions = h('textarea', { rows: 8 });
+  const instructions = markdownField({ label: t('instructions') });
   instructions.value = p.instructions || '';
   const heading = h('h2', null, h('span', { class: 'dot', style: { background: p.color } }), h('span', null, p.name));
   const sub = h('p', { class: 'sub' }, p.description || '');
@@ -2357,16 +2400,14 @@ function renderProject(p) {
         pictures.length + ' / ' + maxProjectImages)),
     h('p', { class: 'help' }, t('knowledgeImagesHelp')),
     pictures.length ? h('div', { class: 'list image-list' }, pictures.map((img) => projectImageRow(p, img))) : null);
-  // The share of the context the documents take, and how the model reads them.
+  // The tokens of the documents, and how the model reads them: whole, or searched for each question.
   const general = roleCapabilities('general');
-  const contextTokens = general.context || 0;
   const totalTokens = (p.files || []).reduce((n, f) => n + estimateTokens(f.text), 0);
   const capacity = h('p', { class: 'help' });
   if ((p.files || []).length) {
     const mode = knowledgeMode(p, general);
-    const share = contextTokens ? Math.round(100 * totalTokens / contextTokens) : 0;
     capacity.textContent = t(mode === 'whole' ? 'knowledgeWhole' : 'knowledgeSearch',
-      { p: share, tokens: tn('tokensCount', totalTokens, { n: formatNumber(totalTokens) }) })
+      { tokens: tn('tokensCount', totalTokens, { n: formatNumber(totalTokens) }) })
       + (rag.embeddingModel() ? '' : ' ' + t('knowledgeNoVectors'));
   }
   const convList = h('div', { class: 'list' });
@@ -3344,8 +3385,10 @@ function userElement(c, m, index, last) {
   if (m.attachments && m.attachments.length) {
     el.append(h('div', { class: 'attachments' }, m.attachments.map((a) => attachmentChip(a))));
   }
-  // A question made of images alone shows no empty bubble.
-  if (m.content || !pictures.length) el.append(h('div', { class: 'bubble' }, m.content));
+  // A question made of images alone shows no empty bubble; its text shows as the composer drew it.
+  if (m.content || !pictures.length) {
+    el.append(h('div', { class: 'bubble md-text', html: drawMarkdown(m.content || '') }));
+  }
   // The time of the question shows before its buttons, which appear when the pointer is over it.
   el.append(h('div', { class: 'meta' }, timeElement(m),
     iconButton('copy', t('copy'), () => copyText(m.content)),
@@ -3498,7 +3541,7 @@ function editMessage(c, m, index, el) {
   const places = () => maxContextImages - pendingImageCount()
     - (contextImages(c, (c.contextStart || 0) > index ? 0 : c.contextStart || 0) - contextImages(c, index));
   const room = () => Math.max(0, places() - attachments.filter((a) => a.kind === 'image').length);
-  const area = h('textarea', { style: { width: '100%', minHeight: '90px', borderRadius: '12px', padding: '10px', border: '1px solid var(--border-strong)', background: 'var(--bg-input)' } });
+  const area = markdownField({ label: t('edit'), className: 'edit-question' });
   area.value = m.content;
   const chips = h('div', { class: 'attachments', style: { justifyContent: 'flex-start', marginBottom: '6px' } });
   const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
@@ -6350,10 +6393,11 @@ async function namePending() {
 
 /*
     Compresses the oldest exchanges of a discussion in the background once they take compactShare of the room the
-    system message and the tools leave them, as the next question will receive them: after an answer, and when the
-    discussion is opened.  The job takes its place in compactions at once, with its own AbortController, which the
-    deletion of the discussion uses (cancelCompaction); a question that comes before the summary is written waits
-    for it only when it does not fit without it (fitContext).  One tab compresses a discussion at a time.
+    system message and the tools leave them in the largest window, as the next question will receive them, after an
+    answer and when the discussion is opened.  The job takes its place in compactions at once, with its own
+    AbortController, which the deletion of the discussion uses (cancelCompaction); a question that comes before the
+    summary is written waits for it only when it does not fit without it (fitContext).  One tab compresses a
+    discussion at a time.
 */
 function compactLater(c) {
   if (!c || !c.messages.length || compactions.has(c.id) || !roleModel(c.role)) return;
@@ -6386,8 +6430,8 @@ async function compactInBackground(c, signal) {
     api.count(model, text.slice(0, 1), toolDefs).catch(() => null)]);
   if (signal.aborted || !all || typeof all.tokens !== 'number' || !all.context) return;
   const reserve = answerReserve(caps, !!(view.reasoning && caps.reasoning));
-  // The room of the working context, within that of the context of the model.
-  const context = Math.min(all.context, caps.working || all.context);
+  // The room of the largest window of the discussion, within that of the context of the model.
+  const context = Math.min(all.context, caps.largest || caps.working || all.context);
   const room = context - Math.min(reserve, Math.floor(context / 2));
   const estimate = tokenEstimate(text, all.tokens, model);
   const media = estimateMedia(role);
@@ -6420,8 +6464,9 @@ async function compactInBackground(c, signal) {
 }
 
 /*
-    The warm-ups of the beginning of a discussion after a compression, one per discussion at most: discussion id ->
-    AbortController.  A question sent in the discussion, its deletion and a new compression of it stop the warm-up.
+    The warm-ups of the beginning of a discussion, after a compression or while its next question is written, one per
+    discussion at most: discussion id -> AbortController.  A question sent in the discussion, its deletion and a new
+    compression of it stop the warm-up.
 */
 const warmups = new Map();
 
@@ -6440,8 +6485,9 @@ function cancelWarmup(id) {
     question reads, with the priority of the work in the background, which the service serves behind the answers,
     without reasoning and for one token; the engine keeps the keys and values it read, which the next question takes
     over, and computes then its own tokens only.  The engine reads the history of each answer ahead by itself; the
-    page asks it only after a summary, which changes the beginning, by the tab that applied the summary, while no
-    answer is written in c.  Its failure is told in the console only.
+    page asks it after a summary, which changes the beginning, by the tab that applied the summary, and while the
+    next question of a long discussion is written (warmWhileTyping), when the keys and values of its beginning may
+    have left the memory, while no answer is written in c.  Its failure is told in the console only.
 */
 async function warmBeginning(c) {
   if (!c || deleted.has(c.id) || generations.has(c.id) || !c.messages.length || !serviceReady()) return;
@@ -6469,6 +6515,26 @@ async function warmBeginning(c) {
   }
 }
 
+/*
+    The read-ahead of a discussion while its next question is written: once for each state of the discussion
+    (contextKey), when the history its next question carries reaches typedWarmupTokens as last measured, the beginning
+    of its prompt is read in the background (warmBeginning), so that the question finds it in the cache of the engine
+    even when it left the memory since the last answer, the engine reading what it lacks while the user writes.
+    Discussion id -> the state read ahead.
+*/
+const typedWarmups = new Map();
+const typedWarmupTokens = 4096;
+
+function warmWhileTyping() {
+  const c = state.view === 'chat' ? state.current : null;
+  if (!c || !c.messages.length || generations.has(c.id) || warmups.has(c.id) || compactions.has(c.id)) return;
+  if (contextUse.id !== c.id || contextUse.tokens < typedWarmupTokens) return;
+  const key = contextKey(c);
+  if (typedWarmups.get(c.id) === key) return;
+  typedWarmups.set(c.id, key);
+  warmBeginning(c);
+}
+
 // Dialogs.
 function dialog(content, small) {
   return new Promise((resolve) => {
@@ -6480,7 +6546,7 @@ function dialog(content, small) {
     document.addEventListener('keydown', onKey);
     content(box, close);
     document.body.append(overlay);
-    const f = box.querySelector('input, textarea, button.primary');
+    const f = box.querySelector('input, textarea, .md-field, button.primary');
     if (f) f.focus();
   });
 }
@@ -6556,7 +6622,7 @@ function generalTab(body, close) {
   });
   const enter = h('input', { type: 'checkbox', checked: state.settings.sendOnEnter });
   enter.addEventListener('change', () => saveSetting('sendOnEnter', enter.checked));
-  const sys = h('textarea', { rows: 4 });
+  const sys = markdownField({ label: t('systemPrompt') });
   sys.value = state.settings.systemPrompt || '';
   sys.addEventListener('change', () => saveSetting('systemPrompt', sys.value));
   body.append(field(t('theme'), theme), field(t('language'), lang), field(t('yourName'), name, t('yourNameHelp')),
@@ -6616,7 +6682,7 @@ function memoryTab(body) {
   const words = memoryLimitWords(backgroundContext());
   const enabled = h('input', { type: 'checkbox', checked: !!state.settings.memoryEnabled });
   const sensitive = h('input', { type: 'checkbox', checked: !!state.settings.memorySensitive });
-  const text = h('textarea', { rows: 8, placeholder: t('memoryEmpty') });
+  const text = markdownField({ label: t('memoryText'), placeholder: t('memoryEmpty') });
   text.value = state.settings.memory || '';
   const size = h('p', { class: 'help', style: { margin: 0, color: 'var(--text-faint)', fontSize: '12.5px' } });
   const showSize = () => {
@@ -7081,11 +7147,12 @@ function buildLayout() {
   ui.topbar = h('header', { class: 'topbar' });
   ui.banner = h('div', { class: 'banner hidden', html: icon('incognito') + '<span>' + escapeHtml(t('incognitoBanner')) + '</span>' });
   ui.content = h('div', { class: 'scroller' });
-  ui.input = h('textarea', { rows: 1, 'aria-label': t('placeholder') });
+  ui.input = markdownField({ label: t('placeholder') });
   ui.input.value = draft;
   ui.input.addEventListener('input', () => {
     autoGrow();
     saveDraft();
+    warmWhileTyping();
   });
   ui.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && state.settings.sendOnEnter) {

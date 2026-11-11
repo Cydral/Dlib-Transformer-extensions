@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.14 LANGUAGES C CXX)
+project(albireo VERSION 1.0.15 LANGUAGES C CXX)
 
 # The version is written in four places that must agree: project() above, the numbers of
 # common/version.h, which the version resources of the programs and of the installer carry and
@@ -208,12 +208,7 @@ if (MSVC)
 else()
    set(ALBIREO_ISA_avx2 -mavx2 -mfma -mf16c)
    set(ALBIREO_ISA_avxvnni ${ALBIREO_ISA_avx2} -mavxvnni)
-   # The 256-bit VNNI kernels through the AVX-512 form of their instructions, to test them
-   # on the processors that have AVX-512 VNNI and lack AVX-VNNI.
-   set(ALBIREO_ISA_vnni256 ${ALBIREO_ISA_avx2} -mavx512vl -mavx512vnni)
-   set(ALBIREO_ISA_vnni256_DEFS ALBIREO_QK_VNNI_EVEX)
    check_cxx_compiler_flag(-mavxvnni ALBIREO_HAS_avxvnni)
-   check_cxx_compiler_flag(-mavx512vnni ALBIREO_HAS_vnni256)
 endif()
 set(ALBIREO_HAS_portable ON)
 set(ALBIREO_HAS_avx2 ON)
@@ -831,22 +826,19 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
    add_executable(test_sampler tests/test_sampler.cpp engine/sampler.cpp)
    target_compile_options(test_sampler PRIVATE ${ALBIREO_WARNINGS})
    albireo_output_dir(test_sampler ${CMAKE_BINARY_DIR}/tests)
-   # The kernels of the other families: their checks and their speed, on the processors
-   # that have their instructions (the others skip them).
-   foreach (family avxvnni vnni256)
-      if (NOT ALBIREO_HAS_${family})
-         continue()
-      endif()
-      albireo_kernels(${family})
+   # The kernels of AVX-VNNI: their checks and their speed, on the processors that have its
+   # instructions (the others skip them).
+   if (ALBIREO_HAS_avxvnni)
+      albireo_kernels(avxvnni)
       foreach (t test_qkernels bench_runtime)
-         add_executable(${t}_${family} tests/${t}.cpp engine/cpu_runtime.cpp engine/model_config.cpp
-            engine/model_file.cpp $<TARGET_OBJECTS:albireo-kernels-${family}> common/system_info.cpp)
-         target_include_directories(${t}_${family} PRIVATE ${ALBIREO_INCLUDE_DIR})
-         target_compile_options(${t}_${family} PRIVATE ${ALBIREO_ISA_avx2})
+         add_executable(${t}_avxvnni tests/${t}.cpp engine/cpu_runtime.cpp engine/model_config.cpp
+            engine/model_file.cpp $<TARGET_OBJECTS:albireo-kernels-avxvnni> common/system_info.cpp)
+         target_include_directories(${t}_avxvnni PRIVATE ${ALBIREO_INCLUDE_DIR})
+         target_compile_options(${t}_avxvnni PRIVATE ${ALBIREO_ISA_avx2})
          if (NOT WIN32)
-            target_link_libraries(${t}_${family} PRIVATE Threads::Threads)
+            target_link_libraries(${t}_avxvnni PRIVATE Threads::Threads)
          endif()
-         albireo_output_dir(${t}_${family} ${CMAKE_BINARY_DIR}/tests)
+         albireo_output_dir(${t}_avxvnni ${CMAKE_BINARY_DIR}/tests)
       endforeach()
-   endforeach()
+   endif()
 endif()

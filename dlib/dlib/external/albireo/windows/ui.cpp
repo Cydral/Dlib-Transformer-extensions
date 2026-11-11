@@ -169,8 +169,6 @@ namespace ui
 
     COLORREF color_background() { return RGB(250, 251, 254); }
     COLORREF color_text() { return RGB(23, 26, 43); }
-    COLORREF color_faint() { return RGB(110, 116, 140); }
-    COLORREF color_accent() { return RGB(61, 107, 255); }
 
     HBRUSH background_brush()
     {

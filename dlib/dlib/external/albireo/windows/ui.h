@@ -45,8 +45,6 @@ namespace ui
     // Colors of the windows.
     COLORREF color_background();
     COLORREF color_text();
-    COLORREF color_faint();
-    COLORREF color_accent();
     HBRUSH background_brush();
 
     /*

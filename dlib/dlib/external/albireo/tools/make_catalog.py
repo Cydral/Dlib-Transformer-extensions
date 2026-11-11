@@ -38,6 +38,37 @@ INPUTS = ("text", "image")
 
 MODELS = [
     {
+        "id": "qwen3-vl-4b-instruct",
+        "name": "Qwen3-VL 4B Instruct",
+        "publisher": "Alibaba",
+        "hub": ("Qwen/Qwen3-VL-4B-Instruct-GGUF", "Qwen3VL-4B-Instruct-Q4_K_M.gguf"),
+        "projector": ("Qwen/Qwen3-VL-4B-Instruct-GGUF", "mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf", "Q8_0"),
+        "quantization": "Q4_K_M",
+        "roles": ["general", "code", "security"],
+        "inputs": ["text", "image"],
+        "default": True,
+        "tools": True,
+        "reasoning": False,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "Multimodal assistant that reads images and text and answers directly, without a reasoning phase: "
+                  "conversation, documents, screenshots, diagrams, code and security. Albireo installs it by "
+                  "default, for computers with 8 GB of memory.",
+            "fr": "Assistant multimodal qui lit les images et le texte et répond directement, sans phase de "
+                  "raisonnement : discussion, documents, captures d'écran, schémas, code et sécurité. Albireo "
+                  "l'installe par défaut, pour les ordinateurs dotés de 8 Go de mémoire.",
+            "de": "Multimodaler Assistent, der Bilder und Text liest und direkt antwortet, ohne Denkphase: "
+                  "Gespräche, Dokumente, Bildschirmfotos, Diagramme, Code und Sicherheit. Albireo installiert ihn "
+                  "standardmäßig, für Computer mit 8 GB Arbeitsspeicher.",
+            "it": "Assistente multimodale che legge immagini e testo e risponde direttamente, senza fase di "
+                  "ragionamento: conversazione, documenti, schermate, schemi, codice e sicurezza. Albireo lo "
+                  "installa per impostazione predefinita, per computer con 8 GB di memoria.",
+            "es": "Asistente multimodal que lee imágenes y texto y responde directamente, sin fase de razonamiento: "
+                  "conversación, documentos, capturas de pantalla, diagramas, código y seguridad. Albireo lo "
+                  "instala por defecto, para ordenadores con 8 GB de memoria.",
+        },
+    },
+    {
         "id": "qwen3-vl-4b-thinking",
         "name": "Qwen3-VL 4B Thinking",
         "publisher": "Alibaba",
@@ -46,27 +77,26 @@ MODELS = [
         "quantization": "Q4_K_M",
         "roles": ["general", "code", "security"],
         "inputs": ["text", "image"],
-        "default": True,
         "tools": True,
         "reasoning": True,
         "reasoning_always": True,
         "license": "Apache-2.0",
         "description": {
             "en": "Multimodal assistant that reads images and text and reasons step by step before answering: "
-                  "conversation, documents, screenshots, diagrams, code and security. Albireo installs it by "
-                  "default, for computers with 8 GB of memory.",
+                  "conversation, documents, screenshots, diagrams, code and security. It runs on computers with "
+                  "8 GB of memory.",
             "fr": "Assistant multimodal qui lit les images et le texte et raisonne étape par étape avant de "
-                  "répondre : discussion, documents, captures d'écran, schémas, code et sécurité. Albireo "
-                  "l'installe par défaut, pour les ordinateurs dotés de 8 Go de mémoire.",
+                  "répondre : discussion, documents, captures d'écran, schémas, code et sécurité. Il fonctionne "
+                  "sur les ordinateurs dotés de 8 Go de mémoire.",
             "de": "Multimodaler Assistent, der Bilder und Text liest und vor der Antwort Schritt für Schritt "
-                  "nachdenkt: Gespräche, Dokumente, Bildschirmfotos, Diagramme, Code und Sicherheit. Albireo "
-                  "installiert ihn standardmäßig, für Computer mit 8 GB Arbeitsspeicher.",
+                  "nachdenkt: Gespräche, Dokumente, Bildschirmfotos, Diagramme, Code und Sicherheit. Er läuft auf "
+                  "Computern mit 8 GB Arbeitsspeicher.",
             "it": "Assistente multimodale che legge immagini e testo e ragiona passo dopo passo prima di "
-                  "rispondere: conversazione, documenti, schermate, schemi, codice e sicurezza. Albireo lo installa "
-                  "per impostazione predefinita, per computer con 8 GB di memoria.",
+                  "rispondere: conversazione, documenti, schermate, schemi, codice e sicurezza. Funziona su "
+                  "computer con 8 GB di memoria.",
             "es": "Asistente multimodal que lee imágenes y texto y razona paso a paso antes de responder: "
-                  "conversación, documentos, capturas de pantalla, diagramas, código y seguridad. Albireo lo "
-                  "instala por defecto, para ordenadores con 8 GB de memoria.",
+                  "conversación, documentos, capturas de pantalla, diagramas, código y seguridad. Funciona en "
+                  "ordenadores con 8 GB de memoria.",
         },
     },
     {
@@ -166,36 +196,6 @@ MODELS = [
             "es": "Modelo multimodal compacto para el texto de imágenes y documentos escaneados, capturas de pantalla "
                   "y respuestas breves. Su tamaño le permite responder rápidamente en cualquier ordenador; sus "
                   "respuestas sobre textos son menos profundas que las de los modelos más grandes.",
-        },
-    },
-    {
-        "id": "qwen3-vl-4b-instruct",
-        "name": "Qwen3-VL 4B Instruct",
-        "publisher": "Alibaba",
-        "hub": ("Qwen/Qwen3-VL-4B-Instruct-GGUF", "Qwen3VL-4B-Instruct-Q4_K_M.gguf"),
-        "projector": ("Qwen/Qwen3-VL-4B-Instruct-GGUF", "mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf", "Q8_0"),
-        "quantization": "Q4_K_M",
-        "roles": ["general", "code"],
-        "inputs": ["text", "image"],
-        "tools": True,
-        "reasoning": False,
-        "license": "Apache-2.0",
-        "description": {
-            "en": "Multimodal assistant that reads images and text and answers directly, without a reasoning phase: "
-                  "description and reading of images, scanned documents and screenshots, conversation, writing and "
-                  "code. It runs on computers with 8 GB of memory.",
-            "fr": "Assistant multimodal qui lit les images et le texte et répond directement, sans phase de "
-                  "raisonnement : description et lecture d'images, de documents numérisés et de captures d'écran, "
-                  "discussion, rédaction et code. Il fonctionne sur les ordinateurs dotés de 8 Go de mémoire.",
-            "de": "Multimodaler Assistent, der Bilder und Text liest und direkt antwortet, ohne Denkphase: "
-                  "Beschreibung und Lesen von Bildern, gescannten Dokumenten und Bildschirmfotos, Gespräche, Texte "
-                  "und Code. Er läuft auf Computern mit 8 GB Arbeitsspeicher.",
-            "it": "Assistente multimodale che legge immagini e testo e risponde direttamente, senza fase di "
-                  "ragionamento: descrizione e lettura di immagini, documenti scansionati e schermate, conversazione, "
-                  "scrittura e codice. Funziona su computer con 8 GB di memoria.",
-            "es": "Asistente multimodal que lee imágenes y texto y responde directamente, sin fase de razonamiento: "
-                  "descripción y lectura de imágenes, documentos escaneados y capturas de pantalla, conversación, "
-                  "redacción y código. Funciona en ordenadores con 8 GB de memoria.",
         },
     },
     {

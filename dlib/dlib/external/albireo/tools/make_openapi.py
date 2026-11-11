@@ -733,11 +733,20 @@ paths = {
                                     "model."}}}),
         "responses": {"200": reply("Activated", ok), "400": reply("Refused", ok)}}},
     "/albireo/v1/models/{id}/deactivate": {"post": {
-        "tags": ["Administration"], "security": admin, "summary": "Deactivates a model for every function",
-        "description": "The model leaves the engine once its requests in progress and waiting are served; an "
-                       "activation meanwhile keeps it loaded. The model of the document search is replaced by "
-                       "the activation of another embedding model.",
-        "parameters": [model_id], "responses": {"200": reply("Deactivated", ok), "400": reply("Refused", ok)}}},
+        "tags": ["Administration"], "security": admin, "summary": "Deactivates a model for a function or for all",
+        "description": "The functions taken from the model go back to the model that comes with Albireo; the "
+                       "functions the model serves through its general function stay with it when the general "
+                       "function alone is taken. The model leaves the engine once its requests in progress and "
+                       "waiting are served, when no function uses it any more; an activation meanwhile keeps it "
+                       "loaded. The model of the document search is replaced by the activation of another "
+                       "embedding model (code embedding_needed). A function the model does not serve is refused "
+                       "with the code role_not_served, and an unknown one with unknown_role.",
+        "parameters": [model_id],
+        "requestBody": json_body({"type": "object", "properties": {
+            "role": {"type": "string", "enum": ["general", "code", "security", "embedding"],
+                     "description": "The function taken from the model; without it, every function."}}},
+            required=False),
+        "responses": {"200": reply("Deactivated", ok), "400": reply("Refused", ok)}}},
     "/albireo/v1/models/{id}/verify": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Recomputes the hash of an installed model",
         "parameters": [model_id], "responses": {"200": reply("Result", {"type": "object"})}}},

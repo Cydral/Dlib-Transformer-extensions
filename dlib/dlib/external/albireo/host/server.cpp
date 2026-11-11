@@ -260,6 +260,14 @@ namespace albireo
             return true;
         }
 
+        // Whether the role of the body of an activation, when it has one, is a string; refused otherwise.
+        bool role_field(const json& body, httplib::Response& res)
+        {
+            if (!body.contains("role") || body["role"].is_string()) return true;
+            send_error(res, 400, "invalid_request_error", "role must be a string", "", "role");
+            return false;
+        }
+
         std::string lower(std::string s)
         {
             for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -1477,7 +1485,7 @@ namespace albireo
                                                                                httplib::Response& res) {
             if (!admin(req, res)) return;
             json body;
-            if (!parse_body(req, res, body)) return;
+            if (!parse_body(req, res, body) || !role_field(body, res)) return;
             user_error error;
             const bool ok = s->activate(req.matches[1], body["role"].str("general"), error);
             send_json(res, ok ? 200 : 400, ok_result(ok, error));
@@ -1485,8 +1493,11 @@ namespace albireo
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/deactivate)", [s, admin](const httplib::Request& req,
                                                                                  httplib::Response& res) {
             if (!admin(req, res)) return;
+            // A role in the body takes that function alone from the model.
+            json body;
+            if (!parse_body(req, res, body) || !role_field(body, res)) return;
             user_error error;
-            const bool ok = s->deactivate(req.matches[1], error);
+            const bool ok = s->deactivate(req.matches[1], body["role"].str(""), error);
             send_json(res, ok ? 200 : 400, ok_result(ok, error));
         });
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/verify)", [s, admin](const httplib::Request& req,

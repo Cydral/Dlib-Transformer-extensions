@@ -3,7 +3,8 @@
 
 /*
     Markdown of the answers: GitHub flavoured markdown, code highlighted by highlight.js,
-    formulas typeset by KaTeX between $...$, $$...$$, \(...\) and \[...\].  The HTML a
+    formulas typeset by KaTeX between $...$, $$...$$, \(...\) and \[...\], and text
+    highlighted between == and ==, as the fields of the questions show it (mdfield.js).  The HTML a
     model writes outside of code is shown as text, and the result is sanitized before it
     reaches the page.  An answer loads nothing from another origin, and shows an image of
     another origin as a link to it, which the browser follows only when the user does.
@@ -76,6 +77,24 @@ const math = [
   }
 ];
 
+// Text highlighted between == and ==, without a space inside the marks.
+const highlight = {
+  name: 'highlight',
+  level: 'inline',
+  start(src) {
+    const i = src.indexOf('==');
+    return i < 0 ? undefined : i;
+  },
+  tokenizer(src) {
+    const m = /^==(?=[^\s=])([\s\S]*?[^\s=])==/.exec(src);
+    if (!m) return undefined;
+    return { type: 'highlight', raw: m[0], text: m[1], tokens: this.lexer.inlineTokens(m[1]) };
+  },
+  renderer(token) {
+    return '<mark>' + this.parser.parseInline(token.tokens) + '</mark>';
+  }
+};
+
 // True while renderMarkdown draws an answer that streams: the code without a language waits
 // for the end of the answer to have its language detected, and a code block whose closing
 // fence has not come yet is highlighted once it comes.
@@ -94,7 +113,7 @@ function openFence(raw) {
 
 const marked = new Marked({ gfm: true, breaks: false });
 marked.use({
-  extensions: math,
+  extensions: math.concat([highlight]),
   renderer: {
     code({ text, lang, raw }) {
       const language = String(lang || '').trim().split(/\s+/)[0].toLowerCase();

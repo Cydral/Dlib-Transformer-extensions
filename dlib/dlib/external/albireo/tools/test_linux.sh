@@ -66,7 +66,7 @@ ENGINES=$BUILD/bin/engines
 CHAT=$BUILD/tests/engine_chat
 
 # The kernels of each family of processors, skipped by the processors without their instructions.
-for family in "" _avxvnni _vnni256; do
+for family in "" _avxvnni; do
   test=$BUILD/tests/test_qkernels$family
   name="quantized kernels${family:+ ${family#_}}"
   if [ ! -x "$test" ]; then
@@ -179,6 +179,32 @@ if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
     BODY="{\"model\": \"albireo-general\", \"reasoning\": false, \"max_tokens\": 40,"
     BODY="$BODY \"messages\": [{\"role\": \"user\", \"content\": \"$QUESTION\"}]}"
     step "service chat" "Paris" curl -sk --max-time 300 https://localhost:$PORT/v1/chat/completions \
+      -H "Content-Type: application/json" -d "$BODY"
+    # One function given to the model, then taken back, the model keeping the general function and answering.
+    MODELS_URL=https://localhost:$PORT/albireo/v1/models
+    ID=$(curl -sk --max-time 5 "$MODELS_URL" | grep -o '"selected":{[^}]*}' | grep -o '"general":"[^"]*"' \
+      | cut -d'"' -f4)
+    ADMIN=(-H "X-Albireo-Admin: $TOKEN" -H "Content-Type: application/json")
+    step "service function given" '"ok":true' curl -sk --max-time 60 -X POST "${ADMIN[@]}" -d '{"role": "code"}' \
+      "$MODELS_URL/$ID/activate"
+    step "service function taken" '"ok":true' curl -sk --max-time 60 -X POST "${ADMIN[@]}" -d '{"role": "code"}' \
+      "$MODELS_URL/$ID/deactivate"
+    # The functions chosen for the models, the general one kept by the model and the code one taken from it.
+    kept() {
+      local selected
+      selected=$(curl -sk --max-time 5 "$MODELS_URL" | grep -o '"selected":{[^}]*}')
+      case "$selected" in *"\"general\":\"$ID\""*) ;; *) echo "general lost: $selected"; return 1 ;; esac
+      case "$selected" in *'"code":'*) echo "code kept: $selected"; return 1 ;; esac
+      echo "general kept, code taken: $selected"
+    }
+    step "service functions kept" "general kept" kept
+    step "service function not served" '"code":"role_not_served"' curl -sk --max-time 5 -X POST "${ADMIN[@]}" \
+      -d '{"role": "embedding"}' "$MODELS_URL/$ID/deactivate"
+    step "service unknown function" '"code":"unknown_role"' curl -sk --max-time 5 -X POST "${ADMIN[@]}" \
+      -d '{"role": "drawing"}' "$MODELS_URL/$ID/deactivate"
+    step "service function not text" 'role must be a string' curl -sk --max-time 5 -X POST "${ADMIN[@]}" \
+      -d '{"role": 5}' "$MODELS_URL/$ID/deactivate"
+    step "service chat after" "Paris" curl -sk --max-time 300 https://localhost:$PORT/v1/chat/completions \
       -H "Content-Type: application/json" -d "$BODY"
     # The voices of the speech synthesis, then a sentence read aloud by the program the service starts.
     step "service speech voices" '"id":"fr-FR"' curl -sk --max-time 5 \

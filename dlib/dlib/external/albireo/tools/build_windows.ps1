@@ -71,12 +71,13 @@
     build-albireo-ov and build-albireo-cuda.  A tree configured by a Visual Studio
     installation removed since (Visual Studio Community replaced by the Build Tools, for
     instance), or the CUDA tree configured for another CUDA integration (an installed toolkit,
-    then the archives), is created again.  The bin\engines folder of a device tree is emptied before
+    then the archives), is created again.  The bin\engines folder of each tree is emptied before
     its build, which places the engines and the libraries they load there again, so that the
-    installer carries the libraries of the current runtimes only; the payload of the
-    installer is then packed again.  The installers are build-albireo\bin\albireo-setup.exe,
-    complete with its models, and build-albireo\bin\albireo-setup-online.exe, the one of
-    the updates, which installs the programs and downloads the models.
+    installer carries the engines of this version and the libraries of the current runtimes
+    only; the payload of the installer is then packed again.  The installers are
+    build-albireo\bin\albireo-setup.exe, complete with its models, and
+    build-albireo\bin\albireo-setup-online.exe, the one of the updates, which installs the
+    programs and downloads the models.
 #>
 param(
     [switch]$NoInstall,
@@ -133,9 +134,9 @@ function Reset-StaleTree([string]$tree, $toolset = $null) {
     }
 }
 
-# The engines folder of a device tree only receives files: the libraries of an earlier version
-# of the CUDA runtime, for instance, would stay there and join the installer.  Its build places
-# the engines and the libraries they load there again.
+# The engines folder of a build tree only receives files, so an engine an earlier version built,
+# or the libraries of an earlier version of the CUDA runtime, would stay there and join the
+# installer.  Its build places the engines and the libraries they load there again.
 function Clear-Engines([string]$tree) {
     $engines = Join-Path $tree "bin\engines"
     if (-not (Test-Path -LiteralPath $engines)) { return }
@@ -971,6 +972,7 @@ $builtin = if ($NoBuiltinModels) { "OFF" } else { "ON" }
 $options = @("-DALBIREO_EXTRA_ENGINE_DIRS=$dirs", "-DALBIREO_TESTS=$testing", "-DALBIREO_BUILTIN_MODELS=$builtin")
 if ($ModelCache) { $options += "-DALBIREO_MODEL_CACHE=$($ModelCache.Replace('\', '/'))" }
 Invoke-Step "configuring the programs" (@("-S", $source, "-B", $main) + $generator + $options)
+Clear-Engines $main
 # The payload of the installer depends on the programs of this tree only: deleted, it is packed
 # again with the engines the device trees have just built.
 $payload = Join-Path $main "payload"
