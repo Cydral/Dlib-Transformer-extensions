@@ -966,6 +966,9 @@ namespace
                     const double cov_err = max(abs(matrix_cast<double>(rc.covariance()) - cov));
                     DLIB_TEST_MSG(cov_err <= tolerance*(1 + max(abs(cov))),
                         "covariance error " << cov_err << " dims " << dims << " halflife " << halflife);
+                    // Both triangles hold the same values, whether or not dlib uses BLAS.
+                    const matrix<T> object_cov = rc.covariance();
+                    DLIB_TEST(object_cov == trans(object_cov));
 
                     // The correlation is the covariance scaled by the deviations.
                     const matrix<double> cor = matrix_cast<double>(rc.correlation());

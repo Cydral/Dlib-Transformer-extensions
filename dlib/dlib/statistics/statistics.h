@@ -1235,7 +1235,21 @@ namespace dlib
             total_weight = old_weight + 1;
             const column_matrix delta = val - avg;
             avg += delta/total_weight;
-            comoment = forget*comoment + (old_weight/total_weight)*(delta*trans(delta));
+
+            // Each element above the diagonal is computed once and copied below it, so
+            // the comoment stays exactly symmetric.  A rank one update done by a BLAS
+            // library multiplies the factors of element (r,c) and of element (c,r) in
+            // different orders, which rounds them differently.
+            const scalar_type gain = old_weight/total_weight;
+            for (long r = 0; r < vect_size; ++r)
+            {
+                for (long c = r; c < vect_size; ++c)
+                {
+                    const scalar_type value = forget*comoment(r,c) + gain*(delta(r)*delta(c));
+                    comoment(r,c) = value;
+                    comoment(c,r) = value;
+                }
+            }
         }
 
         const column_matrix mean (
@@ -1285,25 +1299,22 @@ namespace dlib
             for (long i = 0; i < vect_size; ++i)
                 scale(i) = std::sqrt(comoment(i,i));
 
+            // Each element above the diagonal is computed once and copied below it.
             general_matrix result(vect_size, vect_size);
             for (long r = 0; r < vect_size; ++r)
             {
-                for (long c = 0; c < vect_size; ++c)
+                // just say it's zero if there isn't any variance in a component.
+                result(r,r) = (scale(r) == 0) ? 0 : 1;
+                for (long c = r+1; c < vect_size; ++c)
                 {
-                    if (scale(r) == 0 || scale(c) == 0)
+                    scalar_type temp = 0;
+                    if (scale(r) != 0 && scale(c) != 0)
                     {
-                        // just say it's zero if there isn't any variance in a component.
-                        result(r,c) = 0;
+                        temp = comoment(r,c)/(scale(r)*scale(c));
+                        temp = std::max<scalar_type>(-1, std::min<scalar_type>(1, temp));
                     }
-                    else if (r == c)
-                    {
-                        result(r,c) = 1;
-                    }
-                    else
-                    {
-                        const scalar_type temp = comoment(r,c)/(scale(r)*scale(c));
-                        result(r,c) = std::max<scalar_type>(-1, std::min<scalar_type>(1, temp));
-                    }
+                    result(r,c) = temp;
+                    result(c,r) = temp;
                 }
             }
             return result;

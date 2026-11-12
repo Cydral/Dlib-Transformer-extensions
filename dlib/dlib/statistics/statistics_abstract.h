@@ -1006,6 +1006,8 @@ namespace dlib
                   presented to this object so far.  That is, if x(i) is the i-th vector,
                   w(i) its weight, N == current_n() and m == mean(), this function returns
                   sum over i of w(i)*(x(i)-m)*trans(x(i)-m)/(N-1).
+                - The returned matrix M is exactly symmetric: M(i,j) == M(j,i), whether or
+                  not dlib uses a BLAS library.
         !*/
 
         const general_matrix correlation (
@@ -1021,6 +1023,7 @@ namespace dlib
                       [-1, 1].
                     - C(i,i) == 1 for each component i with a nonzero variance.
                     - Row i and column i of C are 0 when the component i has no variance.
+                    - C is exactly symmetric: C(i,j) == C(j,i).
         !*/
     };
 
