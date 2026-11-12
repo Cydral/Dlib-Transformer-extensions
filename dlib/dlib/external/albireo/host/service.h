@@ -139,11 +139,15 @@ namespace albireo
         /*!
             ensures
                 - Returns the model of the work the applications do in the background
-                  (titles, summaries, memory): the language model that comes with Albireo,
-                  which stays loaded whatever the functions, or empty without one, the
-                  requests for "background" then going to the general model.
+                  (titles, summaries, memory, descriptions of the images of the projects):
+                  the language model that comes with Albireo, which stays loaded whatever the
+                  functions, or empty without one, the requests for "background" then going
+                  to the general model.  The complete installer carries it; after the
+                  installer of the updates, the default language model of the catalog, which
+                  the service downloads at its first start (ensure_default_model()), stands
+                  for it.
         !*/
-        const std::string& background_model() const { return background_model_; }
+        std::string background_model() const;
         /*!
             ensures
                 - Returns the model of each function: the one chosen for it, else the general
@@ -189,7 +193,8 @@ namespace albireo
                   and deletes its file.  A model in the engine is deleted once its requests
                   are served and it left the engine: pending is then true, and the model
                   stays listed, in the state "removing", until then.
-                - A model that comes with Albireo is refused (code "builtin_model"): it
+                - A model that comes with Albireo, or the default model of the catalog that
+                  stands for it (background_model()), is refused (code "builtin_model"): it
                   leaves its functions to other models and stays installed.
         !*/
         bool remove_model(const std::string& id, user_error& error, bool& pending);
@@ -271,10 +276,40 @@ namespace albireo
                   functions of that model, as an update that changes the model that comes
                   with Albireo does; another new one takes the functions no model holds.  The
                   functions of a model that left without a successor are freed.
+                - A new language model receives the functions of the language models of the
+                  catalog made of the file it was made from (source_sha256 of its manifest),
+                  so that the same weights do not load twice.
                 - The first language model among them serves the work in the background.
         !*/
         void register_builtin_models();
+        /*!
+            ensures
+                - Gives the document search the embedding model installed, else downloads
+                  the default embedding model of the catalog.
+                - Without a language model that comes with Albireo, downloads the default
+                  language model of the catalog, whatever the options of the installation
+                  and the other models installed, unless the computer is offline: it then
+                  stands for the model that comes with Albireo (background_model()).
+                - A download of these models in progress goes on, one cancelled waits for the
+                  next start of the service, and one that failed starts again.
+                - Gives the general function, when no model holds it, to a language model
+                  installed.
+        !*/
         void ensure_default_model();
+        /*
+            The model that comes with Albireo, which serves the work in the background: the
+            language model the complete installer carries, else the installed language model
+            of the default entry of the catalog, else the default model of an earlier catalog
+            chosen last (recorded in the database); a model being deleted is left out, and the
+            result is empty without one.
+        */
+        std::string choose_background_model();
+        /*
+            Gives the work in the background to choose_background_model(), which loads whatever its functions,
+            under models_m_, so that a deletion either sees the model chosen or leaves it out of the choice, and
+            records the default model of the catalog chosen.
+        */
+        void update_background_model();
         // Logs why a default model of the catalog could not be downloaded, which the Models
         // window shows as the error of its download until a download starts.
         void note_default_failure(const json& entry, const user_error& error, const std::string& what);
@@ -288,6 +323,9 @@ namespace albireo
                   holds, and the general one when it is free.  A model of the engine whose
                   files changed, a projector given to it say, loads again once its requests
                   are served (retire() with reload).
+                - A language model that becomes the model of the work in the background
+                  (update_background_model()) takes only the functions that no other model
+                  serves (effective_models()).
         !*/
         void on_installed(const installed_model& m);
         static bool is_embedding(const installed_model& m);
@@ -307,8 +345,11 @@ namespace albireo
                 - With reload, the model loads again from its record once it left the engine,
                   when a function or the work in the background still uses it; the model of
                   the work in the background is then unloaded too.
+                - With background, the model of the work in the background leaves the engine
+                  without loading again, for its files to be replaced (replace_model_files(),
+                  which loads it again); otherwise it stays loaded.
         !*/
-        void retire(const std::string& id, bool reload = false);
+        void retire(const std::string& id, bool reload = false, bool background = false);
         // Loads the model id again after its reload, when a function or the work in the background uses it.
         void reload_model(const std::string& id);
         // Waits for the model id to finish unloading, when it is.
@@ -321,7 +362,8 @@ namespace albireo
                   again from its new files once they are recorded (on_installed()), or from its
                   files as they were when place fails.
                 - Returns what place returns; false without running it when the model is being
-                  deleted, serves the work in the background, or when the service stops.
+                  deleted, comes with Albireo (its installer replaces its files), or when the
+                  service stops.
         !*/
         bool replace_model_files(const std::string& id, const std::function<bool()>& place);
         json engine_config(const host_settings& s, const std::string& device) const;
@@ -341,15 +383,19 @@ namespace albireo
         std::vector<engine_candidate> candidates_;
         engine_choice choice_;
         std::string engine_error_;
-        // Set by register_builtin_models() before the server starts, then read only.
+        // The model of the work in the background (background_model()), set by update_background_model().
+        mutable std::mutex background_m_;
         std::string background_model_;
         std::atomic<bool> engines_ready_{false};
         std::atomic<bool> models_ready_{false};
         // Set by run() when a damaged database was set aside and a new one started.
         bool database_restarted_ = false;
 
-        // Guards the server, the model manager and the updater while run() creates and
-        // releases them, for stop(), which a thread of the system may call at any time.
+        /*
+            Guards the server, the model manager and the updater while run() creates and
+            releases them, for stop(), which a thread of the system may call at any time, and
+            for the download workers that end after the stop (choose_background_model()).
+        */
         std::mutex server_m_;
         std::unique_ptr<httplib::SSLServer> server_;
 

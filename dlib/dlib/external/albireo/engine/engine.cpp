@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <deque>
 #include <exception>
 #include <list>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <unordered_map>
@@ -1385,19 +1387,42 @@ namespace albireo
             read-only from their file, take no commit charge, so that the memory their pages hold
             counts in the commit left on Windows (the commit limit less the charge) as in the memory
             Linux can give back (MemAvailable).  The weights whose products the device computes from
-            its copies are left out, since the processor no longer reads their pages; the guard
-            counted them too, and asked the commit left for the 8.2 GB a card of 12 GB held of the
-            15.2 GB of Mistral Small 3.2 24B when a prompt of 5,530 tokens was refused.  The copies
-            come and go with the passes, so that the guard reads them at each block; the budget above
-            still leaves room to all the weights, the copies being made after it.
+            its copies are left out, since the processor no longer reads their pages.  Windows also
+            charges the copies of a card to the commit, as the backing of allocations it may move to
+            the memory of the host, though they take none of it while the card holds them; the first
+            large copy measures it (matmul_offload::charged_bytes()), and the copies then count as
+            room as long as the commit left keeps the margin.  A prompt of 6,000 tokens of Mistral
+            Small 3.2 24B was refused at 4,096 positions on a card of 12 GB that held 8.7 GB of copies
+            of its 14.3 GB.  The copies come and go with the passes, so that the guard reads them at
+            each block; the budget above still leaves room to all the weights, the copies being made
+            after it.  The first refusal after a block given writes the figures of the guard in the log.
         */
         const size_t floor_bytes = bytes_for(std::min<long>(m->context, 4096));
-        runtime->set_kv_guard([margin, weights, floor_bytes, processor](size_t bytes, size_t allocated) {
+        const std::shared_ptr<std::atomic<bool>> refusing = std::make_shared<std::atomic<bool>>(false);
+        runtime->set_kv_guard([this, id, margin, weights, floor_bytes, processor, refusing](size_t bytes,
+            size_t allocated) {
             if (allocated + bytes <= floor_bytes) return true;
             const memory_info now = read_memory_info();
             if (now.commit_available == 0) return true;
             const uint64_t read = weights - std::min<uint64_t>(weights, processor->offloaded_bytes());
-            return now.commit_available >= bytes + margin + read;
+            const uint64_t charged = processor->charged_bytes();
+            uint64_t left = now.commit_available;
+            if (charged > 0 && now.commit_left >= bytes + margin)
+                left = std::max<uint64_t>(left, now.commit_left + charged);
+            if (left >= bytes + margin + read)
+            {
+                refusing->store(false, std::memory_order_relaxed);
+                return true;
+            }
+            if (!refusing->exchange(true, std::memory_order_relaxed))
+                log(ALBIREO_LOG_WARNING, "model '" + id + "': no new block of keys and values, the system can still "
+                    "commit " + std::to_string(now.commit_left >> 20) + " MB, with "
+                    + std::to_string(now.available >> 20) + " MB of physical memory available, and the engine leaves "
+                    + std::to_string(margin >> 20) + " MB to the system and the other programs and "
+                    + std::to_string(read >> 20) + " MB to the weights the processor reads"
+                    + (charged > 0 ? ", the copies of the card counting for " + std::to_string(charged >> 20) + " MB"
+                    : std::string()));
+            return false;
         });
 #ifdef ALBIREO_TENSOR_BACKEND
         runtime->set_offload(device_->make_offload(id));

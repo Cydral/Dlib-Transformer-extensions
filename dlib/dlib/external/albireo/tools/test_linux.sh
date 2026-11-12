@@ -149,8 +149,7 @@ SERVICE=$BUILD/bin/albireo-service
 if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
   HOME_DIR=$WORK/home
   mkdir -p "$HOME_DIR"
-  echo "{\"port\": $PORT, \"offline\": true, \"check_updates\": false, \"default_model\": false}" \
-    > "$HOME_DIR/settings.json"
+  echo "{\"port\": $PORT, \"offline\": true, \"check_updates\": false}" > "$HOME_DIR/settings.json"
   ALBIREO_HOME=$HOME_DIR "$SERVICE" --console > "$WORK/service.log" 2>&1 &
   PID=$!
   START=$(now)

@@ -50,6 +50,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../common/engine_api.h"
@@ -168,6 +169,24 @@ namespace
     {
         static const char* names[] = { "debug", "info", "warning", "error" };
         std::printf("  [%s] %s\n", names[std::max(0, std::min(3, level))], message.c_str());
+    }
+
+    /*
+        Gives the device a card of that many megabytes less its copies (ALBIREO_TEST_CARD_FREE_MB),
+        or its own memory again without megabytes; then waits for the next reading of the memory of
+        the card, which a model makes every quarter of a second at most.
+    */
+    void simulate_card(const char* megabytes)
+    {
+#if defined(_WIN32)
+        _putenv_s("ALBIREO_TEST_CARD_FREE_MB", megabytes ? megabytes : "");
+#else
+        if (megabytes)
+            setenv("ALBIREO_TEST_CARD_FREE_MB", megabytes, 1);
+        else
+            unsetenv("ALBIREO_TEST_CARD_FREE_MB");
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
 
     // A deterministic token of the tiny vocabulary.
@@ -320,6 +339,61 @@ namespace
             expect(st["attention_passes"].as_int() == 0, "the processor attended the passes");
             expect(st["failures"].as_int() == 0, "no device failure without room");
             expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale) && d.top1 >= 0.99, "layers of the device without room");
+
+            /*
+                A card that lacks memory: with 8 GB, the layers and the attention run on the device;
+                with nothing left, the copies leave the card at the next reading of its memory and the
+                processor computes the script; with 8 GB again, the copies come back.  The logits stay
+                those of the processor.
+            */
+            const long blocks = 16;
+            qk_set_exact_products(true);
+            std::vector<float> exact;
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, blocks, kv_format::f16);
+                exact = script(rt);
+            }
+            tensor_device card(device_config(device, 0, "device"), pool, print_log);
+            json roomy, short_of, again;
+            std::vector<float> phases[3];
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, blocks, kv_format::f16);
+                rt.set_offload(card.make_offload());
+                simulate_card("8192");
+                phases[0] = script(rt);
+                roomy = card.stats();
+                simulate_card("0");
+                phases[1] = script(rt);
+                short_of = card.stats();
+                simulate_card("8192");
+                phases[2] = script(rt);
+                again = card.stats();
+            }
+            simulate_card(nullptr);
+            qk_set_exact_products(false);
+            const char* names[3] = { "card with room", "card without memory", "card with room again" };
+            for (int p = 0; p < 3; ++p)
+            {
+                expect(phases[p].size() == exact.size(), "the same rows on a card short of memory");
+                if (phases[p].size() != exact.size()) continue;
+                const stats e = compare(exact.data(), phases[p].data(), static_cast<long>(exact.size()) / V, V);
+                report(names[p], e);
+                expect(e.max_abs <= 1e-3 * std::max(1.0, e.scale) && e.top1 >= 0.99, names[p]);
+            }
+            std::printf("  layer passes %lld, %lld, %lld; copies %lld, %lld, %lld bytes; given back %lld times\n",
+                roomy["layer_passes"].as_int(), short_of["layer_passes"].as_int(), again["layer_passes"].as_int(),
+                roomy["weights_bytes"].as_int(), short_of["weights_bytes"].as_int(), again["weights_bytes"].as_int(),
+                short_of["card_releases"].as_int());
+            expect(roomy["layer_passes"].as_int() > 0 && roomy["weights_bytes"].as_int() > 0,
+                "the layers ran on the card with room");
+            expect(short_of["card_releases"].as_int() >= 1, "the copies left the card without memory");
+            expect(short_of["weights_bytes"].as_int() == 0, "no copy on the card without memory");
+            expect(short_of["layer_passes"].as_int() == roomy["layer_passes"].as_int(),
+                "the processor computed the layers on the card without memory");
+            expect(again["weights_bytes"].as_int() > 0
+                && again["layer_passes"].as_int() > short_of["layer_passes"].as_int(),
+                "the layers ran on the card with room again");
+            expect(again["failures"].as_int() == 0, "no device failure on a card short of memory");
         }
         std::remove(path.c_str());
         if (failures)

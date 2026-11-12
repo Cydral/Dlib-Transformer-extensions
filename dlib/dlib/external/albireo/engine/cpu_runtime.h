@@ -107,6 +107,10 @@ namespace albireo
         // (matmul_offload::mapped_bytes()), 0 without a device.
         size_t offloaded_bytes() const { return offload_ ? offload_->mapped_bytes() : 0; }
 
+        // The bytes of the copies of the device the system charges to the commit of the engine
+        // (matmul_offload::charged_bytes()), 0 without a device.
+        size_t charged_bytes() const { return offload_ ? offload_->charged_bytes() : 0; }
+
         /*!
             requires
                 - no forward pass has run, or the rotary divisors stay the same.

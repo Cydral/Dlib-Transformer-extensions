@@ -547,8 +547,9 @@ paths = {
             "selected": {"type": "object", "additionalProperties": {"type": "string"},
                          "description": "The models chosen for the functions, which Deactivate gives back."},
             "background": {"type": "string",
-                           "description": "The model that comes with Albireo and serves albireo-background, which "
-                                          "stays loaded; empty without one."},
+                           "description": "The model that comes with Albireo, or after the installer of the updates "
+                                          "the default model of the catalog that stands for it once downloaded, "
+                                          "which serves albireo-background and stays loaded; empty without one."},
             "loaded_models": {"type": "array", "items": {"type": "object"},
                               "description": "The models of the engine, with their context and capabilities: "
                                              "context, trained_context, kv_bytes_per_token, kv_type (q8 or f16), "
@@ -580,7 +581,8 @@ paths = {
                 "inputs": {"type": "array", "items": {"type": "string", "enum": ["text", "image", "audio"]},
                            "description": "What the model reads; the attachments of the web application follow."},
                 "installed": {"type": "boolean"},
-                "builtin": {"type": "boolean", "description": "Comes with Albireo: it cannot be deleted."},
+                "builtin": {"type": "boolean", "description": "Comes with Albireo, or is the default model of the "
+                            "catalog that stands for it: it cannot be deleted."},
                 "size": {"type": "integer"}, "quantization": {"type": "string"},
                 "total_size": {"type": "integer", "description": "The bytes of the files of the model, its "
                                "projector included."},
@@ -754,7 +756,8 @@ paths = {
         "tags": ["Administration"], "security": admin, "summary": "Deletes an installed model",
         "description": "A model of the engine is deleted once its requests are served and it left the engine: "
                        "pending is then true, and the model is listed under leaving until then. A model that "
-                       "comes with Albireo is refused with the code builtin_model.",
+                       "comes with Albireo, or the default model of the catalog that stands for it, is refused with "
+                       "the code builtin_model.",
         "parameters": [model_id],
         "responses": {"200": reply("Deleted, or to be deleted", {"type": "object", "properties": {
             "ok": {"type": "boolean"}, "pending": {"type": "boolean"}}}), "400": reply("Refused", ok)}}},

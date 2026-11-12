@@ -31,7 +31,6 @@ namespace setup
         bool autostart = true;        // the tray at the sign in of every user
         bool desktop_shortcut = false;
         bool trust_certificate = true;
-        bool default_model = true;
         bool offline = false;         // no Internet access: nothing is fetched, files are imported
         int port = 8443;
     };

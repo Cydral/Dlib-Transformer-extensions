@@ -1391,7 +1391,11 @@ namespace albireo
             for (const auto& id : s->engine().loaded_models()) loaded.push_back(id);
             o["loaded"] = loaded;
             o["leaving"] = s->leaving_models();
-            o["background"] = s->background_model();
+            const std::string background = s->background_model();
+            o["background"] = background;
+            // The default model of the catalog standing for the model that comes with Albireo shows as that model.
+            for (auto& m : o["models"].elements())
+                if (!background.empty() && m["id"].as_string() == background) m["builtin"] = true;
             send_json(res, 200, o);
         });
         srv.Get("/albireo/v1/usage", [s](const httplib::Request&, httplib::Response& res) {

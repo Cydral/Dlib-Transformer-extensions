@@ -266,19 +266,26 @@ setting `context` chooses another one. The pages are allocated as the sequences 
 budget of two full contexts in that memory, and beyond the pages of the first 4,096 positions a
 guard refuses a new page once the memory the system can still commit comes down to the reserve left
 to the system and to the weights the processor reads, those whose products a card does not compute
-from its copies, the request then waiting or ending as when the budget runs out. The memory of the
-keys and values follows the text actually held: the 262,144 positions of Qwen3-VL 4B take 20.5 GB in
-8 bits (38.6 GB in half precision), which only a conversation of that length reaches, the paging
-file or the swap holding what the physical memory does not. The keys and values stay in the memory
-of the computer with every engine; the engines of CUDA also keep copies of the pages that the steps
-of the generation read on the card, which attends these steps itself (see below), and V²RAM extends
-the memory of the card for the weights. The web application gives a discussion that context whatever
-the speed of the computer, and sizes its own choices within it (see the prompt of a question below).
-The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from the next token of
-every request being generated and a slice of the prompts being read, and draws the next tokens of
-the pass in parallel. When the pages run out, a prompt being read gives its pages back to the
-answers being written and is read again once there is room; the context of a model never exceeds the
-positions its pages can hold, so a prompt the engine accepts can always be read to its end.
+from its copies, the request then waiting or ending as when the budget runs out. Windows charges the
+copies of a card to the commit of the engine too, as the backing of allocations it may move to the
+memory of the host, though they take none of it while the card holds them: the engine measures it on
+its first copy of 64 MB or more (`commit_charged_bytes` in the statistics of the device), and the
+guard then counts these copies as room as long as the commit left keeps the reserve of the system
+and the card keeps half of its own reserve free (see the copies below). The first refusal of the
+guard writes its figures in the log: the commit left, the physical memory available, the reserve and
+the weights the processor reads. The memory of the keys and values follows the text actually held:
+the 262,144 positions of Qwen3-VL 4B take 20.5 GB in 8 bits (38.6 GB in half precision), which only
+a conversation of that length reaches, the paging file or the swap holding what the physical memory
+does not. The keys and values stay in the memory of the computer with every engine; the engines of
+CUDA also keep copies of the pages that the steps of the generation read on the card, which attends
+these steps itself (see below), and V²RAM extends the memory of the card for the weights. The web
+application gives a discussion that context whatever the speed of the computer, and sizes its own
+choices within it (see the prompt of a question below). The scheduler
+([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from the next token of every request
+being generated and a slice of the prompts being read, and draws the next tokens of the pass in
+parallel. When the pages run out, a prompt being read gives its pages back to the answers being
+written and is read again once there is room; the context of a model never exceeds the positions its
+pages can hold, so a prompt the engine accepts can always be read to its end.
 
 The processor engines take no BLAS: their products start from the quantized weights of the mapped
 file, and the packed kernel of the prompt passes reaches 66 to 77 % of the peak of the AVX2 units
@@ -382,6 +389,21 @@ and the budget is full, a matrix without room is computed by the processor, or c
 a product of 128 tokens or more (CUDA), so that the requests of all the models go on together. The statistics of the device
 count the copies that left (`evictions`, `evicted_bytes`), the passes the card attended
 (`attention_passes`) and the bytes of its copies of keys and values (`kv_bytes`).
+
+The budget is set when the engine starts, and the memory of the card changes after it: the other
+programs, the libraries and the buffers of the passes take some of it, and the driver of Windows
+then moves allocations of the card to the memory of the host, where the card reads them over the bus
+more slowly than the processor computes their products. With CUDA, a copy is therefore made only
+while the driver reports 1 GiB free beside it, and the engine reads the free memory of the card
+every quarter of a second while a model computes: below half of that reserve, the copies that make
+up the memory the card lacks leave it, those of the models without requests first, then those of the
+model computing, the last made first, the next reading giving back more if the driver still reports
+the card short; the matrices refused come back once the card has the reserve free beside the
+smallest of them. Mistral Small 3.2 24B on a GeForce RTX 5070 Ti Laptop GPU of 12 GB held 8.7 GB of
+copies while the driver reported no memory free on the card: a product of one token took 39 ms on
+the card for a matrix of 32,768 by 5,120 in Q4_K, where the larger matrix of 151,936 by 2,560 of
+Qwen3-VL 4B took 1.2 ms, and the routing kept most products on the processor. The statistics of the
+device count these releases (`card_releases`, `card_released_bytes`).
 
 A model replaced or deactivated in the Models window leaves the engine once its requests are served
 (`engine_host::unload_model`): from that moment the service routes no new request to it, the
@@ -770,13 +792,15 @@ of the discussion, whichever it is, with the priority of the work in the backgro
 `background` of `/v1/chat/completions`); a question, a deletion or a new compression of the
 discussion stops it, and its failure is silent.
 
-The work the application does in the background, the titles, the summaries and the memory, goes
-to the background model: the model that comes with Albireo (`albireo-background`), which the
-service keeps loaded whatever the functions, without reasoning, the reasoning of a model that
-always reasons ended at once; without it, the general model serves it. It samples as its authors
-advise, without the presence penalty some of them give, so that the titles, the summaries and the
-quotes of the memory take up the words of the discussion, and a summary that repeats its lines keeps
-each of them once.
+The work the application does in the background, the titles, the summaries, the memory and the
+descriptions of the images of the projects, goes to the background model: the model that comes with
+Albireo (`albireo-background`), or after the installer of the updates the default model of the
+catalog that stands for it (see [Models](#models)), which the service keeps loaded whatever the
+functions, without reasoning, the reasoning of a model that always reasons ended at once; without
+it, until its download ends, the general model serves it. It samples as its authors advise, without
+the presence penalty some of them give, so that the titles, the summaries and the quotes of the
+memory take up the words of the discussion, and a summary that repeats its lines keeps each of them
+once.
 
 The memory of the discussions holds short sentences on the user, one after the other in one
 paragraph, the lasting facts the user states about themselves that help in other discussions:
@@ -1071,7 +1095,7 @@ cmake --build build-albireo-win -j
 | `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
-| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor |
+| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it and come back |
 | `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of one and of eight tokens on the matrices of a 2B model, and of the attention of a generated token over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
@@ -1111,20 +1135,21 @@ to stop, then kills it. Their exit code is the number of failed steps.
 
 ## Installation
 
-A build gives two installers. `albireo-setup.exe` is complete: it carries the models that come
-with Albireo and installs a computer that answers at once, without network. `albireo-setup-online.exe`
-is the same program without them: the updates take it, and on a new computer the service
-downloads the default models of the catalog. Windows runs no program of 4 GiB or more: when the
-program and its models would reach that size, as the complete installer does with the libraries of
-CUDA and of OpenVINO, its models lie beside it in `albireo-setup.models`, which the installer reads
-when it carries none; the two files travel together and are renamed together
-(`albireo-setup-complete-<version>.exe` and `albireo-setup-complete-<version>.models`).
+A build gives two installers. `albireo-setup.exe` is complete: it carries the models that come with
+Albireo and installs a computer that answers at once, without network. `albireo-setup-online.exe` is
+the same program without them: the updates take it, and on a new computer the service downloads the
+default models of the catalog, the language one standing for the model that comes with Albireo.
+Windows runs no program of 4 GiB or more: when the program and its models would reach that size, as
+the complete installer does with the libraries of CUDA and of OpenVINO, its models lie beside it in
+`albireo-setup.models`, which the installer reads when it carries none; the two files travel
+together and are renamed together (`albireo-setup-complete-<version>.exe` and
+`albireo-setup-complete-<version>.models`).
 
-The wizard asks for the language, the license, the folders of the programs, of the data and of
-the models, the options (start with Windows, desktop shortcut, trust of the local certificate,
-download of the default model, which the complete installer does not need, port), then installs,
-registers the service and starts the tray. The command line covers the other cases; the options
-it does not give keep the values of the installation in place:
+The wizard asks for the language, the license, the folders of the programs, of the data and of the
+models, the options (start with Windows, desktop shortcut, trust of the local certificate, the
+computer without Internet access, port), then installs, registers the service and starts the tray.
+The command line covers the other cases; the options it does not give keep the values of the
+installation in place:
 
 ```
 albireo-setup /silent [/dir <folder>] [/data-dir <folder>] [/models <folder>] [/port <port>] [/offline]
@@ -1252,7 +1277,6 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `draft_tokens`  | 4       | tokens of the drafts an answer verifies per step, 0 to 6, 0 for none      |
 | `integer_prompt` | true   | products of the prompts on 8-bit integers (Q4_0, Q4_K, Q5_K, Q6_K, and Q8_0 with VNNI), `false` on floats |
 | `check_updates` | true    | checks the feed at each start and every six hours                          |
-| `default_model` | true    | downloads the default language model of the catalog at the first start    |
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port`; the settings give the password as `********`, kept in `proxy.secret` |
 | `web_access`    | true    | the web access of the Web button, `false` turns it off (see [Web access](#web-access)) |
@@ -1650,26 +1674,37 @@ translates and writes the 24 official languages of the European Union best of th
 88.9), and EuroVLM 9B Preview, built on it, reads images in these languages; its publishers give it
 as a preview version.
 
-Without the models that come with the complete installer, the service downloads the default
-language model at its first start, unless the installation said otherwise, and the default
-embedding model in every case, since the search in documents relies on it. A language model that
-arrives takes the functions its entry names that no model holds; an embedding model serves the
-`embedding` function alone. A function without a model chosen for it is served by the general
-model, else by the model that comes with Albireo. In the Models window, Deactivate gives every
-function of the selected model to the model that comes with Albireo, as its deletion does, so that
-these functions stay with it after a restart of the service, and "Activate for…" checks
-the functions it serves: a function not checked is taken from the model that serves it, and a
-function checked goes back to the model that comes with Albireo, which keeps it after a restart;
-the functions of that model stay checked and greyed, with the work in the background it keeps, as
-does the document search of an embedding model (`role` of `/albireo/v1/models/<id>/deactivate`
-for one function). The functions a model serves through its general function stay with it when
-its general function alone goes back, and a function it no longer serves, after a change made
-elsewhere, is refused with the code `role_not_served`, the list then showing its functions as they
-are. The status gives the model each function uses (`active`) apart from the ones chosen
-(`selected`). The engine computes an embedding model as
-it computes a language model, then takes the hidden state of the last token of each text,
-normalized, as its vector (`pooling_type` 3 of the GGUF file); its keys and values are given back
-as soon as each text is read.
+Without the models that come with the complete installer, the service downloads at its first start
+the default language model and the default embedding model of the catalog, whatever the options of
+the installation and the other models installed, unless the computer is offline, whose offline
+bundle carries them. A download of these models in progress goes on, one cancelled in the Models
+window starts again at the next start of the service, and one that failed at the next refresh of the
+catalog, every six hours. The default language model then stands for the model that comes with
+Albireo: it serves the work in the background whatever the models of the functions, the descriptions
+of the images of the projects included, even beside a general model that reads no image; it takes,
+when it arrives, only the functions that no other model serves, a general model chosen serving those
+without a model of their own, then the functions a deactivation or a deletion frees, cannot be
+deleted (code `builtin_model`), and shows as coming with Albireo in the Models window, where a newer
+version of its catalog entry shows as an update. A catalog that names another default model leaves
+the work in the background to the one the service chose and recorded until the other is installed.
+The model of the complete installer, installed over it, takes the work back and the functions of the
+model of the catalog made of the same file, whose files stay until the Models window deletes them. A
+language model that arrives takes the functions its entry names that no model holds; an embedding
+model serves the `embedding` function alone. A function without a model chosen for it is served by
+the general model, else by the model that comes with Albireo. In the Models window, Deactivate gives
+every function of the selected model to the model that comes with Albireo, as its deletion does, so
+that these functions stay with it after a restart of the service, and "Activate for…" checks the
+functions it serves: a function not checked is taken from the model that serves it, and a function
+checked goes back to the model that comes with Albireo, which keeps it after a restart; the
+functions of that model stay checked and greyed, with the work in the background it keeps, as does
+the document search of an embedding model (`role` of `/albireo/v1/models/<id>/deactivate` for one
+function). The functions a model serves through its general function stay with it when its general
+function alone goes back, and a function it no longer serves, after a change made elsewhere, is
+refused with the code `role_not_served`, the list then showing its functions as they are. The status
+gives the model each function uses (`active`) apart from the ones chosen (`selected`). The engine
+computes an embedding model as it computes a language model, then takes the hidden state of the last
+token of each text, normalized, as its vector (`pooling_type` 3 of the GGUF file); its keys and
+values are given back as soon as each text is read.
 
 A model can also be imported from any GGUF file: the Models window sends it to the service
 (`/albireo/v1/models/upload`), read with the rights of the user who chose it, or the service

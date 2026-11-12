@@ -310,6 +310,15 @@ namespace albireo
         */
         virtual size_t mapped_bytes() const { return 0; }
 
+        /*
+            The bytes of the copies of the device that the system charges to the commit of the
+            process, though they take no memory of the host while the device holds them: Windows
+            charges every allocation of a card, in case it moves the allocation to the memory of the
+            host.  0 for a device whose copies the system does not charge, or charges as memory of the
+            host.
+        */
+        virtual size_t charged_bytes() const { return 0; }
+
         /*!
             ensures
                 - Returns an object that computes the layers of model on the device, or null

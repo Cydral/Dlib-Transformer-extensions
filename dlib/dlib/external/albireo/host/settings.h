@@ -53,7 +53,6 @@ namespace albireo
         bool integer_prompt = true;             // products of the prompts on 8-bit integers
         std::map<std::string, std::string> active;   // role -> model identifier
         bool check_updates = true;
-        bool default_model = true;              // download the default model of the catalog at the first start
         // A machine without Internet access: no request leaves the machine, the catalog,
         // the updates and the models come from files (import folder, removable media).
         bool offline = false;

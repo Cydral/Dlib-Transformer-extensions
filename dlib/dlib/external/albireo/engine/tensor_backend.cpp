@@ -258,8 +258,10 @@ namespace albireo
         */
         const long staged_min_tokens = 128;
 
+#if defined(DLIB_USE_CUDA)
         // The bytes of a matrix in single precision that cross the bus at a time when its copy is made.
         const size_t upload_block_bytes = size_t(64) << 20;
+#endif
 
         /*
             The tokens of a product from which the device expands a matrix kept in its GGUF format,
@@ -283,6 +285,20 @@ namespace albireo
 
         // The memory of the card the copies leave to the products, the staged matrices and cuBLAS.
         const size_t card_reserve_bytes = size_t(1) << 30;
+
+        /*
+            The nanoseconds, at least, between two readings of the memory of the card that the driver
+            reports free while a model computes (tensor_offload::check_card()).
+        */
+        const long long card_check_ns = 250000000;
+
+#if defined(DLIB_USE_CUDA) && defined(_WIN32)
+        /*
+            The bytes of the first copy of an engine from which it measures whether the system charges
+            the memory of the card to its commit (tensor_offload::charged_bytes()).
+        */
+        const size_t commit_probe_bytes = size_t(64) << 20;
+#endif
 
         // Samples of each place before the first choice of a shape.
         const int samples_per_place = 2;
@@ -419,6 +435,22 @@ namespace albireo
         int cuda_device = -1;
         // The bytes of copies the memory of the card holds; beyond, the extended memory moves them over the bus.
         size_t card_bytes = std::numeric_limits<size_t>::max();
+        /*
+            Whether the system charges the memory of the card to the commit of the engine, as the
+            first copy of commit_probe_bytes at least showed: 1 when it does, 0 when it does not, -1
+            before that copy.
+        */
+        std::atomic<int> commit_charged{-1};
+        // The copies given back while the card lacked memory, and their bytes (relieve_card()).
+        std::atomic<unsigned long long> card_releases{0};
+        std::atomic<unsigned long long> card_released_bytes{0};
+        /*
+            The smallest copy the card refused for lack of memory since it last had room for it, the
+            largest size when none (tensor_offload::check_card()), and whether the last reading of the
+            card found less than half of card_reserve_bytes free.
+        */
+        std::atomic<size_t> card_refused{std::numeric_limits<size_t>::max()};
+        std::atomic<bool> card_low{false};
 
         mutable std::mutex m;
         std::map<std::string, json> routes;   // the choices made, for the statistics
@@ -450,9 +482,64 @@ namespace albireo
             return true;
         }
 
-        // Takes bytes of the budget of the copies; false when they do not fit.
+        /*
+            The memory the driver of the card reports free, the largest size without a card.  The
+            variable ALBIREO_TEST_CARD_FREE_MB of the tests gives a card of that many megabytes less
+            the copies, with the host code of dlib as with CUDA.
+        */
+        size_t card_free() const
+        {
+            const char* simulated = std::getenv("ALBIREO_TEST_CARD_FREE_MB");
+            if (simulated && *simulated)
+            {
+                const size_t card = static_cast<size_t>(std::max(0LL, std::atoll(simulated))) << 20;
+                const size_t used = resident.load(std::memory_order_relaxed);
+                return card > used ? card - used : 0;
+            }
+#if defined(DLIB_USE_CUDA)
+            size_t free_bytes = 0, total_bytes = 0;
+            if (cuda_device >= 0 && cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) return free_bytes;
+#endif
+            return std::numeric_limits<size_t>::max();
+        }
+
+        // The bytes the card lacks to keep card_reserve_bytes free beside bytes more; 0 when it has them.
+        size_t card_shortfall(size_t bytes) const
+        {
+            const size_t free_bytes = card_free();
+            if (free_bytes == std::numeric_limits<size_t>::max()) return 0;
+            const size_t wanted = bytes + card_reserve_bytes;
+            return free_bytes < wanted ? wanted - free_bytes : 0;
+        }
+
+        /*
+            The copies on the card when the system charges them to the commit of the engine
+            (commit_charged), as Windows does; their excess over the memory of the card, which the
+            extended memory keeps in its file, counts none, and none count while the card lacks
+            memory (card_low), the driver of Windows then keeping part of them in the memory of the
+            host.
+        */
+        size_t charged_bytes() const
+        {
+            if (commit_charged.load(std::memory_order_relaxed) != 1 || card_low.load(std::memory_order_relaxed))
+                return 0;
+            return std::min(resident.load(std::memory_order_relaxed), card_bytes);
+        }
+
+        /*
+            Takes bytes of the budget of the copies; false when they do not fit, or when the card
+            would keep less than card_reserve_bytes free beside them: the memory the driver reports
+            free follows the other programs and the libraries, which the budget, set at the start,
+            does not.
+        */
         bool reserve(size_t bytes)
         {
+            if (card_shortfall(bytes) > 0)
+            {
+                size_t smallest = card_refused.load();
+                while (bytes < smallest && !card_refused.compare_exchange_weak(smallest, bytes)) {}
+                return false;
+            }
             size_t current = resident.load();
             do
             {
@@ -474,6 +561,17 @@ namespace albireo
             A model keeps the copies it does not have to give.
         */
         bool make_room(size_t bytes, const tensor_offload* requester);
+
+        /*
+            Gives back the copies that make up the memory the card lacks to keep card_reserve_bytes
+            free: those of the models without requests first, the least recently used model first,
+            then those of requester, the last made first, then its copies of keys and values.  The
+            lack is read once: the pool of the extended memory keeps part of the buffers it receives,
+            and the driver may report the memory freed late, so that the next reading of the card
+            gives back more if it still lacks memory.  Returns the bytes given back.  Runs between two
+            passes of requester, on the thread of the forward passes.
+        */
+        size_t relieve_card(tensor_offload& requester);
 
         void note_route(const std::string& key, const json& value)
         {
@@ -546,6 +644,53 @@ namespace albireo
             return freed;
         }
 
+        /*
+            Frees the copy of a matrix of this model made last, or its copies of keys and values once
+            no copy of a matrix is left, and returns the bytes freed, 0 when nothing is left; under the
+            lock of the registry (relieve_card()).  The bytes of a matrix leave the budget without
+            moving its generation: the card lacking memory, they give no room to the matrices refused.
+        */
+        size_t drop_last_copy()
+        {
+            auto last = weights_.end();
+            for (auto it = weights_.begin(); it != weights_.end(); ++it)
+                if (last == weights_.end() || it->second.order > last->second.order) last = it;
+            if (last == weights_.end()) return release_pass_pages();
+            const size_t bytes = last->second.bytes;
+            weights_.erase(last);
+            d_.resident -= bytes;
+            return bytes;
+        }
+
+        /*
+            Reads the memory the driver of the card reports free, at most every card_check_ns, and
+            gives copies back when the card keeps less than half of card_reserve_bytes beside them
+            (relieve_card()).  Other programs, the libraries or the buffers of the passes took the
+            memory of the card after the copies were made; the driver of Windows then moves
+            allocations of the card to the memory of the host, where the card reads them over the bus
+            more slowly than the processor computes their products.  Once the card has the reserve
+            free beside the smallest copy it refused, the matrices refused may come back (the
+            generation of the device moves).  Runs between two passes of this model, on the thread of
+            its forward passes.
+        */
+        void check_card()
+        {
+            const long long now = now_ns();
+            if (now - card_checked_ < card_check_ns) return;
+            card_checked_ = now;
+            const bool low = d_.card_shortfall(0) > card_reserve_bytes / 2;
+            d_.card_low = low;
+            if (low)
+            {
+                if (d_.resident.load(std::memory_order_relaxed) > 0) d_.relieve_card(*this);
+                return;
+            }
+            size_t refused = d_.card_refused.load();
+            if (refused != std::numeric_limits<size_t>::max() && d_.card_shortfall(refused) == 0
+                && d_.card_refused.compare_exchange_strong(refused, std::numeric_limits<size_t>::max()))
+                ++d_.generation;
+        }
+
         void matmul(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
             const std::function<void()>& host) override
         {
@@ -555,6 +700,7 @@ namespace albireo
                 host_product(host);
                 return;
             }
+            check_card();
             /*
                 Once the copies exceed the memory of the card, the extended memory brings part of
                 them over the bus for each pass.  A product of a few tokens, as a generated token
@@ -609,6 +755,17 @@ namespace albireo
 #endif
         }
 
+        /*
+            Called by the guard of the keys and values, on the thread of the forward passes: a card
+            found short at its last reading is read again, the engine having perhaps been idle since.
+        */
+        size_t charged_bytes() const override
+        {
+            if (d_.card_low.load(std::memory_order_relaxed) && d_.bind_thread())
+                d_.card_low = d_.card_shortfall(0) > card_reserve_bytes / 2;
+            return d_.charged_bytes();
+        }
+
         std::unique_ptr<layer_pass> make_layer_pass(const dense_model& model) override;
 
     private:
@@ -629,6 +786,8 @@ namespace albireo
             // The blocks of the GGUF format of the matrix, which the kernels of dlib read in
             // place, or false for a copy in single precision.
             bool quantized = false;
+            // The rank of the copy among those of the model: the last made leaves first when the card lacks memory.
+            unsigned long long order = 0;
         };
 
         struct route
@@ -833,6 +992,26 @@ namespace albireo
             return true;
         }
 
+#if defined(DLIB_USE_CUDA) && defined(_WIN32)
+        /*
+            Records whether the commit of the engine grew by half of the bytes of a copy at least while
+            the copy was made, beside its mirror in pinned memory of the host that a tensor has without
+            the extended memory: Windows then charges the memory of the card to the commit, as the
+            backing of allocations it may move to the memory of the host (charged_bytes()).
+        */
+        void note_commit(uint64_t before, uint64_t after, size_t bytes)
+        {
+            const uint64_t grown = after > before ? after - before : 0;
+            const bool charged = grown >= bytes / 2 + (d_.v2ram ? 0 : bytes);
+            int unknown = -1;
+            if (!d_.commit_charged.compare_exchange_strong(unknown, charged ? 1 : 0)) return;
+            d_.message(ALBIREO_LOG_INFO, "device: the commit of the engine grew by " + megabytes(grown)
+                + " for a copy of " + megabytes(bytes) + (charged ? " on the card: the system charges the memory of "
+                "the card to the commit, and the guard of the keys and values counts the copies as room"
+                : " on the card: the system does not charge the memory of the card to the commit"));
+        }
+#endif
+
         // The copy of W, made when it fits in the budget; null otherwise.  created tells
         // whether this call made it.
         const copy* resident_copy(const weight_matrix& W, bool& created)
@@ -860,7 +1039,18 @@ namespace albireo
             c.rows = W.rows;
             c.cols = W.cols;
             c.quantized = quantized;
+            c.order = ++copies_made_;
             bool same = true;
+#if defined(DLIB_USE_CUDA) && defined(_WIN32)
+            /*
+                The first large copy in a GGUF format shows whether the system charges the memory of the
+                card to the commit of the engine, from its allocation and its upload alone: the blocks
+                cross the bus from the mapping of the file, without a buffer of the host.
+            */
+            const bool measured = quantized && bytes >= commit_probe_bytes && d_.commit_charged.load() < 0;
+            const uint64_t commit_before = measured ? process_commit_bytes() : 0;
+            uint64_t commit_after = 0;
+#endif
             try
             {
                 c.t.reset(new dlib::resizable_tensor());
@@ -868,6 +1058,9 @@ namespace albireo
                 {
                     c.t->set_size(static_cast<long long>(bytes / sizeof(float)));
                     upload_blocks(W, *c.t);
+#if defined(DLIB_USE_CUDA) && defined(_WIN32)
+                    if (measured) commit_after = process_commit_bytes();
+#endif
                     same = verify_copy(W, *c.t);
                 }
                 else
@@ -886,6 +1079,9 @@ namespace albireo
                 refused_[W.data] = d_.generation.load();
                 throw;
             }
+#if defined(DLIB_USE_CUDA) && defined(_WIN32)
+            if (measured && commit_before > 0 && commit_after > 0) note_commit(commit_before, commit_after, bytes);
+#endif
             if (!same)
             {
                 // The matrices of this format, this one included, are copied in single precision.
@@ -1332,6 +1528,9 @@ namespace albireo
         std::atomic<bool> busy_{false};
         std::atomic<long long> last_use_{0};
         long long reported_use_ = -1;
+        // The copies made so far, which rank them, and the time of the last reading of the memory of the card.
+        unsigned long long copies_made_ = 0;
+        long long card_checked_ = 0;
         std::unordered_map<const uint8_t*, copy> weights_;
         // The matrices refused for lack of room, with the generation of the refusal.
         std::unordered_map<const uint8_t*, unsigned long long> refused_;
@@ -1395,6 +1594,8 @@ namespace albireo
             o_.last_use_ = now_ns();
             attending_ = false;
             if (n <= 0 || n < d.min_tokens || d.disabled.load() || !d.bind_thread()) return false;
+            // The copies of the previous pass may leave the card before gather_copies() takes them again.
+            o_.check_card();
             // Once the copies exceed the card, a generated token waits for the extended memory.
             if (n < qk_float_product_tokens && d.resident.load(std::memory_order_relaxed) > d.card_bytes) return false;
             try
@@ -1640,9 +1841,10 @@ namespace albireo
     private:
         /*
             The copies of the seven matrices of every layer, made when they are missing; false when
-            one of them lacks room.  The copies of a model leave the device only for another model,
-            between two passes, and never for the copies of their own model: the pointers stay
-            valid for the pass.
+            one of them lacks room.  The copies of a model leave the device between two passes only,
+            for another model or for a card that lacks memory (tensor_offload::check_card(), which
+            begin() calls before this function), and never for the copies of their own model:
+            gathered again at each pass, the pointers stay valid for the pass.
         */
         bool gather_copies()
         {
@@ -2205,15 +2407,56 @@ namespace albireo
         for (tensor_offload* o : idle)
         {
             const size_t current = resident.load();
-            if (current <= target) break;
-            const size_t freed = o->evict_copies(current - target);
+            // The copies beyond the target of the budget, or the memory the card lacks beside bytes more.
+            const size_t over = std::max(current > target ? current - target : size_t(0), card_shortfall(bytes));
+            if (over == 0) break;
+            const size_t freed = o->evict_copies(over);
             ++evictions;
             evicted_bytes += freed;
             message(o->reported_eviction() ? ALBIREO_LOG_DEBUG : ALBIREO_LOG_INFO, "device: copies of '"
                 + o->model() + "', without requests, leave the device for '" + requester->model() + "' ("
                 + megabytes(freed) + ", " + megabytes(o->copy_bytes()) + " stay)");
         }
-        return resident.load() + bytes <= budget;
+        return resident.load() + bytes <= budget && card_shortfall(bytes) == 0;
+    }
+
+    size_t tensor_device::impl::relieve_card(tensor_offload& requester)
+    {
+        std::lock_guard<std::mutex> lock(registry_m);
+        const size_t free_before = card_free();
+        const size_t wanted = card_shortfall(0);
+        if (wanted <= card_reserve_bytes / 2) card_low = false;
+        if (wanted == 0) return 0;
+        std::vector<tensor_offload*> idle;
+        for (tensor_offload* o : offloads)
+            if (o != &requester && !o->busy() && o->copy_bytes() > 0) idle.push_back(o);
+        std::sort(idle.begin(), idle.end(),
+            [](const tensor_offload* a, const tensor_offload* b) { return a->last_use() < b->last_use(); });
+        size_t others = 0;
+        for (tensor_offload* o : idle)
+        {
+            if (others >= wanted) break;
+            others += o->evict_copies(wanted - others);
+        }
+        size_t own = 0;
+        while (others + own < wanted)
+        {
+            const size_t freed = requester.drop_last_copy();
+            if (freed == 0) break;
+            own += freed;
+        }
+        const size_t freed = others + own;
+        // The copies count as room again (charged_bytes()) as soon as the driver reports the card relieved.
+        card_low = card_shortfall(0) > card_reserve_bytes / 2;
+        if (freed == 0) return 0;
+        ++card_releases;
+        card_released_bytes += freed;
+        message(ALBIREO_LOG_INFO, "device: the card had " + megabytes(free_before) + " free, less than half of the "
+            + megabytes(card_reserve_bytes) + " the copies leave to the passes, the libraries and the other programs; "
+            + megabytes(freed) + " of copies leave it (" + megabytes(own) + " of '" + requester.model() + "', which "
+            "keeps " + megabytes(requester.copy_bytes()) + ", and " + megabytes(others) + " of the models without "
+            "requests)");
+        return freed;
     }
 
     tensor_device::tensor_device(const json& config, thread_pool& pool, log_function log)
@@ -2398,6 +2641,11 @@ namespace albireo
         s["disabled"] = d.disabled.load();
         s["evictions"] = d.evictions.load();
         s["evicted_bytes"] = d.evicted_bytes.load();
+        // The copies given back while the card kept less than half of its reserve free (relieve_card()).
+        s["card_releases"] = d.card_releases.load();
+        s["card_released_bytes"] = d.card_released_bytes.load();
+        // The copies charged to the commit of the engine, which the guard of the keys and values counts as room.
+        s["commit_charged_bytes"] = static_cast<unsigned long long>(d.charged_bytes());
 #if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
         for (const auto& op : dlib::npu::get_statistics())
         {

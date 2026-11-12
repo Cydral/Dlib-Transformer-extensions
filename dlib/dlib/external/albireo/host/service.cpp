@@ -40,6 +40,12 @@ namespace albireo
         const int64_t certificate_period = 24 * 3600;
         const int64_t inbox_period = 60;
 
+        /*
+            The key of the database that records the default model of the catalog chosen for the work in the
+            background, which keeps it when a later catalog names another default model.
+        */
+        const char* const background_record = "background_model";
+
         // The errors of the requests that the service ends.
         const char* const stopping_reason = "the service stops";
         const char* const offline_reason = "offline mode: no request leaves this computer";
@@ -850,7 +856,8 @@ namespace albireo
         if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
         if (role == "background")
         {
-            if (!background_model_.empty()) id = background_model_;
+            const std::string background = background_model();
+            if (!background.empty()) id = background;
             else role = "general";
         }
         if (is_role(role))
@@ -1226,17 +1233,42 @@ namespace albireo
                     log_info("models: " + a.id + " takes the place of " + r.id);
                     break;
                 }
-        if (!removed.empty())
+        /*
+            A language model of the catalog made of the file a new model that comes with Albireo was made from
+            (source_sha256 of its manifest), the default model of the catalog that stood for it after the installer
+            of the updates for instance, leaves it its functions, so that the same weights do not load twice; its
+            files stay until the Models window deletes them.
+        */
+        std::map<std::string, std::string> carrier;
+        const std::vector<installed_model> installed = db_->models();
+        for (const auto& a : added)
+        {
+            const std::string source = a.descriptor["source_sha256"].as_string();
+            if (source.empty() || is_embedding(a)) continue;
+            for (const auto& c : installed)
+                if (c.source != "builtin" && !is_embedding(c) && c.sha256 == source && !carrier.count(c.id))
+                {
+                    carrier[c.id] = a.id;
+                    log_info("models: " + a.id + " takes the functions of " + c.id + ", made of the same file");
+                }
+        }
+        if (!removed.empty() || !carrier.empty())
         {
             settings_->update([&](host_settings& s) {
                 for (auto it = s.active.begin(); it != s.active.end();)
                 {
                     const auto next = successor.find(it->second);
+                    const auto same = carrier.find(it->second);
                     const bool left = std::find_if(removed.begin(), removed.end(),
                         [&](const installed_model& r) { return r.id == it->second; }) != removed.end();
                     if (next != successor.end())
                     {
                         it->second = next->second;
+                        ++it;
+                    }
+                    else if (same != carrier.end())
+                    {
+                        it->second = same->second;
                         ++it;
                     }
                     else if (left)
@@ -1254,12 +1286,100 @@ namespace albireo
         // the others.
         for (const auto& m : added)
             if (!successors.count(m.id)) on_installed(m);
-        // The language model that comes with Albireo serves the work in the background.
-        background_model_.clear();
-        for (const auto& m : db_->models())
-            if (m.source == "builtin" && !is_embedding(m) && file_exists(m.file) && background_model_.empty())
-                background_model_ = m.id;
-        if (!background_model_.empty()) log_info("models: " + background_model_ + " serves the work in the background");
+        // The model that comes with Albireo, or the catalog default model standing for it, works in the background.
+        update_background_model();
+    }
+
+    std::string service::background_model() const
+    {
+        std::lock_guard<std::mutex> lock(background_m_);
+        return background_model_;
+    }
+
+    std::string service::choose_background_model()
+    {
+        // A model being deleted once its requests are served is left out.
+        std::set<std::string> leaving;
+        {
+            std::lock_guard<std::mutex> lock(retire_m_);
+            leaving = removing_;
+        }
+        auto usable = [&leaving](const installed_model& m) {
+            return !is_embedding(m) && file_exists(m.file) && leaving.count(m.id) == 0;
+        };
+        const std::vector<installed_model> installed = db_->models();
+        for (const auto& m : installed)
+            if (m.source == "builtin" && usable(m)) return m.id;
+        // A download worker may get here after the stop of the service, which takes the manager away (run()).
+        json catalog;
+        {
+            std::lock_guard<std::mutex> server(server_m_);
+            if (!models_) return std::string();
+            catalog = models_->catalog();
+        }
+        std::string wanted;
+        for (const auto& e : catalog["models"].elements())
+            if (e["default"].as_bool(false) && !has_role(e, embedding_role))
+            {
+                wanted = e["id"].as_string();
+                break;
+            }
+        // The default entry of the catalog, else the default model of an earlier catalog chosen last.
+        const std::string recorded = db_->value(background_record);
+        std::string earlier;
+        for (const auto& m : installed)
+        {
+            if (!usable(m)) continue;
+            if (m.id == wanted) return m.id;
+            if (m.id == recorded) earlier = m.id;
+        }
+        return earlier;
+    }
+
+    void service::update_background_model()
+    {
+        std::string chosen, previous;
+        {
+            // Serialized with the activations and the deletions, which read the model of the background.
+            std::lock_guard<std::mutex> serial(models_m_);
+            if (stopping_) return;
+            chosen = choose_background_model();
+            // A stop during the choice leaves the model as it is: the manager it read may be gone.
+            if (stopping_) return;
+            // The record names the default model of the catalog chosen, none when a model comes with Albireo.
+            installed_model m;
+            const bool builtin = !chosen.empty() && db_->find_model(chosen, m) && m.source == "builtin";
+            const std::string record = builtin ? std::string() : chosen;
+            try
+            {
+                if (!chosen.empty() && db_->value(background_record) != record)
+                    db_->set_value(background_record, record);
+            }
+            catch (const std::exception& e)
+            {
+                log_warning("models: the model of the work in the background cannot be recorded: "
+                    + std::string(e.what()));
+            }
+            std::lock_guard<std::mutex> lock(background_m_);
+            if (chosen == background_model_) return;
+            previous = background_model_;
+            background_model_ = chosen;
+        }
+        if (chosen.empty())
+            log_info("models: no model comes with Albireo, the general model serves the work in the background");
+        else
+            log_info("models: " + chosen + " serves the work in the background");
+        auto leave_unless_used = [this](const std::string& id) {
+            if (id.empty() || id == background_model()) return;
+            bool used = false;
+            for (const auto& kv : settings_->get().active) used = used || kv.second == id;
+            if (!used) retire(id);
+        };
+        // The new model loads whatever its functions; the previous one leaves unless a function uses it.
+        if (!chosen.empty()) reload_model(chosen);
+        leave_unless_used(previous);
+        // A choice made by another thread while the new model loaded leaves it in the same way.
+        leave_unless_used(chosen);
     }
 
     void service::note_default_failure(const json& entry, const user_error& error, const std::string& what)
@@ -1273,6 +1393,24 @@ namespace albireo
         const host_settings st = settings_->get();
         const std::vector<installed_model> installed = db_->models();
         const json catalog = models_->catalog();
+        /*
+            The download of a default model of the catalog: one in progress goes on, one cancelled in the Models
+            window waits for the next start of the service, and one that failed starts again at the next check, at
+            the next refresh of the catalog.
+        */
+        const json jobs = models_->downloads();
+        auto fetch = [&](const json& e, const std::string& what) {
+            const std::string id = e["id"].as_string();
+            std::string state;
+            for (const auto& d : jobs.elements())
+                if (d["id"].as_string() == id) state = d["state"].as_string();
+            if (state == "queued" || state == "downloading" || state == "verifying" || state == "cancelled") return;
+            user_error error;
+            if (models_->start_download(id, error))
+                log_info("models: download of " + what + " " + id);
+            else
+                note_default_failure(e, error, what);
+        };
 
         // The document search always has its embedding model: an installed one, else the
         // default one of the catalog, downloaded whatever the options of the installation
@@ -1292,14 +1430,28 @@ namespace albireo
                 for (const auto& e : catalog["models"].elements())
                 {
                     if (!has_role(e, embedding_role) || !e["default"].as_bool(false)) continue;
-                    if (models_->start_download(e["id"].as_string(), error))
-                        log_info("models: download of the embedding model " + e["id"].as_string());
-                    else
-                        note_default_failure(e, error, "the embedding model");
+                    fetch(e, "the embedding model");
                     break;
                 }
             }
         }
+
+        /*
+            The language model that comes with Albireo: the complete installer carries it, and after the
+            installer of the updates the default language model of the catalog stands for it, downloaded
+            whatever the options of the installation and the other models installed (the computers without
+            network receive it in their offline bundle).  The work in the background, the descriptions of the
+            images of the projects included, then keeps the model chosen for it whatever the models of the
+            functions, a general model that reads no image for instance.
+        */
+        update_background_model();
+        if (background_model().empty() && !st.offline)
+            for (const auto& e : catalog["models"].elements())
+            {
+                if (!e["default"].as_bool(false) || has_role(e, embedding_role)) continue;
+                fetch(e, "the default model");
+                break;
+            }
 
         if (st.active.count("general")) return;
         const installed_model* pick = nullptr;
@@ -1313,25 +1465,6 @@ namespace albireo
         {
             user_error error;
             if (!activate(pick->id, "general", error)) log_warning("models: " + pick->id + ": " + error.text);
-            return;
-        }
-        // No language model installed: the default model of the catalog is downloaded, once,
-        // unless the installation asked otherwise or the computer is offline.
-        if (!st.default_model || st.offline || db_->value("default_model_requested") == "1") return;
-        for (const auto& e : catalog["models"].elements())
-        {
-            if (!e["default"].as_bool(false) || has_role(e, embedding_role)) continue;
-            user_error error;
-            if (models_->start_download(e["id"].as_string(), error))
-            {
-                db_->set_value("default_model_requested", "1");
-                log_info("models: download of the default model " + e["id"].as_string());
-            }
-            else
-            {
-                note_default_failure(e, error, "the default model");
-            }
-            return;
         }
     }
 
@@ -1358,8 +1491,15 @@ namespace albireo
                 log_warning("models: " + m.id + ": " + error.text);
             return;
         }
-        // A new model takes the functions its catalog entry names and no model holds yet,
-        // and the general one when it is free, so that every function has a model.
+        // When no model comes with Albireo, the default model of the catalog that arrives stands for it.
+        update_background_model();
+        const bool background = m.id == background_model();
+        /*
+            A new model takes the functions its catalog entry names and no model holds yet, and the general one
+            when it is free, so that every function has a model.  The model of the work in the background,
+            downloaded beside the models of the user, takes only the functions that no other model serves, the
+            general model serving those without a model of their own (effective_models()).
+        */
         std::vector<std::string> roles;
         for (const auto& r : m.descriptor["roles"].elements())
         {
@@ -1369,7 +1509,14 @@ namespace albireo
         roles.push_back("general");
         for (const auto& role : roles)
         {
-            if (settings_->get().active.count(role)) continue;
+            const host_settings st = settings_->get();
+            if (st.active.count(role)) continue;
+            if (background)
+            {
+                const std::map<std::string, std::string> served = effective_models(st);
+                const auto it = served.find(role);
+                if (it != served.end() && it->second != m.id) continue;
+            }
             user_error error;
             if (!activate(m.id, role, error)) log_warning("models: " + m.id + ": " + error.text);
         }
@@ -1446,12 +1593,12 @@ namespace albireo
             load_model(m, error);
         }
         // The model of the work in the background, loaded with or without functions.
-        if (!background_model_.empty() && !stopping_
-            && std::find(done.begin(), done.end(), background_model_) == done.end())
+        const std::string background = background_model();
+        if (!background.empty() && !stopping_ && std::find(done.begin(), done.end(), background) == done.end())
         {
             installed_model m;
             std::string error;
-            if (db_->find_model(background_model_, m) && file_exists(m.file)) load_model(m, error);
+            if (db_->find_model(background, m) && file_exists(m.file)) load_model(m, error);
         }
     }
 
@@ -1524,10 +1671,13 @@ namespace albireo
         return true;
     }
 
-    void service::retire(const std::string& id, bool reload)
+    void service::retire(const std::string& id, bool reload, bool background)
     {
-        // The model of the work in the background stays loaded without functions; it leaves to load again only.
-        if (!reload && !background_model_.empty() && id == background_model_) return;
+        /*
+            The model of the work in the background stays loaded without functions; it leaves to load again only,
+            or for its new files.
+        */
+        if (!reload && !background && id == background_model()) return;
         std::lock_guard<std::mutex> lock(retire_m_);
         // The threads of the retirements that ended, which take this lock no more.
         for (const auto& ended : ended_retirers_)
@@ -1647,7 +1797,7 @@ namespace albireo
             }
         }
         const host_settings st = settings_->get();
-        bool used = id == background_model_;
+        bool used = id == background_model();
         for (const auto& kv : st.active) used = used || kv.second == id;
         const std::vector<std::string> loaded = engine_.loaded_models();
         installed_model m;
@@ -1660,8 +1810,14 @@ namespace albireo
 
     bool service::replace_model_files(const std::string& id, const std::function<bool()>& place)
     {
-        // The model of the work in the background stays loaded, and comes with Albireo: no file replaces its own.
-        if (!background_model_.empty() && id == background_model_) return false;
+        /*
+            A model that comes with Albireo keeps its files, which a new installer replaces; the default model of the
+            catalog that stands for it, which stays loaded for the work in the background, leaves the engine for its
+            new files and loads again.
+        */
+        installed_model held;
+        if (db_->find_model(id, held) && held.source == "builtin") return false;
+        const bool background = id == background_model();
         bool retired = false;
         for (int attempt = 0; attempt < 3 && !stopping_; ++attempt)
         {
@@ -1690,7 +1846,7 @@ namespace albireo
                 return ok;
             }
             log_info("models: " + id + " leaves the engine once its requests are served, its files being replaced");
-            retire(id);
+            retire(id, false, background);
             wait_retired(id);
             retired = true;
         }
@@ -1715,11 +1871,11 @@ namespace albireo
 
     std::string service::successor_of(const std::string& id)
     {
+        const std::string background = background_model();
         installed_model b;
-        if (background_model_.empty() || background_model_ == id || !db_->find_model(background_model_, b)
-            || !file_exists(b.file))
+        if (background.empty() || background == id || !db_->find_model(background, b) || !file_exists(b.file))
             return std::string();
-        return background_model_;
+        return background;
     }
 
     bool service::deactivate(const std::string& id, const std::string& role, user_error& error)
@@ -1819,7 +1975,8 @@ namespace albireo
             return false;
         }
         const std::string name = m.name.empty() ? id : m.name;
-        if (m.source == "builtin")
+        // The default model of the catalog that stands for the model that comes with Albireo stays as it would.
+        if (m.source == "builtin" || id == background_model())
         {
             error.set("the model " + id + " comes with Albireo: it can leave its functions to other models, it "
                 "cannot be deleted", "builtin_model").arg("m", name);
@@ -1880,11 +2037,12 @@ namespace albireo
     {
         std::map<std::string, std::string> out = st.active;
         const auto general = st.active.find("general");
+        const std::string background = background_model();
         for (const char* role : model_roles)
         {
             if (out.count(role)) continue;
             if (general != st.active.end()) out[role] = general->second;
-            else if (!background_model_.empty()) out[role] = background_model_;
+            else if (!background.empty()) out[role] = background;
         }
         return out;
     }
@@ -1901,9 +2059,10 @@ namespace albireo
         if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
         // The work in the background goes to the model that comes with Albireo, else to the
         // general model.
+        const std::string background = background_model();
         if (role == "background")
         {
-            if (!background_model_.empty() && is_loaded(background_model_)) return background_model_;
+            if (!background.empty() && is_loaded(background)) return background;
             role = "general";
         }
         const auto embedding = st.active.find(embedding_role);
@@ -1917,7 +2076,7 @@ namespace albireo
             // that comes with Albireo, else by the first language model loaded.
             it = st.active.find("general");
             if (it != st.active.end() && is_loaded(it->second)) return it->second;
-            if (!background_model_.empty() && is_loaded(background_model_)) return background_model_;
+            if (!background.empty() && is_loaded(background)) return background;
             for (const auto& id : loaded)
                 if (id != embedder) return id;
             return std::string();
@@ -2049,7 +2208,7 @@ namespace albireo
         for (const auto& kv : st.active) selected[kv.first] = kv.second;
         s["active"] = active;
         s["selected"] = selected;
-        s["background"] = background_model_;
+        s["background"] = background_model();
         json loading = json::object();
         {
             std::lock_guard<std::mutex> lock(m_);

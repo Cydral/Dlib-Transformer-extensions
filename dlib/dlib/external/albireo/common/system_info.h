@@ -83,13 +83,19 @@ namespace albireo
         uint64_t available = 0;   // physical memory available to a new allocation, bytes
         /*
             The memory the system can commit, physical memory and paging file (Windows) or
-            swap (Linux) together: the limit, and what new allocations can still take of it.
+            swap (Linux) together: the limit, and what new allocations can still take of it,
+            never below the physical memory available.
         */
         uint64_t commit_total = 0;
         uint64_t commit_available = 0;
+        // What new allocations can still take of the limit, as the system reports it.
+        uint64_t commit_left = 0;
     };
 
     memory_info read_memory_info();
+
+    // The memory this process commits (its private bytes on Windows), 0 elsewhere or when unknown.
+    uint64_t process_commit_bytes();
 
     // "Windows 11 Pro 24H2 (build 26100)", "Linux 6.8.0 x86_64", ...
     std::string operating_system_name();

@@ -21,6 +21,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// GetProcessMemoryInfo() from kernel32 (K32GetProcessMemoryInfo), without psapi.lib.
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2
+#endif
+#include <psapi.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -191,10 +196,23 @@ namespace albireo
         m.commit_total = m.total + swap_total;
         m.commit_available = m.available + swap_free;
 #endif
+        m.commit_left = m.commit_available;
         // Never below the physical memory, which a system without paging file still commits.
         m.commit_total = std::max(m.commit_total, m.total);
         m.commit_available = std::max(m.commit_available, m.available);
         return m;
+    }
+
+    uint64_t process_commit_bytes()
+    {
+#if defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS_EX c;
+        std::memset(&c, 0, sizeof(c));
+        c.cb = sizeof(c);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&c), sizeof(c)))
+            return static_cast<uint64_t>(c.PrivateUsage);
+#endif
+        return 0;
     }
 
     std::string operating_system_name()

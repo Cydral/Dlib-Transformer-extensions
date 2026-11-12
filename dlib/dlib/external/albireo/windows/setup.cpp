@@ -650,7 +650,7 @@ namespace albireo
         {
             IDC_TITLE = 100, IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL, IDC_DIR,
             IDC_DIR_BROWSE, IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE, IDC_AUTOSTART,
-            IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL,
+            IDC_DESKTOP, IDC_TRUST, IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL,
             IDC_LAUNCH, IDC_KEEP_DATA, IDC_BACK, IDC_NEXT, IDC_CANCEL, IDC_OFFLINE, IDC_DATA_LABEL, IDC_DATA,
             IDC_DATA_BROWSE
         };
@@ -747,7 +747,6 @@ namespace albireo
             ui::set_text(ctl(IDC_AUTOSTART), tr("opt_autostart"));
             ui::set_text(ctl(IDC_DESKTOP), tr("opt_desktop"));
             ui::set_text(ctl(IDC_TRUST), tr("opt_trust"));
-            ui::set_text(ctl(IDC_DEFAULT_MODEL), tr("opt_default_model"));
             ui::set_text(ctl(IDC_OFFLINE), tr("opt_offline"));
             ui::set_text(ctl(IDC_PORT_LABEL), tr("opt_port"));
             ui::set_text(ctl(IDC_LAUNCH), tr("opt_launch"));
@@ -768,8 +767,8 @@ namespace albireo
             wz.current = p;
             const std::vector<int> all = { IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL,
                 IDC_DIR, IDC_DIR_BROWSE, IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE, IDC_MODELS_LABEL, IDC_MODELS,
-                IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL,
-                IDC_OFFLINE, IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_KEEP_DATA };
+                IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_OFFLINE,
+                IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_KEEP_DATA };
             std::vector<int> visible;
             std::wstring title, text;
             switch (p)
@@ -798,9 +797,7 @@ namespace albireo
                 break;
             case P_OPTIONS:
                 title = tr("options_title");
-                // The models of the complete installer answer at once: no default model to download.
                 visible = { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_OFFLINE, IDC_PORT_LABEL, IDC_PORT };
-                if (!wz.builtin_size) visible.push_back(IDC_DEFAULT_MODEL);
                 break;
             case P_PROGRESS:
                 title = wz.uninstall ? tr("uninstall_progress") : wz.update ? tr("update_progress")
@@ -903,7 +900,7 @@ namespace albireo
             ui::place(ctl(IDC_SPACE), x, y + px(186), cw, px(64));
             ui::place(ctl(IDC_SPACE_NOTE), x, y + px(254), cw, px(40));
             int oy = y;
-            for (int id : { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE })
+            for (int id : { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_OFFLINE })
             {
                 ui::place(ctl(id), x, oy, cw, px(40));
                 oy += px(44);
@@ -965,10 +962,7 @@ namespace albireo
             add(IDC_AUTOSTART, ui::checkbox(wz.hwnd, L"", IDC_AUTOSTART, current.autostart));
             add(IDC_DESKTOP, ui::checkbox(wz.hwnd, L"", IDC_DESKTOP, current.desktop_shortcut));
             add(IDC_TRUST, ui::checkbox(wz.hwnd, L"", IDC_TRUST, current.trust_certificate));
-            add(IDC_DEFAULT_MODEL, ui::checkbox(wz.hwnd, L"", IDC_DEFAULT_MODEL, current.default_model));
             add(IDC_OFFLINE, ui::checkbox(wz.hwnd, L"", IDC_OFFLINE, current.offline));
-            // Offline, no model is downloaded.
-            ui::enable(ctl(IDC_DEFAULT_MODEL), !current.offline);
             add(IDC_PORT_LABEL, ui::label(wz.hwnd, L"", IDC_PORT_LABEL));
             add(IDC_PORT, ui::edit(wz.hwnd, std::to_wstring(current.port), IDC_PORT, ES_NUMBER));
             add(IDC_STEP, ui::label(wz.hwnd, L"", IDC_STEP), ui::font_kind::bold);
@@ -1020,7 +1014,6 @@ namespace albireo
                 o.desktop_shortcut = ui::checked(ctl(IDC_DESKTOP));
                 o.trust_certificate = ui::checked(ctl(IDC_TRUST));
                 o.offline = ui::checked(ctl(IDC_OFFLINE));
-                o.default_model = ui::checked(ctl(IDC_DEFAULT_MODEL)) && !o.offline;
                 const long port = std::wcstol(ui::text_of(ctl(IDC_PORT)).c_str(), nullptr, 10);
                 if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
             }
@@ -1123,9 +1116,6 @@ namespace albireo
                     return 0;
                 case IDC_ACCEPT:
                     ui::enable(ctl(IDC_NEXT), ui::checked(ctl(IDC_ACCEPT)));
-                    return 0;
-                case IDC_OFFLINE:
-                    ui::enable(ctl(IDC_DEFAULT_MODEL), !ui::checked(ctl(IDC_OFFLINE)));
                     return 0;
                 case IDC_KEEP_DATA:
                     if (wz.current == P_UNINSTALL) ui::set_text(ctl(IDC_TEXT), uninstall_text());
@@ -1517,7 +1507,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         if (has_arg(args, L"/offline"))
         {
             o.offline = true;
-            o.default_model = false;
             options = true;
         }
         const std::wstring port = arg_after(args, L"/port");

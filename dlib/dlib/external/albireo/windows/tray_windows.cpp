@@ -767,9 +767,10 @@ namespace albireo
                 }
                 if (m["installed"].as_bool(false))
                 {
-                    if (m["builtin"].as_bool(false)) return tr("state_builtin");
+                    // The default model of the catalog standing for the model that comes with Albireo has versions.
                     const bool outdated = m.contains("up_to_date") && !m["up_to_date"].as_bool(true);
-                    return outdated ? tr("state_update") : tr("state_installed");
+                    if (outdated) return tr("state_update");
+                    return m["builtin"].as_bool(false) ? tr("state_builtin") : tr("state_installed");
                 }
                 return tr("state_available");
             }

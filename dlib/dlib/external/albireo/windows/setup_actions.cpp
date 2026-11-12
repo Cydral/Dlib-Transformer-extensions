@@ -602,7 +602,6 @@ namespace setup
             const long long port = s["port"].as_int(0);
             if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
             if (!s["models_dir"].as_string().empty()) o.models_dir = s["models_dir"].as_string();
-            o.default_model = s["default_model"].as_bool(true);
             o.offline = s["offline"].as_bool(false);
         }
         if (!dir.empty())
@@ -1560,7 +1559,8 @@ namespace setup
         }
         s["port"] = o.port;
         s["models_dir"] = o.models_dir.empty() || o.models_dir == default_models_dir() ? std::string() : o.models_dir;
-        s["default_model"] = o.default_model;
+        // The option of the earlier versions: the service downloads the default model of the catalog in every case.
+        s.erase("default_model");
         s["offline"] = o.offline;
         // The service puts its authority in the trusted roots according to this choice.
         s["trust_authority"] = o.trust_certificate;
