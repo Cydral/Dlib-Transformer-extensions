@@ -886,6 +886,167 @@ namespace dlib
     template <
         typename matrix_type
         >
+    class running_covariance_decayed
+    {
+        /*!
+            REQUIREMENTS ON matrix_type
+                Must be some type of dlib::matrix whose scalar type is float, double, or
+                long double.
+
+            INITIAL VALUE
+                - in_vector_size() == 0
+                - current_n() == 0
+
+            WHAT THIS OBJECT REPRESENTS
+                This object is a simple tool for computing the mean and covariance of a
+                stream of vectors.  It is essentially the same as running_covariance
+                except that it forgets about data it has seen after a certain period of
+                time.  It does this by exponentially decaying old statistics, in the same
+                way as running_stats_decayed and running_scalar_covariance_decayed.
+
+                More precisely, the vector given to add() k calls ago has a weight of
+                std::pow(forget_factor(), k).  current_n() is the sum of these weights,
+                and mean() and covariance() are the weighted mean and the weighted sample
+                covariance of the vectors under these weights.
+        !*/
+    public:
+
+        typedef typename matrix_type::mem_manager_type mem_manager_type;
+        typedef typename matrix_type::type scalar_type;
+        typedef typename matrix_type::layout_type layout_type;
+        typedef matrix<scalar_type,0,0,mem_manager_type,layout_type> general_matrix;
+        typedef matrix<scalar_type,0,1,mem_manager_type,layout_type> column_matrix;
+
+        explicit running_covariance_decayed(
+            scalar_type decay_halflife = 1000
+        );
+        /*!
+            requires
+                - decay_halflife > 0
+            ensures
+                - #forget_factor() == std::pow(0.5, 1/decay_halflife);
+                  (i.e. after decay_halflife calls to add() the data given to the first add
+                  will be down weighted by 0.5 in the statistics stored in this object).
+                - #in_vector_size() == 0
+                - #current_n() == 0
+        !*/
+
+        void clear(
+        );
+        /*!
+            ensures
+                - #in_vector_size() == 0
+                - #current_n() == 0
+                - #forget_factor() == forget_factor()
+                  (i.e. clears all memory of any previous data points but keeps the decay
+                  rate given to the constructor)
+        !*/
+
+        scalar_type forget_factor (
+        ) const;
+        /*!
+            ensures
+                - returns the exponential forget factor used to forget old statistics when
+                  add() is called.
+        !*/
+
+        long in_vector_size (
+        ) const;
+        /*!
+            ensures
+                - if (this object has been presented with any input vectors) then
+                    - returns the dimension of the column vectors used with this object
+                - else
+                    - returns 0
+        !*/
+
+        scalar_type current_n (
+        ) const;
+        /*!
+            ensures
+                - returns the effective number of vectors given to this object, that is,
+                  the sum of their weights.  As add() is called this value converges to
+                  1/(1-forget_factor()).
+        !*/
+
+        template <typename T>
+        void add (
+            const T& val
+        );
+        /*!
+            requires
+                - val is a dlib::matrix that represents a column vector.
+                - in_vector_size() == 0 || val.size() == in_vector_size()
+            ensures
+                - updates the mean and covariance stored in this object so that the new
+                  vector is factored into them.
+                - Down weights old statistics by a factor of forget_factor().
+                - #current_n() == current_n()*forget_factor() + 1
+                - #in_vector_size() == val.size()
+        !*/
+
+        const column_matrix mean (
+        ) const;
+        /*!
+            requires
+                - in_vector_size() != 0
+            ensures
+                - returns the weighted mean of all the vectors presented to this object
+                  so far.
+        !*/
+
+        const general_matrix covariance (
+        ) const;
+        /*!
+            requires
+                - in_vector_size() != 0
+                - current_n() > 1
+            ensures
+                - returns the weighted sample covariance matrix of all the vectors
+                  presented to this object so far.  That is, if x(i) is the i-th vector,
+                  w(i) its weight, N == current_n() and m == mean(), this function returns
+                  sum over i of w(i)*(x(i)-m)*trans(x(i)-m)/(N-1).
+        !*/
+
+        const general_matrix correlation (
+        ) const;
+        /*!
+            requires
+                - in_vector_size() != 0
+                - current_n() > 1
+            ensures
+                - returns the correlation matrix C of the vectors presented to this object
+                  so far.  That is, if V == covariance(), then:
+                    - C(i,j) == V(i,j)/std::sqrt(V(i,i)*V(j,j)), clamped to the range
+                      [-1, 1].
+                    - C(i,i) == 1 for each component i with a nonzero variance.
+                    - Row i and column i of C are 0 when the component i has no variance.
+        !*/
+    };
+
+    template <typename matrix_type>
+    void serialize (
+        const running_covariance_decayed<matrix_type>& item,
+        std::ostream& out
+    );
+    /*!
+        provides serialization support
+    !*/
+
+    template <typename matrix_type>
+    void deserialize (
+        running_covariance_decayed<matrix_type>& item,
+        std::istream& in
+    );
+    /*!
+        provides serialization support
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    template <
+        typename matrix_type
+        >
     class running_cross_covariance
     {
         /*!

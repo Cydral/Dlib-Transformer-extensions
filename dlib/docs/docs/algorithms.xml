@@ -69,6 +69,7 @@
          <item>r_squared</item> 
          <item>mean_squared_error</item> 
          <item>running_covariance</item> 
+         <item>running_covariance_decayed</item> 
          <item>running_cross_covariance</item> 
          <item>random_subset_selector</item> 
          <item>randomly_subsample</item> 
@@ -820,6 +821,21 @@
                 covariance of a sequence of vectors.  
          </description>
 
+      </component>
+      
+   <!-- ************************************************************************* -->
+
+      <component>
+         <name>running_covariance_decayed</name>
+         <file>dlib/statistics.h</file>
+         <spec_file link="true">dlib/statistics/statistics_abstract.h</spec_file>
+         <description>
+                This object is a simple tool for computing the mean and covariance of a
+                stream of vectors.  It is essentially the same as
+                <a href="#running_covariance">running_covariance</a> except that it forgets
+                about data it has seen after a certain period of time.  It does this by
+                exponentially decaying old statistics.
+         </description>
       </component>
       
    <!-- ************************************************************************* -->

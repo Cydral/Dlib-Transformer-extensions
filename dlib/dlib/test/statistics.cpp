@@ -904,6 +904,220 @@ namespace
             }
         }
 
+        template <typename T>
+        void test_running_covariance_decayed_against_batch (
+            dlib::rand& rnd,
+            const double tolerance
+        )
+        {
+            typedef matrix<T,0,1> vect;
+            const double halflives[] = {2, 7, 50, 1000};
+            for (long dims = 1; dims <= 6; ++dims)
+            {
+                for (double halflife : halflives)
+                {
+                    print_spinner();
+                    running_covariance_decayed<vect> rc(static_cast<T>(halflife));
+                    DLIB_TEST(rc.in_vector_size() == 0);
+                    DLIB_TEST(rc.current_n() == 0);
+
+                    // A large common offset and correlated components: the statistics
+                    // must keep their precision when the mean dwarfs the spread.
+                    const matrix<double,0,1> offset = 1000*randm(dims,1,rnd);
+                    const matrix<double> mix = randm(dims,dims,rnd) - 0.5;
+                    std::vector<matrix<double,0,1>> samples;
+                    for (int i = 0; i < 400; ++i)
+                    {
+                        matrix<double,0,1> z(dims);
+                        for (long k = 0; k < dims; ++k)
+                            z(k) = rnd.get_random_gaussian();
+                        // Store the value as the object sees it so both sides agree.
+                        const vect x = matrix_cast<T>(offset + mix*z);
+                        samples.push_back(matrix_cast<double>(x));
+                        rc.add(x);
+                    }
+                    DLIB_TEST(rc.in_vector_size() == dims);
+
+                    // The batch computation with the weights of the decay.
+                    const double forget = rc.forget_factor();
+                    const long n = static_cast<long>(samples.size());
+                    double total = 0;
+                    matrix<double,0,1> m = zeros_matrix<double>(dims,1);
+                    for (long i = 0; i < n; ++i)
+                    {
+                        const double w = std::pow(forget, static_cast<double>(n-1-i));
+                        total += w;
+                        m += w*samples[i];
+                    }
+                    m /= total;
+                    matrix<double> cov = zeros_matrix<double>(dims,dims);
+                    for (long i = 0; i < n; ++i)
+                    {
+                        const double w = std::pow(forget, static_cast<double>(n-1-i));
+                        cov += w*(samples[i]-m)*trans(samples[i]-m);
+                    }
+                    cov /= (total-1);
+
+                    DLIB_TEST_MSG(std::abs(rc.current_n() - total) <= tolerance*total,
+                        rc.current_n() << " " << total);
+                    const double mean_err = max(abs(matrix_cast<double>(rc.mean()) - m));
+                    DLIB_TEST_MSG(mean_err <= tolerance*(1 + max(abs(m))),
+                        "mean error " << mean_err << " dims " << dims << " halflife " << halflife);
+                    const double cov_err = max(abs(matrix_cast<double>(rc.covariance()) - cov));
+                    DLIB_TEST_MSG(cov_err <= tolerance*(1 + max(abs(cov))),
+                        "covariance error " << cov_err << " dims " << dims << " halflife " << halflife);
+
+                    // The correlation is the covariance scaled by the deviations.
+                    const matrix<double> cor = matrix_cast<double>(rc.correlation());
+                    for (long r = 0; r < dims; ++r)
+                    {
+                        DLIB_TEST(cor(r,r) == 1);
+                        for (long c = 0; c < dims; ++c)
+                        {
+                            const double expected = cov(r,c)/std::sqrt(cov(r,r)*cov(c,c));
+                            DLIB_TEST_MSG(std::abs(cor(r,c) - expected) <= 100*tolerance,
+                                cor(r,c) << " " << expected);
+                            DLIB_TEST(cor(r,c) == cor(c,r));
+                            DLIB_TEST(std::abs(cor(r,c)) <= 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        void test_running_covariance_decayed()
+        {
+            dlib::rand rnd;
+            test_running_covariance_decayed_against_batch<double>(rnd, 1e-9);
+            test_running_covariance_decayed_against_batch<float>(rnd, 2e-3);
+
+            typedef matrix<double,0,1> vect;
+            print_spinner();
+
+            // With no decay the object computes what running_covariance computes.
+            {
+                running_covariance_decayed<vect> rcd(1e30);
+                running_covariance<vect> rc;
+                DLIB_TEST(rcd.forget_factor() == 1);
+                for (int i = 0; i < 100; ++i)
+                {
+                    const vect x = randm(3,1,rnd);
+                    rcd.add(x);
+                    rc.add(x);
+                }
+                DLIB_TEST(rcd.current_n() == rc.current_n());
+                DLIB_TEST(max(abs(rcd.mean() - rc.mean())) < 1e-12);
+                DLIB_TEST(max(abs(rcd.covariance() - rc.covariance())) < 1e-12);
+            }
+
+            // On pairs, the object agrees with running_scalar_covariance_decayed.
+            {
+                running_covariance_decayed<vect> rcd(30);
+                running_scalar_covariance_decayed<double> rscd(30);
+                DLIB_TEST(rcd.forget_factor() == rscd.forget_factor());
+                for (int i = 0; i < 500; ++i)
+                {
+                    const double a = rnd.get_random_gaussian();
+                    const double b = 0.5*a + rnd.get_random_gaussian();
+                    vect x(2);
+                    x = a, b;
+                    rcd.add(x);
+                    rscd.add(a, b);
+                    if (i > 0)
+                    {
+                        DLIB_TEST(std::abs(rcd.current_n() - rscd.current_n()) < 1e-9);
+                        DLIB_TEST(std::abs(rcd.mean()(0) - rscd.mean_x()) < 1e-9);
+                        DLIB_TEST(std::abs(rcd.mean()(1) - rscd.mean_y()) < 1e-9);
+                        DLIB_TEST(std::abs(rcd.covariance()(0,1) - rscd.covariance()) < 1e-9);
+                        DLIB_TEST(std::abs(rcd.covariance()(0,0) - rscd.variance_x()) < 1e-9);
+                        DLIB_TEST(std::abs(rcd.covariance()(1,1) - rscd.variance_y()) < 1e-9);
+                        DLIB_TEST(std::abs(rcd.correlation()(0,1) - rscd.correlation()) < 1e-9);
+                    }
+                }
+            }
+
+            // The effective count converges to 1/(1-forget_factor()).
+            {
+                running_covariance_decayed<vect> rcd(10);
+                for (int i = 0; i < 1000; ++i)
+                    rcd.add(randm(2,1,rnd));
+                const double limit = 1/(1-rcd.forget_factor());
+                DLIB_TEST_MSG(std::abs(rcd.current_n() - limit) < 1e-9*limit, rcd.current_n() << " " << limit);
+            }
+
+            // A component without variance has a zero row and column of correlation.
+            {
+                running_covariance_decayed<vect> rcd(20);
+                for (int i = 0; i < 50; ++i)
+                {
+                    vect x(3);
+                    x = rnd.get_random_gaussian(), 5, rnd.get_random_gaussian();
+                    rcd.add(x);
+                }
+                const matrix<double> cor = rcd.correlation();
+                DLIB_TEST(cor(0,0) == 1 && cor(2,2) == 1);
+                for (long k = 0; k < 3; ++k)
+                {
+                    DLIB_TEST(cor(1,k) == 0);
+                    DLIB_TEST(cor(k,1) == 0);
+                }
+                DLIB_TEST(rcd.covariance()(1,1) == 0);
+            }
+
+            // A round trip through serialization keeps the state exactly.
+            {
+                running_covariance_decayed<vect> rcd(25), restored(3);
+                std::vector<vect> later;
+                for (int i = 0; i < 200; ++i)
+                {
+                    const vect x = randm(4,1,rnd);
+                    if (i < 120)
+                        rcd.add(x);
+                    else
+                        later.push_back(x);
+                }
+                std::ostringstream sout;
+                serialize(rcd, sout);
+                std::istringstream sin(sout.str());
+                deserialize(restored, sin);
+                DLIB_TEST(restored.forget_factor() == rcd.forget_factor());
+                DLIB_TEST(restored.in_vector_size() == rcd.in_vector_size());
+                for (const auto& x : later)
+                {
+                    rcd.add(x);
+                    restored.add(x);
+                }
+                DLIB_TEST(restored.current_n() == rcd.current_n());
+                DLIB_TEST(max(abs(restored.mean() - rcd.mean())) == 0);
+                DLIB_TEST(max(abs(restored.covariance() - rcd.covariance())) == 0);
+
+                // A wrong version number is refused.
+                std::ostringstream bad;
+                serialize(2, bad);
+                std::istringstream bad_in(bad.str());
+                bool refused = false;
+                try { deserialize(restored, bad_in); }
+                catch (serialization_error&) { refused = true; }
+                DLIB_TEST(refused);
+            }
+
+            // clear() forgets the data and keeps the decay rate.
+            {
+                running_covariance_decayed<vect> rcd(40);
+                for (int i = 0; i < 10; ++i)
+                    rcd.add(randm(5,1,rnd));
+                const double forget = rcd.forget_factor();
+                rcd.clear();
+                DLIB_TEST(rcd.in_vector_size() == 0);
+                DLIB_TEST(rcd.current_n() == 0);
+                DLIB_TEST(rcd.forget_factor() == forget);
+                rcd.add(randm(2,1,rnd));
+                rcd.add(randm(2,1,rnd));
+                DLIB_TEST(rcd.in_vector_size() == 2);
+                DLIB_TEST(rcd.covariance().nr() == 2);
+            }
+        }
+
         void test_probability_values_are_increasing() {
             DLIB_TEST(probability_values_are_increasing(std::vector<double>{1,2,3,4,5,6,7,8}) > 0.99);
             DLIB_TEST(probability_values_are_increasing(std::vector<double>{8,7,6,5,4,4,3,2}) < 0.01);
@@ -953,6 +1167,7 @@ namespace
             test_event_corr();
             test_running_stats_decayed();
             test_running_scalar_covariance_decayed();
+            test_running_covariance_decayed();
             test_equal_error_rate();
             test_probability_values_are_increasing();
         }

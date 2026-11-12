@@ -38,6 +38,8 @@ New Features and Improvements:
    - Update libraries in dlib/external
       - Update libjpeg to version 9e (PR #2619)
       - Update Pybind11 to v2.12.0 (PR #2970)
+      - Add TradingView Lightweight Charts 5.3.0, the charts of the web applications of
+        dlib programs
 
    - Speeding things up:
       - Optimize pointer to matrix assignment (PR #2822)
@@ -55,6 +57,8 @@ New Features and Improvements:
         for variants for matrix objects (PR #2627)
       - Added generalized FFT tooling in the dlib/fft folder (PR #2793)
    - FFMPEG wrappers: dlib::ffmpeg::decoder and dlib::ffmpeg::demuxer (PR #2707)
+   - Added running_covariance_decayed, which computes the mean and covariance of a stream
+     of vectors while exponentially forgetting old statistics.
 
 Non-Backwards Compatible Changes:
    - Dlib now requires C++14 and at least CMake version 3.10.0.

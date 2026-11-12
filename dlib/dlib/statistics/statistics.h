@@ -6,6 +6,7 @@
 #include "statistics_abstract.h"
 #include <limits>
 #include <cmath>
+#include <algorithm>
 #include "../algs.h"
 #include "../matrix.h"
 #include "../sparse_vector.h"
@@ -1118,6 +1119,251 @@ namespace dlib
 
         long vect_size;
     };
+
+// ----------------------------------------------------------------------------------------
+
+    template <
+        typename matrix_type
+        >
+    class running_covariance_decayed
+    {
+        /*!
+            INITIAL VALUE
+                - vect_size == 0
+                - total_weight == 0
+
+            CONVENTION
+                - vect_size == in_vector_size()
+                - total_weight == current_n()
+                - forget == forget_factor()
+
+                - if (total_weight != 0)
+                    - The vector given to add() k calls ago has the weight
+                      std::pow(forget, k), and total_weight is the sum of these weights.
+                    - avg == the weighted mean of all vectors given to add()
+                    - comoment == the weighted sum of (x-avg)*trans(x-avg) over all
+                      vectors x given to add()
+                    - covariance() == comoment/(total_weight-1)
+        !*/
+    public:
+
+        typedef typename matrix_type::mem_manager_type mem_manager_type;
+        typedef typename matrix_type::type scalar_type;
+        typedef typename matrix_type::layout_type layout_type;
+        typedef matrix<scalar_type,0,0,mem_manager_type,layout_type> general_matrix;
+        typedef matrix<scalar_type,0,1,mem_manager_type,layout_type> column_matrix;
+
+        explicit running_covariance_decayed(
+            scalar_type decay_halflife = 1000
+        )
+        {
+            // make sure requires clause is not broken
+            DLIB_ASSERT(decay_halflife > 0,
+                "\t running_covariance_decayed::running_covariance_decayed()"
+                << "\n\t Invalid inputs were given to this function"
+                << "\n\t decay_halflife: " << decay_halflife
+                << "\n\t this:           " << this
+                );
+
+            COMPILE_TIME_ASSERT ((
+                    is_same_type<float,scalar_type>::value ||
+                    is_same_type<double,scalar_type>::value ||
+                    is_same_type<long double,scalar_type>::value
+            ));
+
+            forget = std::pow(static_cast<scalar_type>(0.5), 1/decay_halflife);
+            clear();
+        }
+
+        void clear(
+        )
+        {
+            total_weight = 0;
+            vect_size = 0;
+            avg.set_size(0);
+            comoment.set_size(0,0);
+        }
+
+        scalar_type forget_factor (
+        ) const
+        {
+            return forget;
+        }
+
+        long in_vector_size (
+        ) const
+        {
+            return vect_size;
+        }
+
+        scalar_type current_n (
+        ) const
+        {
+            return total_weight;
+        }
+
+        template <typename T>
+        void add (
+            const T& val
+        )
+        {
+            // make sure requires clause is not broken
+            DLIB_ASSERT(is_col_vector(val) && (in_vector_size() == 0 || val.size() == in_vector_size()),
+                "\t void running_covariance_decayed::add()"
+                << "\n\t Invalid inputs were given to this function"
+                << "\n\t is_col_vector(val): " << is_col_vector(val)
+                << "\n\t in_vector_size():   " << in_vector_size()
+                << "\n\t val.size():         " << val.size()
+                << "\n\t this:               " << this
+                );
+
+            if (total_weight == 0)
+            {
+                vect_size = val.size();
+                avg = val;
+                comoment.set_size(vect_size, vect_size);
+                comoment = 0;
+                total_weight = 1;
+                return;
+            }
+
+            // Weighted form of Welford's update.  The old statistics count for
+            // forget*total_weight and the new vector for 1.  Working on deviations from
+            // the running mean keeps the precision when the mean is large compared to
+            // the spread of the vectors, where the difference of raw sums would cancel.
+            const scalar_type old_weight = forget*total_weight;
+            total_weight = old_weight + 1;
+            const column_matrix delta = val - avg;
+            avg += delta/total_weight;
+            comoment = forget*comoment + (old_weight/total_weight)*(delta*trans(delta));
+        }
+
+        const column_matrix mean (
+        ) const
+        {
+            // make sure requires clause is not broken
+            DLIB_ASSERT( in_vector_size() != 0,
+                "\t running_covariance_decayed::mean()"
+                << "\n\t This object can not execute this function in its current state."
+                << "\n\t in_vector_size(): " << in_vector_size()
+                << "\n\t current_n():      " << current_n()
+                << "\n\t this:             " << this
+                );
+
+            return avg;
+        }
+
+        const general_matrix covariance (
+        ) const
+        {
+            // make sure requires clause is not broken
+            DLIB_ASSERT( in_vector_size() != 0 && current_n() > 1,
+                "\t running_covariance_decayed::covariance()"
+                << "\n\t This object can not execute this function in its current state."
+                << "\n\t in_vector_size(): " << in_vector_size()
+                << "\n\t current_n():      " << current_n()
+                << "\n\t this:             " << this
+                );
+
+            return comoment/(total_weight-1);
+        }
+
+        const general_matrix correlation (
+        ) const
+        {
+            // make sure requires clause is not broken
+            DLIB_ASSERT( in_vector_size() != 0 && current_n() > 1,
+                "\t running_covariance_decayed::correlation()"
+                << "\n\t This object can not execute this function in its current state."
+                << "\n\t in_vector_size(): " << in_vector_size()
+                << "\n\t current_n():      " << current_n()
+                << "\n\t this:             " << this
+                );
+
+            // The scale of the comoment cancels out of the correlation.
+            column_matrix scale(vect_size);
+            for (long i = 0; i < vect_size; ++i)
+                scale(i) = std::sqrt(comoment(i,i));
+
+            general_matrix result(vect_size, vect_size);
+            for (long r = 0; r < vect_size; ++r)
+            {
+                for (long c = 0; c < vect_size; ++c)
+                {
+                    if (scale(r) == 0 || scale(c) == 0)
+                    {
+                        // just say it's zero if there isn't any variance in a component.
+                        result(r,c) = 0;
+                    }
+                    else if (r == c)
+                    {
+                        result(r,c) = 1;
+                    }
+                    else
+                    {
+                        const scalar_type temp = comoment(r,c)/(scale(r)*scale(c));
+                        result(r,c) = std::max<scalar_type>(-1, std::min<scalar_type>(1, temp));
+                    }
+                }
+            }
+            return result;
+        }
+
+        template <typename U>
+        friend void serialize (
+            const running_covariance_decayed<U>& item,
+            std::ostream& out
+        );
+
+        template <typename U>
+        friend void deserialize (
+            running_covariance_decayed<U>& item,
+            std::istream& in
+        );
+
+    private:
+
+        general_matrix comoment;
+        column_matrix avg;
+        scalar_type total_weight;
+        scalar_type forget;
+
+        long vect_size;
+    };
+
+    template <typename matrix_type>
+    void serialize (
+        const running_covariance_decayed<matrix_type>& item,
+        std::ostream& out
+    )
+    {
+        int version = 1;
+        serialize(version, out);
+
+        serialize(item.comoment, out);
+        serialize(item.avg, out);
+        serialize(item.total_weight, out);
+        serialize(item.forget, out);
+        serialize(item.vect_size, out);
+    }
+
+    template <typename matrix_type>
+    void deserialize (
+        running_covariance_decayed<matrix_type>& item,
+        std::istream& in
+    )
+    {
+        int version = 0;
+        deserialize(version, in);
+        if (version != 1)
+            throw dlib::serialization_error("Unexpected version number found while deserializing dlib::running_covariance_decayed object.");
+
+        deserialize(item.comoment, in);
+        deserialize(item.avg, in);
+        deserialize(item.total_weight, in);
+        deserialize(item.forget, in);
+        deserialize(item.vect_size, in);
+    }
 
 // ----------------------------------------------------------------------------------------
 
