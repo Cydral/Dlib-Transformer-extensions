@@ -15,18 +15,6 @@ namespace albireo
 
     namespace
     {
-        float yarn_corr_dim(long n_dims, double n_ctx_orig, double n_rot, double base)
-        {
-            return static_cast<float>(n_dims * std::log(n_ctx_orig / (n_rot * 2.0 * 3.14159265358979323846))
-                / (2.0 * std::log(base)));
-        }
-
-        float yarn_ramp(float low, float high, long i0)
-        {
-            const float y = (static_cast<float>(i0 / 2) - low) / std::max(0.001f, high - low);
-            return 1.0f - std::min(1.0f, std::max(0.0f, y));
-        }
-
         // The rows [first, first + count) of a matrix, as a matrix of their own in its memory.
         weight_matrix row_slice(const weight_matrix& w, long first, long count)
         {
@@ -291,44 +279,12 @@ namespace albireo
     {
         if (positions <= rope_positions_) return;
         const long half = cfg_.rope_dims / 2;
-        const long n_dims = cfg_.rope_dims;
         // Grow in steps, to avoid recomputing for every new token.
         const long target = std::max<long>(positions, rope_positions_ + 1024);
         rope_cos_.resize(static_cast<size_t>(target * half));
         rope_sin_.resize(static_cast<size_t>(target * half));
-
-        const double theta_scale = std::pow(cfg_.rope_base, -2.0 / static_cast<double>(n_dims));
-        float low = 0, high = 0;
-        if (cfg_.yarn)
-        {
-            const float fast = yarn_corr_dim(n_dims, cfg_.yarn_orig_ctx, cfg_.yarn_beta_fast, cfg_.rope_base);
-            const float slow = yarn_corr_dim(n_dims, cfg_.yarn_orig_ctx, cfg_.yarn_beta_slow, cfg_.rope_base);
-            low = std::max(0.0f, std::floor(fast));
-            high = std::min(static_cast<float>(n_dims - 1), std::ceil(slow));
-        }
-        const float freq_scale = static_cast<float>(cfg_.rope_freq_scale);
-        const float attn_factor = static_cast<float>(cfg_.rope_attn_factor);
-        for (long pos = rope_positions_; pos < target; ++pos)
-        {
-            double theta_pow = 1.0;
-            for (long i = 0; i < half; ++i)
-            {
-                float theta_extrap = static_cast<float>(static_cast<double>(pos) * theta_pow);
-                if (!cfg_.rope_freq_factors.empty()) theta_extrap /= cfg_.rope_freq_factors[static_cast<size_t>(i)];
-                const float theta_interp = freq_scale * theta_extrap;
-                float theta = theta_interp;
-                float mscale = attn_factor;
-                if (cfg_.yarn)
-                {
-                    const float mix = yarn_ramp(low, high, 2 * i) * static_cast<float>(cfg_.yarn_ext_factor);
-                    theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
-                    mscale = static_cast<float>(cfg_.yarn_attn_factor * cfg_.rope_attn_factor);
-                }
-                rope_cos_[static_cast<size_t>(pos * half + i)] = std::cos(theta) * mscale;
-                rope_sin_[static_cast<size_t>(pos * half + i)] = std::sin(theta) * mscale;
-                theta_pow *= theta_scale;
-            }
-        }
+        rope_rows(cfg_, rope_positions_, target - rope_positions_, rope_cos_.data() + rope_positions_ * half,
+            rope_sin_.data() + rope_positions_ * half);
         rope_positions_ = target;
     }
 

@@ -40,7 +40,7 @@ namespace albireo
         std::string models_dir;                 // empty: <data>/models
         std::string language = "auto";          // auto, en, fr, de, it, es
         std::string engine = "auto";            // auto, best, or a variant: cpu, cpu-avx2, cpu-avxvnni, ...
-        std::string accelerator = "auto";       // auto, none, npu, gpu, both (offloading engines)
+        std::string accelerator = "auto";       // auto, none, npu, gpu, both (offloading engines), cpu (graph)
         bool v2ram = true;                      // extended device memory of the tensor engines
         long long v2ram_max_mb = 0;             // 0: automatic
         long long device_mb = 0;                // copies of the weights on the device, 0: automatic
@@ -49,6 +49,7 @@ namespace albireo
         int max_sequences = 4;                  // requests computed together per model
         long long kv_mb = 0;                    // 0: automatic
         std::string kv_type = "auto";           // keys and values: auto (8 bits), q8 or f16
+        std::string graph = "auto";             // graph of OpenVINO for the models: auto, on or off
         int draft_tokens = 4;                   // tokens of the drafts a step verifies per answer, 0 to 6, 0: none
         bool integer_prompt = true;             // products of the prompts on 8-bit integers
         std::map<std::string, std::string> active;   // role -> model identifier

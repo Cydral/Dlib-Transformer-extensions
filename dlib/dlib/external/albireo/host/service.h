@@ -44,8 +44,10 @@ namespace albireo
                   accelerator names for the engines that have several;
                 - accelerator "npu", "gpu" or "both": the engine of that device, the
                   fastest measured one for "both";
-                - accelerator "none": the processor engine, the fastest measured one,
-                  else the one of the richest kernels (cpu-avxvnni, cpu-avx2, cpu);
+                - accelerator "cpu": the graph of OpenVINO on the processor (openvino:cpu);
+                - accelerator "none": the processor engine, the fastest measured one, the
+                  graph of OpenVINO on the processor among them, else the one of the richest
+                  kernels (cpu-avxvnni, cpu-avx2, cpu);
                 - engine "best": the fastest measured engine;
                 - otherwise, the automatic choice: the accelerator of the computer, the
                   NVIDIA card (cuda), else the NPU and the graphics processor of Intel
@@ -53,6 +55,9 @@ namespace albireo
                   computing on the processor the products its device does not take; the
                   processor engine when no accelerator is usable, or when a measure
                   found the accelerator slower than the processor engine.
+            - The measures compare by the speed of a typical request
+              (request_tokens_per_second) when every measured choice has one, else by the
+              speed of the answers (tokens_per_second).
             - The returned candidate is null when no engine is usable.
     !*/
     engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s);

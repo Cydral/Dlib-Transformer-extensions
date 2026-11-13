@@ -273,7 +273,8 @@ namespace albireo
                 std::string npu, gpu;
                 for (const auto& d : c.description["devices"].elements())
                 {
-                    // The processor plugin is listed only when DLIB_NPU_DEVICE names it.
+                    // The processor, "CPU", is listed when the plugin of the processor of OpenVINO loads, for the
+                    // graph of the models (openvino:cpu).
                     const std::string type = d["type"].as_string();
                     if (type != "npu" && type != "gpu" && !(type == "cpu" && d["id"].as_string() == "CPU")) continue;
                     const std::string key = "openvino:" + type;
@@ -309,10 +310,22 @@ namespace albireo
     engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s)
     {
         const std::vector<engine_choice> options = engine_options(candidates);
-        auto rate = [&](const engine_choice& e) {
-            return s.engine_benchmarks[e.key]["tokens_per_second"].as_double(0);
+        /*
+            The speed of a typical request when every measured choice has one, else the speed of the
+            answers, which the measures of the versions before 1.0.20 give alone: the choices compare on
+            the same measure.
+        */
+        auto measured = [&](const engine_choice& e, const char* key) {
+            return s.engine_benchmarks[e.key][key].as_double(0);
         };
-        auto is_cpu = [](const engine_choice& e) { return e.key.compare(0, 3, "cpu") == 0; };
+        bool typical = true;
+        for (const auto& e : options)
+            if (measured(e, "tokens_per_second") > 0 && measured(e, "request_tokens_per_second") <= 0) typical = false;
+        auto rate = [&](const engine_choice& e) {
+            return measured(e, typical ? "request_tokens_per_second" : "tokens_per_second");
+        };
+        // The engines of the processor, the graph of OpenVINO on the processor among them.
+        auto is_cpu = [](const engine_choice& e) { return e.key.compare(0, 3, "cpu") == 0 || e.key == "openvino:cpu"; };
         auto is_npu = [](const engine_choice& e) { return e.key == "openvino:npu"; };
         auto is_gpu = [](const engine_choice& e) { return e.key == "cuda" || e.key == "openvino:gpu"; };
         auto is_accelerator = [](const engine_choice& e) {
@@ -343,7 +356,8 @@ namespace albireo
                 if (e.key != s.engine && e.candidate->variant != s.engine && !openvino) continue;
                 if (!named) named = &e;
                 if ((s.accelerator == "npu" && is_npu(e)) || (s.accelerator == "gpu" && is_gpu(e))
-                    || (s.accelerator == "both" && e.key == "openvino:both")) named = &e;
+                    || (s.accelerator == "both" && e.key == "openvino:both")
+                    || (s.accelerator == "cpu" && e.key == "openvino:cpu")) named = &e;
             }
             if (named) return *named;
             log_warning("engines: the engine '" + s.engine + "' of the settings is not usable, automatic selection");
@@ -366,6 +380,11 @@ namespace albireo
         {
             e = fastest(is_accelerator);
             if (!e) e = first({ "cuda", "openvino:both", "openvino:gpu", "openvino:npu" });
+        }
+        else if (s.accelerator == "cpu")
+        {
+            // The graph of OpenVINO on the processor.
+            e = first({ "openvino:cpu" });
         }
         else if (s.accelerator == "none")
         {
@@ -428,6 +447,7 @@ namespace albireo
         c["max_sequences"] = s.max_sequences;
         c["kv_mb"] = s.kv_mb;
         c["kv_type"] = s.kv_type;
+        c["graph"] = s.graph;
         c["draft_tokens"] = s.draft_tokens;
         c["integer_prompt"] = s.integer_prompt;
         c["v2ram"] = s.v2ram;
@@ -2404,7 +2424,10 @@ namespace albireo
                 m["model"] = model.id;
                 m["measured_at"] = static_cast<long long>(now_unix());
                 results[o.key] = m;
-                log_info("engines: " + o.key + " " + std::to_string(r["tokens_per_second"].as_double()) + " tokens/s");
+                log_info("engines: " + o.key + " writes " + std::to_string(r["tokens_per_second"].as_double())
+                    + " tokens/s, reads " + std::to_string(r["prompt_tokens_per_second"].as_double(0))
+                    + " tokens/s, typical request " + std::to_string(r["request_tokens_per_second"].as_double(0))
+                    + " tokens/s");
             }
             else
             {
@@ -2497,14 +2520,13 @@ namespace albireo
                 w->cv.notify_all();
             }
         };
-        auto run = [&](int tokens, json& done) {
+        auto run = [&](const std::string& content, int tokens, json& done) {
             json req = json::object();
             req["model"] = "bench";
             json messages = json::array();
             json msg = json::object();
             msg["role"] = "user";
-            msg["content"] = "Write a detailed explanation of how a refracting telescope forms an image, "
-                "covering the objective lens, the focal length, the eyepiece and the magnification.";
+            msg["content"] = content;
             messages.push_back(msg);
             req["messages"] = messages;
             req["max_tokens"] = tokens;
@@ -2521,28 +2543,58 @@ namespace albireo
             done = json::parse_or_null(w.result);
             return done["usage"].is_object();
         };
+        const std::string question = "Write a detailed explanation of how a refracting telescope forms an image, "
+            "covering the objective lens, the focal length, the eyepiece and the magnification.";
+        // A text of about a thousand tokens, which no earlier request of the measure begins.
+        std::string text = "Summarize the following notes in three sentences.\n\n";
+        const char* const notes[] = {
+            "The objective lens of a refracting telescope gathers the light of a distant object and brings it to a "
+            "focus, forming a small real image at its focal plane. ",
+            "The eyepiece, placed behind that plane, acts as a magnifying glass through which the observer examines "
+            "the image formed by the objective. ",
+            "The magnification equals the focal length of the objective divided by the focal length of the "
+            "eyepiece, so that a long objective and a short eyepiece give a large one. ",
+            "Chromatic aberration, the failure of a single lens to focus every colour at the same point, led the "
+            "makers of the eighteenth century to pair lenses of crown and flint glass. ",
+            "The aperture of the objective sets both the light the telescope collects and the finest detail it can "
+            "separate, which the diffraction of light limits. ",
+            "Mounts that follow the rotation of the sky let the observer keep an object in the field for long "
+            "exposures, which photography and later electronic sensors made routine. " };
+        for (int round = 0; round < 6; ++round)
+            for (const char* n : notes) text += std::string("(") + std::to_string(round + 1) + ") " + n;
         /*
             A first request reads the model from the disk into the memory of the system, lets a
             device compile its graphs and copy its matrices, and lets the engines of the devices
-            measure where each product runs faster.  Two requests are then measured: the faster
-            of the two is kept, so that a pause of the system during one of them does not set
-            the measure.
+            measure where each product runs faster.  A request then reads the notes, which gives the
+            speed of the prompts, and two requests write answers of 64 tokens: the faster of the two
+            is kept, so that a pause of the system during one of them does not set the measure.
         */
-        json warm, done, again;
-        const bool ok = run(16, warm) && run(64, done) && run(64, again);
+        json warm, prompt, done, again;
+        const bool ok = run(question, 16, warm) && run(text, 8, prompt) && run("Question 1. " + question, 64, done)
+            && run("Question 2. " + question, 64, again);
         lib.unload_model(e, "bench");
         lib.destroy(e);
         if (!ok)
         {
-            const json& failed = again.is_object() ? again : done.is_object() ? done : warm;
+            const json& failed = again.is_object() ? again : done.is_object() ? done : prompt.is_object() ? prompt
+                : warm;
             return fail(failed["message"].str("the measure did not complete"));
         }
         const json& t = done["timings"];
         const json& u = again["timings"];
         json r = json::object();
-        r["tokens_per_second"] = std::max(t["generation_per_second"].as_double(0),
+        const double generation = std::max(t["generation_per_second"].as_double(0),
             u["generation_per_second"].as_double(0));
-        r["prompt_tokens_per_second"] = t["prompt_per_second"];
+        const double reading = prompt["timings"]["prompt_per_second"].as_double(0);
+        r["tokens_per_second"] = generation;
+        r["prompt_tokens_per_second"] = reading;
+        r["prompt_tokens"] = prompt["usage"]["prompt_tokens"];
+        /*
+            The speed of a typical request, 1500 tokens read and 300 written, which orders the engines:
+            the reading of the prompts weighs as much as the writing of the answers it precedes.
+        */
+        if (generation > 0 && reading > 0)
+            r["request_tokens_per_second"] = 1800.0 / (1500.0 / reading + 300.0 / generation);
         r["generated"] = done["usage"]["completion_tokens"];
         std::cout << r.dump() << std::endl;
         return 0;

@@ -152,6 +152,15 @@ namespace albireo
     !*/
     void select_rope_factors(model_config& c, long context);
 
+    /*!
+        ensures
+            - Writes the cosines and sines of the rotary pairs of the count positions from
+              first on, c.rope_dims / 2 values per position, position after position: the
+              angles of the base frequencies, adjusted by the linear scaling, the
+              per-frequency divisors and YaRN, and their magnitude correction.
+    !*/
+    void rope_rows(const model_config& c, long first, long count, float* cos_out, float* sin_out);
+
     // One line describing a configuration, for the logs.
     std::string describe(const model_config& c);
 

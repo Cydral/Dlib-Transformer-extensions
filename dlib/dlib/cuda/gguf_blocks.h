@@ -399,6 +399,105 @@ namespace dlib
             default: break;
             }
         }
+
+        /*!
+            requires
+                - TYPE == q4_K or TYPE == q6_K
+                - p points to a super-block of 256 values in the format TYPE, on 4 bytes for q4_K on
+                  the device, which reads its nibbles by words
+                - x points to the 256 floats of the columns of the super-block for the first of n
+                  rows of activations, the rows following each other stride floats apart
+                - 0 <= lane < 32 and n <= N
+            ensures
+                - Adds to acc[t], for t < n, the products of the 8 values of lane lane of the
+                  super-block with row t of x.  The values of a lane are, in Q4_K, the nibbles of
+                  the bytes 4 lane to 4 lane + 3 of the nibbles, the low ones in group 2 (lane / 8)
+                  and the high ones in the next group; in Q6_K, the values of index lane of the
+                  four quarters of each half, which the byte lane of the low nibbles of each half
+                  of a quarter and the byte lane of its high bit pairs give.  The 32 lanes cover the
+                  super-block once: their sums give its products with each row, and a warp of the
+                  device reads the bytes of a super-block in a few contiguous accesses.
+                - The products of a row of x are added in the same order whatever n.
+        !*/
+        template <int TYPE, int N>
+        DLIB_GGUF_HD void lane_products(const uint8_t* p, const float* x, int stride, int n, int lane, float* acc);
+
+        namespace impl
+        {
+            template <int N>
+            DLIB_GGUF_HD void q4_k_lane(const uint8_t* p, const float* x, int stride, int n, int lane, float* acc)
+            {
+                const int c = lane >> 3;
+                // The bytes of a super-block start on 4 bytes in a matrix whose rows do (gguf_matvec).
+#if defined(__CUDA_ARCH__)
+                const uint32_t q = *reinterpret_cast<const uint32_t*>(p + 16 + 4 * lane);
+#else
+                const uint32_t q = read_u32(p + 16 + 4 * lane);
+#endif
+                const float d = read_half(p);
+                const float dmin = read_half(p + 2);
+                int sc_low, mn_low, sc_high, mn_high;
+                scale_min_k4(2 * c, p + 4, sc_low, mn_low);
+                scale_min_k4(2 * c + 1, p + 4, sc_high, mn_high);
+                const float scale_low = d * static_cast<float>(sc_low);
+                const float min_low = dmin * static_cast<float>(mn_low);
+                const float scale_high = d * static_cast<float>(sc_high);
+                const float min_high = dmin * static_cast<float>(mn_high);
+                const int at = 64 * c + (lane & 7) * 4;
+                DLIB_GGUF_UNROLL
+                for (int t = 0; t < N; ++t)
+                {
+                    if (t >= n) break;
+                    const float* a = x + static_cast<size_t>(t) * static_cast<size_t>(stride) + at;
+                    const float* b = a + 32;
+                    const float low = static_cast<float>(q & 15) * a[0] + static_cast<float>((q >> 8) & 15) * a[1]
+                        + static_cast<float>((q >> 16) & 15) * a[2] + static_cast<float>((q >> 24) & 15) * a[3];
+                    const float high = static_cast<float>((q >> 4) & 15) * b[0]
+                        + static_cast<float>((q >> 12) & 15) * b[1] + static_cast<float>((q >> 20) & 15) * b[2]
+                        + static_cast<float>(q >> 28) * b[3];
+                    acc[t] += scale_low * low - min_low * (a[0] + a[1] + a[2] + a[3])
+                        + scale_high * high - min_high * (b[0] + b[1] + b[2] + b[3]);
+                }
+            }
+
+            template <int N>
+            DLIB_GGUF_HD void q6_k_lane(const uint8_t* p, const float* x, int stride, int n, int lane, float* acc)
+            {
+                const float d = read_half(p + 208);
+                const int is = lane >> 4;
+                DLIB_GGUF_UNROLL
+                for (int h = 0; h < 2; ++h)
+                {
+                    const uint8_t* ql = p + 64 * h;
+                    const uint8_t* sc = p + 192 + 8 * h;
+                    const int l0 = ql[lane];
+                    const int l1 = ql[lane + 32];
+                    const int hb = p[128 + 32 * h + lane];
+                    const float q1 = static_cast<float>(((l0 & 15) | ((hb & 3) << 4)) - 32);
+                    const float q2 = static_cast<float>(((l1 & 15) | (((hb >> 2) & 3) << 4)) - 32);
+                    const float q3 = static_cast<float>(((l0 >> 4) | (((hb >> 4) & 3) << 4)) - 32);
+                    const float q4 = static_cast<float>(((l1 >> 4) | (((hb >> 6) & 3) << 4)) - 32);
+                    const float s1 = d * static_cast<float>(static_cast<int8_t>(sc[is]));
+                    const float s2 = d * static_cast<float>(static_cast<int8_t>(sc[is + 2]));
+                    const float s3 = d * static_cast<float>(static_cast<int8_t>(sc[is + 4]));
+                    const float s4 = d * static_cast<float>(static_cast<int8_t>(sc[is + 6]));
+                    DLIB_GGUF_UNROLL
+                    for (int t = 0; t < N; ++t)
+                    {
+                        if (t >= n) break;
+                        const float* a = x + static_cast<size_t>(t) * static_cast<size_t>(stride) + 128 * h + lane;
+                        acc[t] += s1 * q1 * a[0] + s2 * q2 * a[32] + s3 * q3 * a[64] + s4 * q4 * a[96];
+                    }
+                }
+            }
+        }
+
+        template <int TYPE, int N>
+        DLIB_GGUF_HD void lane_products(const uint8_t* p, const float* x, int stride, int n, int lane, float* acc)
+        {
+            if (TYPE == q4_K) impl::q4_k_lane<N>(p, x, stride, n, lane, acc);
+            else impl::q6_k_lane<N>(p, x, stride, n, lane, acc);
+        }
     }
 }
 

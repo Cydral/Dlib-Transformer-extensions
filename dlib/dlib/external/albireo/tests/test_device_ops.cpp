@@ -7,7 +7,9 @@
         test_device_ops [card]
 
     With CUDA, the operations run on the card given, or on the one with the most memory;
-    otherwise on the processor, through the host code of dlib.  For every format:
+    otherwise on the processor, through the host code of dlib.  First, on the processor, the
+    lanes of the kernel of the device for Q4_K and Q6_K (gguf_blocks::lane_products()), against
+    the values qk_dequantize_row() gives.  Then, for every format:
         - tt::gguf_dequantize() against qk_dequantize_row(), row by row;
         - tt::gguf_matvec() for 1 to 20 tokens and for 130 tokens, against products in double
           precision with the rows qk_dequantize_row() expands, with activations that start on
@@ -218,6 +220,47 @@ namespace
             }
         expect(worst <= 2e-5, what + ": products (relative error " + std::to_string(worst) + ")");
         std::printf("  %-7s %4ldx%-5ld products within %.2g of their magnitude\n", f.name, rows, cols, worst);
+    }
+
+    /*
+        The lanes of the kernel of the device for Q4_K and Q6_K (gb::lane_products()), run here one
+        after the other: their sums over the 32 lanes of a super-block against the products of the
+        values qk_dequantize_row() gives, for 1 to 8 rows of activations.
+    */
+    template <int N>
+    void check_lanes(const format& f, std::mt19937& rng)
+    {
+        const long cols = 1024;
+        const long supers = cols / 256;
+        std::vector<uint8_t> row(gb::row_bytes(f.type, cols));
+        random_row(f, row.data(), cols, rng);
+        std::vector<float> values(static_cast<size_t>(cols)), x(static_cast<size_t>(N * cols));
+        qk_dequantize_row(static_cast<dlib::ggml_type>(f.type), row.data(), values.data(), cols);
+        random_floats(x.data(), x.size(), 1.0f, rng);
+        for (int n = 1; n <= N; ++n)
+        {
+            float acc[N] = {};
+            for (long b = 0; b < supers; ++b)
+                for (int lane = 0; lane < 32; ++lane)
+                {
+                    const uint8_t* p = row.data() + static_cast<size_t>(b) * f.block_bytes;
+                    if (f.type == gb::q4_K) gb::lane_products<gb::q4_K, N>(p, x.data() + b * 256, cols, n, lane, acc);
+                    else gb::lane_products<gb::q6_K, N>(p, x.data() + b * 256, cols, n, lane, acc);
+                }
+            for (int t = 0; t < n; ++t)
+            {
+                double want = 0, size = 0;
+                for (long i = 0; i < cols; ++i)
+                {
+                    want += static_cast<double>(values[static_cast<size_t>(i)]) * x[static_cast<size_t>(t * cols + i)];
+                    size += std::fabs(static_cast<double>(values[static_cast<size_t>(i)])
+                        * x[static_cast<size_t>(t * cols + i)]);
+                }
+                expect(std::fabs(acc[t] - want) <= 1e-5 * size + 1e-6, std::string(f.name) + " lanes, row "
+                    + std::to_string(t) + " of " + std::to_string(n) + ": " + std::to_string(acc[t]) + " against "
+                    + std::to_string(want));
+            }
+        }
     }
 
     void check_row_operations(std::mt19937& rng)
@@ -715,6 +758,12 @@ static int run_checks(int argc, char** argv)
 #endif
     std::mt19937 rng(20261104u);
     const long shapes[][2] = { { 37, 256 }, { 9, 768 }, { 70, 2304 } };
+    for (const format& f : formats())
+        if (f.type == gb::q4_K || f.type == gb::q6_K)
+        {
+            check_lanes<1>(f, rng);
+            check_lanes<8>(f, rng);
+        }
     for (const format& f : formats())
         for (const auto& s : shapes) check_format(f, s[0], s[1], rng);
     check_row_operations(rng);

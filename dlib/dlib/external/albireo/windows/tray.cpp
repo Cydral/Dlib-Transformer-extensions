@@ -606,7 +606,9 @@ namespace albireo
             for (const auto& o : eng["options"].elements())
             {
                 const std::string kind = o["kind"].as_string();
-                if (kind != "gpu" && kind != "npu" && kind != "both") continue;
+                // The devices, and the processor through the graph of OpenVINO.
+                if (kind != "gpu" && kind != "npu" && kind != "both" && o["key"].as_string() != "openvino:cpu")
+                    continue;
                 const std::pair<std::string, std::string> settings = choice_settings(o);
                 const int index = static_cast<int>(tray.choices.size());
                 if (settings.first == engine && settings.second == accelerator) marked = index;

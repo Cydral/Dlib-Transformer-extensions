@@ -3,6 +3,7 @@
 
 #include "model_config.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -233,6 +234,60 @@ namespace albireo
         if (pooling < 0 || pooling > 4) throw std::runtime_error("unknown pooling type");
         c.pooling = static_cast<int>(pooling);
         return c;
+    }
+
+    namespace
+    {
+        float yarn_corr_dim(long n_dims, double n_ctx_orig, double n_rot, double base)
+        {
+            return static_cast<float>(n_dims * std::log(n_ctx_orig / (n_rot * 2.0 * 3.14159265358979323846))
+                / (2.0 * std::log(base)));
+        }
+
+        float yarn_ramp(float low, float high, long i0)
+        {
+            const float y = (static_cast<float>(i0 / 2) - low) / std::max(0.001f, high - low);
+            return 1.0f - std::min(1.0f, std::max(0.0f, y));
+        }
+    }
+
+    void rope_rows(const model_config& c, long first, long count, float* cos_out, float* sin_out)
+    {
+        const long half = c.rope_dims / 2;
+        const long n_dims = c.rope_dims;
+        const double theta_scale = std::pow(c.rope_base, -2.0 / static_cast<double>(n_dims));
+        float low = 0, high = 0;
+        if (c.yarn)
+        {
+            const float fast = yarn_corr_dim(n_dims, c.yarn_orig_ctx, c.yarn_beta_fast, c.rope_base);
+            const float slow = yarn_corr_dim(n_dims, c.yarn_orig_ctx, c.yarn_beta_slow, c.rope_base);
+            low = std::max(0.0f, std::floor(fast));
+            high = std::min(static_cast<float>(n_dims - 1), std::ceil(slow));
+        }
+        const float freq_scale = static_cast<float>(c.rope_freq_scale);
+        const float attn_factor = static_cast<float>(c.rope_attn_factor);
+        for (long r = 0; r < count; ++r)
+        {
+            const long pos = first + r;
+            double theta_pow = 1.0;
+            for (long i = 0; i < half; ++i)
+            {
+                float theta_extrap = static_cast<float>(static_cast<double>(pos) * theta_pow);
+                if (!c.rope_freq_factors.empty()) theta_extrap /= c.rope_freq_factors[static_cast<size_t>(i)];
+                const float theta_interp = freq_scale * theta_extrap;
+                float theta = theta_interp;
+                float mscale = attn_factor;
+                if (c.yarn)
+                {
+                    const float mix = yarn_ramp(low, high, 2 * i) * static_cast<float>(c.yarn_ext_factor);
+                    theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
+                    mscale = static_cast<float>(c.yarn_attn_factor * c.rope_attn_factor);
+                }
+                cos_out[r * half + i] = std::cos(theta) * mscale;
+                sin_out[r * half + i] = std::sin(theta) * mscale;
+                theta_pow *= theta_scale;
+            }
+        }
     }
 
     void select_rope_factors(model_config& c, long context)

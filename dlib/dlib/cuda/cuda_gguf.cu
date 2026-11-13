@@ -152,6 +152,90 @@ namespace dlib
                 }
             }
 
+            // The super-blocks of 256 columns of x that gguf_matvec_k_kernel copies to shared memory at a time.
+            const int matvec_supers = 4;
+
+            /*
+                gguf_matvec_kernel for the matrices in Q4_K and Q6_K, whose super-blocks the lanes of a
+                warp read in a few contiguous accesses (gguf_blocks::lane_products()), where a lane of
+                gguf_matvec_kernel reads a group of 32 values byte after byte: a warp computes a row,
+                one super-block at a time, each lane taking the products of its 8 values with the n
+                rows of x, which the block copies to its shared memory by chunks of 4 super-blocks.
+                The warp adds the sums of its lanes.  A lane adds its products in the same order for
+                every token and every n, so that a token gets the same result in any launch.
+            */
+            template <int TYPE, int N>
+            __global__ void __launch_bounds__(32 * warps_per_block) gguf_matvec_k_kernel(
+                const uint8_t* __restrict__ w,
+                size_t row_bytes,
+                int rows,
+                int cols,
+                const float* __restrict__ x,
+                int n,
+                bool aligned,
+                float* __restrict__ y
+            )
+            {
+                const int span = matvec_supers * 256;
+                __shared__ __align__(16) float xs[N * matvec_supers * 256];
+                const int lane = threadIdx.x;
+                const int thread = threadIdx.y * 32 + lane;
+                const int row = blockIdx.x * warps_per_block + threadIdx.y;
+                // A warp past the matrix copies its share of x and computes nothing.
+                const bool computes = row < rows;
+                const uint8_t* wr = w + static_cast<size_t>(computes ? row : 0) * row_bytes;
+                const size_t block_bytes = TYPE == gguf_blocks::q4_K ? 144 : 210;
+                const int supers = cols / 256;
+                float acc[N];
+#pragma unroll
+                for (int t = 0; t < N; ++t) acc[t] = 0;
+                for (int first = 0; first < supers; first += matvec_supers)
+                {
+                    const int count = supers - first < matvec_supers ? supers - first : matvec_supers;
+                    const float* xc = x + static_cast<size_t>(first) * 256;
+                    // The warps have read the previous chunk.
+                    __syncthreads();
+                    if (aligned)
+                    {
+                        const int quads = count * 64;
+                        for (int i = thread; i < n * quads; i += 32 * warps_per_block)
+                        {
+                            const int t = i / quads;
+                            const int q = i - t * quads;
+                            reinterpret_cast<float4*>(xs + t * span)[q]
+                                = reinterpret_cast<const float4*>(xc + static_cast<size_t>(t) * cols)[q];
+                        }
+                    }
+                    else
+                    {
+                        const int values = count * 256;
+                        for (int i = thread; i < n * values; i += 32 * warps_per_block)
+                        {
+                            const int t = i / values;
+                            const int j = i - t * values;
+                            xs[t * span + j] = xc[static_cast<size_t>(t) * cols + j];
+                        }
+                    }
+                    __syncthreads();
+                    if (computes)
+                    {
+#pragma unroll
+                        for (int s = 0; s < matvec_supers; ++s)
+                            if (s < count)
+                                gguf_blocks::lane_products<TYPE, N>(wr + static_cast<size_t>(first + s) * block_bytes,
+                                    xs + s * 256, span, n, lane, acc);
+                    }
+                }
+                // A warp past the matrix leaves once the last barrier is behind it.
+                if (!computes) return;
+#pragma unroll
+                for (int t = 0; t < N; ++t)
+                {
+                    const float s = warp_sum(acc[t]);
+                    if (lane == 0 && t < n) y[static_cast<size_t>(t) * rows + row] = s;
+                }
+            }
+
             /*
                 dst[r * cols + i] = W[first + r][i], for r < count and i < cols: a thread decodes
                 one group of 32 values at a time, and writes them four at a time when dst starts
@@ -234,6 +318,23 @@ namespace dlib
                 const bool aligned = reinterpret_cast<uintptr_t>(x) % 16 == 0;
                 const dim3 threads(32, warps_per_block);
                 const dim3 blocks((rows + warps_per_block - 1) / warps_per_block);
+                /*
+                    The K-quants of most models read their super-blocks in contiguous accesses: Q6_K by
+                    bytes, Q4_K by words of 4 bytes, which its rows start on when the matrix does, a row
+                    of Q4_K holding a multiple of 16 bytes.
+                */
+                if (type == gguf_blocks::q4_K && reinterpret_cast<uintptr_t>(w) % 4 == 0)
+                {
+                    gguf_matvec_k_kernel<gguf_blocks::q4_K, N><<<blocks, threads>>>(w, row_bytes, rows, cols, x, n,
+                        aligned, y);
+                    return;
+                }
+                if (type == gguf_blocks::q6_K)
+                {
+                    gguf_matvec_k_kernel<gguf_blocks::q6_K, N><<<blocks, threads>>>(w, row_bytes, rows, cols, x, n,
+                        aligned, y);
+                    return;
+                }
                 with_format(type, [&](auto format) {
                     gguf_matvec_kernel<decltype(format)::value, N><<<blocks, threads>>>(w, row_bytes, rows, cols, x,
                         n, aligned, y);

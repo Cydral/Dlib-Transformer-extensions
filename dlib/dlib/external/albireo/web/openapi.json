@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Albireo Community Edition local interface",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, albireo-background the model that comes with Albireo, or the default model of the catalog that stands for it, which the web application uses for its work in the background, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.\n\nRequests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, DELETE and OPTIONS take no body (400). While the JSON bodies being read at once hold the values of their budget, a route that reads one answers 503 with the code busy and a Retry-After of 2 seconds. An answer being written whose model has no memory left for its keys and values ends with the error code out_of_memory.\n\nBefore any route, the server refuses, as plain text: a request whose Host header names another server than this computer (421), a request whose Origin header names another origin than the local server (403), so that no web site drives the service through a browser, and a body of more than 8 MB while four such bodies are being read (503, with a Retry-After header).",
   "license": {
    "name": "Boost Software License 1.0",
@@ -640,7 +640,7 @@
            "items": {
             "type": "object"
            },
-           "description": "The models of the engine, with their context and capabilities: context, trained_context, kv_bytes_per_token, kv_type (q8 or f16), and the speeds measured on their answers, prompt_tokens_per_second and generation_tokens_per_second, 0 until they answered."
+           "description": "The models of the engine, with their context and capabilities: context, trained_context, kv_bytes_per_token (two positions of the buffers of the plugin for the graph of OpenVINO, which grows them to twice the positions of a sequence), kv_type (q8 or f16), runtime (processor, or openvino-graph: and the device of the graph of OpenVINO), and the speeds measured on their answers, prompt_tokens_per_second and generation_tokens_per_second, 0 until they answered."
           },
           "models_state": {
            "type": "object",
@@ -3388,8 +3388,10 @@
        "none",
        "npu",
        "gpu",
-       "both"
-      ]
+       "both",
+       "cpu"
+      ],
+      "description": "The device of the engines that have several: none for the processor engines, the fastest measured one, npu, gpu or both for the devices, cpu for the graph of OpenVINO on the processor."
      },
      "v2ram": {
       "type": "boolean",
@@ -3427,7 +3429,17 @@
        "f16"
       ],
       "default": "auto",
-      "description": "Storage of the keys and values of the language models: q8, 8-bit integers by groups of 32 values with a scale, the keys rotated; f16, half precision. auto takes q8 for the models whose heads hold whole groups."
+      "description": "Storage of the keys and values of the language models: q8, 8-bit integers by groups of 32 values with a scale, the keys rotated; f16, half precision. auto takes q8 for the models whose heads hold whole groups. The graph of OpenVINO keeps half precision unless q8 is chosen, its 8-bit format then being that of the plugin of the processor."
+     },
+     "graph": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "on",
+       "off"
+      ],
+      "default": "auto",
+      "description": "The graph of OpenVINO of the OpenVINO engine: auto computes each model it supports as one graph on the processor or on the graphics processor, the processor runtime taking the others and those whose graph cannot be compiled; on requires it; off leaves the models to the processor runtime and their products to the devices."
      },
      "draft_tokens": {
       "type": "integer",
@@ -3699,7 +3711,7 @@
         },
         "measure": {
          "type": "object",
-         "description": "The last measure of the choice."
+         "description": "The last measure of the choice: tokens_per_second, the writing of answers of 64 tokens; prompt_tokens_per_second, the reading of a prompt of about a thousand tokens (prompt_tokens); request_tokens_per_second, the speed of a typical request of 1500 tokens read and 300 written, which orders the engines."
         }
        }
       }

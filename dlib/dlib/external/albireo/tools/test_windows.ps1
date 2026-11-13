@@ -11,12 +11,14 @@
     embedding model the build prepares for the installer; the steps whose model or build tree is
     missing are skipped.
 
-    Steps: the quantized kernels; the loading of damaged model files and of a file of more
-    than 2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on
-    the device of -Device (CPU by default, which every machine has) and a question to the
-    OpenVINO engine; with the CUDA tree, when the machine has a card it supports, a question to
-    the CUDA engine, then test_device_ops, test_offload on the card and its check of the attention
-    of the card on a tiny model; the embedding model;
+    Steps: the quantized kernels; the loading of damaged model files and of a file of more than
+    2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on the
+    device of -Device (CPU by default, which every machine has), test_ov_graph on the processor,
+    with the graph of the graphics processor on the processor too, and on the graphics processor
+    when -Device names it, and a question to each OpenVINO engine, on its devices and through
+    the graph of the processor; with the CUDA tree, when the machine has a card it supports, a
+    question to the CUDA engine, then test_device_ops, test_offload on the card and its check of
+    the attention of the card on a tiny model; the embedding model;
     the models that come with Albireo, prepared by the build, and a question to their language
     model, these engine steps with the PATH of the service, System32 and the Windows folder
     only; a sentence read aloud by the program of the speech synthesis; then the installed
@@ -134,6 +136,14 @@ try {
         Invoke-Check "offload $Device" "all checks passed" (Join-Path $openvino "tests\test_offload.exe") @($Model,
             $Device) | Out-Null
         Remove-Item Env:DLIB_NPU_DEVICE
+        # The graph of OpenVINO against the processor runtime, on the processor, and on the graphics
+        # processor when -Device names it.
+        $graphTest = Join-Path $openvino "tests\test_ov_graph.exe"
+        foreach ($graphDevice in @(@("CPU") + @(@($Device) | Where-Object { $_ -match "^GPU" }))) {
+            Invoke-Check "graph $graphDevice" "^passed" $graphTest @($Model, $graphDevice) | Out-Null
+        }
+        # The graph of the graphics processor, whose attention takes the causal mask, on the processor.
+        Invoke-Check "graph CPU mask" "^passed" $graphTest @($Model, "CPU", "0", "f16-mask") | Out-Null
         # One OpenVINO engine per family of processor kernels, skipped by the processors that lack them.
         foreach ($variant in @("openvino-avxvnni", "openvino")) {
             $engine = Join-Path $openvino "bin\engines\albireo-engine-$variant.dll"
@@ -147,6 +157,9 @@ try {
             $arguments = @($engine, $Model, "--reasoning", "off", "--max", "40")
             if ($Device -ne "CPU") { $arguments += @("--device", $Device) }
             Invoke-Check "engine $variant" "Paris" $chat ($arguments + $question) | Out-Null
+            # The graph of OpenVINO on the processor.
+            Invoke-Check "engine $variant graph" "Paris" $chat (@($engine, $Model, "--device", "CPU", "--reasoning",
+                "off", "--max", "40") + $question) | Out-Null
         }
     }
     else {

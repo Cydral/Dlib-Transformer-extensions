@@ -817,7 +817,7 @@ namespace albireo
         bool validate_settings(const json& body, std::string& error)
         {
             static const char* const keys[] = { "port", "language", "engine", "accelerator", "v2ram", "v2ram_max_mb",
-                "device_mb", "threads", "context", "max_sequences", "kv_mb", "kv_type", "draft_tokens",
+                "device_mb", "threads", "context", "max_sequences", "kv_mb", "kv_type", "graph", "draft_tokens",
                 "integer_prompt", "check_updates", "offline", "proxy", "web_access", "web_search" };
             for (const auto& kv : body.items())
             {
@@ -854,9 +854,9 @@ namespace albireo
             }
             return one_of("web_search", { "wikipedia", "none" }) && boolean("web_access")
                 && one_of("language", { "auto", "en", "fr", "de", "it", "es" })
-                && one_of("kv_type", { "auto", "q8", "f16" })
+                && one_of("kv_type", { "auto", "q8", "f16" }) && one_of("graph", { "auto", "on", "off" })
                 && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "openvino", "cuda" })
-                && one_of("accelerator", { "auto", "none", "npu", "gpu", "both" })
+                && one_of("accelerator", { "auto", "none", "npu", "gpu", "both", "cpu" })
                 && in_range("port", 1024, 65535) && in_range("threads", 0, 1024) && in_range("context", 0, 1 << 20)
                 && in_range("max_sequences", 1, 64) && in_range("kv_mb", 0, 1 << 24)
                 && in_range("draft_tokens", 0, 6) && boolean("integer_prompt")
@@ -1647,7 +1647,7 @@ namespace albireo
                 || after.v2ram_max_mb != before.v2ram_max_mb || after.device_mb != before.device_mb
                 || after.threads != before.threads
                 || after.context != before.context || after.max_sequences != before.max_sequences
-                || after.kv_mb != before.kv_mb || after.kv_type != before.kv_type
+                || after.kv_mb != before.kv_mb || after.kv_type != before.kv_type || after.graph != before.graph
                 || after.draft_tokens != before.draft_tokens || after.integer_prompt != before.integer_prompt;
             json o = ok_result(true);
             o["restart"] = restart;

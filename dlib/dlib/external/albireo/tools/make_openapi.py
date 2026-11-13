@@ -316,7 +316,10 @@ schemas = {
                    "computing the products its device does not take; the processor engine when no accelerator is "
                    "usable or when a measure found the accelerator slower. best: the fastest measured engine. A "
                    "variant: that engine, with the device of accelerator for the engines that have several."},
-        "accelerator": {"type": "string", "enum": ["auto", "none", "npu", "gpu", "both"]},
+        "accelerator": {"type": "string", "enum": ["auto", "none", "npu", "gpu", "both", "cpu"],
+                        "description": "The device of the engines that have several: none for the processor "
+                                       "engines, the fastest measured one, npu, gpu or both for the devices, cpu for "
+                                       "the graph of OpenVINO on the processor."},
         "v2ram": {"type": "boolean", "description": "Extended device memory of the graphics engines."},
         "v2ram_max_mb": {"type": "integer", "description": "Limit of the extended memory, 0 for automatic."},
         "device_mb": {"type": "integer", "description": "Memory of the device for the copies of the weights of "
@@ -331,7 +334,14 @@ schemas = {
         "kv_type": {"type": "string", "enum": ["auto", "q8", "f16"], "default": "auto",
                     "description": "Storage of the keys and values of the language models: q8, 8-bit integers by "
                                    "groups of 32 values with a scale, the keys rotated; f16, half precision. auto "
-                                   "takes q8 for the models whose heads hold whole groups."},
+                                   "takes q8 for the models whose heads hold whole groups. The graph of OpenVINO "
+                                   "keeps half precision unless q8 is chosen, its 8-bit format then being that of "
+                                   "the plugin of the processor."},
+        "graph": {"type": "string", "enum": ["auto", "on", "off"], "default": "auto",
+                  "description": "The graph of OpenVINO of the OpenVINO engine: auto computes each model it "
+                                 "supports as one graph on the processor or on the graphics processor, the processor "
+                                 "runtime taking the others and those whose graph cannot be compiled; on requires it; "
+                                 "off leaves the models to the processor runtime and their products to the devices."},
         "draft_tokens": {"type": "integer", "minimum": 0, "maximum": 6, "default": 4,
                          "description": "Tokens of the drafts of the answers a step of a language model verifies at "
                                         "most: the tokens that followed the last ones in the context, which the "
@@ -415,7 +425,10 @@ schemas = {
                 "kind": {"type": "string", "enum": ["cpu", "gpu", "npu", "both"]},
                 "names": {"type": "array", "items": {"type": "string"},
                           "description": "The names of the devices of the choice."},
-                "measure": {"type": "object", "description": "The last measure of the choice."}}}},
+                "measure": {"type": "object", "description": "The last measure of the choice: tokens_per_second, "
+                            "the writing of answers of 64 tokens; prompt_tokens_per_second, the reading of a prompt "
+                            "of about a thousand tokens (prompt_tokens); request_tokens_per_second, the speed of a "
+                            "typical request of 1500 tokens read and 300 written, which orders the engines."}}}},
         "current": {"type": "string", "description": "The key of the choice in use."},
         "setting": {"type": "string"}, "accelerator": {"type": "string"},
         "accelerators_available": {"type": "boolean"},
@@ -552,9 +565,13 @@ paths = {
                                           "which serves albireo-background and stays loaded; empty without one."},
             "loaded_models": {"type": "array", "items": {"type": "object"},
                               "description": "The models of the engine, with their context and capabilities: "
-                                             "context, trained_context, kv_bytes_per_token, kv_type (q8 or f16), "
-                                             "and the speeds measured on their answers, prompt_tokens_per_second "
-                                             "and generation_tokens_per_second, 0 until they answered."},
+                                             "context, trained_context, kv_bytes_per_token (two positions of the "
+                                             "buffers of the plugin for the graph of OpenVINO, which grows them "
+                                             "to twice the positions of a sequence), kv_type (q8 or f16), "
+                                             "runtime (processor, or openvino-graph: and the device of the graph "
+                                             "of OpenVINO), and the speeds measured on their answers, "
+                                             "prompt_tokens_per_second and generation_tokens_per_second, 0 until "
+                                             "they answered."},
             "models_state": {"type": "object", "additionalProperties": {"type": "string"},
                              "description": "loading, ready, unloading, removing, or the error of a load."},
             "web": {"type": "object", "description": "The web access of the Web button, which the web application "

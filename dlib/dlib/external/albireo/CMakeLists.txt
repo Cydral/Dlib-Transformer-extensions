@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.19 LANGUAGES C CXX)
+project(albireo VERSION 1.0.20 LANGUAGES C CXX)
 
 # The version is written in four places that must agree: project() above, the numbers of
 # common/version.h, which the version resources of the programs and of the installer carry and
@@ -358,15 +358,13 @@ function(albireo_copy_runtime target dirs extra exclude)
       VERBATIM)
 endfunction()
 
-# The runtime libraries of the device of this tree, which its engine and its test program
+# The runtime libraries of the device of this tree, which its engine and its test programs
 # load: the folders they come from, more files to copy, the names to leave out, and the
-# libraries loaded on first use only (MSVC).  The test program receives more files than
-# the engine: the CPU plugin of OpenVINO, for a machine without NPU or Intel graphics.
+# libraries loaded on first use only (MSVC).
 set(ALBIREO_RUNTIME_DIRS)
 set(ALBIREO_RUNTIME_EXTRA)
 set(ALBIREO_RUNTIME_EXCLUDE)
 set(ALBIREO_DELAYED_LIBRARIES)
-set(ALBIREO_TEST_RUNTIME_EXTRA)
 
 function(albireo_device_runtime target)
    foreach (name ${ALBIREO_DELAYED_LIBRARIES})
@@ -531,7 +529,9 @@ if (ALBIREO_ENGINE_OPENVINO)
          file(GLOB tbbbind_libraries "${tbb_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}tbbbind*${CMAKE_SHARED_LIBRARY_SUFFIX}")
          list(FILTER tbbbind_libraries EXCLUDE REGEX "_debug${CMAKE_SHARED_LIBRARY_SUFFIX}$")
       endif()
-      foreach (device npu gpu)
+      # The plugins of the NPU and of the graphics processor, and that of the processor, which runs the
+      # graphs of the models (engine/ov_graph.h) on any machine.
+      foreach (device npu gpu cpu)
          set(plugin "${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${device}_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
          list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${plugin}")
       endforeach()
@@ -547,14 +547,32 @@ if (ALBIREO_ENGINE_OPENVINO)
       foreach (engine ${openvino_engines})
          albireo_device_runtime(${engine})
       endforeach()
-      set(ALBIREO_TEST_RUNTIME_EXTRA
-         "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_cpu_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
       if (ALBIREO_COPY_RUNTIME)
          # The license of the Python package, or of the archive distribution.
          file(GLOB openvino_licenses "${openvino_dir}/../../openvino-*.dist-info/licenses/LICENSE"
             "${openvino_dir}/../../openvino-*.dist-info/LICENSE" "${openvino_dir}/../../../../docs/licensing/LICENSE")
          albireo_copy_license(albireo-engine-openvino openvino-license.txt ${openvino_licenses})
       endif()
+   endif()
+   if (TARGET openvino::runtime)
+      # The graph of the whole decoder (engine/ov_graph.h): engine/ov_graph.cpp alone includes the
+      # headers of OpenVINO, which need C++17, and is compiled on its own so that the other sources
+      # keep C++14; the engines link the runtime library itself.
+      add_library(albireo-ov-graph OBJECT engine/ov_graph.cpp)
+      set_target_properties(albireo-ov-graph PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+         POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden
+         VISIBILITY_INLINES_HIDDEN ON)
+      target_include_directories(albireo-ov-graph PRIVATE ${ALBIREO_INCLUDE_DIR})
+      target_compile_options(albireo-ov-graph PRIVATE ${ALBIREO_WARNINGS} ${ALBIREO_ISA_avx2})
+      target_link_libraries(albireo-ov-graph PRIVATE openvino::runtime)
+      foreach (engine ${openvino_engines})
+         target_sources(${engine} PRIVATE $<TARGET_OBJECTS:albireo-ov-graph>)
+         target_link_libraries(${engine} PRIVATE $<TARGET_LINKER_FILE:openvino::runtime>)
+         target_compile_definitions(${engine} PRIVATE ALBIREO_OV_GRAPH)
+      endforeach()
+   else()
+      message(STATUS "The OpenVINO runtime was not found by find_package(OpenVINO): the engines carry no graph of "
+         "the whole decoder.")
    endif()
 endif()
 if (ALBIREO_ENGINE_DLIB)
@@ -768,7 +786,6 @@ if (ALBIREO_TESTS AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO
       target_link_libraries(test_offload PRIVATE Threads::Threads)
    endif()
    albireo_output_dir(test_offload ${CMAKE_BINARY_DIR}/tests)
-   list(APPEND ALBIREO_RUNTIME_EXTRA ${ALBIREO_TEST_RUNTIME_EXTRA})
    albireo_device_runtime(test_offload)
 
    # The operations of dlib on the weights in their GGUF formats, against the processor kernels.
@@ -786,6 +803,20 @@ if (ALBIREO_TESTS AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO
    endif()
    albireo_output_dir(test_device_ops ${CMAKE_BINARY_DIR}/tests)
    albireo_device_runtime(test_device_ops)
+
+   if (TARGET albireo-ov-graph)
+      # The graph of the whole decoder against the processor runtime, on a real model.
+      add_executable(test_ov_graph tests/test_ov_graph.cpp engine/cpu_runtime.cpp engine/model_config.cpp
+         engine/model_file.cpp engine/qkernels.cpp common/system_info.cpp $<TARGET_OBJECTS:albireo-ov-graph>)
+      target_include_directories(test_ov_graph PRIVATE ${ALBIREO_INCLUDE_DIR})
+      target_link_libraries(test_ov_graph PRIVATE $<TARGET_LINKER_FILE:openvino::runtime>)
+      target_compile_options(test_ov_graph PRIVATE ${ALBIREO_WARNINGS} ${ALBIREO_ISA_avx2})
+      if (NOT WIN32)
+         target_link_libraries(test_ov_graph PRIVATE Threads::Threads)
+      endif()
+      albireo_output_dir(test_ov_graph ${CMAKE_BINARY_DIR}/tests)
+      albireo_device_runtime(test_ov_graph)
+   endif()
 endif()
 
 if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)

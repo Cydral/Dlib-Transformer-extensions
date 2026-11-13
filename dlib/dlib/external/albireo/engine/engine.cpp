@@ -30,6 +30,9 @@
 #ifdef ALBIREO_TENSOR_BACKEND
 #include "tensor_backend.h"
 #endif
+#ifdef ALBIREO_OV_GRAPH
+#include "ov_graph.h"
+#endif
 
 #ifndef ALBIREO_ENGINE_VARIANT
 #if defined(__AVX2__)
@@ -61,6 +64,33 @@ namespace albireo
             const long long x = v.as_int(def);
             return x < lo ? lo : x > hi ? hi : x;
         }
+
+#ifdef ALBIREO_OV_GRAPH
+        /*
+            The device of OpenVINO that computes the graphs of the models (ov_graph.h) for the device
+            setting of the engine: the processor for "CPU", the graphics processor of "GPU", "GPU.1" or of
+            a list that names one ("NPU,GPU"), the graphics processor too when the setting is empty, as the
+            NPU and the graphics processor are then used together; none for the NPU alone, whose compiler
+            takes graphs of fixed shapes, the products of the models then going to it one by one.
+        */
+        std::string graph_device(const std::string& setting)
+        {
+            std::string all;
+            for (char ch : setting)
+                if (ch != ' ') all += static_cast<char>(ch >= 'a' && ch <= 'z' ? ch - 'a' + 'A' : ch);
+            if (all.empty()) return "GPU";
+            if (all == "CPU") return "CPU";
+            size_t start = 0;
+            while (start <= all.size())
+            {
+                const size_t comma = std::min(all.find(',', start), all.size());
+                const std::string one = all.substr(start, comma - start);
+                if (one.compare(0, 3, "GPU") == 0) return one;
+                start = comma + 1;
+            }
+            return std::string();
+        }
+#endif
 
         // Bytes of text that end on a complete UTF-8 character; an incomplete sequence at
         // the end waits for the token that completes it.
@@ -299,6 +329,8 @@ namespace albireo
         dlib::hf_tokenizer tok;
         std::unique_ptr<chat_format> format;
         std::unique_ptr<model_runtime> runtime;
+        // processor, or openvino-graph: and the device of the graph of OpenVINO (ov_graph.h).
+        std::string runtime_name = "processor";
         long context = 0;
         long max_sequences = 8;
         long batch_tokens = 512;
@@ -1061,7 +1093,12 @@ namespace albireo
         log(ALBIREO_LOG_INFO, std::string("engine ") + ALBIREO_ENGINE_VARIANT + " " + ALBIREO_VERSION + ", "
             + std::to_string(threads_) + " threads, kernels " + qk_isa());
 #ifdef ALBIREO_TENSOR_BACKEND
-        device_.reset(new tensor_device(settings_, *pool_, [this](int level, const std::string& m) { log(level, m); }));
+#ifdef ALBIREO_OV_GRAPH
+        // The graphs of the processor run the models without the products of a device of dlib.
+        if (graph_device(settings_["device"].str()) != "CPU")
+#endif
+            device_.reset(new tensor_device(settings_, *pool_,
+                [this](int level, const std::string& m) { log(level, m); }));
 #endif
         worker_ = std::thread([this]() { run(); });
     }
@@ -1166,7 +1203,29 @@ namespace albireo
             const json accelerators = tensor_device::describe(backend, runtime, why, why_code, why_args);
             if (!runtime.empty()) d["runtime"] = runtime;
             for (const auto& a : accelerators.elements()) devices.push_back(a);
-            if (accelerators.empty() && backend != "dlib")
+            bool graph_processor = false;
+#ifdef ALBIREO_OV_GRAPH
+            // The plugin of the processor of OpenVINO runs the graphs of the models on any machine.
+            std::string processor_name;
+            if (ov_graph_processor(processor_name))
+            {
+                bool listed = false;
+                for (const auto& a : accelerators.elements())
+                    listed = listed || (a["type"].as_string() == "cpu" && a["id"].as_string() == "CPU");
+                if (!listed)
+                {
+                    json g = json::object();
+                    g["type"] = "cpu";
+                    g["id"] = "CPU";
+                    g["name"] = processor_name;
+                    g["graph"] = true;
+                    devices.push_back(g);
+                }
+                graph_processor = true;
+                if (runtime.empty()) d["runtime"] = "OpenVINO " + ov_graph_version();
+            }
+#endif
+            if (accelerators.empty() && backend != "dlib" && !graph_processor)
             {
                 usable = false;
                 reason = why;
@@ -1230,7 +1289,7 @@ namespace albireo
             m->vision.reset(new vision_encoder(m->projector, *pool_));
 #ifdef ALBIREO_TENSOR_BACKEND
             // The products of the encoder go to the device as those of the model do, by measure.
-            m->vision->set_offload(device_->make_offload(id + " (images)"));
+            if (device_) m->vision->set_offload(device_->make_offload(id + " (images)"));
 #endif
             // Qwen3-VL places the tokens of an image by multimodal rotary positions, a LLaVA-NeXT
             // or a Pixtral decoder by their order.
@@ -1329,8 +1388,35 @@ namespace albireo
             log(ALBIREO_LOG_WARNING, "model '" + id + "': heads of " + std::to_string(m->cfg.head_dim) + " values "
                 "hold no whole groups of 8-bit keys and values, which stay in half precision");
 
-        const size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * static_cast<size_t>(m->cfg.n_kv_heads)
+        size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * static_cast<size_t>(m->cfg.n_kv_heads)
             * kv_row_bytes(m->kv_type, m->cfg.head_dim);
+#ifdef ALBIREO_OV_GRAPH
+        /*
+            The graph of OpenVINO (ov_graph.h) on the device of the engine: the processor of the choice
+            openvino:cpu, else the graphics processor.  graph auto takes it when it computes the model and
+            falls back to the processor runtime when it cannot be compiled, on requires it, off leaves the
+            models to the processor runtime and their products to the devices.  Its keys and values stay
+            in half precision unless kv_type asks for 8 bits: the 8-bit format of the plugin of the
+            processor, by position and head, departs from the logits of the processor runtime ten times
+            more than the groups of 32 values of kv_format::q8 (tests/test_ov_graph.cpp).
+        */
+        const json& graph_value = options.contains("graph") ? options["graph"] : settings_["graph"];
+        const std::string graph_mode = graph_value.is_string() ? graph_value.as_string() : "auto";
+        if ((!graph_value.is_null() && !graph_value.is_string())
+            || (graph_mode != "auto" && graph_mode != "on" && graph_mode != "off"))
+            throw std::invalid_argument("the setting graph must be auto, on or off");
+        const std::string graph_on = graph_mode == "off" ? std::string() : graph_device(settings_["device"].str());
+        const std::string graph_why = graph_mode == "off" ? std::string("graph off")
+            : graph_on.empty() ? std::string("the NPU alone computes no graph")
+            : ov_graph_unsupported(m->cfg, *m->file);
+        if (graph_mode == "on" && !graph_why.empty())
+            throw std::invalid_argument("the graph of OpenVINO cannot compute this model: " + graph_why);
+        const bool graph_half = kv_type != "q8" || graph_on != "CPU";
+        // The buffers of the cache of a sequence of the graph hold up to twice its positions (ov_graph.h).
+        const size_t graph_per_token = 2 * 2 * static_cast<size_t>(m->cfg.n_layers)
+            * static_cast<size_t>(m->cfg.n_kv_heads) * static_cast<size_t>(graph_half ? 2 * m->cfg.head_dim
+            : m->cfg.head_dim + 8);
+#endif
         const memory_info mem = read_memory_info();
         /*
             The memory the keys and values leave to the system and to the other programs (margin), and
@@ -1346,40 +1432,87 @@ namespace albireo
         const uint64_t room_bytes = mem.commit_total > reserve ? mem.commit_total - reserve : 0;
         // The bytes of the keys and values of positions, in whole blocks.
         const long block_positions = embedding ? 64 : 256;
-        auto bytes_for = [&](long positions) {
+        auto bytes_for = [&](size_t per, long positions) {
             const long blocks = (positions + block_positions - 1) / block_positions;
-            return per_token * static_cast<size_t>(blocks * block_positions);
+            return per * static_cast<size_t>(blocks * block_positions);
         };
-        size_t kv = (embedding && !options.contains("kv_mb") ? size_t(0)
+        const size_t kv_mb = (embedding && !options.contains("kv_mb") ? size_t(0)
             : static_cast<size_t>(setting("kv_mb", 0, 0, 1 << 24))) << 20;
-        if (kv == 0 && embedding)
+        auto kv_budget = [&](size_t per) {
+            size_t kv = kv_mb;
+            if (kv == 0 && embedding)
+            {
+                // One input of the whole context.
+                kv = bytes_for(per, m->context);
+            }
+            else if (kv == 0)
+            {
+                /*
+                    Two full contexts, within the memory the system can commit, its physical memory
+                    and its paging file or swap together, less the reserve.  The blocks are
+                    allocated as the sequences grow, and the guard below refuses a new block when
+                    the memory the system has left comes down to the reserve: this budget is a
+                    bound that only sequences of that length reach, the paging file or the swap
+                    then holding what the physical memory does not.  The context of the model comes
+                    down to what this memory can hold, unless a setting chose it.
+                */
+                kv = 2 * bytes_for(per, m->context);
+                if (known) kv = std::min<size_t>(kv, static_cast<size_t>(room_bytes));
+                if (chosen_context) kv = std::max<size_t>(kv, bytes_for(per, m->context));
+                kv = std::max<size_t>(kv, bytes_for(per, std::min<long>(m->context, 4096)));
+                if (chosen_context && known && bytes_for(per, m->context) > room_bytes)
+                    log(ALBIREO_LOG_WARNING, "model '" + id + "': the keys and values of a context of "
+                        + std::to_string(m->context) + " tokens take "
+                        + std::to_string(bytes_for(per, m->context) >> 20) + " MB, beyond the "
+                        + std::to_string(room_bytes >> 20) + " MB the system can commit for them");
+            }
+            return kv;
+        };
+        std::unique_ptr<model_runtime> runtime;
+        cpu_runtime* processor = nullptr;
+#ifdef ALBIREO_OV_GRAPH
+        ov_graph_runtime* graph = nullptr;
+        if (graph_why.empty())
         {
-            // One input of the whole context.
-            kv = bytes_for(m->context);
+            try
+            {
+                ov_graph_settings gs;
+                gs.device = graph_on;
+                gs.kv_half = graph_half;
+                // The threads the settings give, else the choice of the plugin, which knows the cores of a
+                // hybrid processor.
+                gs.threads = settings_["threads"].as_int(0) > 0 ? threads_ : 0;
+                // The file of the weights the graph keeps mapped, in the folder of the engine for its caches.
+                const std::string cache = settings_["cache_dir"].str();
+                if (!cache.empty()) gs.weights_dir = cache + "/graphs";
+                std::unique_ptr<ov_graph_runtime> g = make_ov_graph_runtime(m->file, m->cfg, gs,
+                    kv_budget(graph_per_token));
+                graph = g.get();
+                per_token = graph_per_token;
+                m->kv_type = graph_half ? kv_format::f16 : kv_format::q8;
+                m->runtime_name = "openvino-graph:" + graph_on;
+                runtime = std::move(g);
+                log(ALBIREO_LOG_INFO, "model '" + id + "': graph of OpenVINO on " + graph_on + " built and compiled in "
+                    + std::to_string(static_cast<long>(1000 * graph->build_seconds())) + " ms");
+            }
+            catch (const std::exception& e)
+            {
+                if (graph_mode == "on") throw;
+                log(ALBIREO_LOG_WARNING, "model '" + id + "': the graph of OpenVINO on " + graph_on + " could not be "
+                    "compiled (" + e.what() + "), the processor runtime computes the model");
+            }
         }
-        else if (kv == 0)
+#endif
+        if (!runtime)
         {
-            /*
-                Two full contexts, within the memory the system can commit, its physical memory
-                and its paging file or swap together, less the reserve.  The blocks are
-                allocated as the sequences grow, and the guard below refuses a new block when
-                the memory the system has left comes down to the reserve: this budget is a
-                bound that only sequences of that length reach, the paging file or the swap
-                then holding what the physical memory does not.  The context of the model comes
-                down to what this memory can hold, unless a setting chose it.
-            */
-            kv = 2 * bytes_for(m->context);
-            if (known) kv = std::min<size_t>(kv, static_cast<size_t>(room_bytes));
-            if (chosen_context) kv = std::max<size_t>(kv, bytes_for(m->context));
-            kv = std::max<size_t>(kv, bytes_for(std::min<long>(m->context, 4096)));
-            if (chosen_context && known && bytes_for(m->context) > room_bytes)
-                log(ALBIREO_LOG_WARNING, "model '" + id + "': the keys and values of a context of "
-                    + std::to_string(m->context) + " tokens take " + std::to_string(bytes_for(m->context) >> 20)
-                    + " MB, beyond the " + std::to_string(room_bytes >> 20) + " MB the system can commit for them");
+            std::unique_ptr<cpu_runtime> r(new cpu_runtime(m->file, m->cfg, *pool_, kv_budget(per_token),
+                block_positions, m->kv_type));
+            processor = r.get();
+#ifdef ALBIREO_TENSOR_BACKEND
+            if (device_) r->set_offload(device_->make_offload(id));
+#endif
+            runtime = std::move(r);
         }
-        std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, block_positions,
-            m->kv_type));
-        cpu_runtime* const processor = runtime.get();
         /*
             A new block of keys and values, beyond the blocks of the first 4096 positions, which the
             model always has, leaves in the memory the system can still commit the margin of the system
@@ -1396,16 +1529,18 @@ namespace albireo
             of its 14.3 GB.  The copies come and go with the passes, so that the guard reads them at
             each block; the budget above still leaves room to all the weights, the copies being made
             after it.  The first refusal after a block given writes the figures of the guard in the log.
+            The graph of OpenVINO holds its weights in the memory of the process, already committed: it
+            reads none from the file.
         */
-        const size_t floor_bytes = bytes_for(std::min<long>(m->context, 4096));
+        const size_t floor_bytes = bytes_for(per_token, std::min<long>(m->context, 4096));
         const std::shared_ptr<std::atomic<bool>> refusing = std::make_shared<std::atomic<bool>>(false);
-        runtime->set_kv_guard([this, id, margin, weights, floor_bytes, processor, refusing](size_t bytes,
-            size_t allocated) {
+        std::function<bool(size_t, size_t)> guard = [this, id, margin, weights, floor_bytes, processor, refusing](
+            size_t bytes, size_t allocated) {
             if (allocated + bytes <= floor_bytes) return true;
             const memory_info now = read_memory_info();
             if (now.commit_available == 0) return true;
-            const uint64_t read = weights - std::min<uint64_t>(weights, processor->offloaded_bytes());
-            const uint64_t charged = processor->charged_bytes();
+            const uint64_t read = processor ? weights - std::min<uint64_t>(weights, processor->offloaded_bytes()) : 0;
+            const uint64_t charged = processor ? processor->charged_bytes() : 0;
             uint64_t left = now.commit_available;
             if (charged > 0 && now.commit_left >= bytes + margin)
                 left = std::max<uint64_t>(left, now.commit_left + charged);
@@ -1423,9 +1558,21 @@ namespace albireo
                     + (charged > 0 ? ", the copies of the card counting for " + std::to_string(charged >> 20) + " MB"
                     : std::string()));
             return false;
-        });
-#ifdef ALBIREO_TENSOR_BACKEND
-        runtime->set_offload(device_->make_offload(id));
+        };
+        if (processor) processor->set_kv_guard(guard);
+#ifdef ALBIREO_OV_GRAPH
+        if (graph)
+        {
+            graph->set_kv_guard(guard);
+            // A sequence cut after the drafts of each step would read and write its whole cache again.
+            m->draft_tokens = 0;
+            /*
+                Passes of 2048 tokens: the plugin of the processor attends to the tokens of a pass that
+                follows another one at a time, about a third slower than in the first pass of a prompt.
+            */
+            if (!embedding && !options.contains("batch_tokens") && settings_["batch_tokens"].is_null())
+                m->batch_tokens = 2048;
+        }
 #endif
         m->runtime = std::move(runtime);
 
@@ -1440,7 +1587,10 @@ namespace albireo
             m->context = room;
         }
         // The rotary divisors of a model with LongRoPE follow the context of its sequences.
-        processor->set_context(m->context);
+        if (processor) processor->set_context(m->context);
+#ifdef ALBIREO_OV_GRAPH
+        if (graph) graph->set_context(m->context);
+#endif
         select_rope_factors(m->cfg, m->context);
 
         if (m->tok.eos_id() >= 0) m->stops.push_back(m->tok.eos_id());
@@ -1460,7 +1610,8 @@ namespace albireo
         for (const auto& kvp : by_type)
             if (kvp.second > most) { most = kvp.second; m->quantization = kvp.first; }
 
-        if (settings_["warm_up"].as_bool(true)) m->file->warm_up(true);
+        // The graph of OpenVINO read the weights it holds while it was built.
+        if (processor && settings_["warm_up"].as_bool(true)) m->file->warm_up(true);
 
         const std::string use = embedding ? "vectors of " + std::to_string(m->cfg.d_model) + " dimensions"
             : std::string("chat format ") + m->format->name();
@@ -1524,6 +1675,7 @@ namespace albireo
         j["bytes"] = static_cast<unsigned long long>(m.bytes);
         j["kv_bytes_per_token"] = static_cast<unsigned long long>(m.runtime->kv_bytes_per_token());
         j["kv_type"] = m.kv_type == kv_format::q8 ? "q8" : "f16";
+        j["runtime"] = m.runtime_name;
         // The measured speeds, 0 until the model answered (loaded_model::prompt_rate).
         j["prompt_tokens_per_second"] = std::round(10.0 * m.prompt_rate.load(std::memory_order_relaxed)) / 10.0;
         j["generation_tokens_per_second"] = std::round(10.0 * m.generation_rate.load(std::memory_order_relaxed)) / 10.0;
@@ -1951,7 +2103,8 @@ namespace albireo
 #ifdef ALBIREO_TENSOR_BACKEND
         // CUDA keeps one current device per thread: this thread computes on the card of the
         // engine.
-        if (!device_->bind_thread()) log(ALBIREO_LOG_WARNING, "device: the card of the engine cannot be selected");
+        if (device_ && !device_->bind_thread())
+            log(ALBIREO_LOG_WARNING, "device: the card of the engine cannot be selected");
 #endif
         for (;;)
         {
@@ -2286,18 +2439,22 @@ namespace albireo
         {
             cache_entry& e = m.idle[best];
             const bool take = best_len * 2 >= static_cast<long>(e.tokens.size());
+            /*
+                The request owns its sequence before a truncation or a copy, which may throw with the graph of
+                OpenVINO: the error then releases it with the request, and no entry of the cache names it.
+            */
             if (take)
             {
                 // The rest of the cached sequence is of no further use: take it over.
                 r.seq = e.seq;
-                m.runtime->truncate_sequence(r.seq, best_len);
                 m.idle.erase(m.idle.begin() + static_cast<std::ptrdiff_t>(best));
+                m.runtime->truncate_sequence(r.seq, best_len);
             }
             else
             {
                 // Another conversation may still need it: copy the shared prefix.
-                const int s = m.runtime->create_sequence();
-                bool copied = m.runtime->copy_sequence(e.seq, s, best_len);
+                r.seq = m.runtime->create_sequence();
+                bool copied = m.runtime->copy_sequence(e.seq, r.seq, best_len);
                 while (!copied && m.idle.size() > 1)
                 {
                     // Free the least recently used other sequence and try again.
@@ -2307,18 +2464,17 @@ namespace albireo
                     m.runtime->release_sequence(m.idle[lru].seq);
                     m.idle.erase(m.idle.begin() + static_cast<std::ptrdiff_t>(lru));
                     if (lru < best) --best;
-                    copied = m.runtime->copy_sequence(m.idle[best].seq, s, best_len);
+                    copied = m.runtime->copy_sequence(m.idle[best].seq, r.seq, best_len);
                 }
                 if (!copied)
                 {
-                    m.runtime->release_sequence(s);
+                    m.runtime->release_sequence(r.seq);
                     r.seq = m.idle[best].seq;
-                    m.runtime->truncate_sequence(r.seq, best_len);
                     m.idle.erase(m.idle.begin() + static_cast<std::ptrdiff_t>(best));
+                    m.runtime->truncate_sequence(r.seq, best_len);
                 }
                 else
                 {
-                    r.seq = s;
                     m.idle[best].stamp = ++m.stamp;
                 }
             }
@@ -3337,9 +3493,12 @@ namespace albireo
         s["waiting"] = waiting;
         s["models"] = models;
 #ifdef ALBIREO_TENSOR_BACKEND
-        s["device"] = device_->stats();
-        const json memory = device_->memory();
-        if (!memory.is_null()) s["memory"] = memory;
+        if (device_)
+        {
+            s["device"] = device_->stats();
+            const json memory = device_->memory();
+            if (!memory.is_null()) s["memory"] = memory;
+        }
 #endif
         return s;
     }
