@@ -405,6 +405,18 @@ the card for a matrix of 32,768 by 5,120 in Q4_K, where the larger matrix of 151
 Qwen3-VL 4B took 1.2 ms, and the routing kept most products on the processor. The statistics of the
 device count these releases (`card_releases`, `card_released_bytes`).
 
+After a release, the copies keep to the bytes that stayed on the card (`card_cap_bytes` in the
+statistics of the device, null while the budget alone bounds them). Without that ceiling, the
+driver of Windows reported the memory of the copies free again, the copies were made again in the
+next passes and the card lacked the memory a moment later: the same Mistral Small 3.2 24B gave back
+about 1.1 GB 184 times while it answered a prompt of 6,888 tokens, 203 GB crossing the bus again in
+190 seconds. Once the readings of the card have found the reserve free beside 256 MB more during 30
+seconds and a copy waits for it, the ceiling rises by half the least room these readings found
+beside the reserve, 256 MB at least, the buffers the pool of V²RAM keeps counting as room up to
+half the reserve; the first reading after a pause of the models, taken before the buffers of its
+pass are made, ends no such period. The ceiling is lifted when it reaches the budget or when the
+last copies leave with their model, and a new release sets it again.
+
 A model replaced or deactivated in the Models window leaves the engine once its requests are served
 (`engine_host::unload_model`): from that moment the service routes no new request to it, the
 requests in progress and waiting end normally, possibly computed together with those of the other
@@ -1095,7 +1107,7 @@ cmake --build build-albireo-win -j
 | `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
-| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it and come back |
+| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise) and come back |
 | `test_device_ops` | the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of one and of eight tokens on the matrices of a 2B model, and of the attention of a generated token over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
@@ -1288,8 +1300,9 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 The interface compatible with OpenAI takes no key: the service listens on the loopback interface
 only and refuses the requests whose `Host` or `Origin` names another site. The `model` field takes
 the identifier of a loaded model, a function (`general`, `code`, `security`, or `albireo-code` and
-its siblings), `albireo-background` for the model that comes with Albireo, or `auto`; the `model`
-of `/v1/embeddings` takes `albireo-embedding`.
+its siblings), `albireo-background` for the model that comes with Albireo or the default model of
+the catalog that stands for it, or `auto`; the `model` of `/v1/embeddings` takes
+`albireo-embedding`.
 
 | Route                                    | Use                                                       |
 |------------------------------------------|-----------------------------------------------------------|

@@ -292,6 +292,35 @@ namespace albireo
         */
         const long long card_check_ns = 250000000;
 
+        /*
+            The nanoseconds between two readings of the card, by any model, beyond which the second one
+            follows a pause of the models and ends no period of a rise of the ceiling of the copies: the
+            buffers of the pass it precedes are not made yet (tensor_device::impl::raise_card_cap()).
+        */
+        const long long card_gap_ns = 1000000000;
+
+        /*
+            After copies left a card short of memory, the least bytes by which the ceiling of the
+            copies rises, and the milliseconds during which the readings of the card must find
+            card_reserve_bytes free beside those bytes more before each rise
+            (tensor_device::impl::raise_card_cap()): 30 seconds, or the milliseconds, a day at most,
+            the variable ALBIREO_TEST_CARD_RAISE_MS of the tests gives.
+        */
+        const size_t card_cap_step = size_t(256) << 20;
+
+        long long card_raise_ms()
+        {
+            const char* test = std::getenv("ALBIREO_TEST_CARD_RAISE_MS");
+            if (test && *test) return std::max(0LL, std::min(std::atoll(test), 86400000LL));
+            return 30000;
+        }
+
+        // A duration of ms milliseconds, in seconds when it holds whole seconds.
+        std::string duration_text(long long ms)
+        {
+            return ms % 1000 == 0 ? std::to_string(ms / 1000) + " s" : std::to_string(ms) + " ms";
+        }
+
 #if defined(DLIB_USE_CUDA) && defined(_WIN32)
         /*
             The bytes of the first copy of an engine from which it measures whether the system charges
@@ -451,6 +480,22 @@ namespace albireo
         */
         std::atomic<size_t> card_refused{std::numeric_limits<size_t>::max()};
         std::atomic<bool> card_low{false};
+        /*
+            The ceiling of the copies since copies left a card short of memory (relieve_card()), the
+            largest size while the budget alone bounds them.  The driver may report the memory of the
+            copies free again at once, and the card lacks it again as soon as they are made again: the
+            copies keep to what stayed after the release until the readings of the card have found room
+            for card_cap_step more during card_raise_ms(), from the time card_roomy_since gives, 0 when
+            the last reading lacked that room, the least of that room in card_roomy_least, and a copy
+            has met the ceiling with room in the budget and on the card since the ceiling last moved
+            (card_cap_met; raise_card_cap()).
+        */
+        std::atomic<size_t> card_cap{std::numeric_limits<size_t>::max()};
+        std::atomic<long long> card_roomy_since{0};
+        std::atomic<size_t> card_roomy_least{0};
+        std::atomic<bool> card_cap_met{false};
+        // The time of the last reading of the card by any model (tensor_offload::check_card()).
+        std::atomic<long long> card_read_at{0};
 
         mutable std::mutex m;
         std::map<std::string, json> routes;   // the choices made, for the statistics
@@ -526,11 +571,17 @@ namespace albireo
             return std::min(resident.load(std::memory_order_relaxed), card_bytes);
         }
 
+        // The bytes the copies may hold: the budget, or the ceiling a card short of memory left when lower.
+        size_t ceiling() const
+        {
+            return std::min(budget, card_cap.load());
+        }
+
         /*
-            Takes bytes of the budget of the copies; false when they do not fit, or when the card
-            would keep less than card_reserve_bytes free beside them: the memory the driver reports
-            free follows the other programs and the libraries, which the budget, set at the start,
-            does not.
+            Takes bytes of the budget of the copies; false when they do not fit under ceiling(), or
+            when the card would keep less than card_reserve_bytes free beside them: the memory the
+            driver reports free follows the other programs and the libraries, which the budget, set
+            at the start, does not.
         */
         bool reserve(size_t bytes)
         {
@@ -540,10 +591,15 @@ namespace albireo
                 while (bytes < smallest && !card_refused.compare_exchange_weak(smallest, bytes)) {}
                 return false;
             }
+            const size_t limit = ceiling();
             size_t current = resident.load();
             do
             {
-                if (current + bytes > budget) return false;
+                if (current + bytes > limit)
+                {
+                    if (current + bytes <= budget) card_cap_met = true;
+                    return false;
+                }
             } while (!resident.compare_exchange_weak(current, current + bytes));
             return true;
         }
@@ -556,9 +612,9 @@ namespace albireo
 
         /*
             Frees copies of the models without requests, the least recently used model
-            first, until bytes fit in the budget, and a sixteenth of the budget more so
-            that the next matrices of the requester find room too; true when bytes fit.
-            A model keeps the copies it does not have to give.
+            first, until bytes fit under ceiling(), and a sixteenth of it more so that the
+            next matrices of the requester find room too; true when bytes fit.  A model
+            keeps the copies it does not have to give.
         */
         bool make_room(size_t bytes, const tensor_offload* requester);
 
@@ -568,10 +624,22 @@ namespace albireo
             then those of requester, the last made first, then its copies of keys and values.  The
             lack is read once: the pool of the extended memory keeps part of the buffers it receives,
             and the driver may report the memory freed late, so that the next reading of the card
-            gives back more if it still lacks memory.  Returns the bytes given back.  Runs between two
-            passes of requester, on the thread of the forward passes.
+            gives back more if it still lacks memory.  The copies that stay set the ceiling of the
+            copies (card_cap).  Returns the bytes given back.  Runs between two passes of requester, on
+            the thread of the forward passes.
         */
         size_t relieve_card(tensor_offload& requester);
+
+        /*
+            Raises the ceiling of the copies once the readings of the card have found card_reserve_bytes
+            free beside card_cap_step more during card_raise_ms() and a copy has met the ceiling: by half
+            the least room those readings found beside the reserve, card_cap_step at least, the buffers
+            the pool of the extended memory keeps counting as room up to half the reserve, and lifts it
+            at the budget; the matrices refused may then come back (the generation moves).  Called at
+            each reading that found the card with half of its reserve free at least, at the time now;
+            after_gap tells a reading that follows a pause of the models (card_gap_ns).
+        */
+        void raise_card_cap(long long now, bool after_gap);
 
         void note_route(const std::string& key, const json& value)
         {
@@ -594,6 +662,8 @@ namespace albireo
             std::lock_guard<std::mutex> lock(d_.registry_m);
             d_.offloads.erase(std::remove(d_.offloads.begin(), d_.offloads.end(), this), d_.offloads.end());
             evict_copies(std::numeric_limits<size_t>::max());
+            // The ceiling a card short of memory set came from the passes of the models: without a copy left, it goes.
+            if (d_.resident.load() == 0) d_.card_cap = std::numeric_limits<size_t>::max();
         }
 
         void set_busy(bool busy) override
@@ -668,23 +738,28 @@ namespace albireo
             (relieve_card()).  Other programs, the libraries or the buffers of the passes took the
             memory of the card after the copies were made; the driver of Windows then moves
             allocations of the card to the memory of the host, where the card reads them over the bus
-            more slowly than the processor computes their products.  Once the card has the reserve
-            free beside the smallest copy it refused, the matrices refused may come back (the
-            generation of the device moves).  Runs between two passes of this model, on the thread of
-            its forward passes.
+            more slowly than the processor computes their products.  Once the card has the reserve free
+            beside the smallest copy it refused, the matrices refused may come back (the generation of
+            the device moves): those that the ceiling of the copies then refuses, when no model without
+            requests gives room under it, wait for the ceiling to rise while the card keeps room
+            (raise_card_cap()).  Runs between two passes of this model, on the thread of its forward
+            passes.
         */
         void check_card()
         {
             const long long now = now_ns();
             if (now - card_checked_ < card_check_ns) return;
             card_checked_ = now;
+            const bool after_gap = now - d_.card_read_at.exchange(now) > card_gap_ns;
             const bool low = d_.card_shortfall(0) > card_reserve_bytes / 2;
             d_.card_low = low;
             if (low)
             {
+                d_.card_roomy_since = 0;
                 if (d_.resident.load(std::memory_order_relaxed) > 0) d_.relieve_card(*this);
                 return;
             }
+            d_.raise_card_cap(now, after_gap);
             size_t refused = d_.card_refused.load();
             if (refused != std::numeric_limits<size_t>::max() && d_.card_shortfall(refused) == 0
                 && d_.card_refused.compare_exchange_strong(refused, std::numeric_limits<size_t>::max()))
@@ -2394,20 +2469,21 @@ namespace albireo
 
     bool tensor_device::impl::make_room(size_t bytes, const tensor_offload* requester)
     {
-        // A matrix larger than the whole budget never fits: nothing leaves for it.
-        if (bytes > budget) return false;
+        // A matrix larger than the budget, or than the ceiling a card short of memory left, does not fit.
+        const size_t limit = ceiling();
+        if (bytes > limit) return false;
         std::lock_guard<std::mutex> lock(registry_m);
         std::vector<tensor_offload*> idle;
         for (tensor_offload* o : offloads)
             if (o != requester && !o->busy() && o->copy_bytes() > 0) idle.push_back(o);
         std::sort(idle.begin(), idle.end(),
             [](const tensor_offload* a, const tensor_offload* b) { return a->last_use() < b->last_use(); });
-        const size_t room = budget - bytes;
-        const size_t target = room - std::min(room, budget / 16);
+        const size_t room = limit - bytes;
+        const size_t target = room - std::min(room, limit / 16);
         for (tensor_offload* o : idle)
         {
             const size_t current = resident.load();
-            // The copies beyond the target of the budget, or the memory the card lacks beside bytes more.
+            // The copies beyond the target under the ceiling, or the memory the card lacks beside bytes more.
             const size_t over = std::max(current > target ? current - target : size_t(0), card_shortfall(bytes));
             if (over == 0) break;
             const size_t freed = o->evict_copies(over);
@@ -2417,7 +2493,7 @@ namespace albireo
                 + o->model() + "', without requests, leave the device for '" + requester->model() + "' ("
                 + megabytes(freed) + ", " + megabytes(o->copy_bytes()) + " stay)");
         }
-        return resident.load() + bytes <= budget && card_shortfall(bytes) == 0;
+        return resident.load() + bytes <= ceiling() && card_shortfall(bytes) == 0;
     }
 
     size_t tensor_device::impl::relieve_card(tensor_offload& requester)
@@ -2449,14 +2525,63 @@ namespace albireo
         // The copies count as room again (charged_bytes()) as soon as the driver reports the card relieved.
         card_low = card_shortfall(0) > card_reserve_bytes / 2;
         if (freed == 0) return 0;
+        const size_t cap = resident.load();
+        card_cap = cap;
+        card_cap_met = false;
+        card_roomy_since = 0;
         ++card_releases;
         card_released_bytes += freed;
         message(ALBIREO_LOG_INFO, "device: the card had " + megabytes(free_before) + " free, less than half of the "
             + megabytes(card_reserve_bytes) + " the copies leave to the passes, the libraries and the other programs; "
             + megabytes(freed) + " of copies leave it (" + megabytes(own) + " of '" + requester.model() + "', which "
             "keeps " + megabytes(requester.copy_bytes()) + ", and " + megabytes(others) + " of the models without "
-            "requests)");
+            "requests); the copies keep to " + megabytes(cap) + " until the card has kept room for more during "
+            + duration_text(card_raise_ms()));
         return freed;
+    }
+
+    void tensor_device::impl::raise_card_cap(long long now, bool after_gap)
+    {
+        size_t cap = card_cap.load();
+        if (cap == std::numeric_limits<size_t>::max()) return;
+        /*
+            The memory free beside the reserve, with the buffers the pool of the extended memory keeps
+            for the copies and the passes, up to half the reserve: the other programs cannot take them.
+        */
+        size_t free_bytes = card_free();
+#if defined(DLIB_USE_CUDA)
+        if (v2ram && free_bytes != std::numeric_limits<size_t>::max())
+            free_bytes += std::min(dlib::get_extended_memory_stats().pooled_bytes, card_reserve_bytes / 2);
+#endif
+        const size_t room = free_bytes > card_reserve_bytes ? free_bytes - card_reserve_bytes : 0;
+        if (room < card_cap_step)
+        {
+            card_roomy_since = 0;
+            return;
+        }
+        const long long since = card_roomy_since.load();
+        if (since == 0)
+        {
+            card_roomy_since = now;
+            card_roomy_least = room;
+            return;
+        }
+        const size_t least = std::min(card_roomy_least.load(), room);
+        card_roomy_least = least;
+        // The ceiling moves only for a copy that waits for it, by half the least room the readings found.
+        const long long period = card_raise_ms();
+        if (after_gap || now - since < period * 1000000LL || !card_cap_met.load()) return;
+        const size_t step = std::max(card_cap_step, least / 2);
+        const bool lifted = budget - std::min(budget, cap) <= step;
+        const size_t raised = lifted ? std::numeric_limits<size_t>::max() : cap + step;
+        if (!card_cap.compare_exchange_strong(cap, raised)) return;
+        card_cap_met = false;
+        card_roomy_since = now;
+        card_roomy_least = room;
+        ++generation;
+        message(ALBIREO_LOG_INFO, "device: the card kept " + megabytes(least) + " of room at least beside the "
+            + megabytes(card_reserve_bytes) + " of its reserve during " + duration_text(period) + "; the copies may "
+            "take " + (lifted ? "their whole budget again, " + megabytes(budget) : "up to " + megabytes(raised)));
     }
 
     tensor_device::tensor_device(const json& config, thread_pool& pool, log_function log)
@@ -2644,6 +2769,10 @@ namespace albireo
         // The copies given back while the card kept less than half of its reserve free (relieve_card()).
         s["card_releases"] = d.card_releases.load();
         s["card_released_bytes"] = d.card_released_bytes.load();
+        // The ceiling of the copies since such a release, null while the budget alone bounds them.
+        const size_t cap = d.card_cap.load();
+        s["card_cap_bytes"] = cap == std::numeric_limits<size_t>::max() ? json()
+            : json(static_cast<unsigned long long>(cap));
         // The copies charged to the commit of the engine, which the guard of the keys and values counts as room.
         s["commit_charged_bytes"] = static_cast<unsigned long long>(d.charged_bytes());
 #if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)

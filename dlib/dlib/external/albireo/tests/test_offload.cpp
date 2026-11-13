@@ -38,7 +38,9 @@
     processor alone and through the device, whose layers and attention must run there and
     whose logits must agree with those of the processor; then the same with a budget of 1 MB,
     which holds the matrices but no copy of the keys and values: the layers run on the device,
-    the processor attends.
+    the processor attends; then on a card that runs out of memory (ALBIREO_TEST_CARD_FREE_MB),
+    whose copies leave it, wait for the ceiling the release left to rise once the card has room
+    again (ALBIREO_TEST_CARD_RAISE_MS gives the period of the rise), and come back.
 */
 
 #include <algorithm>
@@ -171,6 +173,19 @@ namespace
         std::printf("  [%s] %s\n", names[std::max(0, std::min(3, level))], message.c_str());
     }
 
+    // Sets a variable of the environment, or removes it without value.
+    void set_variable(const char* name, const char* value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
+
     /*
         Gives the device a card of that many megabytes less its copies (ALBIREO_TEST_CARD_FREE_MB),
         or its own memory again without megabytes; then waits for the next reading of the memory of
@@ -178,14 +193,7 @@ namespace
     */
     void simulate_card(const char* megabytes)
     {
-#if defined(_WIN32)
-        _putenv_s("ALBIREO_TEST_CARD_FREE_MB", megabytes ? megabytes : "");
-#else
-        if (megabytes)
-            setenv("ALBIREO_TEST_CARD_FREE_MB", megabytes, 1);
-        else
-            unsetenv("ALBIREO_TEST_CARD_FREE_MB");
-#endif
+        set_variable("ALBIREO_TEST_CARD_FREE_MB", megabytes);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
 
@@ -341,10 +349,14 @@ namespace
             expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale) && d.top1 >= 0.99, "layers of the device without room");
 
             /*
-                A card that lacks memory: with 8 GB, the layers and the attention run on the device;
-                with nothing left, the copies leave the card at the next reading of its memory and the
-                processor computes the script; with 8 GB again, the copies come back.  The logits stay
-                those of the processor.
+                A card that lacks memory, with a budget of 512 MB: with 8 GB, the layers and the
+                attention run on the device; with nothing left, the copies leave the card at the next
+                reading of its memory and the processor computes the script; with 1,792 MB, the copies
+                keep to the ceiling the release left, nothing, while the period of the rise of the
+                ceiling (ALBIREO_TEST_CARD_RAISE_MS, 10 minutes) runs; with a period of a millisecond,
+                the ceiling rises by half the 768 MB the card keeps beside its reserve, and the copies
+                come back; once the model leaves, no copy is left and the ceiling goes.  The logits
+                stay those of the processor.
             */
             const long blocks = 16;
             qk_set_exact_products(true);
@@ -353,26 +365,34 @@ namespace
                 cpu_runtime rt(file, cfg, pool, size_t(64) << 20, blocks, kv_format::f16);
                 exact = script(rt);
             }
-            tensor_device card(device_config(device, 0, "device"), pool, print_log);
-            json roomy, short_of, again;
-            std::vector<float> phases[3];
+            tensor_device card(device_config(device, 512, "device"), pool, print_log);
+            json roomy, short_of, held, again;
+            std::vector<float> phases[4];
             {
                 cpu_runtime rt(file, cfg, pool, size_t(64) << 20, blocks, kv_format::f16);
                 rt.set_offload(card.make_offload());
+                set_variable("ALBIREO_TEST_CARD_RAISE_MS", "600000");
                 simulate_card("8192");
                 phases[0] = script(rt);
                 roomy = card.stats();
                 simulate_card("0");
                 phases[1] = script(rt);
                 short_of = card.stats();
-                simulate_card("8192");
+                simulate_card("1792");
                 phases[2] = script(rt);
+                held = card.stats();
+                set_variable("ALBIREO_TEST_CARD_RAISE_MS", "1");
+                simulate_card("1792");
+                phases[3] = script(rt);
                 again = card.stats();
             }
+            const json gone = card.stats();
             simulate_card(nullptr);
+            set_variable("ALBIREO_TEST_CARD_RAISE_MS", nullptr);
             qk_set_exact_products(false);
-            const char* names[3] = { "card with room", "card without memory", "card with room again" };
-            for (int p = 0; p < 3; ++p)
+            const char* names[4] = { "card with room", "card without memory", "card with room, copies held",
+                "card with room again" };
+            for (int p = 0; p < 4; ++p)
             {
                 expect(phases[p].size() == exact.size(), "the same rows on a card short of memory");
                 if (phases[p].size() != exact.size()) continue;
@@ -380,20 +400,34 @@ namespace
                 report(names[p], e);
                 expect(e.max_abs <= 1e-3 * std::max(1.0, e.scale) && e.top1 >= 0.99, names[p]);
             }
-            std::printf("  layer passes %lld, %lld, %lld; copies %lld, %lld, %lld bytes; given back %lld times\n",
-                roomy["layer_passes"].as_int(), short_of["layer_passes"].as_int(), again["layer_passes"].as_int(),
-                roomy["weights_bytes"].as_int(), short_of["weights_bytes"].as_int(), again["weights_bytes"].as_int(),
-                short_of["card_releases"].as_int());
+            std::printf("  layer passes %lld, %lld, %lld, %lld; copies %lld, %lld, %lld, %lld bytes; given back %lld "
+                "times; ceiling %lld bytes, then %s\n", roomy["layer_passes"].as_int(),
+                short_of["layer_passes"].as_int(), held["layer_passes"].as_int(), again["layer_passes"].as_int(),
+                roomy["weights_bytes"].as_int(), short_of["weights_bytes"].as_int(), held["weights_bytes"].as_int(),
+                again["weights_bytes"].as_int(), again["card_releases"].as_int(), again["card_cap_bytes"].as_int(-1),
+                gone["card_cap_bytes"].is_null() ? "none" : "kept");
             expect(roomy["layer_passes"].as_int() > 0 && roomy["weights_bytes"].as_int() > 0,
                 "the layers ran on the card with room");
+            expect(roomy["card_cap_bytes"].is_null(), "no ceiling before the card lacked memory");
             expect(short_of["card_releases"].as_int() >= 1, "the copies left the card without memory");
             expect(short_of["weights_bytes"].as_int() == 0, "no copy on the card without memory");
             expect(short_of["layer_passes"].as_int() == roomy["layer_passes"].as_int(),
                 "the processor computed the layers on the card without memory");
+            expect(!short_of["card_cap_bytes"].is_null() && short_of["card_cap_bytes"].as_int() == 0,
+                "the copies keep to what stayed on the card");
+            expect(held["weights_bytes"].as_int() == 0
+                && held["layer_passes"].as_int() == short_of["layer_passes"].as_int(),
+                "the copies wait for the ceiling to rise");
             expect(again["weights_bytes"].as_int() > 0
-                && again["layer_passes"].as_int() > short_of["layer_passes"].as_int(),
+                && again["layer_passes"].as_int() > held["layer_passes"].as_int(),
                 "the layers ran on the card with room again");
+            expect(again["card_cap_bytes"].as_int(-1) == (384LL << 20),
+                "the ceiling rose by half the room of the card");
+            expect(again["card_releases"].as_int() == short_of["card_releases"].as_int(),
+                "no release while the card had room");
             expect(again["failures"].as_int() == 0, "no device failure on a card short of memory");
+            expect(gone["weights_bytes"].as_int() == 0 && gone["card_cap_bytes"].is_null(),
+                "the ceiling left with the last copies");
         }
         std::remove(path.c_str());
         if (failures)
