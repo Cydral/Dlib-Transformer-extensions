@@ -319,7 +319,8 @@ schemas = {
         "accelerator": {"type": "string", "enum": ["auto", "none", "npu", "gpu", "both", "cpu"],
                         "description": "The device of the engines that have several: none for the processor "
                                        "engines, the fastest measured one, npu, gpu or both for the devices, cpu for "
-                                       "the graph of OpenVINO on the processor."},
+                                       "the graph of OpenVINO on the processor when graph is not off, else the "
+                                       "processor engines."},
         "v2ram": {"type": "boolean", "description": "Extended device memory of the graphics engines."},
         "v2ram_max_mb": {"type": "integer", "description": "Limit of the extended memory, 0 for automatic."},
         "device_mb": {"type": "integer", "description": "Memory of the device for the copies of the weights of "
@@ -337,11 +338,15 @@ schemas = {
                                    "takes q8 for the models whose heads hold whole groups. The graph of OpenVINO "
                                    "keeps half precision unless q8 is chosen, its 8-bit format then being that of "
                                    "the plugin of the processor."},
-        "graph": {"type": "string", "enum": ["auto", "on", "off"], "default": "auto",
-                  "description": "The graph of OpenVINO of the OpenVINO engine: auto computes each model it "
+        "graph": {"type": "string", "enum": ["auto", "on", "off"], "default": "off",
+                  "description": "The graph of OpenVINO of the OpenVINO engine: off leaves the models to the "
+                                 "processor runtime and their products to the devices; auto computes each model it "
                                  "supports as one graph on the processor or on the graphics processor, the processor "
-                                 "runtime taking the others and those whose graph cannot be compiled; on requires it; "
-                                 "off leaves the models to the processor runtime and their products to the devices."},
+                                 "runtime taking the others and those whose graph cannot be compiled, and offers the "
+                                 "choice openvino:cpu; on requires it and leaves out the choices openvino:npu and "
+                                 "openvino:both, the NPU computing no graph. Settings written before version 1.0.21 "
+                                 "with auto, "
+                                 "the default of their version, read off, unless their accelerator is cpu."},
         "draft_tokens": {"type": "integer", "minimum": 0, "maximum": 6, "default": 4,
                          "description": "Tokens of the drafts of the answers a step of a language model verifies at "
                                         "most: the tokens that followed the last ones in the context, which the "

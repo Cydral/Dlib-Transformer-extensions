@@ -16,9 +16,10 @@
     device of -Device (CPU by default, which every machine has), test_ov_graph on the processor,
     with the graph of the graphics processor on the processor too, and on the graphics processor
     when -Device names it, and a question to each OpenVINO engine, on its devices and through
-    the graph of the processor; with the CUDA tree, when the machine has a card it supports, a
-    question to the CUDA engine, then test_device_ops, test_offload on the card and its check of
-    the attention of the card on a tiny model; the embedding model;
+    the graph of the processor, and of the graphics processor when -Device names it, its weights
+    read back from a cache folder as in the service; with the CUDA tree, when the machine has a
+    card it supports, a question to the CUDA engine, then test_device_ops, test_offload on the
+    card and its check of the attention of the card on a tiny model; the embedding model;
     the models that come with Albireo, prepared by the build, and a question to their language
     model, these engine steps with the PATH of the service, System32 and the Windows folder
     only; a sentence read aloud by the program of the speech synthesis; then the installed
@@ -157,9 +158,15 @@ try {
             $arguments = @($engine, $Model, "--reasoning", "off", "--max", "40")
             if ($Device -ne "CPU") { $arguments += @("--device", $Device) }
             Invoke-Check "engine $variant" "Paris" $chat ($arguments + $question) | Out-Null
-            # The graph of OpenVINO on the processor.
-            Invoke-Check "engine $variant graph" "Paris" $chat (@($engine, $Model, "--device", "CPU", "--reasoning",
-                "off", "--max", "40") + $question) | Out-Null
+            # The graph of OpenVINO on the processor, and on the graphics processor when -Device names it,
+            # its weights read back from the cache of the engine as in the service.
+            foreach ($graphDevice in @(@("CPU") + @(@($Device) | Where-Object { $_ -match "^GPU" }))) {
+                $step = "engine $variant graph"
+                if ($graphDevice -ne "CPU") { $step += " $graphDevice" }
+                Invoke-Check $step "Paris" $chat (@($engine, $Model, "--device", $graphDevice, "--graph", "on",
+                    "--cache-dir", (Join-Path $logs "engine-cache"), "--reasoning", "off", "--max", "40") +
+                    $question) | Out-Null
+            }
         }
     }
     else {

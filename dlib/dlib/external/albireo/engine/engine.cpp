@@ -1393,15 +1393,18 @@ namespace albireo
 #ifdef ALBIREO_OV_GRAPH
         /*
             The graph of OpenVINO (ov_graph.h) on the device of the engine: the processor of the choice
-            openvino:cpu, else the graphics processor.  graph auto takes it when it computes the model and
-            falls back to the processor runtime when it cannot be compiled, on requires it, off leaves the
-            models to the processor runtime and their products to the devices.  Its keys and values stay
-            in half precision unless kv_type asks for 8 bits: the 8-bit format of the plugin of the
-            processor, by position and head, departs from the logits of the processor runtime ten times
+            openvino:cpu, else the graphics processor.  graph off, the default, leaves the models to the
+            processor runtime and their products to the devices: on the processors without AVX-512 nor
+            AMX, the graph reads the passes that follow another one and writes the answers more slowly
+            than the processor runtime, whose weights stay mapped from their file rather than copied by
+            the plugin (README.md).  auto takes the graph when it computes the model and falls back to
+            the processor runtime when it cannot be compiled, on requires it.  Its keys and values stay
+            in half precision unless kv_type asks for 8 bits on the processor: the 8-bit format of its
+            plugin, by position and head, departs from the logits of the processor runtime ten times
             more than the groups of 32 values of kv_format::q8 (tests/test_ov_graph.cpp).
         */
         const json& graph_value = options.contains("graph") ? options["graph"] : settings_["graph"];
-        const std::string graph_mode = graph_value.is_string() ? graph_value.as_string() : "auto";
+        const std::string graph_mode = graph_value.is_string() ? graph_value.as_string() : "off";
         if ((!graph_value.is_null() && !graph_value.is_string())
             || (graph_mode != "auto" && graph_mode != "on" && graph_mode != "off"))
             throw std::invalid_argument("the setting graph must be auto, on or off");

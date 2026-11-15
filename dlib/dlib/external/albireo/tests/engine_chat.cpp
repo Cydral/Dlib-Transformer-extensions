@@ -35,8 +35,12 @@
         --system TEXT        system message of the conversations
         --render FILE        prints the prompt the model receives for the conversation of FILE,
                              a JSON object {"messages", "tools", "reasoning"}, and exits
-        --device NAME        device of the OpenVINO engine (NPU, GPU, NPU,GPU) or number of
-                             the card of the CUDA engine
+        --device NAME        device of the OpenVINO engine (NPU, GPU, NPU,GPU, CPU for its graph
+                             with --graph auto or on) or number of the card of the CUDA engine; it
+                             takes over the variable DLIB_NPU_DEVICE of the environment
+        --graph MODE         graph of OpenVINO for the model: off, the default, auto or on
+        --cache-dir DIR      folder of the cache of the engine, where the graph of OpenVINO writes
+                             the file of its weights, as in the service
         --routing MODE       auto, device (every product on the device) or host
         --projector FILE     image encoder of a model that reads images (mmproj GGUF)
         --image FILE         a PNG or JPEG image given before each question, as a data URL;
@@ -344,7 +348,7 @@ int main(int argc, char** argv)
     int threads = 0;
     long context = 4096;
     std::vector<std::string> questions;
-    std::string system, device, routing, reference, projector, detail, tool_result;
+    std::string system, device, routing, reference, projector, detail, tool_result, graph, cache_dir;
     bool with_result = false;
     std::vector<std::string> images;
     for (int i = 3; i < argc; ++i)
@@ -376,6 +380,8 @@ int main(int argc, char** argv)
         else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--context" && i + 1 < argc) context = std::atol(argv[++i]);
         else if (a == "--device" && i + 1 < argc) device = argv[++i];
+        else if (a == "--graph" && i + 1 < argc) graph = argv[++i];
+        else if (a == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
         else if (a == "--routing" && i + 1 < argc) routing = argv[++i];
         else if (a == "--reference" && i + 1 < argc) reference = argv[++i];
         else if (a == "--projector" && i + 1 < argc) projector = argv[++i];
@@ -384,11 +390,16 @@ int main(int argc, char** argv)
         else questions.push_back(a);
     }
 
-    // The OpenVINO engine reads its device from the environment when it first looks for the
-    // devices, which describe() below already does.
+    /*
+        The OpenVINO engine reads its device from the environment when it first looks for the
+        devices, which describe() below already does.  On Windows, the engine library, whose
+        runtime of C is not the one of this program, takes its environment from the block of the
+        process, which SetEnvironmentVariableA writes before the library loads.
+    */
     if (!device.empty())
     {
 #if defined(_WIN32)
+        SetEnvironmentVariableA("DLIB_NPU_DEVICE", device.c_str());
         _putenv_s("DLIB_NPU_DEVICE", device.c_str());
 #else
         setenv("DLIB_NPU_DEVICE", device.c_str(), 1);
@@ -454,6 +465,8 @@ int main(int argc, char** argv)
     // The device engines: the device (NPU, GPU, NPU,GPU, or the number of a CUDA card) and the
     // routing of the products (auto, device, host).
     if (!device.empty()) config["device"] = device;
+    if (!graph.empty()) config["graph"] = graph;
+    if (!cache_dir.empty()) config["cache_dir"] = cache_dir;
     if (!routing.empty()) config["routing"] = routing;
     if (!warm) config["warm_history"] = false;
     if (floats) config["integer_prompt"] = false;

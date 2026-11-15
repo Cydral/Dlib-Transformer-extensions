@@ -38,13 +38,16 @@ namespace albireo
 
     /*!
         ensures
-            - Returns the engine to run for the settings s among the candidates found
-              next to the service:
+            - Returns the engine to run for the settings s among the choices that
+              engine_options() makes of the candidates found next to the service for the
+              setting graph:
                 - engine names a variant: that variant, when usable, with the device the
                   accelerator names for the engines that have several;
                 - accelerator "npu", "gpu" or "both": the engine of that device, the
                   fastest measured one for "both";
-                - accelerator "cpu": the graph of OpenVINO on the processor (openvino:cpu);
+                - accelerator "cpu": the graph of OpenVINO on the processor (openvino:cpu),
+                  never a device of the OpenVINO engine; the setting graph off, the
+                  default, leaves it out, and the processor engine computes the models;
                 - accelerator "none": the processor engine, the fastest measured one, the
                   graph of OpenVINO on the processor among them, else the one of the richest
                   kernels (cpu-avxvnni, cpu-avx2, cpu);
@@ -67,9 +70,13 @@ namespace albireo
             - Returns the engines a set of candidates offers, one per device: what the tray
               lists.  Among the OpenVINO engines, one per family of processor kernels
               (openvino-avxvnni, openvino), the richest usable one offers the NPU, the
-              graphics processor and both.
+              graphics processor and both, and the graph of the models on the processor
+              (openvino:cpu), following graph, the setting graph: off leaves out
+              openvino:cpu, on leaves out the choices of the NPU (openvino:npu,
+              openvino:both), which computes no graph.
     !*/
-    std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates);
+    std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates,
+        const std::string& graph);
     bool is_openvino_variant(const std::string& variant);
 
     class service

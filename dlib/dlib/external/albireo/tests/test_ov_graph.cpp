@@ -20,13 +20,15 @@
         2. the speeds of both runtimes: the first pass of the prompt, the passes that follow
            it, which attend to the positions before them, and the steps;
         3. the operations of the sequences: a sequence cut inside its positions, then read
-           further; a second sequence that copies the start of the first; both stepping in
-           one batch, then again after trim_memory();
+           further, also against a new sequence of each runtime that reads the same tokens; a
+           second sequence that copies the start of the first; both stepping in one batch, then
+           again after trim_memory();
         4. the logits of the processor runtime with keys and values in 8 bits, the default
            of the engine, against the reference, as a measure of the agreement to expect.
 
     The program fails when the graph gives another most probable token than the reference
-    in more than one step out of eight, or when its mean divergence exceeds 0.05.
+    in more than one step out of eight, or when its mean divergence exceeds 0.05, and when
+    the cut sequence of the graph departs from its new sequence by a divergence above 0.01.
 */
 
 #include <algorithm>
@@ -338,7 +340,7 @@ int main(int argc, char** argv)
         report_speed(("graph, " + device).c_str(), t_graph);
 
         std::printf("agreement with the processor runtime in half precision:\n");
-        agreement all, scratch;
+        agreement all, scratch, fresh;
         compare("processor runtime, keys and values in 8 bits", ref, q8, vocab, scratch);
         compare(("graph on " + device).c_str(), ref, graph, vocab, all);
 
@@ -370,6 +372,38 @@ int main(int argc, char** argv)
                 b.push_back(lb);
             }
             compare("cut inside the prompt, then read further", a, b, vocab, all);
+
+            /*
+                The same tokens read from the start by a new sequence of each runtime.  The cut sequence of
+                the graph holds what the new one holds; the processor runtime departs from its own new
+                sequence, its passes of 8 tokens and more computing on floats and the shorter ones on 8-bit
+                integers (qk_float_product_tokens), so that the cut above also compares the two runtimes.
+            */
+            {
+                const int f1 = cr.create_sequence();
+                const int g1 = rt->create_sequence();
+                std::vector<std::vector<float>> fa, fb;
+                for (long first = 0; first < cut; first += chunk)
+                {
+                    run_pass(cr, f1, text, first, std::min(chunk, cut - first), la);
+                    run_pass(*rt, g1, text, first, std::min(chunk, cut - first), lb);
+                }
+                run_pass(cr, f1, text, cut, 5, la);
+                run_pass(*rt, g1, text, cut, 5, lb);
+                fa.push_back(la);
+                fb.push_back(lb);
+                for (long i = 0; i < 6; ++i)
+                {
+                    run_pass(cr, f1, text, cut + 5 + i, 1, la);
+                    run_pass(*rt, g1, text, cut + 5 + i, 1, lb);
+                    fa.push_back(la);
+                    fb.push_back(lb);
+                }
+                compare("cut against a new read, processor runtime", fa, a, vocab, scratch);
+                compare("cut against a new read, graph", fb, b, vocab, fresh);
+                cr.release_sequence(f1);
+                rt->release_sequence(g1);
+            }
 
             // A second sequence copies the start of the first, then both step in one batch.
             const long shared = prompt / 4 + 1;
@@ -504,6 +538,16 @@ int main(int argc, char** argv)
         if (all.top_share() < 0.875 || all.mean() > 0.05 || hidden_cosine < 0.99)
         {
             std::printf("FAILED: the graph departs from the processor runtime\n");
+            return 1;
+        }
+        /*
+            The positions the cut keeps came from a pass of chunk tokens, those of the new sequence from
+            a shorter one, which the plugin may compute with other kernels: a near tie may then change
+            the most probable token while the divergence stays small.
+        */
+        if (fresh.max_divergence > 0.01)
+        {
+            std::printf("FAILED: a cut sequence of the graph departs from a new read of its tokens\n");
             return 1;
         }
         std::printf("passed\n");

@@ -40,7 +40,9 @@
     which holds the matrices but no copy of the keys and values: the layers run on the device,
     the processor attends; then on a card that runs out of memory (ALBIREO_TEST_CARD_FREE_MB),
     whose copies leave it, wait for the ceiling the release left to rise once the card has room
-    again (ALBIREO_TEST_CARD_RAISE_MS gives the period of the rise), and come back.
+    again (ALBIREO_TEST_CARD_RAISE_MS gives the period of the rise), and come back, then leave
+    again within the period of that rise, their bytes bounding the next rises and the period
+    doubling.
 */
 
 #include <algorithm>
@@ -355,8 +357,10 @@ namespace
                 keep to the ceiling the release left, nothing, while the period of the rise of the
                 ceiling (ALBIREO_TEST_CARD_RAISE_MS, 10 minutes) runs; with a period of a millisecond,
                 the ceiling rises by half the 768 MB the card keeps beside its reserve, and the copies
-                come back; once the model leaves, no copy is left and the ceiling goes.  The logits
-                stay those of the processor.
+                come back; with nothing left again, within the period of 10 minutes of that rise, the
+                copies leave, their bytes bound the next rises and the period doubles; once the model
+                leaves, no copy is left and the ceiling and its bound go.  The logits stay those of the
+                processor.
             */
             const long blocks = 16;
             qk_set_exact_products(true);
@@ -366,8 +370,8 @@ namespace
                 exact = script(rt);
             }
             tensor_device card(device_config(device, 512, "device"), pool, print_log);
-            json roomy, short_of, held, again;
-            std::vector<float> phases[4];
+            json roomy, short_of, held, again, after;
+            std::vector<float> phases[5];
             {
                 cpu_runtime rt(file, cfg, pool, size_t(64) << 20, blocks, kv_format::f16);
                 rt.set_offload(card.make_offload());
@@ -385,14 +389,18 @@ namespace
                 simulate_card("1792");
                 phases[3] = script(rt);
                 again = card.stats();
+                set_variable("ALBIREO_TEST_CARD_RAISE_MS", "600000");
+                simulate_card("0");
+                phases[4] = script(rt);
+                after = card.stats();
             }
             const json gone = card.stats();
             simulate_card(nullptr);
             set_variable("ALBIREO_TEST_CARD_RAISE_MS", nullptr);
             qk_set_exact_products(false);
-            const char* names[4] = { "card with room", "card without memory", "card with room, copies held",
-                "card with room again" };
-            for (int p = 0; p < 4; ++p)
+            const char* names[5] = { "card with room", "card without memory", "card with room, copies held",
+                "card with room again", "card without memory after a rise" };
+            for (int p = 0; p < 5; ++p)
             {
                 expect(phases[p].size() == exact.size(), "the same rows on a card short of memory");
                 if (phases[p].size() != exact.size()) continue;
@@ -426,8 +434,17 @@ namespace
             expect(again["card_releases"].as_int() == short_of["card_releases"].as_int(),
                 "no release while the card had room");
             expect(again["failures"].as_int() == 0, "no device failure on a card short of memory");
-            expect(gone["weights_bytes"].as_int() == 0 && gone["card_cap_bytes"].is_null(),
-                "the ceiling left with the last copies");
+            std::printf("  after a rise: given back %lld times, bound %lld bytes, period %lld ms\n",
+                after["card_releases"].as_int(), after["card_short_bytes"].as_int(-1),
+                after["card_raise_ms"].as_int());
+            expect(again["card_short_bytes"].is_null(), "no bound before a release that follows a rise");
+            expect(after["card_releases"].as_int() == again["card_releases"].as_int() + 1
+                && after["weights_bytes"].as_int() == 0, "the copies left the card without memory after a rise");
+            expect(after["card_short_bytes"].as_int(-1) == again["weights_bytes"].as_int(),
+                "the copies of a release that follows a rise bound the next rises");
+            expect(after["card_raise_ms"].as_int() == 1200000, "the period of the rises doubled");
+            expect(gone["weights_bytes"].as_int() == 0 && gone["card_cap_bytes"].is_null()
+                && gone["card_short_bytes"].is_null(), "the ceiling and its bound left with the last copies");
         }
         std::remove(path.c_str());
         if (failures)

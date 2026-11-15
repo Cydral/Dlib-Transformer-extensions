@@ -308,6 +308,15 @@ namespace albireo
         */
         const size_t card_cap_step = size_t(256) << 20;
 
+        /*
+            The period of the rises of the ceiling doubles at the first release that follows a rise within
+            it, up to card_period_growth times card_raise_ms(); after card_forget_periods times card_raise_ms()
+            without a release, the copies the card lacked memory with after a rise and that period are
+            forgotten (tensor_device::impl::raise_card_cap()).
+        */
+        const long long card_period_growth = 20;
+        const long long card_forget_periods = 60;
+
         long long card_raise_ms()
         {
             const char* test = std::getenv("ALBIREO_TEST_CARD_RAISE_MS");
@@ -496,6 +505,18 @@ namespace albireo
         std::atomic<bool> card_cap_met{false};
         // The time of the last reading of the card by any model (tensor_offload::check_card()).
         std::atomic<long long> card_read_at{0};
+        /*
+            The bytes of the copies when the card last lacked memory within the period of a rise, the
+            largest size when none, which the ceiling then stays card_cap_step below; the period of the
+            rises in milliseconds, 0 for card_raise_ms(); the times of the last rise and of the last
+            release; whether no release has followed the last rise yet, so that the period doubles once
+            per rise (relieve_card(), raise_card_cap()).
+        */
+        std::atomic<size_t> card_short_level{std::numeric_limits<size_t>::max()};
+        std::atomic<long long> card_period_ms{0};
+        std::atomic<long long> card_raised_at{0};
+        std::atomic<long long> card_released_at{0};
+        std::atomic<bool> card_rise_unreleased{false};
 
         mutable std::mutex m;
         std::map<std::string, json> routes;   // the choices made, for the statistics
@@ -632,14 +653,28 @@ namespace albireo
 
         /*
             Raises the ceiling of the copies once the readings of the card have found card_reserve_bytes
-            free beside card_cap_step more during card_raise_ms() and a copy has met the ceiling: by half
-            the least room those readings found beside the reserve, card_cap_step at least, the buffers
-            the pool of the extended memory keeps counting as room up to half the reserve, and lifts it
-            at the budget; the matrices refused may then come back (the generation moves).  Called at
-            each reading that found the card with half of its reserve free at least, at the time now;
-            after_gap tells a reading that follows a pause of the models (card_gap_ns).
+            free beside card_cap_step more during the period of the rises and a copy has met the
+            ceiling: by half the least room those readings found beside the reserve, card_cap_step at
+            least, the buffers the pool of the extended memory keeps counting as room up to half the
+            reserve, and lifts it at the budget.  The readings, taken between the passes, miss what the
+            passes and the driver take during them: once the card lacked memory within the period of a
+            rise, the ceiling stays card_cap_step below the copies it lacked memory with, and is not
+            lifted while that level is known.  The matrices refused may then come back (the generation
+            moves).  Called at each reading that found the card with half of its reserve free at least,
+            at the time now; after_gap tells a reading that follows a pause of the models (card_gap_ns).
         */
         void raise_card_cap(long long now, bool after_gap);
+
+        // Lifts the ceiling of the copies, and forgets the level the card lacked memory at and the period of the rises.
+        void lift_card_cap()
+        {
+            card_cap = std::numeric_limits<size_t>::max();
+            card_short_level = std::numeric_limits<size_t>::max();
+            card_period_ms = 0;
+            card_raised_at = 0;
+            card_released_at = 0;
+            card_rise_unreleased = false;
+        }
 
         void note_route(const std::string& key, const json& value)
         {
@@ -663,7 +698,7 @@ namespace albireo
             d_.offloads.erase(std::remove(d_.offloads.begin(), d_.offloads.end(), this), d_.offloads.end());
             evict_copies(std::numeric_limits<size_t>::max());
             // The ceiling a card short of memory set came from the passes of the models: without a copy left, it goes.
-            if (d_.resident.load() == 0) d_.card_cap = std::numeric_limits<size_t>::max();
+            if (d_.resident.load() == 0) d_.lift_card_cap();
         }
 
         void set_busy(bool busy) override
@@ -2503,6 +2538,17 @@ namespace albireo
         const size_t wanted = card_shortfall(0);
         if (wanted <= card_reserve_bytes / 2) card_low = false;
         if (wanted == 0) return 0;
+        const size_t level = resident.load();
+        // What the extended memory held on the card when it lacked memory, beside the copies.
+        std::string held;
+#if defined(DLIB_USE_CUDA)
+        if (v2ram)
+        {
+            const dlib::extended_memory_stats st = dlib::get_extended_memory_stats();
+            held = "; the extended memory held " + megabytes(st.device_bytes) + " of tensors, "
+                + megabytes(st.scratch_bytes) + " of workspaces and " + megabytes(st.pooled_bytes) + " in its pool";
+        }
+#endif
         std::vector<tensor_offload*> idle;
         for (tensor_offload* o : offloads)
             if (o != &requester && !o->busy() && o->copy_bytes() > 0) idle.push_back(o);
@@ -2531,12 +2577,34 @@ namespace albireo
         card_roomy_since = 0;
         ++card_releases;
         card_released_bytes += freed;
+        /*
+            A release within the period of the last rise: the readings found more room than the passes
+            left.  Its level then bounds the next rises, the level of the last of the releases that
+            follow one another, and their period doubles at the first of them.
+        */
+        const long long now = now_ns();
+        const long long base = card_raise_ms();
+        long long period = std::max(card_period_ms.load(), base);
+        const long long raised_at = card_raised_at.load();
+        if (raised_at > 0 && now - raised_at < period * 1000000LL)
+        {
+            if (card_rise_unreleased.exchange(false))
+            {
+                period = std::min(period * 2, std::max(base, base * card_period_growth));
+                card_period_ms = period;
+            }
+            card_short_level = level;
+        }
+        card_released_at = now;
+        const size_t bound = card_short_level.load();
         message(ALBIREO_LOG_INFO, "device: the card had " + megabytes(free_before) + " free, less than half of the "
-            + megabytes(card_reserve_bytes) + " the copies leave to the passes, the libraries and the other programs; "
-            + megabytes(freed) + " of copies leave it (" + megabytes(own) + " of '" + requester.model() + "', which "
-            "keeps " + megabytes(requester.copy_bytes()) + ", and " + megabytes(others) + " of the models without "
-            "requests); the copies keep to " + megabytes(cap) + " until the card has kept room for more during "
-            + duration_text(card_raise_ms()));
+            + megabytes(card_reserve_bytes) + " the copies leave to the passes, the libraries and the other programs, "
+            "with " + megabytes(level) + " of copies" + held + "; " + megabytes(freed) + " of copies leave it ("
+            + megabytes(own) + " of '" + requester.model() + "', which keeps " + megabytes(requester.copy_bytes())
+            + ", and " + megabytes(others) + " of the models without requests); the copies keep to " + megabytes(cap)
+            + " until the card has kept room for more during " + duration_text(period)
+            + (bound == std::numeric_limits<size_t>::max() ? std::string() : ", and then stay "
+            + megabytes(card_cap_step) + " below the " + megabytes(bound) + " of copies of a release after a rise"));
         return freed;
     }
 
@@ -2568,20 +2636,47 @@ namespace albireo
         }
         const size_t least = std::min(card_roomy_least.load(), room);
         card_roomy_least = least;
+        const long long base = card_raise_ms();
+        // A card that kept its copies for card_forget_periods periods since its last release: its level and period go.
+        size_t level = card_short_level.load();
+        const long long released_at = card_released_at.load();
+        if (level != std::numeric_limits<size_t>::max() && now - released_at > base * card_forget_periods * 1000000LL)
+        {
+            card_short_level = std::numeric_limits<size_t>::max();
+            card_period_ms = 0;
+            level = std::numeric_limits<size_t>::max();
+        }
         // The ceiling moves only for a copy that waits for it, by half the least room the readings found.
-        const long long period = card_raise_ms();
+        const long long period = std::max(card_period_ms.load(), base);
         if (after_gap || now - since < period * 1000000LL || !card_cap_met.load()) return;
-        const size_t step = std::max(card_cap_step, least / 2);
-        const bool lifted = budget - std::min(budget, cap) <= step;
+        size_t step = std::max(card_cap_step, least / 2);
+        // Below the copies the card last lacked memory with, by card_cap_step.
+        const bool bounded = level != std::numeric_limits<size_t>::max();
+        if (bounded)
+        {
+            const size_t limit = level > card_cap_step ? level - card_cap_step : 0;
+            if (limit <= cap)
+            {
+                card_roomy_since = now;
+                card_roomy_least = room;
+                return;
+            }
+            step = std::min(step, limit - cap);
+        }
+        const bool lifted = !bounded && budget - std::min(budget, cap) <= step;
         const size_t raised = lifted ? std::numeric_limits<size_t>::max() : cap + step;
         if (!card_cap.compare_exchange_strong(cap, raised)) return;
         card_cap_met = false;
         card_roomy_since = now;
         card_roomy_least = room;
+        card_raised_at = now;
+        card_rise_unreleased = true;
         ++generation;
         message(ALBIREO_LOG_INFO, "device: the card kept " + megabytes(least) + " of room at least beside the "
             + megabytes(card_reserve_bytes) + " of its reserve during " + duration_text(period) + "; the copies may "
-            "take " + (lifted ? "their whole budget again, " + megabytes(budget) : "up to " + megabytes(raised)));
+            "take " + (lifted ? "their whole budget again, " + megabytes(budget) : "up to " + megabytes(raised))
+            + (bounded ? ", " + megabytes(card_cap_step) + " below the " + megabytes(level) + " of copies the card "
+            "lacked memory with" : ""));
     }
 
     tensor_device::tensor_device(const json& config, thread_pool& pool, log_function log)
@@ -2773,6 +2868,11 @@ namespace albireo
         const size_t cap = d.card_cap.load();
         s["card_cap_bytes"] = cap == std::numeric_limits<size_t>::max() ? json()
             : json(static_cast<unsigned long long>(cap));
+        // The copies the card last lacked memory with, which bound the ceiling, and the period of its rises.
+        const size_t level = d.card_short_level.load();
+        s["card_short_bytes"] = level == std::numeric_limits<size_t>::max() ? json()
+            : json(static_cast<unsigned long long>(level));
+        s["card_raise_ms"] = std::max(d.card_period_ms.load(), card_raise_ms());
         // The copies charged to the commit of the engine, which the guard of the keys and values counts as room.
         s["commit_charged_bytes"] = static_cast<unsigned long long>(d.charged_bytes());
 #if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)

@@ -52,13 +52,35 @@ namespace albireo
             return join_path(parent_path(settings_path), "web_search.secret");
         }
 
-        // Whether a document of the settings holds a setting this version lacks, or another provider of the search.
+        /*
+            The version of the documents settings.json that write() gives them: 2 since Albireo 1.0.21,
+            whose graph of OpenVINO is off by default.  A document without it is of version 1.
+        */
+        const long long settings_version = 2;
+
+        /*
+            Whether a document of the settings holds a setting this version lacks, or another provider of the
+            search, or comes from an earlier version of the document.
+        */
         bool obsolete_settings(const json& j)
         {
             for (const char* key : { "public_link", "web_search_url", "web_search_key", "web_search_key_set" })
                 if (j.contains(key)) return true;
             const std::string search = j["web_search"].as_string();
-            return j.contains("web_search") && search != "wikipedia" && search != "none";
+            return (j.contains("web_search") && search != "wikipedia" && search != "none")
+                || j["settings_version"].as_int(1) < settings_version;
+        }
+
+        // The settings of a document of settings.json, from the version that wrote it.
+        void read_document(host_settings& s, const json& j)
+        {
+            s.from_json(j);
+            /*
+                The default auto of the graph of OpenVINO, which the versions before 1.0.21 wrote, gives
+                way to off, unless the accelerator cpu, the graph on the processor, was chosen.
+            */
+            if (j["settings_version"].as_int(1) < settings_version && s.graph == "auto" && s.accelerator != "cpu")
+                s.graph = host_settings().graph;
         }
 
         // The text of a secret file without the ends of line and the spaces that follow it.
@@ -189,7 +211,8 @@ namespace albireo
             std::string text, error;
             if (read_settings(path_, text, j, error))
             {
-                s_.from_json(j);
+                read_document(s_, j);
+                version_ = j["settings_version"].as_int(1);
                 obsolete = obsolete_settings(j);
                 // The copy follows a valid file, the one the installer or a hand wrote included.
                 const std::string backup = backup_path(path_);
@@ -207,7 +230,11 @@ namespace albireo
                 json saved;
                 std::string saved_text, unused;
                 restored = read_settings(backup_path(path_), saved_text, saved, unused);
-                if (restored) s_.from_json(saved);
+                if (restored)
+                {
+                    read_document(s_, saved);
+                    version_ = saved["settings_version"].as_int(1);
+                }
                 log_warning("settings: " + path_ + " is not valid JSON (" + error + "), "
                     + (restored ? "its last copy is used" : "defaults used"));
             }
@@ -245,7 +272,9 @@ namespace albireo
         const std::string secret = secret_path(path_);
         const bool password = masked_proxy(s_.proxy) != s_.proxy;
         if (password && !write_file_restricted(secret, s_.proxy)) return false;
-        const std::string text = s_.to_json().dump_formatted(2) + "\n";
+        json document = s_.to_json();
+        document["settings_version"] = std::max(version_, settings_version);
+        const std::string text = document.dump_formatted(2) + "\n";
         if (!write_file_atomic(path_, text)) return false;
         // The copy read when settings.json is damaged, written once settings.json is in place.
         if (!write_file_atomic(backup_path(path_), text)) log_warning("settings: its copy cannot be written");

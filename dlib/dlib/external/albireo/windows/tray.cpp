@@ -591,7 +591,7 @@ namespace albireo
             why an engine of a device cannot run here and which devices the runtime of an
             engine left out.  The check mark follows the settings; settings that name none of
             the choices, an accelerator with the automatic engine for instance, mark the choice
-            in use.
+            in use, the processor alone when a processor engine computes the models.
         */
         HMENU accelerator_menu(bool on)
         {
@@ -603,9 +603,13 @@ namespace albireo
             tray.choices.clear();
             std::vector<std::wstring> labels;
             int marked = -1, in_use = -1;
+            // Whether a processor engine computes the models, which no choice of the list shows.
+            bool processor_in_use = false;
             for (const auto& o : eng["options"].elements())
             {
                 const std::string kind = o["kind"].as_string();
+                processor_in_use = processor_in_use
+                    || (o["current"].as_bool(false) && o["key"].as_string().compare(0, 3, "cpu") == 0);
                 // The devices, and the processor through the graph of OpenVINO.
                 if (kind != "gpu" && kind != "npu" && kind != "both" && o["key"].as_string() != "openvino:cpu")
                     continue;
@@ -617,7 +621,12 @@ namespace albireo
                 labels.push_back(choice_label(o));
             }
             const bool auto_marked = automatic && accelerator == "auto";
-            const bool none_marked = (automatic && accelerator == "none") || engine.compare(0, 3, "cpu") == 0;
+            /*
+                Settings that name a choice the list leaves out, the accelerator cpu with the setting graph off
+                or the NPU with graph on, while a processor engine computes the models, mark the processor alone.
+            */
+            const bool none_marked = (automatic && accelerator == "none") || engine.compare(0, 3, "cpu") == 0
+                || (!auto_marked && marked < 0 && in_use < 0 && processor_in_use);
             if (marked < 0 && !auto_marked && !none_marked) marked = in_use;
             const UINT enabled = on ? 0 : MF_GRAYED;
             AppendMenuW(acc, MF_STRING | enabled | (auto_marked ? MF_CHECKED : 0), CMD_ACCEL_AUTO,

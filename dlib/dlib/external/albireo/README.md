@@ -185,71 +185,108 @@ richest family the processor runs and offers its devices (`openvino:npu`, `openv
 need instructions the processor lacks is reported as such without being loaded, since the runtime
 of a device takes seconds to start.
 
-The OpenVINO engines also compute a whole model as one graph of OpenVINO
+The OpenVINO engines can also compute a whole model as one graph of OpenVINO
 ([`engine/ov_graph.h`](engine/ov_graph.h)), on the processor (`openvino:cpu`, accelerator `cpu`, the
 plugin of the processor of OpenVINO being installed beside the engines) or on the graphics processor
 of Intel (`openvino:gpu`, `openvino:both`), rather than send the products of the processor runtime
-one by one to the device. The NPU alone keeps the products, its compiler taking graphs of fixed
-shapes. The graph holds the normalizations, the products, the rotary positions, the attention and
-the feed-forward blocks of every layer, and the logits of the rows a pass asks for; the host
-computes the embeddings of the tokens and the cosines and sines of their positions, whatever the
-frequency adjustments and the multimodal positions of the model (Qwen3-VL and its DeepStack slices
-included). The keys and values of each sequence live in the variables of an inference request of its
-own, which the plugin of the processor fuses with the attention of each layer; a sequence cut or
-copied reads its variables and writes the part kept back, so that the drafts of the answers are off
-with the graph, and its passes take 2048 tokens, the plugin attending one token at a time to a pass
-that follows another. Answers written together run one inference each, each reading all the weights,
-where the processor runtime computes their tokens in one pass that reads the weights once: three
-answers of Qwen3 0.6B written at once on two cores came at 8.1 to 8.3 tokens per second each with
-the graph, and at 16.6 to 20.7 with the processor runtime, one answer alone at about 20 with either.
-The weights become constants the plugins multiply in their compact form: Q4_0, Q8_0 and Q5_0 keep
-their exact values in 4-bit or 8-bit integers by groups of 32 with a scale in half precision; Q4_K
-and Q4_1 keep their 4-bit values and their minimums, the values and their scales forming one product
-and the minimums a second one, small, over the sums of the inputs by groups of 32 (the minimums of
-Q4_K as their 6-bit integers by blocks of 8 groups, which keeps those sums in single precision),
-Q4_1 exactly and Q4_K with the scale of each group, the product of the scale of its block and of its
-6-bit integer, rounded to half precision, a relative error below 2^-11; Q5_K, Q6_K, Q5_1, Q2_K, Q3_K
-and IQ4_NL are rounded again to 8-bit integers by groups of 32, which adds to their own rounding an
-error of about a quarter of it for Q6_K, an eighth for Q5_K and Q5_1, and less for the formats of
-fewer bits. The products of Q, K and V, and those of the gate and up projections, run as one product
-when their matrices share a format. Once built, the graph is written to `engine-cache\graphs` and
-read back with its weights mapped from their file, which the system can drop once the plugin has
-copied them into its own layout: the process then holds the weights once (Qwen3-VL 2B: 1.2 GB of
-weights, 1.6 GB more in the process, against 2.8 GB with the constants in its memory); the file goes
-when the model leaves, at once on Linux, or when the graph fails, and a graph that cannot be written
-there leaves the model to the processor runtime rather than hold its weights twice, as does a
-graphics processor OpenVINO does not find, before the weights are converted. The keys and values
-stay in half precision unless `kv_type` is `q8`: the 8-bit format of the plugin of the processor, by
-position and head, departs from the logits of the processor runtime ten times more than the groups
-of 32 values of the processor runtime. The plugin grows the buffers of the cache of a sequence to
-twice its positions when a pass fills them, and keeps the tensor of a state it is given: the budget
-of the keys and values and the guard of the memory count these buffers, the old ones beside the new
-ones while the plugin copies them, the context a memory allows counts two of their positions for
-each position (`kv_bytes_per_token`), and on the processor, with the versions of OpenVINO from
-2025.0 to 2026.4, whose plugin copies a state at once, the positions a cut or a copy keeps reach the
-plugin through a buffer the runtime frees once they are written. The setting `graph` (`auto`) takes
+one by one to the device, when the setting `graph` asks for it. It is `off` by default; `auto` takes
 the graph for each model it computes, the processor runtime keeping the mixtures of experts and the
-models whose graph cannot be compiled; `on` requires it and `off` leaves the models to the processor
-runtime.
+models whose graph cannot be compiled, and offers the choice `openvino:cpu`; `on` requires it, and
+leaves out the choices `openvino:npu` and `openvino:both`, the NPU computing no graph. The settings
+written before version 1.0.21 with `auto`, the default of their version, read `off`, unless their
+accelerator is `cpu`, the graph on the processor chosen in the Accelerator menu; with `off`, the
+accelerator `cpu` gives the models to the processor engine. The NPU alone keeps the products, its
+compiler taking graphs of fixed shapes. The graph holds the normalizations, the products, the rotary
+positions, the attention and the feed-forward blocks of every layer, and the logits of the rows a
+pass asks for; the host computes the embeddings of the tokens and the cosines and sines of their
+positions, whatever the frequency adjustments and the multimodal positions of the model (Qwen3-VL
+and its DeepStack slices included). The keys and values of each sequence live in the variables of an
+inference request of its own, which the plugin of the processor fuses with the attention of each
+layer; a sequence cut or copied reads its variables and writes the part kept back, so that the
+drafts of the answers are off with the graph, and its passes take 2048 tokens, the plugin attending
+one token at a time to a pass that follows another. Answers written together run one inference each,
+each reading all the weights, where the processor runtime computes their tokens in one pass that
+reads the weights once. The weights become constants the plugins multiply in their compact form:
+Q4_0, Q8_0 and Q5_0 keep their exact values in 4-bit or 8-bit integers by groups of 32 with a scale
+in half precision; Q4_K and Q4_1 keep their 4-bit values and their minimums, the values and their
+scales forming one product and the minimums a second one, small, over the sums of the inputs by
+groups of 32 (the minimums of Q4_K as their 6-bit integers by blocks of 8 groups, which keeps those
+sums in single precision), Q4_1 exactly and Q4_K with the scale of each group, the product of the
+scale of its block and of its 6-bit integer, rounded to half precision, a relative error below
+2^-11; Q5_K, Q6_K, Q5_1, Q2_K, Q3_K and IQ4_NL are rounded again to 8-bit integers by groups of 32,
+which adds to their own rounding an error of about a quarter of it for Q6_K, an eighth for Q5_K and
+Q5_1, and less for the formats of fewer bits. The products of Q, K and V, and those of the gate and
+up projections, run as one product when their matrices share a format. Once built, the graph is
+written to `engine-cache\graphs` and read back by the reader of graph files of OpenVINO,
+`openvino_ir_frontend`, installed beside the engines, with its weights mapped from their file, which
+the system can drop once the plugin has copied them into its own layout; the file goes when the
+model leaves, at once on Linux, or when the graph fails. A folder that cannot take a graph, or a
+runtime without that reader, fails before the weights are converted, as does a graphics processor
+OpenVINO does not find, and leaves the model to the processor runtime rather than hold its weights
+twice. The keys and values stay in half precision unless `kv_type` is `q8` on the processor: the
+8-bit format of its plugin, by position and head, departs from the logits of the processor runtime
+ten times more than the groups of 32 values of the processor runtime. On the graphics processor they
+stay in half precision: its plugin keeps them in 8 bits by default on the graphics processors
+without systolic arrays, and then refuses to read and write the states of the cache, which the cuts
+and the copies of the sequences use. The plugin of the processor grows the buffers of the cache of a
+sequence to twice its positions when a pass fills them, and keeps the tensor of a state it is given:
+the budget of the keys and values and the guard of the memory count these buffers, the old ones
+beside the new ones while the plugin copies them, the context a memory allows counts two of their
+positions for each position (`kv_bytes_per_token`), and on the processor, with the versions of
+OpenVINO from 2025.0 to 2026.4, whose plugin copies a state at once, the positions a cut or a copy
+keeps reach the plugin through a buffer the runtime frees once they are written.
 
-Against the processor runtime with the kernels of AVX-VNNI, on two cores limited to the
-instructions of AVX2 and AVX-VNNI (`tests/test_ov_graph.cpp`, prompts of 256 to 512 tokens,
-128 steps), the graph reads the prompts faster and writes the answers of the models in Q4_K_M a
-little slower, the Q6_K matrices it holds in 8 bits, the output matrix among them, and the
-minimums of Q4_K adding about a fifth to the bytes a step reads:
+The tables below compare the graph with the processor runtime and its kernels of AVX-VNNI
+(`tests/test_ov_graph.cpp`: a prompt of 512 tokens read by two passes of 256, the second following
+the first, then 32 steps), in tokens per second, the graph first. On a Core Ultra 9 275HX (8
+performance and 16 efficient cores, AVX2 and AVX-VNNI, Windows, OpenVINO 2026.4.1), with Qwen3-VL 4B
+Q4_K_M, the graph reads the first pass of a prompt faster, but the passes that follow another one,
+which each turn of a conversation reads after its history, at about half the speed of the processor
+runtime, and writes the answers more slowly as the threads grow:
 
-| Model                         | Prompt, graph | Prompt, processor | Steps, graph | Steps, processor |
-|-------------------------------|---------------|-------------------|--------------|------------------|
-| Qwen3 0.6B Q4_K_M             | 190 to 250    | 170 to 216        | 19.6 to 20.4 | 20.7 to 22.1     |
-| Qwen3-VL 2B Q4_K_M            | 89.5          | 69.3              | 7.7          | 8.9              |
-| SmolLM2 135M Q8_0             | 1008          | 548               | 62.9         | 65.4             |
-| SmolLM2 135M Q5_K_M           | 717           | 620               | 75.0         | 38.0             |
-| Qwen3 Embedding 0.6B Q8_0     | 372           | 149               | 26.6         | 23.0             |
+| Threads | First pass    | Later passes  | Steps         |
+|---------|---------------|---------------|---------------|
+| 24      | 260.1 / 216.0 | 111.6 / 198.3 | 13.45 / 19.48 |
+| 8       | 190.8 / 137.7 | 62.0 / 126.0  | 12.60 / 15.25 |
+| 4       | 120.7 / 84.3  | 40.5 / 77.9   | 9.51 / 10.87  |
+| 2       | 52.1 / 45.4   | 19.6 / 41.2   | 6.65 / 6.70   |
+
+On 24 threads of that machine, Qwen3 0.6B Q4_K_M read its first pass at 1172 to 1290 tokens per
+second with the graph against 1304 to 1354, its later passes at 317 to 428 against 1063 to 1088, and
+wrote at 38.9 to 43.3 against 80.6 to 87.7; three answers of Qwen3-VL 4B written at once came at
+4.81 tokens per second each with the graph and at 15.39 with the processor runtime. The plugin
+holds the weights in its own layout: the process committed 3.7 GB more with the graph of Qwen3-VL
+4B, of 2.7 GB of weights, where the processor runtime reads them from the mapping of their file, and
+the graph took 9 to 16 seconds to build at each load. On the graphics processor of that machine,
+Qwen3 0.6B read its passes faster with the graph (1614 and 1408 against 1376 and 1075) and wrote at
+less than half the speed of the processor runtime (36.4 against 81.6).
+
+The measures of version 1.0.20 came from a Xeon whose AVX-512, AVX512-FP16 and AMX the plugin of
+OpenVINO used, the processor runtime keeping to AVX2 and AVX-VNNI: on two of its cores, Qwen3-VL 4B
+Thinking Q4_K_M read its first pass at 51.2 tokens per second with the graph against 26.7, its later
+passes at 41.4 against 25.3, and wrote at 4.02 against 4.19. With OpenVINO limited there to AVX2 and
+AVX-VNNI (`ONEDNN_MAX_CPU_ISA=AVX2_VNNI`), on two cores:
+
+| Model                       | First pass    | Later passes  | Steps         |
+|-----------------------------|---------------|---------------|---------------|
+| Qwen3 0.6B Q4_K_M           | 227.9 / 200.4 | 158.7 / 175.1 | 20.27 / 21.68 |
+| Qwen3-VL 2B Q4_K_M          | 86.1 / 62.5   | 74.6 / 58.7   | 8.02 / 8.40   |
+| Qwen3-VL 4B Thinking Q4_K_M | 32.3 / 25.9   | 28.8 / 26.0   | 3.69 / 4.01   |
+| SmolLM2 135M Q8_0           | 896 / 501     | 500 / 466     | 65.4 / 60.6   |
+| SmolLM2 135M Q5_K_M         | 897 / 521     | 517 / 443     | 67.4 / 30.6   |
+| SmolLM2 135M Q4_0           | 783 / 494     | 489 / 457     | 84.1 / 64.9   |
+| Qwen3 Embedding 0.6B Q8_0   | 209 / 130     | 156 / 116     | 23.9 / 20.0   |
+
+There the graph reads the prompts faster and writes the answers of the models in Q4_K_M a little
+slower, the Q6_K matrices it holds in 8 bits, the output matrix among them, and the minimums of Q4_K
+adding to the bytes a step reads; it writes faster where the kernels of the processor runtime are
+slower, Q5_K above all. Its memory weighs on the small configurations: the graph of Qwen3-VL 2B took
+1.5 GB more in the process, that of Qwen3-VL 4B 3.4 GB more.
 
 The measure of the engines (tray, Accelerator, Measure the engines) gives each choice a typical
 request of 1500 tokens read and 300 written, from the reading of a prompt of about a thousand tokens
-and the writing of answers of 64, one at a time, which orders the engines of the processor and the
-graph of the processor among them.
+and the writing of answers of 64, one at a time, which orders the engines of the processor, and the
+graph of the processor among them when the setting `graph` is not `off`.
 
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
@@ -489,6 +526,18 @@ beside the reserve, 256 MB at least, the buffers the pool of V²RAM keeps counti
 half the reserve; the first reading after a pause of the models, taken before the buffers of its
 pass are made, ends no such period. The ceiling is lifted when it reaches the budget or when the
 last copies leave with their model, and a new release sets it again.
+
+The readings, taken between the passes, miss what the passes and the driver take during them: with
+version 1.0.19, the same Mistral Small 3.2 24B gave its copies back four times in the 100 seconds of
+its prompt of 6,888 tokens, each rise aiming at 8.2 to 8.3 GB of copies where the card lacked memory
+again from 7.95 to 8.04 GB, about 2 GB below what the readings foresaw. Since version 1.0.21, a
+release within the period of the last rise bounds the next rises: the ceiling stays 256 MB below the
+copies the card lacked memory with (`card_short_bytes` in the statistics, null while none), is not
+lifted while that bound holds, and the period of the rises doubles once per rise (`card_raise_ms`),
+up to 10 minutes. After 30 minutes without a release, the bound and the period go, so that the
+ceiling follows a card that other programs left. The message of a release gives the copies the card
+lacked memory with and what V²RAM then held on it: its tensors, the copies among them, its
+workspaces and its pool.
 
 A model replaced or deactivated in the Models window leaves the engine once its requests are served
 (`engine_host::unload_model`): from that moment the service routes no new request to it, the
@@ -1180,16 +1229,16 @@ cmake --build build-albireo-win -j
 | `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
-| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise) and come back |
+| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise), come back, then leave it again within the period of that rise, which bounds the next rises and doubles their period |
 | `test_device_ops` | on the processor, the lanes of the kernel of the card for Q4_K and Q6_K (`gguf_blocks::lane_products()`) against the processor kernels; then the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of one and of eight tokens on the matrices of a 2B model, and of the attention of a generated token over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` |
-| `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input. `test_ov_graph model.gguf [device] [threads] [f16\|u8\|f16-mask\|u8-mask] [prompt] [chunk] [steps]` |
+| `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input. `test_ov_graph model.gguf [device] [threads] [f16\|u8\|f16-mask\|u8-mask] [prompt] [chunk] [steps]` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
@@ -1351,7 +1400,7 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `models_dir`    | `""`    | folder of the models, `<data>\models` when empty                          |
 | `language`      | `auto`  | `auto`, `en`, `fr`, `de`, `it`, `es`                                      |
 | `engine`        | `auto`  | `auto` (the accelerator of the computer: cuda, else `openvino:both`, `openvino:gpu` or `openvino:npu`, the processor computing what its device does not take; the processor engine, the fastest measured or the one of the richest kernels, when no accelerator is usable or when a measure found the accelerator slower), `best` (the fastest measured), or a variant |
-| `accelerator`   | `auto`  | `none` (the processor engine), `npu`, `gpu`, `both`: the device of the engines that have several; `cpu`: the graph of OpenVINO on the processor |
+| `accelerator`   | `auto`  | `none` (the processor engine), `npu`, `gpu`, `both`: the device of the engines that have several; `cpu`: the graph of OpenVINO on the processor when `graph` is not `off`, else the processor engine |
 | `v2ram`         | true    | extended device memory of the CUDA engine                                  |
 | `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; a size lets the copies of the weights go beyond the card into it; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
 | `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
@@ -1360,7 +1409,7 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `max_sequences` | 4       | requests computed together per model                                      |
 | `kv_mb`         | 0       | memory of the keys and values, 0 for two contexts within the memory the system can commit, a reserve left |
 | `kv_type`       | `auto`  | keys and values: `q8` (8 bits, the keys rotated), `f16` (half precision), `auto` (`q8` for the language models whose heads hold whole groups of 32 values) |
-| `graph`         | `auto`  | graph of OpenVINO of the OpenVINO engine: `auto` for the models it computes, `on` required, `off` for the processor runtime and the products of the devices |
+| `graph`         | `off`   | graph of OpenVINO of the OpenVINO engine: `off` for the processor runtime and the products of the devices, `auto` for the models it computes, with the choice `openvino:cpu`, `on` required, without the choices `openvino:npu` and `openvino:both`; `auto` in a `settings.json` written before version 1.0.21 reads `off`, unless `accelerator` is `cpu` |
 | `draft_tokens`  | 4       | tokens of the drafts an answer verifies per step, 0 to 6, 0 for none      |
 | `integer_prompt` | true   | products of the prompts on 8-bit integers (Q4_0, Q4_K, Q5_K, Q6_K, and Q8_0 with VNNI), `false` on floats |
 | `check_updates` | true    | checks the feed at each start and every six hours                          |

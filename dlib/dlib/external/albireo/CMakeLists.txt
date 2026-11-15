@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.20 LANGUAGES C CXX)
+project(albireo VERSION 1.0.21 LANGUAGES C CXX)
 
 # The version is written in four places that must agree: project() above, the numbers of
 # common/version.h, which the version resources of the programs and of the installer carry and
@@ -542,8 +542,13 @@ if (ALBIREO_ENGINE_OPENVINO)
          list(APPEND ALBIREO_RUNTIME_EXTRA
             "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${part}${CMAKE_SHARED_LIBRARY_SUFFIX}")
       endforeach()
-      list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}tbbbind*"
-         ${tbbbind_libraries} "${openvino_dir}/cache.json")
+      file(GLOB package_tbbbind "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}tbbbind*${CMAKE_SHARED_LIBRARY_SUFFIX}*")
+      list(FILTER package_tbbbind EXCLUDE REGEX "_debug")
+      # The reader of the graphs written in files, which OpenVINO looks for beside its runtime: the
+      # graph of a model reads its weights back from the file it writes in the cache of the engine.
+      list(APPEND ALBIREO_RUNTIME_EXTRA
+         "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_ir_frontend${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+         ${package_tbbbind} ${tbbbind_libraries} "${openvino_dir}/cache.json")
       foreach (engine ${openvino_engines})
          albireo_device_runtime(${engine})
       endforeach()

@@ -252,7 +252,7 @@ namespace albireo
         return variant.compare(0, 8, "openvino") == 0;
     }
 
-    std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates)
+    std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates, const std::string& graph)
     {
         // The OpenVINO engine with the richest processor kernels that run here: its devices
         // make the choices of the NPU and of the graphics processor.
@@ -273,10 +273,16 @@ namespace albireo
                 std::string npu, gpu;
                 for (const auto& d : c.description["devices"].elements())
                 {
-                    // The processor, "CPU", is listed when the plugin of the processor of OpenVINO loads, for the
-                    // graph of the models (openvino:cpu).
+                    /*
+                        The processor, "CPU", is listed when the plugin of the processor of OpenVINO loads, for the
+                        graph of the models (openvino:cpu), which the setting graph off leaves out; graph on leaves
+                        out the NPU, which computes no graph, and with it the choice of both devices.
+                    */
                     const std::string type = d["type"].as_string();
-                    if (type != "npu" && type != "gpu" && !(type == "cpu" && d["id"].as_string() == "CPU")) continue;
+                    const bool processor = type == "cpu" && d["id"].as_string() == "CPU";
+                    if ((type != "npu" && type != "gpu" && !processor) || (processor && graph == "off")
+                        || (type == "npu" && graph == "on"))
+                        continue;
                     const std::string key = "openvino:" + type;
                     bool seen = false;
                     for (const auto& e : out) seen = seen || e.key == key;
@@ -309,7 +315,7 @@ namespace albireo
 
     engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s)
     {
-        const std::vector<engine_choice> options = engine_options(candidates);
+        const std::vector<engine_choice> options = engine_options(candidates, s.graph);
         /*
             The speed of a typical request when every measured choice has one, else the speed of the
             answers, which the measures of the versions before 1.0.20 give alone: the choices compare on
@@ -350,17 +356,25 @@ namespace albireo
             // accelerator setting picks the device.  "openvino" names the OpenVINO engine
             // that engine_options() keeps.
             const engine_choice* named = nullptr;
+            const bool graph_cpu = s.accelerator == "cpu";
             for (const auto& e : options)
             {
                 const bool openvino = s.engine == "openvino" && is_openvino_variant(e.candidate->variant);
                 if (e.key != s.engine && e.candidate->variant != s.engine && !openvino) continue;
+                // The accelerator cpu names the graph on the processor and none of the devices of OpenVINO.
+                if (graph_cpu && is_openvino_variant(e.candidate->variant) && e.key != "openvino:cpu") continue;
                 if (!named) named = &e;
                 if ((s.accelerator == "npu" && is_npu(e)) || (s.accelerator == "gpu" && is_gpu(e))
                     || (s.accelerator == "both" && e.key == "openvino:both")
-                    || (s.accelerator == "cpu" && e.key == "openvino:cpu")) named = &e;
+                    || (graph_cpu && e.key == "openvino:cpu")) named = &e;
             }
             if (named) return *named;
-            log_warning("engines: the engine '" + s.engine + "' of the settings is not usable, automatic selection");
+            if (graph_cpu && is_openvino_variant(s.engine))
+                log_warning("engines: the graph of OpenVINO on the processor, the accelerator cpu of the settings, is "
+                    + std::string(s.graph == "off" ? "off (setting graph)" : "not usable") + ", automatic selection");
+            else
+                log_warning("engines: the engine '" + s.engine + "' of the settings is not usable, automatic "
+                    "selection");
         }
         // The processor engine: the fastest measured one, else the one of the richest kernels.
         const engine_choice* processor = fastest(is_cpu);
@@ -841,7 +855,7 @@ namespace albireo
             {
                 engine_error_ = choice_.key + ": " + e;
                 log_error("engines: " + engine_error_);
-                for (const auto& o : engine_options(candidates_))
+                for (const auto& o : engine_options(candidates_, st.graph))
                 {
                     if (o.key.compare(0, 3, "cpu") != 0) continue;
                     if (engine_.start(*o.candidate, engine_config(st, o.device), e))
@@ -2297,7 +2311,7 @@ namespace albireo
             list.push_back(j);
         }
         json options = json::array();
-        for (const auto& o : engine_options(candidates_))
+        for (const auto& o : engine_options(candidates_, st.graph))
         {
             json j = json::object();
             j["key"] = o.key;
@@ -2329,7 +2343,7 @@ namespace albireo
         out["accelerator"] = st.accelerator;
         // The tray offers the choice of the accelerator while a processor engine runs.
         bool accelerators = false;
-        for (const auto& o : engine_options(candidates_))
+        for (const auto& o : engine_options(candidates_, st.graph))
             accelerators = accelerators || o.key == "cuda" || o.key == "openvino:npu" || o.key == "openvino:gpu";
         out["accelerators_available"] = accelerators;
         if (!accelerators)
@@ -2391,7 +2405,7 @@ namespace albireo
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
         };
-        for (const auto& o : engine_options(candidates_))
+        for (const auto& o : engine_options(candidates_, st.graph))
         {
             if (stopping_) break;
             json config = engine_config(st, o.device);

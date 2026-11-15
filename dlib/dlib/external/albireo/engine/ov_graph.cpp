@@ -21,6 +21,7 @@
 #include <openvino/core/graph_util.hpp>
 #include <openvino/core/model.hpp>
 #include <openvino/core/version.hpp>
+#include <openvino/frontend/manager.hpp>
 #include <openvino/op/add.hpp>
 #include <openvino/op/assign.hpp>
 #include <openvino/op/broadcast.hpp>
@@ -870,8 +871,10 @@ namespace albireo
                 settings_.device = upper(settings_.device);
                 cpu_ = settings_.device == "CPU";
                 views_ = cpu_ && state_copied_at_once();
-                // A device that OpenVINO does not find fails here, before the weights are converted.
+                // A device that OpenVINO does not find, or a folder of the weights where a graph cannot be
+                // written and read back, fails here, before the weights are converted.
                 if (!cpu_) check_device();
+                if (!settings_.weights_dir.empty()) check_spill();
                 // The plugin of the processor fuses the causal attention with its cache, and the others take a mask.
                 explicit_mask_ = !cpu_ || settings_.explicit_mask;
                 // On the processor, the variables hold half precision and the plugin its own format.
@@ -892,6 +895,15 @@ namespace albireo
                         : ov::element::u8;
                     properties[ov::hint::dynamic_quantization_group_size.name()] = static_cast<uint64_t>(group_size);
                     if (settings_.threads > 0) properties[ov::inference_num_threads.name()] = settings_.threads;
+                }
+                else
+                {
+                    /*
+                        The GPU plugin keeps the keys and values in 8 bits by default on the graphics processors
+                        without systolic arrays, and the states of such a cache refuse get_state and set_state,
+                        which the cuts and the copies of the sequences use.
+                    */
+                    properties[ov::hint::kv_cache_precision.name()] = ov::element::f16;
                 }
                 if (!settings_.weights_dir.empty()) model = spill(model);
                 compiled_ = core_.compile_model(model, settings_.device, properties);
@@ -1202,8 +1214,39 @@ namespace albireo
                     remove_file(bin);
                     bin_.path.clear();
                     throw std::runtime_error(std::string("ov_graph: the graph could not be written to ")
-                        + dir.u8string() + " (" + e.what() + ")");
+                        + dir.u8string() + " and read back (" + e.what() + ")" + missing_reader());
                 }
+            }
+
+            // A graph of one addition written in settings_.weights_dir and read back, then deleted.
+            void check_spill()
+            {
+                const auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{ 1 });
+                const auto one = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{ 1 }, { 1.0f });
+                const auto sum = std::make_shared<ov::op::v1::Add>(input, one);
+                const auto model = std::make_shared<ov::Model>(
+                    ov::ResultVector{ std::make_shared<ov::op::v0::Result>(sum) }, ov::ParameterVector{ input });
+                // The graph read back maps its file, which is deleted once the graph goes.
+                spill(model).reset();
+                remove_file(bin_.path);
+                bin_.path.clear();
+            }
+
+            // Why OpenVINO cannot read a graph back when it has no reader of graph files beside its runtime.
+            static std::string missing_reader()
+            {
+                try
+                {
+                    ov::frontend::FrontEndManager manager;
+                    const std::vector<std::string> names = manager.get_available_front_ends();
+                    if (std::find(names.begin(), names.end(), "ir") == names.end())
+                        return "; the reader of graph files of OpenVINO, openvino_ir_frontend, is missing beside its "
+                            "runtime";
+                }
+                catch (const std::exception&)
+                {
+                }
+                return std::string();
             }
 
             /*

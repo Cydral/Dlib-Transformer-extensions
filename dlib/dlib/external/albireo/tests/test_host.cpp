@@ -1650,6 +1650,47 @@ int main(int argc, char** argv)
         check(wikipedia && off && s.web_search == "wikipedia" && !document.contains("public_link")
             && !document.contains("web_search_url") && !document.contains("web_search_key_set"),
             "the search of the settings is wikipedia or none, and the documents give no link and no key");
+
+        // The graph of OpenVINO: auto, the default before version 2 of the document, reads off.
+        write_text(settings_file, "{\"port\": 9124, \"graph\": \"auto\"}");
+        bool before = false;
+        {
+            albireo::settings_store store(settings_file);
+            const json written = json::parse_or_null(read_text(settings_file));
+            before = store.get().port == 9124 && store.get().graph == "off"
+                && written["settings_version"].as_int() == 2 && written["graph"].as_string() == "off";
+        }
+        // The accelerator cpu, the graph on the processor chosen before version 2, keeps it.
+        write_text(settings_file, "{\"port\": 9126, \"graph\": \"auto\", \"accelerator\": \"cpu\"}");
+        bool kept = false;
+        {
+            albireo::settings_store store(settings_file);
+            kept = store.get().port == 9126 && store.get().graph == "auto" && store.get().accelerator == "cpu";
+        }
+        write_text(settings_file, "{\"port\": 9125, \"graph\": \"auto\", \"settings_version\": 2}");
+        bool chosen = false;
+        {
+            albireo::settings_store store(settings_file);
+            chosen = store.get().port == 9125 && store.get().graph == "auto";
+        }
+        // A document of a later version keeps its version when this one writes it.
+        write_text(settings_file, "{\"port\": 9127, \"graph\": \"auto\", \"settings_version\": 3}");
+        bool later = false;
+        {
+            albireo::settings_store store(settings_file);
+            store.update([](albireo::host_settings& s) { s.port = 9128; });
+            const json written = json::parse_or_null(read_text(settings_file));
+            later = store.get().graph == "auto" && written["port"].as_int() == 9128
+                && written["settings_version"].as_int() == 3;
+        }
+        json change = albireo::host_settings().to_json();
+        change["graph"] = "auto";
+        albireo::host_settings changed;
+        changed.from_json(change);
+        check(before && kept && chosen && later && albireo::host_settings().graph == "off" && changed.graph == "auto"
+                && !change.contains("settings_version"),
+            "the graph of OpenVINO is off by default, auto of a document before version 2 reads off unless the "
+            "accelerator is cpu, auto chosen since then stays, and a document of a later version keeps its version");
     }
 
     {

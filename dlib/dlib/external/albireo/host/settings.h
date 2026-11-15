@@ -49,7 +49,7 @@ namespace albireo
         int max_sequences = 4;                  // requests computed together per model
         long long kv_mb = 0;                    // 0: automatic
         std::string kv_type = "auto";           // keys and values: auto (8 bits), q8 or f16
-        std::string graph = "auto";             // graph of OpenVINO for the models: auto, on or off
+        std::string graph = "off";              // graph of OpenVINO for the models: off, auto or on
         int draft_tokens = 4;                   // tokens of the drafts a step verifies per answer, 0 to 6, 0: none
         bool integer_prompt = true;             // products of the prompts on 8-bit integers
         std::map<std::string, std::string> active;   // role -> model identifier
@@ -103,7 +103,12 @@ namespace albireo
                 A settings.json of an earlier version that holds settings this version
                 lacks, or another provider of the search, is written again at the start
                 without them, and web_search.secret, the key of a search provider of those
-                versions, is deleted.
+                versions, is deleted.  The file carries the version of its document,
+                settings_version, 2 since Albireo 1.0.21: a document without it, written
+                before, reads the graph of OpenVINO "auto", the default of its version, as
+                "off", the default since then, unless its accelerator is "cpu", the graph on
+                the processor, and is written again with its version.  A document of a
+                later version keeps its version when this one writes it.
         !*/
     public:
         explicit settings_store(const std::string& path);
@@ -127,6 +132,8 @@ namespace albireo
         std::string path_;
         mutable std::mutex m_;
         host_settings s_;
+        // The version of the document read, which write() keeps when a later version wrote it.
+        long long version_ = 0;
     };
 
 }

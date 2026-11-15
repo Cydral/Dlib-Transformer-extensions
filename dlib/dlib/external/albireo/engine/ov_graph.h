@@ -62,7 +62,11 @@ namespace albireo
     {
         // The device of OpenVINO that computes the graph: "CPU", "GPU", "GPU.1".
         std::string device = "CPU";
-        // Keys and values in half precision; otherwise in 8-bit integers on the processor.
+        /*
+            Keys and values in half precision; otherwise in 8-bit integers on the processor.  The
+            other devices keep them in half precision, which the cuts and the copies of the
+            sequences need on the graphics processor.
+        */
         bool kv_half = true;
         // Threads of the plugin of the processor, 0 for its own choice.
         int threads = 0;
@@ -78,8 +82,10 @@ namespace albireo
             Linux, when the model leaves on Windows), or when the graph fails.  The plugins copy the
             weights into their own layout, and the pages of the file, which the system can drop,
             then hold the constants the graph keeps rather than the memory of the process.  A graph
-            that cannot be written there fails.  Empty: the constants stay in the memory of the
-            process, which then holds the weights twice.
+            that cannot be written there and read back fails, before the conversion of the weights
+            when a graph of one addition fails the same way: the reader of graph files of OpenVINO,
+            openvino_ir_frontend, has to stand beside its runtime.  Empty: the constants stay in
+            the memory of the process, which then holds the weights twice.
         */
         std::string weights_dir;
     };
@@ -130,9 +136,9 @@ namespace albireo
             - Converts the weights of the model, builds its graph and compiles it for
               settings.device, the keys and values of its sequences taking up to
               kv_budget_bytes.
-            - Throws std::runtime_error with the reason when OpenVINO finds no such device,
-              before the weights are converted, and when it cannot compile or run the graph
-              on the device.
+            - Throws std::runtime_error with the reason when OpenVINO finds no such device or
+              when settings.weights_dir cannot take a graph, before the weights are converted,
+              and when it cannot compile or run the graph on the device.
     !*/
     std::unique_ptr<ov_graph_runtime> make_ov_graph_runtime(std::shared_ptr<model_file> file,
         const model_config& config, const ov_graph_settings& settings, size_t kv_budget_bytes);
