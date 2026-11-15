@@ -66,6 +66,10 @@ namespace ui
     HWND combo(HWND parent, int id, bool editable = false);
     // A strip of tabs, the first one selected.
     HWND tabs(HWND parent, int id, const std::vector<std::wstring>& labels);
+    // An icon of the resources of the program, size pixels on a side.
+    HWND icon(HWND parent, int resource, int size, int id = 0);
+    // Gives the icon control c the icon resource at size pixels, after a change of resolution; 0 frees it.
+    void set_icon(HWND c, int resource, int size);
     HWND progress(HWND parent, int id);
     HWND listview(HWND parent, int id, DWORD style = 0);
 

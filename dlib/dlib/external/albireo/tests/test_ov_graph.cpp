@@ -4,12 +4,13 @@
     Checks and measures the OpenVINO graph of a model (engine/ov_graph.h) against the
     processor runtime.
 
-        test_ov_graph model.gguf [device] [threads] [f16|u8|f16-mask|u8-mask] [prompt] [chunk] [steps]
+        test_ov_graph model.gguf [device] [threads] [f16|u8][-mask][-f32] [prompt] [chunk] [steps]
 
     device is a device of OpenVINO, CPU by default; threads the threads of both runtimes,
     those of the machine by default; f16 or u8 the keys and values of the graph (half
     precision by default), -mask giving the processor the graph of the other devices, whose
-    attention takes the causal mask as an input.  The program reads a text of prompt tokens
+    attention takes the causal mask as an input, and -f32 having the other devices compute in
+    single precision rather than in half precision.  The program reads a text of prompt tokens
     (512) by passes of chunk tokens (256), then writes steps tokens (32) one at a time, each
     step reading the next token of the text, through the processor runtime with keys and
     values in half precision, which is the reference, then through the graph:
@@ -29,6 +30,8 @@
     The program fails when the graph gives another most probable token than the reference
     in more than one step out of eight, or when its mean divergence exceeds 0.05, and when
     the cut sequence of the graph departs from its new sequence by a divergence above 0.01.
+    A comparison whose largest divergence exceeds 0.1 names its row: the pass or the step, the
+    most probable token of each runtime and the probabilities both give it.
 */
 
 #include <algorithm>
@@ -65,6 +68,11 @@ namespace
         long same_top = 0;
         double divergence = 0;
         double max_divergence = 0;
+        // The row of the largest divergence, the most probable token of each side, and the
+        // probabilities of both tokens in the reference (ref_p) and in the other side (x_p).
+        long worst = -1;
+        long worst_ref_top = 0, worst_x_top = 0;
+        double ref_p[2] = { 0, 0 }, x_p[2] = { 0, 0 };
 
         void add(const float* ref, const float* x, long n)
         {
@@ -90,6 +98,16 @@ namespace
                 const double lr = ref[i] - mr - lzr;
                 const double lx = x[i] - mx - lzx;
                 kl += std::exp(lr) * (lr - lx);
+            }
+            if (worst < 0 || kl > max_divergence)
+            {
+                worst = rows;
+                worst_ref_top = a;
+                worst_x_top = b;
+                ref_p[0] = std::exp(ref[a] - mr - lzr);
+                ref_p[1] = std::exp(ref[b] - mr - lzr);
+                x_p[0] = std::exp(x[a] - mx - lzx);
+                x_p[1] = std::exp(x[b] - mx - lzx);
             }
             ++rows;
             if (a == b) ++same_top;
@@ -214,8 +232,14 @@ namespace
             t.step_count / std::max(1e-9, t.steps));
     }
 
+    /*
+        Compares the rows of x with those of the reference, and names the row of the largest
+        divergence once it exceeds 0.1: with tok, the rows of a script(), whose first pass_rows rows
+        are the last tokens of the passes of the prompt and the others steps, and their tokens.
+    */
     void compare(const char* what, const std::vector<std::vector<float>>& ref,
-        const std::vector<std::vector<float>>& x, long vocab, agreement& a)
+        const std::vector<std::vector<float>>& x, long vocab, agreement& a,
+        const dlib::hf_tokenizer* tok = nullptr, long pass_rows = 0)
     {
         agreement local;
         for (size_t i = 0; i < ref.size() && i < x.size(); ++i)
@@ -225,6 +249,19 @@ namespace
         }
         std::printf("  %-40s same top token %5.1f%%, divergence mean %.5f, max %.5f\n", what,
             100.0 * local.top_share(), local.mean(), local.max_divergence);
+        if (local.max_divergence <= 0.1 || local.worst < 0) return;
+        auto name = [tok](long id) {
+            std::string t = tok ? tok->decode({ static_cast<int>(id) }, false) : std::to_string(id);
+            for (char& c : t)
+                if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            return "'" + t + "'";
+        };
+        const std::string row = !tok ? "row " + std::to_string(local.worst + 1)
+            : local.worst < pass_rows ? "the last token of pass " + std::to_string(local.worst + 1)
+            : "step " + std::to_string(local.worst - pass_rows + 1);
+        std::printf("    largest at %s: reference %s %.3f (other %.3f), other %s %.3f (reference %.3f)\n",
+            row.c_str(), name(local.worst_ref_top).c_str(), local.ref_p[0], local.x_p[0],
+            name(local.worst_x_top).c_str(), local.x_p[1], local.ref_p[1]);
     }
 
     std::vector<int> make_text(const dlib::hf_tokenizer& tok, long count)
@@ -251,7 +288,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: test_ov_graph model.gguf [device] [threads] [f16|u8|f16-mask|u8-mask] [prompt] [chunk] "
+        std::printf("usage: test_ov_graph model.gguf [device] [threads] [f16|u8][-mask][-f32] [prompt] [chunk] "
             "[steps]\n");
         return 2;
     }
@@ -262,7 +299,8 @@ int main(int argc, char** argv)
             : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
         const std::string kv = argc > 4 ? argv[4] : "f16";
         const bool kv_half = kv.compare(0, 2, "u8") != 0;
-        const bool explicit_mask = kv.size() > 5 && kv.compare(kv.size() - 5, 5, "-mask") == 0;
+        const bool explicit_mask = kv.find("-mask") != std::string::npos;
+        const bool single_precision = kv.find("-f32") != std::string::npos;
         const long prompt = argc > 5 ? std::max(2L, std::atol(argv[5])) : 512;
         const long chunk = argc > 6 ? std::max(1L, std::atol(argv[6])) : 256;
         const long steps = argc > 7 ? std::max(1L, std::atol(argv[7])) : 32;
@@ -312,6 +350,7 @@ int main(int argc, char** argv)
         settings.device = device;
         settings.kv_half = kv_half;
         settings.explicit_mask = explicit_mask;
+        settings.single_precision = single_precision;
         settings.threads = threads;
         // The folder of the system for temporary files, where the graph writes its weights and deletes them.
         const char* temp = std::getenv("TEMP");
@@ -342,7 +381,7 @@ int main(int argc, char** argv)
         std::printf("agreement with the processor runtime in half precision:\n");
         agreement all, scratch, fresh;
         compare("processor runtime, keys and values in 8 bits", ref, q8, vocab, scratch);
-        compare(("graph on " + device).c_str(), ref, graph, vocab, all);
+        compare(("graph on " + device).c_str(), ref, graph, vocab, all, &tok, (prompt + chunk - 1) / chunk);
 
         // The hidden states after the final normalization, which an embedding model returns.
         const double hidden_cosine = cosine(ref_hidden, graph_hidden);

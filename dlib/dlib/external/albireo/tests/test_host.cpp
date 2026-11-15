@@ -1669,7 +1669,7 @@ int main(int argc, char** argv)
             albireo::settings_store store(settings_file);
             const json written = json::parse_or_null(read_text(settings_file));
             before = store.get().port == 9124 && store.get().graph == "off"
-                && written["settings_version"].as_int() == 2 && written["graph"].as_string() == "off";
+                && written["settings_version"].as_int() == 3 && written["graph"].as_string() == "off";
         }
         // The accelerator cpu, the graph on the processor chosen before version 2, keeps it.
         write_text(settings_file, "{\"port\": 9126, \"graph\": \"auto\", \"accelerator\": \"cpu\"}");
@@ -1685,15 +1685,33 @@ int main(int argc, char** argv)
             chosen = store.get().port == 9125 && store.get().graph == "auto";
         }
         // A document of a later version keeps its version when this one writes it.
-        write_text(settings_file, "{\"port\": 9127, \"graph\": \"auto\", \"settings_version\": 3}");
+        write_text(settings_file, "{\"port\": 9127, \"graph\": \"auto\", \"settings_version\": 4}");
         bool later = false;
         {
             albireo::settings_store store(settings_file);
             store.update([](albireo::host_settings& s) { s.port = 9128; });
             const json written = json::parse_or_null(read_text(settings_file));
             later = store.get().graph == "auto" && written["port"].as_int() == 9128
+                && written["settings_version"].as_int() == 4;
+        }
+        // The 8192 tokens of an answer of the relay, the default of version 2, read 16384; chosen since, they stay.
+        write_text(settings_file, "{\"port\": 9129, \"relay\": {\"max_output\": 8192}, \"settings_version\": 2}");
+        bool raised = false;
+        {
+            albireo::settings_store store(settings_file);
+            const json written = json::parse_or_null(read_text(settings_file));
+            raised = store.get().relay.max_output == 16384 && written["relay"]["max_output"].as_int() == 16384
                 && written["settings_version"].as_int() == 3;
         }
+        write_text(settings_file, "{\"port\": 9130, \"relay\": {\"max_output\": 8192}, \"settings_version\": 3}");
+        bool output_kept = false;
+        {
+            albireo::settings_store store(settings_file);
+            output_kept = store.get().port == 9130 && store.get().relay.max_output == 8192;
+        }
+        check(raised && output_kept && albireo::relay_settings().max_output == 16384,
+            "the relay gives 16384 tokens to an answer by default, 8192 of a document of version 2 reads 16384, and "
+            "8192 chosen since stays");
         json change = albireo::host_settings().to_json();
         change["graph"] = "auto";
         albireo::host_settings changed;
@@ -2115,6 +2133,12 @@ int main(int argc, char** argv)
                 res.set_content(refusal.dump(), "application/json");
                 return;
             }
+            if (mode == "credit")
+            {
+                res.status = 402;
+                res.set_content("{\"error\": {\"message\": \"insufficient credits\"}}", "application/json");
+                return;
+            }
             if (mode == "whole")
             {
                 res.set_content("{\"choices\": [{\"message\": {\"content\": \"Xoydoeh Nuggwdfsorn habite Qbspm.\"}, "
@@ -2161,6 +2185,40 @@ int main(int argc, char** argv)
         });
         relay_server.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
             record(req);
+            // A search of the web: its query in parts, its results, then a text that cites one of them.
+            if (json::parse_or_null(req.body)["tools"].is_array())
+            {
+                const char* const searched[] = {
+                    "{\"type\": \"message_start\", \"message\": {\"usage\": {\"input_tokens\": 30}}}",
+                    "{\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": "
+                        "\"server_tool_use\", \"id\": \"srvtoolu_1\", \"name\": \"web_search\"}}",
+                    "{\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"input_json_delta\", "
+                        "\"partial_json\": \"{\\\"query\\\": \\\"capitale\"}}",
+                    "{\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"input_json_delta\", "
+                        "\"partial_json\": \" Italie\\\"}\"}}",
+                    "{\"type\": \"content_block_stop\", \"index\": 0}",
+                    "{\"type\": \"content_block_start\", \"index\": 1, \"content_block\": {\"type\": "
+                        "\"web_search_tool_result\", \"tool_use_id\": \"srvtoolu_1\", \"content\": [{\"type\": "
+                        "\"web_search_result\", \"title\": \"Rome\", \"url\": "
+                        "\"https://fr.wikipedia.org/wiki/Rome\"}]}}",
+                    "{\"type\": \"content_block_stop\", \"index\": 1}",
+                    "{\"type\": \"content_block_start\", \"index\": 2, \"content_block\": {\"type\": \"text\", "
+                        "\"text\": \"\"}}",
+                    "{\"type\": \"content_block_delta\", \"index\": 2, \"delta\": {\"type\": \"citations_delta\", "
+                        "\"citation\": {\"type\": \"web_search_result_location\", \"url\": "
+                        "\"https://www.fr.wikipedia.org/wiki/Rome_(ville)\", \"title\": \"Rome\"}}}",
+                    "{\"type\": \"content_block_delta\", \"index\": 2, \"delta\": {\"type\": \"text_delta\", "
+                        "\"text\": \"Rome est la capitale.\"}}",
+                    "{\"type\": \"content_block_stop\", \"index\": 2}",
+                    "{\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\"}, \"usage\": "
+                        "{\"output_tokens\": 12, \"server_tool_use\": {\"web_search_requests\": 1}}}",
+                    "{\"type\": \"message_stop\"}" };
+                std::string sse;
+                for (const char* e : searched)
+                    sse += "event: " + json::parse_or_null(e)["type"].as_string() + "\ndata: " + e + "\n\n";
+                res.set_content(sse, "text/event-stream");
+                return;
+            }
             const char* const events[] = {
                 "{\"type\": \"message_start\", \"message\": {\"usage\": {\"input_tokens\": 20, "
                     "\"cache_read_input_tokens\": 5}}}",
@@ -2362,6 +2420,76 @@ int main(int argc, char** argv)
         check(listed["ok"].as_bool(false) && listed["models"].size() == 2 && !refused_test["ok"].as_bool(true),
             "the test of the relay lists the models of the engine, and fails with a wrong key");
 
+        // An account without credit, then the substitutes left in the answer, a check of what left.
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            mock.mode = "credit";
+        }
+        const bool credit = ask(request, a, status, code)
+            && json::parse_or_null(a->error)["message"].as_string().find("no credit left") != std::string::npos
+            && a->error.find("insufficient credits") != std::string::npos;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            mock.mode = "ok";
+        }
+        set_relay([&](albireo::relay_settings& r) {
+            r.provider = "openai";
+            r.url = origin + "/v1/";
+            r.model = "local-test";
+            r.secret = "sk-test-secret";
+            r.pseudonymize = true;
+            r.keep_substitutes = true;
+        });
+        const bool kept = ask(request, a, status, code) && a->content == "Xoydoeh Nuggwdfsorn habite Qbspm."
+            && a->reasoning == "Xoydoeh vit \xC3\xA0 Qbspm."
+            && albireo::relay_description(hs.relay)["keep_substitutes"].as_bool(false);
+        check(credit && kept, "an account without credit ends the answer with its reason, and the check of what "
+            "left keeps the substitutes in the answer (" + a->content + ")");
+
+        // An address without /v1, which the relay completes, one with the path of an operation, and their failures.
+        set_relay([&](albireo::relay_settings& r) {
+            r.provider = "openai";
+            r.url = origin;
+            r.model = "local-test";
+            r.secret = "sk-test-secret";
+        });
+        json plain = json::object();
+        plain["model"] = albireo::relay_model_id;
+        plain["stream"] = true;
+        plain["messages"] = json::parse_or_null("[{\"role\": \"user\", \"content\": \"Bonjour\"}]");
+        const bool completed = ask(plain, a, status, code) && a->error.empty()
+            && a->content == "Xoydoeh Nuggwdfsorn habite Qbspm.";
+        albireo::relay_settings bare = hs.relay;
+        const json found = relay.test(bare);
+        bare.url = origin + "/v1/chat/completions";
+        const json pasted = relay.test(bare);
+        bare.url = origin + "/nothing";
+        const json nowhere = relay.test(bare);
+        bare.url = origin + "/v1";
+        bare.secret = "wrong";
+        const json refused_key = relay.test(bare);
+        check(completed && found["ok"].as_bool(false) && found["url"].as_string() == origin + "/v1"
+            && pasted["ok"].as_bool(false) && pasted["url"].as_string() == origin + "/v1"
+            && !nowhere["ok"].as_bool(true) && nowhere["code"].as_string() == "relay_http_address"
+            && nowhere["args"]["s"].as_string() == "404" && refused_key["code"].as_string() == "relay_http_key"
+            && refused_key["args"]["s"].as_string() == "401" && refused_key["detail"].as_string() == "unauthorized"
+            && !refused_key.contains("url"),
+            "an address without /v1 or with the path of an operation reaches the interface at /v1, and the failures "
+            "of the test give their code, their status and the message of the engine (" + nowhere.dump() + ")");
+        // A user, a query or a fragment beside the host is refused; an engine out of reach is named by its code.
+        bare.url = "http://evil.example?.localhost/v1";
+        const json hidden = relay.test(bare);
+        bare.url = "http://user@127.0.0.1:" + std::to_string(relay_port) + "/v1";
+        const json with_user = relay.test(bare);
+        bare.url = "http://127.0.0.1:1/v1";
+        const json closed = relay.test(bare);
+        check(hidden["code"].as_string() == "relay_address" && with_user["code"].as_string() == "relay_address"
+            && albireo::valid_relay_url("http://gpu_box.lan:8000/v1") && albireo::valid_relay_url("http://[::1]:8080")
+            && !albireo::valid_relay_url("http://host:70000/v1") && !albireo::valid_relay_url("http://host#x/v1")
+            && closed["code"].as_string() == "relay_unreachable",
+            "an address whose host carries a user, a query or a fragment is refused, and an engine out of reach gives "
+            "its code (" + closed.dump() + ")");
+
         // Claude: the system apart, the reasoning summarized with its effort, no temperature, the image as is.
         set_relay([&](albireo::relay_settings& r) {
             r.provider = "claude";
@@ -2398,6 +2526,35 @@ int main(int argc, char** argv)
             "the request of Claude has its system, its reasoning, its effort, its image and 64000 tokens of answer "
             "without a bound of the request, no temperature, the key in x-api-key");
 
+        // The search of the web of Claude: its tool, its query with the reasoning, its source after the text.
+        json searching = claude;
+        searching["web_search"] = true;
+        answered = ask(searching, a, status, code);
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            body = mock.body;
+        }
+        const json searched_done = json::parse_or_null(a->done);
+        const json tool = static_cast<const json&>(body)["tools"][0];
+        const bool searched = answered && tool["type"].as_string() == "web_search_20250305"
+            && tool["max_uses"].as_int() == 5
+            && a->content
+                == "Rome est la capitale. ([fr.wikipedia.org](https://www.fr.wikipedia.org/wiki/Rome_%28ville%29))"
+            && a->reasoning.find("web_search: capitale Italie") != std::string::npos
+            && searched_done["usage"]["web_search_requests"].as_int() == 1;
+        {
+            std::lock_guard<std::mutex> lock(settings_m);
+            hs.web_access = false;
+        }
+        const bool web_off = !ask(searching, a, status, code) && status == 403 && code == "web_access_off";
+        {
+            std::lock_guard<std::mutex> lock(settings_m);
+            hs.web_access = true;
+        }
+        check(searched && web_off, "Claude searches the web when the request asks for it, its query shown with the "
+            "reasoning and its source as a link after the text, and the web access turned off refuses it ("
+            + a->content + " | " + a->reasoning + ")");
+
         // Ollama: the reasoning of a model that turns it on or off, the image as is.
         set_relay([&](albireo::relay_settings& r) {
             r.provider = "ollama";
@@ -2415,6 +2572,10 @@ int main(int argc, char** argv)
             && body.dump().find("image_url") != std::string::npos
             && body.dump().find("Jean Dupont") != std::string::npos,
             "Ollama receives the reasoning turned off and the image itself without pseudonymization");
+        json ollama_web = ollama;
+        ollama_web["web_search"] = true;
+        check(!ask(ollama_web, a, status, code) && status == 400 && code == "web_search_not_supported",
+            "the search of the web of the relay takes Claude alone");
 
         // The refusals before any request.
         json tools = request;
@@ -2431,6 +2592,84 @@ int main(int argc, char** argv)
         });
         const bool no_key = !ask(request, a, status, code) && status == 404 && code == "relay_unavailable";
         check(no_tools && offline && no_key, "the relay refuses the tools, the offline mode and a missing key");
+
+        /*
+            Offline, an engine of this computer answers, reached directly whatever the cancellation
+            of the downloads, which the offline mode holds, Pseudalis included; the providers of the
+            Internet and a public address are refused before any connection.
+        */
+        albireo::http_cancel_all("offline mode");
+        set_relay([&](albireo::relay_settings& r) {
+            r.provider = "openai";
+            r.url = origin + "/v1";
+            r.model = "local-test";
+            r.secret = "sk-test-secret";
+            r.pseudonymize = true;
+        });
+        const bool local = ask(request, a, status, code) && a->error.empty()
+            && a->content == "Jean Dupont habite Paris.";
+        const std::string local_error = a ? a->error : std::string();
+        std::string why;
+        albireo::relay_settings remote = hs.relay;
+        remote.url = "http://93.184.215.14/v1";
+        const bool remote_refused = !albireo::relay_offline_ready(remote, why)
+            && why.find("neither") != std::string::npos;
+        const json remote_test = relay.test(remote);
+        remote.url = "http://[2606:4700:4700::1111]/v1";
+        const bool remote6_refused = !albireo::relay_offline_ready(remote, why);
+        albireo::relay_settings loopback6 = hs.relay;
+        loopback6.url = "http://[::1]:8080/v1";
+        albireo::relay_settings cloud = hs.relay;
+        cloud.provider = "claude";
+        cloud.model = "claude-opus-5-5";
+        cloud.secret = key;
+        const bool cloud_refused = !albireo::relay_offline_ready(cloud, why)
+            && why.find("Internet") != std::string::npos;
+        const json cloud_test = relay.test(cloud);
+        albireo::relay_settings named = hs.relay;
+        named.url = "http://localhost:" + std::to_string(relay_port) + "/v1";
+        const json named_test = relay.test(named);
+        /*
+            A name of the local network leads the request to the address checked, a name the
+            resolver of the system does not know here; a name with a public address among its
+            own is refused.
+        */
+        albireo::relay_name_for_tests("engine.albireo-test", { "127.0.0.1" });
+        albireo::relay_name_for_tests("mixed.albireo-test", { "10.0.0.5", "93.184.215.14" });
+        albireo::relay_settings pinned = hs.relay;
+        pinned.url = "http://Engine.Albireo-Test:" + std::to_string(relay_port) + "/v1";
+        const json pinned_test = relay.test(pinned);
+        albireo::relay_settings mixed = hs.relay;
+        mixed.url = "http://mixed.albireo-test:" + std::to_string(relay_port) + "/v1";
+        const json mixed_test = relay.test(mixed);
+        albireo::relay_name_for_tests("engine.albireo-test", {});
+        albireo::relay_name_for_tests("mixed.albireo-test", {});
+        // A name under .localhost reaches 127.0.0.1 whatever the resolver; the local network alone stays in reach.
+        albireo::relay_settings dotted = hs.relay;
+        dotted.url = "http://engine.localhost:" + std::to_string(relay_port) + "/v1";
+        const json dotted_test = relay.test(dotted);
+        albireo::relay_settings nearby = hs.relay;
+        nearby.url = "http://100.64.1.1:8080/v1";
+        const bool shared_refused = !albireo::relay_offline_ready(nearby, why);
+        nearby.url = "http://[64:ff9b:1::1]:8080/v1";
+        const bool translated_refused = !albireo::relay_offline_ready(nearby, why);
+        nearby.url = "http://192.168.1.20:8080/v1";
+        const bool lan_ready = albireo::relay_offline_ready(nearby, why);
+        nearby.url = "http://[fd00::1]:8080/v1";
+        const bool unique_local_ready = albireo::relay_offline_ready(nearby, why);
+        check(pinned_test["ok"].as_bool(false) && mixed_test["code"].as_string() == "relay_offline_remote"
+            && dotted_test["ok"].as_bool(false) && shared_refused && translated_refused && lan_ready
+            && unique_local_ready,
+            "offline, a name of the local network leads the request to the address checked, a name under .localhost "
+            "to 127.0.0.1, and the addresses outside the local network are refused (" + pinned_test.dump() + " | "
+            + mixed_test.dump() + " | " + dotted_test.dump() + ")");
+        albireo::http_restore();
+        check(local && remote_refused && remote6_refused && remote_test["code"].as_string() == "relay_offline_remote"
+            && albireo::relay_offline_ready(loopback6, why) && cloud_refused
+            && cloud_test["code"].as_string() == "relay_offline" && named_test["ok"].as_bool(false),
+            "offline, the relay answers through an engine of this computer and Pseudalis whatever the cancellation of "
+            "the downloads, and refuses the providers of the Internet and a public address before any connection ("
+            + local_error + " | " + named_test.dump() + ")");
         bool leaked = false;
         for (const auto& line : albireo::log_file::instance().recent())
             leaked = leaked || line.find("sk-test") != std::string::npos || line.find(key) != std::string::npos
@@ -2438,6 +2677,16 @@ int main(int argc, char** argv)
         check(!leaked, "the log names no key and no value of the discussions");
         relay.stop();
         albireo::pseudalis_client::endpoint_for_tests("");
+        // The state of Pseudalis names by a code why it is not reached, whether this computer holds it or not.
+        {
+            albireo::pseudalis_client client;
+            const json s = client.status();
+            const std::string code = s["code"].as_string();
+            const bool coherent = s["found"].as_bool(false) ? code.empty() && s["reason"].as_string().empty()
+                : (code == "not_installed" || code == "no_authority" || code == "unprotected" || code == "failed")
+                    && !s["reason"].as_string().empty();
+            check(coherent, "the state of Pseudalis names by a code why it is not reached (" + s.dump() + ")");
+        }
         albireo::relay_origin_for_tests("claude", "");
         albireo::relay_origin_for_tests("ollama", "");
         relay_server.stop();

@@ -70,7 +70,11 @@ namespace albireo
                 other callers waiting for its result.
         !*/
     public:
-        // {"found", "port", "reason"}
+        /*
+            {"found", "port", "reason", "code"}: code names the reason Pseudalis is not reached, not_installed,
+            no_authority (its local authority is missing), unprotected (its folder could be written by another
+            account) or failed, and is empty when Pseudalis is found.
+        */
         json status();
 
         /*!

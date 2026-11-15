@@ -577,11 +577,13 @@ namespace albireo
                 {
                     /*
                         The failures of the external engine of the relay are those of a gateway, a
-                        Pseudalis away makes the relay unavailable, and an image that no model
-                        of the computer describes is refused as an image of the engine is.
+                        Pseudalis away or an engine out of reach of the offline mode make the
+                        relay unavailable, and an image that no model of the computer describes is
+                        refused as an image of the engine is.
                     */
                     const std::string code = done["code"].as_string();
-                    const int status = code.compare(0, 6, "relay_") == 0 ? 502 : code == "pseudonymization_failed" ? 503
+                    const int status = code.compare(0, 6, "relay_") == 0 ? 502
+                        : code == "pseudonymization_failed" || code == "offline" ? 503
                         : code == "image_input_not_supported" ? 400 : 500;
                     send_error(res, status, status == 400 ? "invalid_request_error" : "server_error",
                         done["message"].as_string(), code);
@@ -925,7 +927,7 @@ namespace albireo
         bool validate_relay(const json& r, std::string& error)
         {
             static const char* const keys[] = { "enabled", "provider", "url", "model", "auth", "user", "secret",
-                "context", "max_output", "images", "reasoning", "pseudonymize", "tags" };
+                "context", "max_output", "images", "reasoning", "pseudonymize", "tags", "keep_substitutes" };
             if (!r.is_object())
             {
                 error = "relay must be an object";
@@ -942,7 +944,7 @@ namespace albireo
                 error = std::string("invalid value for relay.") + key;
                 return false;
             };
-            for (const char* key : { "enabled", "images", "reasoning", "pseudonymize", "tags" })
+            for (const char* key : { "enabled", "images", "reasoning", "pseudonymize", "tags", "keep_substitutes" })
                 if (r.contains(key) && !r[key].is_bool()) return fail(key);
             const std::string provider = r["provider"].as_string();
             if (r.contains("provider") && provider != "openai" && provider != "ollama" && provider != "claude")

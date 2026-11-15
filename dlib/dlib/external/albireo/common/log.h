@@ -57,14 +57,14 @@ namespace albireo
                 that two files at most are kept.  The last lines also stay in memory, for
                 the windows that show them.  Each message passes through
                 without_publication_space(), and the files a version before this one wrote
-                pass through it when they are opened.
+                pass through it when they are opened.  The messages of the level debug, those
+                that the engines give included, are left out.
         !*/
     public:
         static log_file& instance();
 
         void open(const std::string& path, uint64_t max_bytes = 4u << 20);
         void set_console(bool on) { console_ = on; }
-        void set_level(log_level l) { level_ = l; }
 
         void write(log_level level, const std::string& message);
         std::deque<std::string> recent() const;
@@ -75,7 +75,7 @@ namespace albireo
         std::string path_;
         uint64_t max_bytes_ = 4u << 20;
         bool console_ = false;
-        log_level level_ = log_level::info;
+        const log_level level_ = log_level::info;
         std::deque<std::string> recent_;
     };
 

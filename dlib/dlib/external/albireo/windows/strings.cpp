@@ -64,10 +64,29 @@ namespace albireo
             { "tray_install_update", { "Install version {v} and restart", "Installer la version {v} et redémarrer",
                 "Version {v} installieren und neu starten", "Installa la versione {v} e riavvia",
                 "Instalar la versión {v} y reiniciar" } },
-            { "tray_restart", { "Restart Albireo", "Redémarrer Albireo", "Albireo neu starten", "Riavvia Albireo",
-                "Reiniciar Albireo" } },
-            { "tray_start_service", { "Start the service", "Démarrer le service", "Dienst starten", "Avvia il servizio",
-                "Iniciar el servicio" } },
+            { "tray_service", { "Service management", "Gestion du service", "Dienstverwaltung",
+                "Gestione del servizio", "Gestión del servicio" } },
+            { "tray_restart", { "Restart", "Redémarrer", "Neu starten", "Riavvia", "Reiniciar" } },
+            { "tray_stop_service", { "Stop", "Arrêter", "Beenden", "Arresta", "Detener" } },
+            { "tray_start_service", { "Start", "Démarrer", "Starten", "Avvia", "Iniciar" } },
+            { "tray_service_auto", { "Starts with Windows", "Démarre avec Windows", "Startet mit Windows",
+                "Si avvia con Windows", "Se inicia con Windows" } },
+            { "tray_service_manual", { "Starts from this icon only", "Démarre depuis cette icône seulement",
+                "Startet nur über dieses Symbol", "Si avvia solo da questa icona",
+                "Se inicia solo desde este icono" } },
+            { "tray_service_disabled", { "Disabled by an administrator", "Désactivé par un administrateur",
+                "Von einem Administrator deaktiviert", "Disattivato da un amministratore",
+                "Desactivado por un administrador" } },
+            { "tray_stop_confirm", { "Stop the Albireo service? The answers in progress end, and the service no longer "
+                "starts with Windows until you start it again from this icon.",
+                "Arrêter le service Albireo ? Les réponses en cours s'arrêtent, et le service ne démarre plus avec "
+                "Windows tant que vous ne le démarrez pas depuis cette icône.",
+                "Den Albireo-Dienst beenden? Laufende Antworten enden, und der Dienst startet nicht mehr mit Windows, "
+                "bis Sie ihn über dieses Symbol wieder starten.",
+                "Arrestare il servizio Albireo? Le risposte in corso si interrompono e il servizio non si avvia più "
+                "con Windows finché non lo avviate di nuovo da questa icona.",
+                "¿Detener el servicio Albireo? Las respuestas en curso terminan y el servicio ya no se inicia con "
+                "Windows hasta que lo vuelva a iniciar desde este icono." } },
             { "tray_docs", { "Interface documentation", "Documentation de l'interface",
                 "Dokumentation der Schnittstelle", "Documentazione dell'interfaccia",
                 "Documentación de la interfaz" } },
@@ -87,6 +106,11 @@ namespace albireo
             { "tip_stopped", { "Albireo: the service is stopped", "Albireo : le service est arrêté",
                 "Albireo: Der Dienst ist beendet", "Albireo: il servizio è arrestato",
                 "Albireo: el servicio está detenido" } },
+            { "tip_stopped_manual", { "Albireo: the service is stopped until started from this icon",
+                "Albireo : le service est arrêté jusqu'à son démarrage depuis cette icône",
+                "Albireo: Der Dienst ist beendet, bis er über dieses Symbol gestartet wird",
+                "Albireo: il servizio è arrestato finché non viene avviato da questa icona",
+                "Albireo: el servicio está detenido hasta que se inicie desde este icono" } },
             { "tip_no_model", { "no active model", "aucun modèle actif", "kein aktives Modell", "nessun modello attivo",
                 "ningún modelo activo" } },
             { "tip_loading", { "loading the model", "chargement du modèle", "Modell wird geladen",
@@ -249,6 +273,21 @@ namespace albireo
                 "Die Markierungen der Werte senden (sonst nur ihre Ersatzwerte)",
                 "Inviare i tag dei valori (altrimenti solo i loro sostituti)",
                 "Enviar las etiquetas de los valores (si no, solo sus sustitutos)" } },
+            { "relay_offline_note", { "Offline mode: only an engine of this computer or of the local network stays "
+                "within reach; Ollama and Claude need the Internet.",
+                "Mode hors ligne : seul un moteur de cet ordinateur ou du réseau local reste joignable ; Ollama et "
+                "Claude demandent l'accès à Internet.",
+                "Offlinemodus: Nur eine Engine dieses Computers oder des lokalen Netzwerks bleibt erreichbar; Ollama "
+                "und Claude benötigen das Internet.",
+                "Modalità offline: resta raggiungibile solo un motore di questo computer o della rete locale; Ollama "
+                "e Claude richiedono Internet.",
+                "Modo sin conexión: solo sigue accesible un motor de este equipo o de la red local; Ollama y Claude "
+                "necesitan Internet." } },
+            { "relay_keep", { "Leave the substitutes in the answers, to check what leaves this computer",
+                "Laisser les substituts dans les réponses, pour vérifier ce qui quitte cet ordinateur",
+                "Ersatzwerte in den Antworten belassen, um zu prüfen, was diesen Computer verlässt",
+                "Lasciare i sostituti nelle risposte, per verificare ciò che lascia questo computer",
+                "Dejar los sustitutos en las respuestas, para comprobar lo que sale de este equipo" } },
             { "relay_pseudalis_found", { "Pseudalis answers on this computer.", "Pseudalis répond sur cet ordinateur.",
                 "Pseudalis antwortet auf diesem Computer.", "Pseudalis risponde su questo computer.",
                 "Pseudalis responde en este equipo." } },
@@ -257,6 +296,53 @@ namespace albireo
                 "Pseudalis ist nicht verfügbar ({r}): Ohne es verlässt kein Text pseudonymisiert den Computer.",
                 "Pseudalis non è disponibile ({r}): senza di esso nessun testo parte pseudonimizzato.",
                 "Pseudalis no está disponible ({r}): sin él ningún texto sale seudonimizado." } },
+            { "relay_pseudalis_not_installed", { "Pseudalis is not installed on this computer: no text leaves "
+                "pseudonymized without it.",
+                "Pseudalis n'est pas installé sur cet ordinateur : aucun texte ne part pseudonymisé sans lui.",
+                "Pseudalis ist auf diesem Computer nicht installiert: Ohne es verlässt kein Text pseudonymisiert den "
+                "Computer.",
+                "Pseudalis non è installato su questo computer: senza di esso nessun testo parte pseudonimizzato.",
+                "Pseudalis no está instalado en este equipo: sin él ningún texto sale seudonimizado." } },
+            { "relay_pseudalis_no_authority", { "The local authority of Pseudalis is missing: reinstall Pseudalis; no "
+                "text leaves pseudonymized without it.",
+                "L'autorité locale de Pseudalis manque : réinstallez Pseudalis ; aucun texte ne part pseudonymisé "
+                "sans elle.",
+                "Die lokale Zertifizierungsstelle von Pseudalis fehlt: Installieren Sie Pseudalis neu; ohne sie "
+                "verlässt kein Text pseudonymisiert den Computer.",
+                "Manca l'autorità locale di Pseudalis: reinstallare Pseudalis; senza di essa nessun testo parte "
+                "pseudonimizzato.",
+                "Falta la autoridad local de Pseudalis: reinstale Pseudalis; sin ella ningún texto sale "
+                "seudonimizado." } },
+            { "relay_pseudalis_unprotected", { "The data folder of Pseudalis could be written by another account than "
+                "the administrators: no text is sent to Pseudalis.",
+                "Le dossier des données de Pseudalis peut être écrit par un autre compte que les administrateurs : "
+                "aucun texte n'est envoyé à Pseudalis.",
+                "Der Datenordner von Pseudalis kann von einem anderen Konto als den Administratoren beschrieben "
+                "werden: Kein Text wird an Pseudalis gesendet.",
+                "La cartella dei dati di Pseudalis può essere scritta da un account diverso dagli amministratori: "
+                "nessun testo viene inviato a Pseudalis.",
+                "La carpeta de datos de Pseudalis puede escribirla otra cuenta distinta de los administradores: "
+                "ningún texto se envía a Pseudalis." } },
+            { "relay_pseudalis_about", { "Pseudalis, the anonymization tool installed on this computer, finds the "
+                "names, addresses, numbers and other personal values and replaces them with consistent substitutes "
+                "before they leave. The service keeps the correspondence in memory only, never on disk, and puts the "
+                "values back in the answers.",
+                "Pseudalis, l'outil d'anonymisation installé sur cet ordinateur, repère les noms, adresses, numéros "
+                "et autres valeurs personnelles et les remplace par des substituts cohérents avant l'envoi. Le "
+                "service garde la correspondance en mémoire seulement, jamais sur disque, et rétablit les valeurs "
+                "dans les réponses.",
+                "Pseudalis, das auf diesem Computer installierte Anonymisierungswerkzeug, erkennt Namen, Adressen, "
+                "Nummern und andere persönliche Werte und ersetzt sie vor dem Versand durch stimmige Ersatzwerte. "
+                "Der Dienst hält die Zuordnung nur im Speicher, nie auf der Festplatte, und setzt die Werte in den "
+                "Antworten wieder ein.",
+                "Pseudalis, lo strumento di anonimizzazione installato su questo computer, individua nomi, "
+                "indirizzi, numeri e altri valori personali e li sostituisce con sostituti coerenti prima "
+                "dell'invio. Il servizio conserva la corrispondenza solo in memoria, mai su disco, e ripristina i "
+                "valori nelle risposte.",
+                "Pseudalis, la herramienta de anonimización instalada en este equipo, detecta nombres, direcciones, "
+                "números y otros valores personales y los sustituye por sustitutos coherentes antes del envío. El "
+                "servicio guarda la correspondencia solo en memoria, nunca en disco, y restablece los valores en las "
+                "respuestas." } },
             { "btn_test", { "Test", "Tester", "Testen", "Prova", "Probar" } },
             { "btn_save", { "Save", "Enregistrer", "Speichern", "Salva", "Guardar" } },
             { "relay_testing", { "The engine is being asked…", "Le moteur est interrogé…", "Die Engine wird abgefragt…",
@@ -267,6 +353,14 @@ namespace albireo
             { "relay_test_failed", { "The test failed: {e}", "Le test a échoué : {e}",
                 "Der Test ist fehlgeschlagen: {e}",
                 "La prova non è riuscita: {e}", "La prueba falló: {e}" } },
+            { "relay_test_base", { "The interface answers at {u}.", "L'interface répond à {u}.",
+                "Die Schnittstelle antwortet unter {u}.", "L'interfaccia risponde a {u}.",
+                "La interfaz responde en {u}." } },
+            { "relay_model_unlisted", { "{m} is not among its models.", "{m} ne figure pas parmi ses modèles.",
+                "{m} ist nicht unter seinen Modellen.", "{m} non è tra i suoi modelli.",
+                "{m} no figura entre sus modelos." } },
+            { "relay_engine_says", { "The engine says: {d}", "Le moteur indique : {d}", "Die Engine meldet: {d}",
+                "Il motore indica: {d}", "El motor indica: {d}" } },
             { "relay_saved", { "The relay is saved.", "Le relais est enregistré.", "Das Relais ist gespeichert.",
                 "L'inoltro è salvato.", "El relé está guardado." } },
             { "col_model", { "Model", "Modèle", "Modell", "Modello", "Modelo" } },
@@ -330,6 +424,86 @@ namespace albireo
                 "digitate di nuovo la chiave.",
                 "La clave oculta del relé solo vale para su proveedor, dirección y usuario guardados: escriba la "
                 "clave de nuevo." } },
+            { "err_relay_address", { "The address is not valid: http:// or https:// followed by the base of the "
+                "interface.", "L'adresse n'est pas valide : http:// ou https:// suivi de la base de l'interface.",
+                "Die Adresse ist ungültig: http:// oder https://, gefolgt von der Basis der Schnittstelle.",
+                "L'indirizzo non è valido: http:// o https:// seguito dalla base dell'interfaccia.",
+                "La dirección no es válida: http:// o https:// seguido de la base de la interfaz." } },
+            { "err_relay_key_missing", { "The key is missing.", "La clé manque.", "Der Schlüssel fehlt.",
+                "Manca la chiave.", "Falta la clave." } },
+            { "err_relay_password_missing", { "The password is missing.", "Le mot de passe manque.",
+                "Das Passwort fehlt.", "Manca la password.", "Falta la contraseña." } },
+            { "err_relay_offline", { "Offline mode: this provider needs the Internet.",
+                "Mode hors ligne : ce fournisseur demande l'accès à Internet.",
+                "Offlinemodus: Dieser Anbieter benötigt das Internet.",
+                "Modalità offline: questo fornitore richiede Internet.",
+                "Modo sin conexión: este proveedor necesita Internet." } },
+            { "err_relay_offline_remote", { "Offline mode: the address of the engine is neither on this computer nor "
+                "on the local network.", "Mode hors ligne : l'adresse du moteur n'est ni sur cet ordinateur ni sur le "
+                "réseau local.", "Offlinemodus: Die Adresse der Engine liegt weder auf diesem Computer noch im lokalen "
+                "Netzwerk.", "Modalità offline: l'indirizzo del motore non è né su questo computer né sulla rete "
+                "locale.",
+                "Modo sin conexión: la dirección del motor no está ni en este equipo ni en la red local." } },
+            { "err_relay_offline_unresolved", { "Offline mode: the name of the engine has no address on this network.",
+                "Mode hors ligne : le nom du moteur n'a pas d'adresse sur ce réseau.",
+                "Offlinemodus: Der Name der Engine hat in diesem Netzwerk keine Adresse.",
+                "Modalità offline: il nome del motore non ha indirizzo su questa rete.",
+                "Modo sin conexión: el nombre del motor no tiene dirección en esta red." } },
+            { "err_relay_unreachable", { "The external engine cannot be reached.", "Le moteur externe est injoignable.",
+                "Die externe Engine ist nicht erreichbar.", "Il motore esterno non è raggiungibile.",
+                "No se puede contactar con el motor externo." } },
+            { "err_relay_proxy", { "The proxy of the settings cannot be reached.", "Le proxy des paramètres est "
+                "injoignable.", "Der Proxy der Einstellungen ist nicht erreichbar.",
+                "Il proxy delle impostazioni non è raggiungibile.",
+                "No se puede contactar con el proxy de la configuración." } },
+            { "err_relay_certificate", { "The certificate of the external engine is not trusted, or names another "
+                "server.", "Le certificat du moteur externe n'est pas reconnu, ou nomme un autre serveur.",
+                "Das Zertifikat der externen Engine wird nicht anerkannt oder nennt einen anderen Server.",
+                "Il certificato del motore esterno non è riconosciuto, o indica un altro server.",
+                "El certificado del motor externo no es de confianza o nombra otro servidor." } },
+            { "err_relay_no_answer", { "The external engine stopped answering.", "Le moteur externe ne répond plus.",
+                "Die externe Engine antwortet nicht mehr.", "Il motore esterno non risponde più.",
+                "El motor externo dejó de responder." } },
+            { "err_relay_http_key", { "The external engine refuses the key or the user (HTTP {s}).",
+                "Le moteur externe refuse la clé ou l'utilisateur (HTTP {s}).",
+                "Die externe Engine lehnt den Schlüssel oder den Benutzer ab (HTTP {s}).",
+                "Il motore esterno rifiuta la chiave o l'utente (HTTP {s}).",
+                "El motor externo rechaza la clave o el usuario (HTTP {s})." } },
+            { "err_relay_http_credit", { "The account of the external engine has no credit left (HTTP {s}).",
+                "Le compte du moteur externe n'a plus de crédit (HTTP {s}).",
+                "Das Konto der externen Engine hat kein Guthaben mehr (HTTP {s}).",
+                "L'account del motore esterno non ha più credito (HTTP {s}).",
+                "La cuenta del motor externo no tiene saldo (HTTP {s})." } },
+            { "err_relay_http_address", { "The external engine knows neither this model nor this address (HTTP {s}).",
+                "Le moteur externe ne connaît ni ce modèle ni cette adresse (HTTP {s}).",
+                "Die externe Engine kennt weder dieses Modell noch diese Adresse (HTTP {s}).",
+                "Il motore esterno non conosce né questo modello né questo indirizzo (HTTP {s}).",
+                "El motor externo no conoce ni este modelo ni esta dirección (HTTP {s})." } },
+            { "err_relay_http_size", { "The external engine refuses a request this large (HTTP {s}).",
+                "Le moteur externe refuse une requête aussi grande (HTTP {s}).",
+                "Die externe Engine lehnt eine so große Anfrage ab (HTTP {s}).",
+                "Il motore esterno rifiuta una richiesta così grande (HTTP {s}).",
+                "El motor externo rechaza una solicitud tan grande (HTTP {s})." } },
+            { "err_relay_http_limit", { "The external engine limits the requests or the credits of the account "
+                "(HTTP {s}).", "Le moteur externe limite les requêtes ou les crédits du compte (HTTP {s}).",
+                "Die externe Engine begrenzt die Anfragen oder das Guthaben des Kontos (HTTP {s}).",
+                "Il motore esterno limita le richieste o i crediti dell'account (HTTP {s}).",
+                "El motor externo limita las solicitudes o el saldo de la cuenta (HTTP {s})." } },
+            { "err_relay_http_failing", { "The external engine is overloaded or failing (HTTP {s}).",
+                "Le moteur externe est surchargé ou en panne (HTTP {s}).",
+                "Die externe Engine ist überlastet oder gestört (HTTP {s}).",
+                "Il motore esterno è sovraccarico o guasto (HTTP {s}).",
+                "El motor externo está sobrecargado o falla (HTTP {s})." } },
+            { "err_relay_http_refused", { "The external engine refuses the request (HTTP {s}).",
+                "Le moteur externe refuse la requête (HTTP {s}).",
+                "Die externe Engine lehnt die Anfrage ab (HTTP {s}).",
+                "Il motore esterno rifiuta la richiesta (HTTP {s}).",
+                "El motor externo rechaza la solicitud (HTTP {s})." } },
+            { "err_relay_not_interface", { "The address answers without the list of models of an interface of "
+                "OpenAI.", "L'adresse répond sans la liste de modèles d'une interface OpenAI.",
+                "Die Adresse antwortet ohne die Modellliste einer OpenAI-Schnittstelle.",
+                "L'indirizzo risponde senza l'elenco dei modelli di un'interfaccia OpenAI.",
+                "La dirección responde sin la lista de modelos de una interfaz de OpenAI." } },
             { "err_proxy_password", { "The masked password of the proxy applies to its saved address and user only: "
                 "type the password again.", "Le mot de passe masqué du proxy ne vaut que pour l'adresse et "
                 "l'utilisateur enregistrés : saisissez à nouveau le mot de passe.", "Das maskierte Kennwort des "

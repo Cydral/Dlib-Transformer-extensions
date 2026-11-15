@@ -31,6 +31,19 @@ namespace albireo
         std::mutex test_origin_m;
         std::string test_origin;
 
+        // The reasons Pseudalis is not reached that the state names by a code, which the icon translates.
+        const char* const pseudalis_not_installed = "Pseudalis is not installed";
+        const char* const pseudalis_no_authority = "the local authority of Pseudalis is missing";
+        const char* const pseudalis_unprotected = "the data folder of Pseudalis is not protected";
+
+        std::string pseudalis_code(const std::string& reason)
+        {
+            if (reason == pseudalis_not_installed) return "not_installed";
+            if (reason == pseudalis_no_authority) return "no_authority";
+            if (reason == pseudalis_unprotected) return "unprotected";
+            return "failed";
+        }
+
         // Thrown from the socket of a client about to connect once the requests of the service are cancelled.
         struct request_cancelled
         {
@@ -226,14 +239,14 @@ namespace albireo
         const std::string dir = pseudalis_data_dir();
         if (dir.empty())
         {
-            reason = "Pseudalis is not installed";
+            reason = pseudalis_not_installed;
             return false;
         }
         const std::string settings_path = join_path(dir, "settings.json");
         e.ca = join_path(join_path(dir, "certificates"), "pseudalis-authority.crt");
         if (!file_exists(e.ca))
         {
-            reason = "the local authority of Pseudalis is missing";
+            reason = pseudalis_no_authority;
             return false;
         }
         /*
@@ -244,7 +257,7 @@ namespace albireo
         if (!folder_admin_only(dir) || !folder_admin_only(join_path(dir, "certificates")) || !owned_by_system(e.ca)
             || (file_exists(settings_path) && !owned_by_system(settings_path)))
         {
-            reason = "the data folder of Pseudalis is not protected";
+            reason = pseudalis_unprotected;
             return false;
         }
         int port = 8444;
@@ -314,6 +327,7 @@ namespace albireo
         const size_t colon = e.origin.rfind(':');
         j["port"] = found && colon != std::string::npos ? std::atoll(e.origin.c_str() + colon + 1) : 0LL;
         j["reason"] = found ? std::string() : reason;
+        j["code"] = found ? std::string() : pseudalis_code(reason);
         return j;
     }
 
@@ -338,9 +352,13 @@ namespace albireo
             c->set_read_timeout(300);
             c->set_write_timeout(60);
             c->set_keep_alive(false);
-            // The stop of the service ends the request (http_cancel_all()), the cancellation of its answer too.
+            /*
+                Pseudalis answers on this computer, in the offline mode too, which cancels the
+                downloads: the cancellation of its answer ends the request, and the stop of the
+                service through its registration (http_cancel_all()).
+            */
             c->set_socket_options([cancel](socket_t sock) {
-                if (!http_cancelled() && !(cancel && cancel->cancelled())) return;
+                if (!(cancel && cancel->cancelled())) return;
                 httplib::detail::close_socket(sock);
                 throw request_cancelled();
             });
@@ -348,7 +366,7 @@ namespace albireo
             if (cancel) cancel->hold(c);
             httplib::Result r;
             bool thrown = false;
-            if (!http_cancelled() && !(cancel && cancel->cancelled()))
+            if (!(cancel && cancel->cancelled()))
             {
                 try
                 {
@@ -360,7 +378,7 @@ namespace albireo
                 }
             }
             if (cancel) cancel->release();
-            if (thrown || http_cancelled() || (cancel && cancel->cancelled()))
+            if (thrown || (cancel && cancel->cancelled()))
             {
                 error = "the request to Pseudalis was cancelled";
                 return false;

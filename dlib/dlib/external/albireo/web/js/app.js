@@ -615,8 +615,23 @@ function conversationDeleted(id) {
   web.forgetPages(id);
   forgetDraft(id);
   state.conversations = state.conversations.filter((x) => x.id !== id);
-  if (state.current && state.current.id === id) go('#/');
-  else refreshViews();
+  afterDeletion(id);
+}
+
+/*
+    The pages follow the deletion of a discussion, here or in another tab.  The discussion shown, when it is the one
+    deleted, gives way to a new discussion; a page of a project or of the licenses that hides it stays shown.
+*/
+function afterDeletion(id) {
+  if (!(state.current && state.current.id === id)) {
+    refreshViews();
+  } else if (state.view !== 'chat') {
+    leaveCurrent();
+    showDiscussion(newConversation(null));
+    refreshViews();
+  } else {
+    go('#/');
+  }
 }
 
 // Every discussion and every project deleted in another tab; the draft of "New chat" stays.
@@ -803,6 +818,15 @@ function chatRole(c) {
   return c && r && c.relay === relayKey(r) ? 'relay' : (c ? c.role : 'general');
 }
 
+/*
+    Whether Web is on for c with the model that answers it: the choice made for the external model of the relay holds
+    for it alone, and the one made for the models of this computer for them alone, so that a relay that lapses hands
+    no search of the web to a model of the computer that was not asked for it.
+*/
+function webChosen(c) {
+  return !!(c && c.web && (c.webRelay || '') === (chatRole(c) === 'relay' ? c.relay : ''));
+}
+
 // The name of the external model with its provider.
 function relayName(r) {
   return (r.name || r.model) + ' · ' + r.provider_name;
@@ -817,8 +841,20 @@ function relayCapabilities() {
   const thinking = r.thinking || 'none';
   const context = r.context || 0;
   return { reasoning: thinking !== 'none', reasoningAlways: thinking === 'always', tools: false, context,
-    working: context, read: relayReadRate, write: relayWriteRate, relay: true,
+    working: context, read: relayReadRate, write: relayWriteRate, relay: true, webSearch: !!r.web,
     efforts: Array.isArray(r.efforts) ? r.efforts : [], defaultEffort: r.default_effort || '' };
+}
+
+/*
+    Why the Web button of a discussion of the relay is off: '' when its external model searches the web itself
+    (Claude) and the service gives the web access, the reason otherwise.
+*/
+function relayWebUnavailable(caps) {
+  if (!caps.webSearch) return t('relayNoTools');
+  const s = state.status;
+  if (!s || !s.web || typeof s.web !== 'object') return t('webUnavailable');
+  if (s.web.available) return '';
+  return s.offline ? t('webOffline') : t('webOff');
 }
 
 function modelInfo(id) {
@@ -966,7 +1002,7 @@ function searchProvider() {
 function toolSet(c, caps) {
   const reasoning = !!(c.reasoning && caps.reasoning);
   const agent = !!(c.agent && toolsAvailable(caps, reasoning));
-  const webOn = !!(c.web && !webUnavailable(caps, reasoning));
+  const webOn = webChosen(c) && !webUnavailable(caps, reasoning);
   const search = webOn && state.status.web.search === 'wikipedia';
   const definitions = (agent ? tools.definitions : []).concat(webOn ? web.definitions(search) : []);
   return { agent, web: webOn, search, definitions: definitions.length ? definitions : null };
@@ -1065,8 +1101,8 @@ async function pollStatus() {
         a newer catalog of the service the capabilities that the list of the models gives the models, and the relay
         the padlock of the composer and the discussions that go to it.
     */
-    const relay = (r) => r ? [r.ready, r.provider, r.model, r.pseudonymize, r.image_mode, r.thinking, r.context,
-      r.scope] : null;
+    const relay = (r) => r ? [r.ready, r.provider, r.model, r.pseudonymize, r.keep_substitutes, r.image_mode,
+      r.thinking, r.context, r.scope] : null;
     const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background, x.web, x.offline,
       x.catalog ? x.catalog.updated : null, relay(x.relay)]);
     changed = !state.status || key(state.status) !== key(s);
@@ -1171,7 +1207,7 @@ function contextKey(c) {
   const role = chatRole(c);
   const caps = roleCapabilities(role);
   return [c.id, role, roleModel(role), c.messages.length, last ? last.id : '',
-    last && last.steps ? last.steps.length : 0, c.contextStart || 0, c.agent ? 1 : 0, c.web ? 1 : 0,
+    last && last.steps ? last.steps.length : 0, c.contextStart || 0, c.agent ? 1 : 0, webChosen(c) ? 1 : 0,
     c.reasoning ? 1 : 0, caps.tools ? 1 : 0, caps.reasoning ? 1 : 0, c.updated || 0].join('|');
 }
 
@@ -1849,8 +1885,7 @@ async function removeConversation(c) {
   await images.removeOwner(c.id).catch(() => {});
   broadcast({ type: 'deleted', id: c.id });
   state.conversations = state.conversations.filter((x) => x.id !== c.id);
-  if (state.current && state.current.id === c.id) go('#/');
-  else refreshViews();
+  afterDeletion(c.id);
 }
 
 // The name of the file of a discussion, its title without the characters a file name cannot hold.
@@ -2557,7 +2592,12 @@ function renderProject(p) {
   for (const c of convs) {
     convList.append(h('div', { class: 'row click', onclick: () => go('#/c/' + c.id) },
       h('span', { html: icon('chat') }), h('span', { class: 'label' }, c.title || t('untitled')),
-      h('span', { class: 'faint' }, new Date(c.updated).toLocaleDateString(language()))));
+      h('span', { class: 'faint' }, new Date(c.updated).toLocaleDateString(language())),
+      // A discussion leaves from its project as from the list of the discussions, once confirmed; both lists follow.
+      iconButton('trash', t('delete'), (ev) => {
+        ev.stopPropagation();
+        removeConversation(liveCopy(c));
+      })));
   }
   if (!convs.length) convList.append(h('div', { class: 'empty-note' }, t('noDiscussions')));
   // The card of the knowledge, which also takes the files dropped on it, with the count of its items.
@@ -4264,8 +4304,8 @@ function renderRelayButton(c) {
   }
   ui.relayButton.classList.toggle('on', on);
   ui.relayButton.setAttribute('aria-pressed', String(on));
-  let title = t(on ? 'relayOn' : 'relayOff', { model: relayName(r) });
-  if (r.pseudonymize) title += ' ' + t('relayPseudonymized');
+  let title = t(on ? 'relayOn' : 'relayOff', { model: r.name || r.model });
+  if (r.pseudonymize) title += ' ' + t(r.keep_substitutes ? 'relaySubstitutes' : 'relayPseudonymized');
   if (r.image_mode === 'described') title += ' ' + t('relayImagesDescribed');
   ui.relayButton.title = title;
   ui.relayButton.setAttribute('aria-label', title);
@@ -4322,12 +4362,12 @@ function renderComposerState() {
     : caps.tools ? t('agentNeedsReasoning') : t('agentNoTools');
   // The Web button is off and disabled, with the reason as its title, while the model calls no tool, while a model
   // that can reason lacks its deep reasoning, or while the service gives no web access.
-  const reason = caps.relay ? t('relayNoTools') : webUnavailable(caps, reasoning);
-  const webOn = !!(c && c.web && !reason);
+  const reason = caps.relay ? relayWebUnavailable(caps) : webUnavailable(caps, reasoning);
+  const webOn = webChosen(c) && !reason;
   ui.webButton.classList.toggle('on', webOn);
   ui.webButton.setAttribute('aria-pressed', String(webOn));
   ui.webButton.disabled = !!reason;
-  ui.webButton.title = reason || t('webHint');
+  ui.webButton.title = reason || (caps.relay ? t('relayWebHint') : t('webHint'));
   // The attachments the model of the function reads, the images while the context has places for them.
   const room = imageRoom(c);
   if (ui.fileInput) ui.fileInput.accept = acceptFor(role, room);
@@ -5602,8 +5642,9 @@ async function runTurn(c, abort, turn) {
         turn.promptTokens = fitted.tokens;
       }
       const body = { model: 'albireo-' + role, messages: fitted.messages, reasoning };
-      // The level of effort of an external model chosen for the discussion.
+      // The level of effort of an external model chosen for the discussion, and the search of the web of Claude.
       if (caps.relay && caps.efforts.includes(c.effort)) body.reasoning_effort = c.effort;
+      if (caps.relay && webChosen(c) && !relayWebUnavailable(caps)) body.web_search = true;
       if (stepTools) body.tools = stepTools;
       if (state.settings.temperature != null) body.temperature = state.settings.temperature;
       if (state.settings.topP != null) body.top_p = state.settings.topP;
@@ -7488,7 +7529,8 @@ function buildLayout() {
     html: icon('globe') + '<span>' + escapeHtml(t('web')) + '</span>',
     onclick: async () => {
       const c = state.current;
-      c.web = !c.web;
+      c.web = !webChosen(c);
+      c.webRelay = c.web && chatRole(c) === 'relay' ? c.relay : '';
       renderComposerState();
       if (c.messages.length) await persist(c);
       refreshViews();
@@ -7504,10 +7546,10 @@ function buildLayout() {
       const c = state.current;
       const r = relayStatus();
       c.relay = chatRole(c) === 'relay' || !r ? '' : relayKey(r);
-      if (c.relay) {
-        c.agent = false;
-        c.web = false;
-      }
+      // The agent stays with the models of this computer; the web of the external model and that of the computer
+      // differ, each turned on anew.
+      if (c.relay) c.agent = false;
+      c.web = false;
       renderComposerState();
       if (c.messages.length) await persist(c);
       refreshViews();

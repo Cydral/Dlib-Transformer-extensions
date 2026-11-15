@@ -7,9 +7,20 @@
 
 #include "relay.h"
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
@@ -18,6 +29,7 @@
 #include "../common/engine_api.h"
 #include "../common/log.h"
 #include "../common/platform.h"
+#include "../common/version.h"
 #include "certificates.h"
 #include "crypto.h"
 #include "http_fetch.h"
@@ -86,8 +98,15 @@ namespace albireo
         */
         const long long claude_default_tokens = 64000;
 
+        /*
+            The searches of the web that an answer of Claude makes at most, when its request asks for
+            them (web_search): each one is billed by Anthropic, and a turn this short never pauses.
+        */
+        const long long claude_web_searches = 5;
+
         std::mutex origins_m;
         std::map<std::string, std::string> test_origins;
+        std::map<std::string, std::vector<std::string>> test_names;
 
         // Thrown from the socket of a client about to connect once its answer or the requests of the service end.
         struct answer_cancelled
@@ -214,24 +233,50 @@ namespace albireo
             return text;
         }
 
-        // The message of an error that an external engine answered, without the request it may quote.
-        std::string provider_error(int status, const std::string& body, const relay_settings& r)
+        // The message that an external engine gives with an error, without the secret, the user and the host.
+        std::string provider_message(const std::string& body, const relay_settings& r)
         {
             const json j = json::parse_or_null(body.substr(0, 64 * 1024));
             std::string message;
             if (j["error"].is_string()) message = j["error"].as_string();
             else if (j["error"]["message"].is_string()) message = j["error"]["message"].as_string();
             else if (j["message"].is_string()) message = j["message"].as_string();
+            else if (j["detail"].is_string()) message = j["detail"].as_string();
             message = redacted(message, r);
             if (message.size() > 300) message = message.substr(0, 300) + "...";
+            return message;
+        }
+
+        // The code of an HTTP status of an external engine, by which the tray words it in its language.
+        const char* status_code(int status)
+        {
+            if (status == 401 || status == 403) return "relay_http_key";
+            if (status == 402) return "relay_http_credit";
+            if (status == 404) return "relay_http_address";
+            if (status == 413) return "relay_http_size";
+            if (status == 429) return "relay_http_limit";
+            if (status >= 500) return "relay_http_failing";
+            return "relay_http_refused";
+        }
+
+        std::string status_text(int status)
+        {
             std::string what;
             if (status == 401 || status == 403) what = "the external engine refuses the key or the user";
-            else if (status == 404) what = "the external engine does not know the model or the address";
+            else if (status == 402) what = "the account of the external engine has no credit left";
+            else if (status == 404) what = "the external engine knows neither this model nor this address";
             else if (status == 413) what = "the external engine refuses a request this large";
             else if (status == 429) what = "the external engine limits the requests or the credits of the account";
             else if (status >= 500) what = "the external engine is overloaded or failing";
             else what = "the external engine refuses the request";
-            return what + " (HTTP " + std::to_string(status) + ")" + (message.empty() ? "" : ": " + message);
+            return what + " (HTTP " + std::to_string(status) + ")";
+        }
+
+        // The message of an error that an external engine answered, without the request it may quote.
+        std::string provider_error(int status, const std::string& body, const relay_settings& r)
+        {
+            const std::string message = provider_message(body, r);
+            return status_text(status) + (message.empty() ? "" : ": " + message);
         }
 
         std::string transfer_error(const httplib::Error e)
@@ -251,6 +296,369 @@ namespace albireo
             case httplib::Error::Timeout: return "the external engine stopped answering";
             default: return std::string("the request to the external engine failed: ") + httplib::to_string(e);
             }
+        }
+
+        // The code of a failed transfer, by which the tray words it in its language.
+        const char* transfer_code(const httplib::Error e)
+        {
+            switch (e)
+            {
+            case httplib::Error::SSLServerVerification:
+            case httplib::Error::SSLServerHostnameVerification: return "relay_certificate";
+            case httplib::Error::Read:
+            case httplib::Error::Timeout: return "relay_no_answer";
+            default: return "relay_unreachable";
+            }
+        }
+
+        /*
+            Whether the origin "scheme://host:port" holds a host and a port alone: a name of
+            letters, digits, dots, hyphens and underscores, or an IPv6 address in brackets, then
+            ":" and a port from 1 to 65535.  A user, a query or a fragment there would make the
+            client reach another host than the one the offline mode checks.
+        */
+        bool plain_authority(const std::string& origin)
+        {
+            const size_t scheme = origin.find("://");
+            if (scheme == std::string::npos) return false;
+            const std::string a = origin.substr(scheme + 3);
+            size_t i = 0;
+            if (!a.empty() && a[0] == '[')
+            {
+                const size_t close = a.find(']');
+                if (close == std::string::npos || close < 3) return false;
+                for (i = 1; i < close; ++i)
+                    if (!std::isxdigit(static_cast<unsigned char>(a[i])) && a[i] != ':' && a[i] != '.') return false;
+                i = close + 1;
+            }
+            else
+            {
+                while (i < a.size() && (std::isalnum(static_cast<unsigned char>(a[i])) || a[i] == '.' || a[i] == '-'
+                    || a[i] == '_'))
+                    ++i;
+                if (i == 0) return false;
+            }
+            if (i == a.size()) return true;
+            const std::string port = a.substr(i + 1);
+            if (a[i] != ':' || port.empty() || port.size() > 5
+                || port.find_first_not_of("0123456789") != std::string::npos)
+                return false;
+            const long value = std::atol(port.c_str());
+            return value >= 1 && value <= 65535;
+        }
+
+        // The host of an origin "scheme://host:port" as it is written, an IPv6 address without its brackets.
+        std::string written_host(const std::string& origin)
+        {
+            const size_t scheme = origin.find("://");
+            std::string host = origin.substr(scheme == std::string::npos ? 0 : scheme + 3);
+            if (!host.empty() && host[0] == '[')
+            {
+                const size_t end = host.find(']');
+                return host.substr(1, end == std::string::npos ? std::string::npos : end - 1);
+            }
+            return host.substr(0, host.find_first_of(":/"));
+        }
+
+        // The host of an origin in lowercase.
+        std::string origin_host(const std::string& origin)
+        {
+            std::string host = written_host(origin);
+            for (char& c : host) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return host;
+        }
+
+        // The addresses of the name host, as the resolver of the system gives them.
+        std::vector<std::string> resolve_name(const std::string& host)
+        {
+            {
+                std::lock_guard<std::mutex> lock(origins_m);
+                auto it = test_names.find(host);
+                if (it != test_names.end()) return it->second;
+            }
+            std::vector<std::string> addresses;
+            addrinfo hints = {};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* found = nullptr;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0 || !found) return addresses;
+            for (const addrinfo* a = found; a; a = a->ai_next)
+            {
+                char text[INET6_ADDRSTRLEN] = {};
+                const void* bytes = nullptr;
+                unsigned long zone = 0;
+                if (a->ai_family == AF_INET) bytes = &reinterpret_cast<const sockaddr_in*>(a->ai_addr)->sin_addr;
+                else if (a->ai_family == AF_INET6)
+                {
+                    const sockaddr_in6* v6 = reinterpret_cast<const sockaddr_in6*>(a->ai_addr);
+                    bytes = &v6->sin6_addr;
+                    zone = static_cast<unsigned long>(v6->sin6_scope_id);
+                }
+                // A link-local address keeps its zone, the interface the connection leaves by.
+                if (bytes && inet_ntop(a->ai_family, bytes, text, sizeof(text)))
+                    addresses.push_back(zone ? std::string(text) + "%" + std::to_string(zone) : std::string(text));
+            }
+            freeaddrinfo(found);
+            return addresses;
+        }
+
+        // Whether the IPv4 address of 4 bytes lies on this computer or its local network.
+        bool local_v4(const unsigned char* a)
+        {
+            const bool unspecified = a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0;
+            return unspecified || a[0] == 127 || a[0] == 10 || (a[0] == 172 && (a[1] & 0xf0) == 16)
+                || (a[0] == 192 && a[1] == 168) || (a[0] == 169 && a[1] == 254);
+        }
+
+        /*
+            Whether the address numeric, its zone left aside, lies on this computer or its local
+            network: unspecified or loopback (0.0.0.0, 127.0.0.0/8, ::, ::1), private
+            (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7) or link-local (169.254.0.0/16,
+            fe80::/10), an IPv4 address mapped in IPv6 as that IPv4 address.  Every other
+            address, the shared space of the operators and the tunnels or translations of IPv6
+            included, leads off the local network.
+        */
+        bool local_network_address(const std::string& numeric)
+        {
+            const std::string text = numeric.substr(0, numeric.find('%'));
+            unsigned char b[16] = {};
+            if (inet_pton(AF_INET, text.c_str(), b) == 1) return local_v4(b);
+            if (inet_pton(AF_INET6, text.c_str(), b) != 1) return false;
+            static const unsigned char mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std::memcmp(b, mapped, sizeof(mapped)) == 0) return local_v4(b + 12);
+            bool zeros = true;
+            for (int i = 0; i < 15; ++i) zeros = zeros && b[i] == 0;
+            return (zeros && b[15] <= 1) || (b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80);
+        }
+
+        // Whether host is an IPv4 or IPv6 address rather than a name.
+        bool address_literal(const std::string& host)
+        {
+            unsigned char bytes[16];
+            return inet_pton(AF_INET, host.c_str(), bytes) == 1 || inet_pton(AF_INET6, host.c_str(), bytes) == 1;
+        }
+
+        // "localhost" and the names under .localhost, which name this computer whatever the resolver gives.
+        bool loopback_name(const std::string& host)
+        {
+            const std::string tail = ".localhost";
+            return host == "localhost"
+                || (host.size() > tail.size() && host.compare(host.size() - tail.size(), tail.size(), tail) == 0);
+        }
+
+        const char* const offline_remote = "offline mode: the address of the engine is neither on this computer nor "
+            "on its local network";
+
+        /*
+            Whether host lies on this computer or its local network, which the offline mode keeps
+            within reach: a loopback name, an address of the local network
+            (local_network_address()), or a name whose every address is so.  why and code say
+            otherwise.  address receives the address checked that the request connects to, so
+            that no later resolution of the name leads elsewhere: 127.0.0.1 for a loopback name,
+            which the resolver of Windows may answer otherwise, and for another name an IPv4
+            address first, where the engines listen most often, else an IPv6 address with its
+            zone.  It stays empty for an address, which the client connects to as it is.
+        */
+        bool local_host(const std::string& host, std::string& why, std::string& code, std::string& address)
+        {
+            address.clear();
+            if (loopback_name(host))
+            {
+                address = "127.0.0.1";
+                return true;
+            }
+            const bool literal = address_literal(host);
+            const std::vector<std::string> addresses = literal ? std::vector<std::string>{ host } : resolve_name(host);
+            if (addresses.empty())
+            {
+                why = "offline mode: the name of the engine has no address on this network";
+                code = "relay_offline_unresolved";
+                return false;
+            }
+            for (const std::string& a : addresses)
+                if (!local_network_address(a))
+                {
+                    why = offline_remote;
+                    code = "relay_offline_remote";
+                    return false;
+                }
+            if (literal) return true;
+            address = addresses.front();
+            for (const std::string& a : addresses)
+                if (a.find(':') == std::string::npos)
+                {
+                    address = a;
+                    break;
+                }
+            return true;
+        }
+
+        /*
+            The client of the relay for origin.  Online, a client of the downloads (http_client()),
+            with their proxy and their cancellation.  In the offline mode, which cancels the
+            downloads, an engine of the interface of OpenAI on this computer or its local network
+            alone, reached directly: its requests end with the cancellation of their answer, and
+            with the stop of the service through their registration (http_registration).  code
+            names a refusal of the offline mode for the tray.
+        */
+        std::shared_ptr<httplib::Client> relay_client(const relay_settings& r, bool offline, const std::string& origin,
+            int timeout_seconds, std::string& error, std::string& code)
+        {
+            if (!offline)
+            {
+                std::shared_ptr<httplib::Client> c = http_client(origin, timeout_seconds, error);
+                if (!c && !http_cancelled())
+                {
+                    // The server or the proxy out of reach, which the tray words in its language.
+                    std::string host, user, password;
+                    int port = 0;
+                    code = http_proxy_for(origin, host, port, user, password) ? "relay_proxy" : "relay_unreachable";
+                    wipe_secret(password);
+                }
+                return c;
+            }
+            if (r.provider != "openai")
+            {
+                error = std::string("offline mode: ") + provider_name(r.provider) + " needs the Internet";
+                code = "relay_offline";
+                return nullptr;
+            }
+            std::string address;
+            if (!local_host(origin_host(origin), error, code, address)) return nullptr;
+            auto c = std::make_shared<httplib::Client>(origin);
+            if (!address.empty()) c->set_hostname_addr_map({ { written_host(origin), address } });
+            c->set_follow_location(false);
+            c->set_connection_timeout(connect_seconds, 0);
+            c->set_read_timeout(timeout_seconds, 0);
+            c->set_write_timeout(timeout_seconds, 0);
+            c->set_keep_alive(false);
+            c->set_default_headers({ { "User-Agent", std::string(ALBIREO_PRODUCT_NAME) + "/" + ALBIREO_VERSION } });
+            return c;
+        }
+
+        // The answer of GET <base>/models: its status, or the failure of its transfer, and the models it lists.
+        struct model_listing
+        {
+            int status = 0;
+            httplib::Error transfer = httplib::Error::Success;
+            std::string error;              // the client could not be made: offline, a proxy, the service stopping
+            std::string code;               // the refusal of the offline mode, for the tray
+            bool listed = false;            // a list of models, {"data": [{"id"}, ...]}
+            json models = json::array();
+            std::string body;               // the start of an answer of another status, for its message
+        };
+
+        /*
+            Asks base for its models, the connection held by control when given, which a
+            cancellation stops; offline, the client of the offline mode (relay_client()).
+        */
+        model_listing list_models(const relay_settings& r, bool offline, const std::string& base, int timeout_seconds,
+            cancellable* control)
+        {
+            model_listing out;
+            url_parts u;
+            if (!parse_url(base + "/models", u))
+            {
+                out.error = "the relay has no valid address";
+                return out;
+            }
+            std::shared_ptr<httplib::Client> client = relay_client(r, offline, u.origin, timeout_seconds, out.error,
+                out.code);
+            if (!client) return out;
+            // The cancellation of the downloads, which the offline mode holds, ends the requests online only.
+            if (control)
+            {
+                client->set_socket_options([control, offline](socket_t sock) {
+                    if (!(!offline && http_cancelled()) && !control->cancelled()) return;
+                    httplib::detail::close_socket(sock);
+                    throw answer_cancelled();
+                });
+                control->hold(client);
+            }
+            http_registration registered(client);
+            httplib::Result res;
+            try
+            {
+                if (!control || !control->cancelled()) res = client->Get(u.target, headers_of(r));
+            }
+            catch (...)
+            {
+            }
+            if (control) control->release();
+            if (!res)
+            {
+                // A request not sent, or stopped by its socket, is a cancellation.
+                out.transfer = (control && control->cancelled()) || (!offline && http_cancelled())
+                    ? httplib::Error::Canceled : res.error();
+                return out;
+            }
+            out.status = res->status;
+            if (res->status != 200)
+            {
+                out.body = res->body.substr(0, 64 * 1024);
+                return out;
+            }
+            const json answer = json::parse_or_null(res->body.substr(0, size_t(8) << 20));
+            out.listed = answer["data"].is_array();
+            for (const json& m : answer["data"].elements())
+            {
+                if (out.models.size() >= 500) break;
+                if (m["id"].is_string()) out.models.push_back(m["id"]);
+            }
+            return out;
+        }
+
+        /*
+            The bases where the interface of an "openai" engine may answer for its address: the
+            address typed, without the path of an operation pasted with it, then the same with /v1,
+            where most engines serve it (Ollama, vLLM, LM Studio).
+        */
+        std::vector<std::string> openai_bases(const relay_settings& r)
+        {
+            std::string base = relay_base_url(r);
+            for (const char* tail : { "/chat/completions", "/completions", "/models" })
+            {
+                const size_t n = std::strlen(tail);
+                if (base.size() > n && base.compare(base.size() - n, n, tail) == 0)
+                {
+                    base.erase(base.size() - n);
+                    break;
+                }
+            }
+            while (!base.empty() && base.back() == '/') base.pop_back();
+            std::vector<std::string> bases{ base };
+            if (base.size() < 3 || base.compare(base.size() - 3, 3, "/v1") != 0) bases.push_back(base + "/v1");
+            return bases;
+        }
+
+        /*
+            The answer of the base where the interface of the provider of r lies, which base gives:
+            the first base whose answer is no "nothing here" (404, 405, or a page that lists no
+            models), the address typed when every base answers so.
+        */
+        model_listing reach_interface(const relay_settings& r, bool offline, int timeout_seconds, cancellable* control,
+            std::string& base)
+        {
+            const std::vector<std::string> bases = r.provider == "openai" ? openai_bases(r)
+                : std::vector<std::string>{ relay_base_url(r) };
+            model_listing first;
+            base = bases.front();
+            for (size_t i = 0; i < bases.size(); ++i)
+            {
+                model_listing l = list_models(r, offline, bases[i], timeout_seconds, control);
+                const bool nothing = l.status == 404 || l.status == 405 || (l.status == 200 && !l.listed);
+                if (i == 0) first = l;
+                // A client refused settles every base, which lie on the same server.
+                if (!l.error.empty()) return l;
+                // A base that cannot be reached settles nothing for the next one, which lies on the same server.
+                if (i == 0 ? !nothing : l.status != 0 && !nothing)
+                {
+                    base = bases[i];
+                    return l;
+                }
+                if (control && control->cancelled()) break;
+            }
+            return first;
         }
 
         /*
@@ -454,9 +862,9 @@ namespace albireo
             return body;
         }
 
-        // The body of a request of the interface of Anthropic.
+        // The body of a request of the interface of Anthropic, with its search of the web when web is true.
         json claude_body(const relay_model& m, const std::vector<message>& msgs, const json& request,
-            const std::string& effort)
+            const std::string& effort, bool web)
         {
             json body = json::object();
             body["model"] = m.id;
@@ -530,9 +938,54 @@ namespace albireo
                 output["effort"] = effort;
                 body["output_config"] = output;
             }
+            if (web)
+            {
+                json tool = json::object();
+                tool["type"] = "web_search_20250305";
+                tool["name"] = "web_search";
+                tool["max_uses"] = claude_web_searches;
+                json tools = json::array();
+                tools.push_back(tool);
+                body["tools"] = tools;
+            }
             return body;
         }
 
+        /*
+            The sources of a text of Claude, the links that follow it: the domain of each address of
+            the web cited, once each, in markdown, which the web application shows as links.  The
+            addresses that are not http:// or https:// are left out.
+        */
+        std::string source_links(const std::vector<std::string>& urls)
+        {
+            std::string out;
+            std::vector<std::string> seen;
+            for (const std::string& url : urls)
+            {
+                const bool web = url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
+                if (!web || url.size() > 2048 || std::find(seen.begin(), seen.end(), url) != seen.end()) continue;
+                seen.push_back(url);
+                std::string host = url.substr(url.find("://") + 3);
+                host = host.substr(0, host.find_first_of("/?#"));
+                if (host.compare(0, 4, "www.") == 0) host = host.substr(4);
+                std::string target;
+                for (const char c : url)
+                {
+                    if (c == '(') target += "%28";
+                    else if (c == ')') target += "%29";
+                    else if (c == ' ') target += "%20";
+                    else if (static_cast<unsigned char>(c) < 0x20) continue;
+                    else target += c;
+                }
+                std::string text;
+                for (const char c : host)
+                    if (c != '[' && c != ']' && c != '*' && c != '_' && c != '`') text += c;
+                out += (out.empty() ? "" : ", ") + std::string("[") + text + "](" + target + ")";
+            }
+            return out.empty() ? out : " (" + out + ")";
+        }
+
+        // The end of an answer of Claude; a turn paused among its searches (pause_turn) ends with what it wrote.
         std::string finish_of_claude(const std::string& stop)
         {
             if (stop == "max_tokens" || stop == "model_context_window_exceeded") return "length";
@@ -567,7 +1020,8 @@ namespace albireo
         if (url.empty() || url.size() > 2048 || !parse_url(url, u)) return false;
         for (const char c : url)
             if (static_cast<unsigned char>(c) <= ' ' || c == '"' || c == '<' || c == '>' || c == '\\') return false;
-        return u.target.find('?') == std::string::npos && u.target.find('#') == std::string::npos;
+        return plain_authority(u.origin) && u.target.find('?') == std::string::npos
+            && u.target.find('#') == std::string::npos;
     }
 
     std::string relay_base_url(const relay_settings& r)
@@ -589,6 +1043,13 @@ namespace albireo
         std::lock_guard<std::mutex> lock(origins_m);
         if (origin.empty()) test_origins.erase(provider);
         else test_origins[provider] = origin;
+    }
+
+    void relay_name_for_tests(const std::string& name, const std::vector<std::string>& addresses)
+    {
+        std::lock_guard<std::mutex> lock(origins_m);
+        if (addresses.empty()) test_names.erase(name);
+        else test_names[name] = addresses;
     }
 
     bool relay_model_of(const relay_settings& r, relay_model& m)
@@ -631,6 +1092,22 @@ namespace albireo
             why.clear();
             return true;
         }
+        return false;
+    }
+
+    bool relay_offline_ready(const relay_settings& r, std::string& why)
+    {
+        if (r.provider != "openai")
+        {
+            why = std::string("offline mode: ") + provider_name(r.provider) + " needs the Internet";
+            return false;
+        }
+        url_parts u;
+        if (!parse_url(relay_base_url(r), u)) return true;
+        // A name of the network is resolved by the request, which checks each of its addresses.
+        const std::string host = origin_host(u.origin);
+        if (loopback_name(host) || !address_literal(host) || local_network_address(host)) return true;
+        why = offline_remote;
         return false;
     }
 
@@ -683,6 +1160,7 @@ namespace albireo
         }
         j["pseudonymize"] = r.pseudonymize;
         j["tags"] = r.tags;
+        j["keep_substitutes"] = r.pseudonymize && r.keep_substitutes;
         // What the relay was set for, its address included, which this fingerprint stands for without naming it.
         j["scope"] = sha256_hex(r.secret_scope()).substr(0, 16);
         return j;
@@ -739,10 +1217,18 @@ namespace albireo
         };
         std::string why;
         if (!relay_ready(st.relay, why)) return refuse(404, "relay_unavailable", why);
-        if (st.offline) return refuse(503, "offline", "offline mode: the relay sends nothing out of this computer");
+        if (st.offline && !relay_offline_ready(st.relay, why)) return refuse(503, "offline", why);
         if (request["tools"].size() > 0)
             return refuse(400, "tools_not_supported", "the relay takes no tools: the agent mode and the web access "
                 "stay with the models of the computer");
+        // The search of the web that Claude makes itself, which the web access of the settings allows.
+        if (request["web_search"].as_bool(false))
+        {
+            if (st.relay.provider != "claude")
+                return refuse(400, "web_search_not_supported", "the search of the web of the relay takes Claude, which "
+                    "searches the web itself");
+            if (!st.web_access) return refuse(403, "web_access_off", "the administrator turned the web access off");
+        }
         if (request["n"].as_int(1) != 1)
             return refuse(400, "invalid_value", "only one choice per request (n = 1) is supported");
         if (!request["messages"].is_array() || request["messages"].size() == 0)
@@ -930,6 +1416,12 @@ namespace albireo
                     p.text = std::move(out);
                 }
         }
+        // The check of what left keeps the substitutes in the answer: no value comes back.
+        if (r.keep_substitutes)
+        {
+            for (auto& v : values) wipe_secret(v.second);
+            values.clear();
+        }
         stream_restorer content_restorer(values), reasoning_restorer(values);
         for (auto& v : values) wipe_secret(v.second);
         values.clear();
@@ -945,27 +1437,38 @@ namespace albireo
             else reasoning_off = true;
         }
         const bool claude = r.provider == "claude";
-        const json body = claude ? claude_body(m, msgs, request, effort)
+        const bool web = claude && request["web_search"].as_bool(false) && st.web_access;
+        const json body = claude ? claude_body(m, msgs, request, effort, web)
                                  : openai_body(r, m, msgs, request, effort, reasoning_off);
         msgs.clear();
 
+        // The base of an engine of the interface of OpenAI, as typed or with /v1, which its models tell once.
+        const std::string base = base_of(r, &j->control);
         url_parts u;
-        if (!parse_url(relay_base_url(r) + (claude ? "/messages" : "/chat/completions"), u))
+        if (!parse_url(base + (claude ? "/messages" : "/chat/completions"), u))
         {
             fail("the relay has no valid address", "relay_unavailable");
             return;
         }
-        std::string error;
-        std::shared_ptr<httplib::Client> client = http_client(u.origin, 300, error);
+        std::string error, refusal;
+        const bool offline = st.offline;
+        std::shared_ptr<httplib::Client> client = relay_client(r, offline, u.origin, 300, error, refusal);
         if (!client)
         {
-            fail(error.empty() ? std::string("the external engine cannot be reached") : error, "relay_unreachable");
+            // A refusal of the offline mode answers with the code offline, an engine out of reach with its own.
+            const bool refused = refusal.compare(0, 13, "relay_offline") == 0;
+            fail(error.empty() ? std::string("the external engine cannot be reached") : error,
+                refused ? "offline" : "relay_unreachable");
             return;
         }
-        // The connection opens for an answer that goes on alone, whatever the moment of its cancellation.
+        /*
+            The connection opens for an answer that goes on alone, whatever the moment of its
+            cancellation; the cancellation of the downloads, which the offline mode holds, ends
+            the answers online only.
+        */
         const cancellable* control = &j->control;
-        client->set_socket_options([control](socket_t sock) {
-            if (!http_cancelled() && !control->cancelled()) return;
+        client->set_socket_options([control, offline](socket_t sock) {
+            if (!(!offline && http_cancelled()) && !control->cancelled()) return;
             httplib::detail::close_socket(sock);
             throw answer_cancelled();
         });
@@ -999,6 +1502,29 @@ namespace albireo
                                                                      : content_restorer.feed(text);
             if (!out.empty()) j->sink(kind, out);
         };
+        /*
+            The blocks of an answer of Claude that its search of the web adds: the queries of its
+            searches (server_tool_use), shown with the reasoning, and the sources a text cites,
+            whose links follow the text, by the index of their block.
+        */
+        struct claude_block
+        {
+            std::string type;
+            std::string input;
+            std::vector<std::string> sources;
+        };
+        std::map<long long, claude_block> blocks;
+        long long web_searches = 0;
+        auto add_source = [](claude_block& b, const json& citation) {
+            if (citation["url"].is_string() && b.sources.size() < 16) b.sources.push_back(citation["url"].as_string());
+        };
+        auto web_block = [&](const json& b) {
+            const std::string kind = b["type"].as_string();
+            if (kind == "server_tool_use" && b["name"].as_string() == "web_search" && b["input"]["query"].is_string())
+                emit(ALBIREO_EVENT_REASONING, "\nweb_search: " + b["input"]["query"].as_string() + "\n");
+            if (kind == "web_search_tool_result" && b["content"]["error_code"].is_string())
+                emit(ALBIREO_EVENT_REASONING, "\nweb_search: " + b["content"]["error_code"].as_string() + "\n");
+        };
         auto on_event = [&](const std::string& name, const std::string& data) {
             if (!claude && data == "[DONE]")
             {
@@ -1018,18 +1544,49 @@ namespace albireo
                     prompt_tokens = usage["input_tokens"].as_int(0) + cached_tokens
                         + usage["cache_creation_input_tokens"].as_int(0);
                 }
+                else if (type == "content_block_start")
+                {
+                    const json& b = e["content_block"];
+                    claude_block& block = blocks[e["index"].as_int(0)];
+                    block.type = b["type"].as_string();
+                    if (block.type == "text")
+                        for (const json& c : b["citations"].elements()) add_source(block, c);
+                    if (block.type == "web_search_tool_result") web_block(b);
+                }
                 else if (type == "content_block_delta")
                 {
                     const json& d = e["delta"];
                     const std::string kind = d["type"].as_string();
                     if (kind == "text_delta") emit(ALBIREO_EVENT_CONTENT, d["text"].as_string());
                     else if (kind == "thinking_delta") emit(ALBIREO_EVENT_REASONING, d["thinking"].as_string());
+                    else if (kind == "input_json_delta" || kind == "citations_delta")
+                    {
+                        claude_block& block = blocks[e["index"].as_int(0)];
+                        if (kind == "citations_delta") add_source(block, d["citation"]);
+                        else if (block.input.size() < 64 * 1024) block.input += d["partial_json"].as_string();
+                    }
+                }
+                else if (type == "content_block_stop")
+                {
+                    auto it = blocks.find(e["index"].as_int(0));
+                    if (it == blocks.end()) return;
+                    if (it->second.type == "server_tool_use")
+                    {
+                        json b = json::object();
+                        b["type"] = "server_tool_use";
+                        b["name"] = "web_search";
+                        b["input"] = json::parse_or_null(it->second.input);
+                        web_block(b);
+                    }
+                    if (it->second.type == "text") emit(ALBIREO_EVENT_CONTENT, source_links(it->second.sources));
+                    blocks.erase(it);
                 }
                 else if (type == "message_delta")
                 {
                     if (e["delta"]["stop_reason"].is_string())
                         finish = finish_of_claude(e["delta"]["stop_reason"].as_string());
                     completion_tokens = e["usage"]["output_tokens"].as_int(completion_tokens);
+                    web_searches = e["usage"]["server_tool_use"]["web_search_requests"].as_int(web_searches);
                 }
                 else if (type == "message_stop")
                 {
@@ -1161,8 +1718,15 @@ namespace albireo
                 for (const json& b : a["content"].elements())
                 {
                     if (b["type"].as_string() == "thinking") emit(ALBIREO_EVENT_REASONING, b["thinking"].as_string());
-                    if (b["type"].as_string() == "text") emit(ALBIREO_EVENT_CONTENT, b["text"].as_string());
+                    if (b["type"].as_string() == "text")
+                    {
+                        claude_block block;
+                        for (const json& c : b["citations"].elements()) add_source(block, c);
+                        emit(ALBIREO_EVENT_CONTENT, b["text"].as_string() + source_links(block.sources));
+                    }
+                    web_block(b);
                 }
+                web_searches = a["usage"]["server_tool_use"]["web_search_requests"].as_int(0);
                 if (a["stop_reason"].is_string()) finish = finish_of_claude(a["stop_reason"].as_string());
                 cached_tokens = a["usage"]["cache_read_input_tokens"].as_int(0);
                 prompt_tokens = a["usage"]["input_tokens"].as_int(0) + cached_tokens
@@ -1191,9 +1755,10 @@ namespace albireo
                     ? a["error"].as_string() : a["error"]["message"].as_string(), r).substr(0, 300);
             }
         }
-        if (j->control.cancelled() || http_cancelled())
+        const bool downloads_cancelled = !offline && http_cancelled();
+        if (j->control.cancelled() || downloads_cancelled)
         {
-            fail(http_cancelled() ? std::string("the request to the external engine was cancelled")
+            fail(downloads_cancelled ? std::string("the request to the external engine was cancelled")
                 : std::string("the answer was cancelled"), "cancelled");
             return;
         }
@@ -1236,6 +1801,8 @@ namespace albireo
         usage["completion_tokens"] = completion_tokens;
         usage["total_tokens"] = prompt_tokens + completion_tokens;
         usage["cached_tokens"] = cached_tokens;
+        // The searches of the web of Claude, which Anthropic bills apart.
+        if (web_searches > 0) usage["web_search_requests"] = web_searches;
         json timings = json::object();
         timings["queued_ms"] = 0.0;
         timings["prompt_ms"] = prompt_ms;
@@ -1250,71 +1817,86 @@ namespace albireo
         done["relay"] = true;
         // One line per answer, its provider, its model and its tokens, never its texts.
         log_info("relay: " + r.provider + " " + m.id + ", " + std::to_string(prompt_tokens) + " tokens read, "
-            + std::to_string(completion_tokens) + " written");
+            + std::to_string(completion_tokens) + " written"
+            + (web_searches > 0 ? ", " + std::to_string(web_searches) + " searches of the web" : std::string()));
         j->sink(ALBIREO_EVENT_DONE, done.dump());
         j->done = true;
+    }
+
+    std::string relay_service::base_of(const relay_settings& r, cancellable* control)
+    {
+        if (r.provider != "openai") return relay_base_url(r);
+        const std::string typed = openai_bases(r).front();
+        {
+            std::lock_guard<std::mutex> lock(bases_m_);
+            auto it = bases_.find(typed);
+            if (it != bases_.end() && (it->second.until == 0 || now_unix() < it->second.until)) return it->second.base;
+        }
+        std::string base;
+        const model_listing l = reach_interface(r, settings_().offline, 15, control, base);
+        if (l.status == 200 && l.listed) remember_base(typed, base, 0);
+        else if (l.status != 0) remember_base(typed, base, now_unix() + unlisted_seconds);
+        return base;
+    }
+
+    void relay_service::remember_base(const std::string& typed, const std::string& base, int64_t until)
+    {
+        std::lock_guard<std::mutex> lock(bases_m_);
+        if (bases_.size() >= max_bases && bases_.find(typed) == bases_.end()) bases_.clear();
+        known_base& k = bases_[typed];
+        k.base = base;
+        k.until = until;
     }
 
     json relay_service::test(const relay_settings& r)
     {
         json o = json::object();
         o["ok"] = false;
-        const relay_settings& t = r;
-        if (t.provider == "openai" && !valid_relay_url(t.url))
+        auto refuse = [&o](const std::string& error, const std::string& code) {
+            o["error"] = error;
+            if (!code.empty()) o["code"] = code;
+            return o;
+        };
+        const std::string auth = auth_of(r);
+        if (r.provider == "openai" && !valid_relay_url(r.url))
+            return refuse("the address is not valid: http:// or https:// followed by the base of the interface",
+                "relay_address");
+        if (auth == "basic" && r.secret.empty()) return refuse("the password is missing", "relay_password_missing");
+        if (auth != "none" && r.secret.empty()) return refuse("the key is missing", "relay_key_missing");
+        const bool offline = settings_().offline;
+        std::string why;
+        if (offline && !relay_offline_ready(r, why))
+            return refuse(why, r.provider == "openai" ? "relay_offline_remote" : "relay_offline");
+        std::string base;
+        const model_listing l = reach_interface(r, offline, 30, nullptr, base);
+        if (!l.error.empty()) return refuse(l.error, l.code);
+        if (l.status == 0)
         {
-            o["error"] = "the address is not valid: http:// or https:// followed by the base of the interface";
+            if (l.transfer == httplib::Error::Canceled)
+                return refuse("the request to the external engine was cancelled", "");
+            return refuse(transfer_error(l.transfer), transfer_code(l.transfer));
+        }
+        if (l.status != 200)
+        {
+            refuse(provider_error(l.status, l.body, r), status_code(l.status));
+            json args = json::object();
+            args["s"] = std::to_string(l.status);
+            o["args"] = args;
+            // The message of the engine, in its language, which the tray adds to its own.
+            const std::string message = provider_message(l.body, r);
+            if (!message.empty()) o["detail"] = message;
             return o;
         }
-        if (auth_of(t) != "none" && t.secret.empty())
+        if (!l.listed)
+            return refuse("the address answers, but not as an interface of OpenAI", "relay_not_interface");
+        if (r.provider == "openai")
         {
-            o["error"] = auth_of(t) == "basic" ? "the password is missing" : "the key is missing";
-            return o;
-        }
-        if (settings_().offline)
-        {
-            o["error"] = "offline mode: the relay sends nothing out of this computer";
-            return o;
-        }
-        url_parts u;
-        parse_url(relay_base_url(t) + "/models", u);
-        std::string error;
-        std::shared_ptr<httplib::Client> client = http_client(u.origin, 30, error);
-        if (!client)
-        {
-            o["error"] = error.empty() ? std::string("the external engine cannot be reached") : error;
-            return o;
-        }
-        http_registration registered(client);
-        httplib::Headers h = headers_of(t);
-        httplib::Result res;
-        try
-        {
-            res = client->Get(u.target, h);
-        }
-        catch (...)
-        {
-            o["error"] = "the request to the external engine was cancelled";
-            return o;
-        }
-        if (!res)
-        {
-            o["error"] = transfer_error(res.error());
-            return o;
-        }
-        if (res->status != 200)
-        {
-            o["error"] = provider_error(res->status, res->body, t);
-            return o;
-        }
-        const json answer = json::parse_or_null(res->body.substr(0, size_t(8) << 20));
-        json models = json::array();
-        for (const json& m : answer["data"].elements())
-        {
-            if (models.size() >= 500) break;
-            if (m["id"].is_string()) models.push_back(m["id"]);
+            remember_base(openai_bases(r).front(), base, 0);
+            // The base found when it differs from the address typed: with /v1, or without an operation.
+            if (base != relay_base_url(r)) o["url"] = base;
         }
         o["ok"] = true;
-        o["models"] = models;
+        o["models"] = l.models;
         return o;
     }
 

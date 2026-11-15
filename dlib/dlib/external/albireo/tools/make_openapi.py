@@ -47,16 +47,20 @@ generation_replies = dict(engine_replies, **{
 })
 # The chat completions, which the relay may also answer (albireo-relay), and its failures once it started.
 relay_replies = dict(generation_replies, **{
-    "400": reply("Invalid request; for albireo-relay, tools, sounds, several choices, or images that neither the "
-                 "external model nor a model of the computer can take (code image_input_not_supported)", ref("Error")),
-    "404": reply("Unknown or inactive model; for albireo-relay, a relay turned off or incomplete (code "
-                 "relay_unavailable)", ref("Error")),
+    "400": reply("Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the "
+                 "external model nor a model of the computer can take (code image_input_not_supported), or a search "
+                 "of the web asked of another provider than Claude (web_search_not_supported)", ref("Error")),
+    "403": reply("albireo-relay: a search of the web asked while the web access of the settings is off (code "
+                 "web_access_off)", ref("Error")),
+    "404": reply("Unknown or inactive model; for albireo-relay, a relay turned off, incomplete or out of reach of "
+                 "the offline mode (code relay_unavailable)", ref("Error")),
     "502": reply("albireo-relay, not streamed: the external engine refused the request (code relay_refused, its "
                  "reason without the key nor the address), failed (relay_failed) or could not be reached "
                  "(relay_unreachable)", ref("Error")),
 })
-relay_replies["503"] = reply(generation_replies["503"]["description"] + "; for albireo-relay, the offline mode (code "
-                             "offline), eight answers in progress (engine_busy), or Pseudalis away while the relay "
+relay_replies["503"] = reply(generation_replies["503"]["description"] + "; for albireo-relay, an engine found out of "
+                             "reach of the offline mode by the request itself, its name resolved (code offline), "
+                             "eight answers in progress (engine_busy), or Pseudalis away while the relay "
                              "pseudonymizes (pseudonymization_failed)", ref("Error"))
 admin = [{"adminToken": []}]
 offline_reply = {"409": reply("Refused in offline mode", {"type": "object", "properties": {
@@ -75,6 +79,11 @@ import_codes = ["import_path_relative", "import_path_network", "import_path_devi
                 "import_folder_insecure"]
 import_refusal = {"allOf": [ref("Refusal"), {"type": "object", "properties": {"code": {"type": "string",
                   "enum": import_codes}}}]}
+# Why Pseudalis is not reached (pseudalis_client::status() in host/pseudonyms.h), empty once it is found.
+pseudalis_code = {"type": "string", "enum": ["", "not_installed", "no_authority", "unprotected", "failed"],
+                  "description": "Why Pseudalis is not reached: not installed, its local authority missing, its "
+                                 "folder writable by another account than the administrators, or another failure "
+                                 "named by reason; empty once it is found."}
 
 schemas = {
     "Error": {"type": "object", "properties": {"error": {"type": "object", "properties": {
@@ -196,6 +205,10 @@ schemas = {
                                                 "For albireo-relay, the level of effort of the external model among "
                                                 "those it takes (efforts in /albireo/v1/relay), its own without "
                                                 "one."},
+            "web_search": {"type": "boolean", "description": "albireo-relay with Claude: the external model searches "
+                           "the web, five searches at most, which Anthropic bills; its queries come with the "
+                           "reasoning, its sources as links after the texts that cite them, and usage gives "
+                           "web_search_requests. The web access of the settings allows it."},
             "reasoning_budget": {"type": "integer", "minimum": -1, "nullable": True,
                                  "description": "The tokens the reasoning may take: beyond them, the engine ends it "
                                                 "with a sentence that asks the model to answer from what it has "
@@ -399,7 +412,8 @@ schemas = {
                      "description": "openai: an engine of the interface of OpenAI at url; ollama: the cloud of "
                                     "Ollama; claude: the interface of Anthropic."},
         "url": {"type": "string", "maxLength": 2048, "description": "openai: the base of its interface, http:// or "
-                "https://, without query, where /chat/completions and /models lie."},
+                "https://, without query, where /chat/completions and /models lie; without /v1, the relay adds it "
+                "when the models answer there only."},
         "model": {"type": "string", "maxLength": 256},
         "auth": {"type": "string", "enum": ["key", "basic", "none"], "default": "key",
                  "description": "openai: a bearer key, a user and a password, or none; the others take a key."},
@@ -411,7 +425,7 @@ schemas = {
                                   "relay_secret) otherwise."},
         "context": {"type": "integer", "minimum": 1024, "maximum": 16777216, "default": 131072,
                     "description": "openai: the context window of its model."},
-        "max_output": {"type": "integer", "minimum": 16, "maximum": 1048576, "default": 8192,
+        "max_output": {"type": "integer", "minimum": 16, "maximum": 1048576, "default": 16384,
                        "description": "openai: the tokens of an answer at most."},
         "images": {"type": "boolean", "default": False, "description": "openai: the model reads images."},
         "reasoning": {"type": "boolean", "default": False,
@@ -419,7 +433,10 @@ schemas = {
         "pseudonymize": {"type": "boolean", "default": False,
                          "description": "The texts leave through Pseudalis, the images described on the computer."},
         "tags": {"type": "boolean", "default": False,
-                 "description": "The values leave as their tags rather than as their substitutes alone."}}},
+                 "description": "The values leave as their tags rather than as their substitutes alone."},
+        "keep_substitutes": {"type": "boolean", "default": False,
+                             "description": "The answers keep the substitutes, without their values: a check of "
+                                            "what left the computer."}}},
     "RelayModel": {"type": "object", "properties": {
         "id": {"type": "string"}, "name": {"type": "string"}, "context": {"type": "integer"},
         "max_output": {"type": "integer"}, "images": {"type": "boolean"},
@@ -435,6 +452,13 @@ schemas = {
         "images": {"type": "boolean"}, "thinking": {"type": "string"},
         "efforts": {"type": "array", "items": {"type": "string"}}, "default_effort": {"type": "string"},
         "pseudonymize": {"type": "boolean"}, "tags": {"type": "boolean"},
+        "keep_substitutes": {"type": "boolean", "description": "With the pseudonymization, the answers keep the "
+                             "substitutes."},
+        "web": {"type": "boolean", "description": "The external model searches the web when a request asks for it "
+                "(web_search): Claude."},
+        "offline": {"type": "boolean", "description": "The offline mode, which keeps an engine of the interface of "
+                    "OpenAI on this computer or its local network alone: ready is false for the other providers and "
+                    "for a public address."},
         "scope": {"type": "string", "description": "A fingerprint of the provider, the address, the authentication "
                   "and the user of the relay, which changes with them without naming them."},
         "image_mode": {"type": "string", "enum": ["sent", "described", "none"],
@@ -443,6 +467,7 @@ schemas = {
         "pseudalis": {"type": "object", "description": "With the pseudonymization: whether Pseudalis answers, and "
                       "the values kept in memory.", "properties": {
                           "found": {"type": "boolean"}, "port": {"type": "integer"}, "reason": {"type": "string"},
+                          "code": pseudalis_code,
                           "memory": {"type": "object", "properties": {"texts": {"type": "integer"},
                               "values": {"type": "integer"}, "bytes": {"type": "integer"}}}}}}},
     "WebSearchRequest": {"type": "object", "required": ["query"], "properties": {
@@ -759,18 +784,31 @@ paths = {
             "pseudalis": {"type": "object", "description": "Whether Pseudalis answers on this computer, and the "
                           "values the relay keeps in memory.", "properties": {
                               "found": {"type": "boolean"}, "port": {"type": "integer"},
-                              "reason": {"type": "string"}, "memory": {"type": "object"}}}}})}}},
+                              "reason": {"type": "string"}, "code": pseudalis_code,
+                              "memory": {"type": "object"}}}}})}}},
     "/albireo/v1/relay/test": {"post": {
         "tags": ["Administration"], "summary": "Lists the models of a provider of the relay",
-        "description": "The settings given, over those saved, reach the models route of the provider; the masked "
-                       "secret stands for the stored one under the rule of the settings.",
+        "description": "The settings given, over those saved, reach the models route of the provider, for an "
+                       "engine of OpenAI at the address typed, then with /v1; the masked secret stands for the "
+                       "stored one under the rule of the settings.",
         "security": admin,
         "requestBody": json_body(ref("RelaySettings")),
         "responses": {"200": reply("Whether the provider answered", {"type": "object", "properties": {
             "ok": {"type": "boolean"}, "models": {"type": "array", "items": {"type": "string"}},
-            "error": {"type": "string"}}}), "400": reply("Invalid settings, or a masked secret given for another "
-                                                         "provider, address or user (code relay_secret)",
-                                                         ref("Error"))}}},
+            "url": {"type": "string", "description": "The base where the interface of an engine of OpenAI answers, "
+                    "when it differs from the address typed."},
+            "error": {"type": "string"},
+            "code": {"type": "string", "enum": ["relay_address", "relay_key_missing", "relay_password_missing",
+                                                "relay_offline", "relay_offline_remote", "relay_offline_unresolved",
+                                                "relay_unreachable", "relay_proxy", "relay_certificate",
+                                                "relay_no_answer", "relay_http_key", "relay_http_credit",
+                                                "relay_http_address", "relay_http_size", "relay_http_limit",
+                                                "relay_http_failing", "relay_http_refused", "relay_not_interface"],
+                     "description": "The failure, which the tray words in its language."},
+            "args": {"type": "object", "description": "s: the HTTP status of the engine."},
+            "detail": {"type": "string", "description": "The message of the engine with its status."}}}),
+            "400": reply("Invalid settings, or a masked secret given for another provider, address or user (code "
+                         "relay_secret)", ref("Error"))}}},
     "/albireo/v1/count": {"post": {
         "tags": ["Service"], "summary": "Tokens of messages, or of a text, for a model",
         "description": "For albireo-relay, an estimate (estimated: true) of the tokens of the external model: as the "

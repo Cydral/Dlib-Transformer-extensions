@@ -127,20 +127,10 @@ namespace albireo
         uint8_t* block_memory(int b) { return blocks_[static_cast<size_t>(b)].get(); }
         const uint8_t* block_memory(int b) const { return blocks_[static_cast<size_t>(b)].get(); }
 
-        size_t allocated_blocks() const
-        {
-            std::lock_guard<std::mutex> l(m_);
-            return blocks_.size() - vacant_.size();
-        }
         size_t used_blocks() const
         {
             std::lock_guard<std::mutex> l(m_);
             return blocks_.size() - free_.size() - vacant_.size();
-        }
-        size_t free_capacity_blocks() const
-        {
-            std::lock_guard<std::mutex> l(m_);
-            return free_.size() + vacant_.size() + (max_blocks_ - blocks_.size());
         }
 
         // Returns a block index, held once, or -1 when the budget is exhausted; throws

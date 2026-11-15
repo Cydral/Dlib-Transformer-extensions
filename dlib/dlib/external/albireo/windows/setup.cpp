@@ -18,6 +18,9 @@
                                             (/purge, accepted, is the default)
         albireo-setup /models-dir <folder>  moves the models folder (asked by the tray)
         albireo-setup /service start|stop|restart
+                                            the service started with its start with Windows
+                                            turned on, or stopped with it turned off, as the
+                                            menu of the icon asks
         albireo-setup /lang <code>          language of the wizard: en, fr, de, it, es
 
     The programs travel inside this program as a ZIP payload (a resource); the copy left
@@ -1346,9 +1349,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     const std::wstring svc = arg_after(args, L"/service");
     if (!svc.empty())
     {
+        /*
+            A service stopped from the icon stays stopped, after a restart of Windows too,
+            until the icon starts it, which gives it its automatic start again.  A service
+            that an administrator disabled stays disabled when it stops.
+        */
         bool ok = true;
-        if (svc == L"stop" || svc == L"restart") ok = setup::stop_service(60000, error);
-        if (svc == L"start" || svc == L"restart") ok = setup::start_service(error) && ok;
+        auto step = [&](bool done) {
+            if (!done) setup::log("service " + narrow(svc) + ": " + error);
+            ok = ok && done;
+        };
+        if (svc == L"stop" && !setup::service_disabled()) step(setup::set_service_start(false, error));
+        if (svc == L"stop" || svc == L"restart") step(setup::stop_service(60000, error));
+        if (svc == L"start" || svc == L"restart")
+        {
+            step(setup::set_service_start(true, error));
+            step(setup::start_service(error));
+        }
         return ok ? 0 : 1;
     }
 

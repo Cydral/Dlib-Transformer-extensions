@@ -40,7 +40,8 @@ namespace albireo
                 computer staying in place for the others.
 
                 provider is "openai", an engine of the interface of OpenAI at url (its base,
-                "https://host/v1", where /chat/completions and /models lie), "ollama", the
+                "https://host/v1", where /chat/completions and /models lie, or the same without
+                /v1, which relay.cpp then adds), "ollama", the
                 cloud of Ollama, or "claude", the interface of Anthropic: the last two have their
                 address and their models in relay.cpp.  auth is "key" (a bearer key, the only
                 one of the last two), "basic" (user and secret) or "none".  context, max_output,
@@ -49,7 +50,9 @@ namespace albireo
 
                 pseudonymize sends the texts through Pseudalis, the anonymization service of
                 the computer, before they leave (pseudonyms.h), with the tags of its values
-                when tags is true and their substitutes alone otherwise.
+                when tags is true and their substitutes alone otherwise.  keep_substitutes
+                leaves the substitutes in the answers, without their values: a check of what
+                left the computer.
         !*/
         bool enabled = false;
         std::string provider = "openai";        // openai, ollama or claude
@@ -59,11 +62,12 @@ namespace albireo
         std::string user;                       // basic
         std::string secret;                     // the key or the password, kept in relay.secret
         long context = 131072;                  // openai: the context window of the model
-        long max_output = 8192;                 // openai: the tokens of an answer at most
+        long max_output = 16384;                // openai: the tokens of an answer at most
         bool images = false;                    // openai: the model reads images
         bool reasoning = false;                 // openai: the model takes reasoning_effort
         bool pseudonymize = false;
         bool tags = false;
+        bool keep_substitutes = false;          // the answers keep the substitutes, a check
 
         // What the secret was given for: a secret never goes to another provider, address or user.
         std::string secret_scope() const;
@@ -153,11 +157,13 @@ namespace albireo
                 lacks, or another provider of the search, is written again at the start
                 without them, and web_search.secret, the key of a search provider of those
                 versions, is deleted.  The file carries the version of its document,
-                settings_version, 2 since Albireo 1.0.21: a document without it, written
-                before, reads the graph of OpenVINO "auto", the default of its version, as
-                "off", the default since then, unless its accelerator is "cpu", the graph on
-                the processor, and is written again with its version.  A document of a
-                later version keeps its version when this one writes it.
+                settings_version, 3 since Albireo 1.0.23: a document without it, written
+                before 1.0.21, reads the graph of OpenVINO "auto", the default of its version,
+                as "off", the default since then, unless its accelerator is "cpu", the graph on
+                the processor; a document before version 3 reads the 8192 tokens of an answer
+                of the relay, the default of 1.0.22, as 16384, the default since then.  Both
+                are written again with their version.  A document of a later version keeps
+                its version when this one writes it.
         !*/
     public:
         explicit settings_store(const std::string& path);

@@ -71,9 +71,10 @@ namespace albireo
 
         /*
             The version of the documents settings.json that write() gives them: 2 since Albireo 1.0.21,
-            whose graph of OpenVINO is off by default.  A document without it is of version 1.
+            whose graph of OpenVINO is off by default, 3 since Albireo 1.0.23, whose relay gives 16384
+            tokens to an answer by default.  A document without it is of version 1.
         */
-        const long long settings_version = 2;
+        const long long settings_version = 3;
 
         /*
             Whether a document of the settings holds a setting this version lacks, or another provider of the
@@ -96,8 +97,10 @@ namespace albireo
                 The default auto of the graph of OpenVINO, which the versions before 1.0.21 wrote, gives
                 way to off, unless the accelerator cpu, the graph on the processor, was chosen.
             */
-            if (j["settings_version"].as_int(1) < settings_version && s.graph == "auto" && s.accelerator != "cpu")
-                s.graph = host_settings().graph;
+            const long long version = j["settings_version"].as_int(1);
+            if (version < 2 && s.graph == "auto" && s.accelerator != "cpu") s.graph = host_settings().graph;
+            // The 8192 tokens of an answer of the relay, the default of 1.0.22, give way to the default since.
+            if (version < 3 && s.relay.max_output == 8192) s.relay.max_output = relay_settings().max_output;
         }
 
         // The text of a secret file without the ends of line and the spaces that follow it.
@@ -164,6 +167,7 @@ namespace albireo
         j["reasoning"] = reasoning;
         j["pseudonymize"] = pseudonymize;
         j["tags"] = tags;
+        j["keep_substitutes"] = keep_substitutes;
         return j;
     }
 
@@ -185,6 +189,7 @@ namespace albireo
         reasoning = j["reasoning"].as_bool(d.reasoning);
         pseudonymize = j["pseudonymize"].as_bool(d.pseudonymize);
         tags = j["tags"].as_bool(d.tags);
+        keep_substitutes = j["keep_substitutes"].as_bool(d.keep_substitutes);
     }
 
     json host_settings::to_json() const

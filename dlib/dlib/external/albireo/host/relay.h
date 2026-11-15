@@ -88,6 +88,18 @@ namespace albireo
     !*/
     bool relay_ready(const relay_settings& r, std::string& why);
 
+    /*!
+        ensures
+            - Returns true when the relay of r can answer in the offline mode, which keeps this
+              computer and its local network alone within reach: an "openai" engine whose
+              address is "localhost" or a name under .localhost, reached at 127.0.0.1, an IP
+              address of the local network (loopback, private or link-local), or a name of the
+              network, which each request resolves, refuses when one of its addresses lies
+              elsewhere, and reaches at an address it checked.  The providers "ollama" and
+              "claude" need the Internet.  Otherwise why tells it.
+    !*/
+    bool relay_offline_ready(const relay_settings& r, std::string& why);
+
     // {"providers": [{"id", "name", "url", "auths", "models": [...]}]}: what the tray offers.
     json relay_catalog();
 
@@ -105,8 +117,11 @@ namespace albireo
                 requests alone, and never in a log, an answer or an error.
 
                 The requests follow the proxy and the cancellation of the downloads
-                (http_fetch.h): the offline mode, which the relay then refuses, and the stop of
-                the service end them.
+                (http_fetch.h), and the stop of the service ends them.  In the offline mode,
+                which cancels the downloads, the relay reaches an "openai" engine of this
+                computer or of its local network alone, directly, without the proxy: each
+                address of its name is checked before any connection, which goes to one of
+                them (relay_offline_ready()).
         !*/
     public:
         typedef std::function<void(int kind, const std::string& data)> sink_type;
@@ -134,8 +149,9 @@ namespace albireo
                   pseudonymization; the answers of Claude take 64000 tokens at most when the
                   request gives no bound.
                 - Returns false, with error, the HTTP status and the code of the refusal, when
-                  the relay refuses the request at once: turned off or incomplete, offline,
-                  too many answers in progress, tools, or several choices.
+                  the relay refuses the request at once: turned off or incomplete, an engine
+                  out of reach of the offline mode, too many answers in progress, tools, or
+                  several choices.
         !*/
         bool submit(const json& request, sink_type sink, uint64_t& id, std::string& error, int& status,
             std::string& code);
@@ -149,9 +165,13 @@ namespace albireo
         /*!
             ensures
                 - Asks the external engine of r for its models, which tells whether its address
-                  and its secret are right: {"ok", "models": [...]} or {"ok": false, "error"}.
-                  The settings of r stand as they are, the mask of the secret excepted, which
-                  the caller replaces by the stored secret.
+                  and its secret are right: {"ok", "models": [...]}, with "url" when the
+                  interface of an "openai" engine answers at another base than the address
+                  typed (with /v1, or without the path of an operation), or {"ok": false,
+                  "error", "code"}, the code naming the failure for the tray ("relay_address",
+                  "relay_http_key", ...), with "args": {"s": status} and "detail", the message
+                  of the engine, for an HTTP status.  The settings of r stand as they are, the
+                  mask of the secret excepted, which the caller replaces by the stored secret.
         !*/
         json test(const relay_settings& r);
 
@@ -166,6 +186,16 @@ namespace albireo
     private:
         struct job;
         void run(const std::shared_ptr<job>& j);
+        /*
+            The base of the interface of the provider of r: for "openai", the address typed, or
+            the same with /v1 when only there a list of models answers, found once per address
+            and kept; an engine that answers without listing its models is asked again after
+            unlisted_seconds, one out of reach at the next request.  The connection of the
+            search is held by control.
+        */
+        std::string base_of(const relay_settings& r, cancellable* control);
+        // Keeps base for the address typed, until the time until (Unix seconds), 0 for as long as the service runs.
+        void remember_base(const std::string& typed, const std::string& base, int64_t until);
         // Joins the threads of the answers that ended; jobs_m_ is held.
         void reap();
 
@@ -178,6 +208,17 @@ namespace albireo
         std::list<std::shared_ptr<job>> jobs_;
         uint64_t next_id_ = 1;
         bool stopped_ = false;
+
+        // The bases found for the addresses of "openai" engines, max_bases at most, with the end of their use.
+        struct known_base
+        {
+            std::string base;
+            int64_t until = 0;
+        };
+        std::mutex bases_m_;
+        std::map<std::string, known_base> bases_;
+        static const size_t max_bases = 32;
+        static const int unlisted_seconds = 600;
 
         // The descriptions of the images by the SHA-256 of their data URL, max_descriptions at most.
         std::mutex descriptions_m_;
@@ -192,6 +233,14 @@ namespace albireo
               where a test server answers as the provider; an empty origin gives them their address back.
     !*/
     void relay_origin_for_tests(const std::string& provider, const std::string& origin);
+
+    /*!
+        Reserved for the tests (tests/test_host.cpp).  No setting and no route reaches it.
+        ensures
+            - The offline mode resolves name, in lowercase, to addresses rather than through the
+              resolver of the system; empty addresses give the name back to the resolver.
+    !*/
+    void relay_name_for_tests(const std::string& name, const std::vector<std::string>& addresses);
 
 }
 

@@ -77,6 +77,11 @@ namespace albireo
         */
         bool explicit_mask = false;
         /*
+            The other devices compute in single precision rather than in half precision, their
+            default: slower, for the tests that look for what half precision changes.
+        */
+        bool single_precision = false;
+        /*
             A folder where the graph is written once built and read back with its weights mapped
             from their file, which the runtime deletes when it no longer needs it (at once on
             Linux, when the model leaves on Windows), or when the graph fails.  The plugins copy the

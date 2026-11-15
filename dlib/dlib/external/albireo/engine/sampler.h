@@ -66,9 +66,6 @@ namespace albireo
         // Records a token of the sequence (generated or prompt) for the penalties.
         void accept(int token);
 
-        // Probability of the token last returned by sample(), for log probabilities.
-        float last_probability() const { return last_p_; }
-
         const sampling_params& params() const { return p_; }
 
     private:
@@ -78,7 +75,6 @@ namespace albireo
         // The times each token of the history occurs, kept as it grows when the penalties read all of it.
         std::unordered_map<int, int> counts_;
         std::vector<std::pair<float, int>> candidates_;
-        float last_p_ = 1.0f;
     };
 
 }

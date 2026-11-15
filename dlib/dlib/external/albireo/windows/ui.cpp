@@ -299,6 +299,22 @@ namespace ui
         return c;
     }
 
+    HWND icon(HWND parent, int resource, int size, int id)
+    {
+        HWND c = create(parent, L"STATIC", L"", SS_ICON | SS_CENTERIMAGE, id);
+        set_icon(c, resource, size);
+        return c;
+    }
+
+    void set_icon(HWND c, int resource, int size)
+    {
+        // The control frees no icon of its own: each one it held goes here.
+        HICON h = size > 0 ? static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(resource),
+            IMAGE_ICON, size, size, LR_DEFAULTCOLOR)) : nullptr;
+        HICON old = reinterpret_cast<HICON>(SendMessageW(c, STM_SETICON, reinterpret_cast<WPARAM>(h), 0));
+        if (old) DestroyIcon(old);
+    }
+
     HWND progress(HWND parent, int id)
     {
         HWND c = create(parent, PROGRESS_CLASSW, L"", PBS_SMOOTH, id);

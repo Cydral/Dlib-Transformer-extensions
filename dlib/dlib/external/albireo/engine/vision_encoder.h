@@ -109,7 +109,6 @@ namespace albireo
         long factor() const { return patch_ * merge_; }
         // Pixels per side of a view (LLaVA-NeXT), the longest edge of an image (Pixtral).
         long image_size() const { return image_size_; }
-        long output_dim() const { return out_dim_; }
         long deepstack_count() const { return static_cast<long>(deepstack_.size()); }
         long output_width() const { return out_dim_ * (1 + deepstack_count()); }
         size_t weight_bytes() const { return weight_bytes_; }
@@ -154,8 +153,6 @@ namespace albireo
             !*/
         public:
             long tokens() const { return tokens_; }
-            long grid_width() const { return grid_w_; }     // merged tokens per row
-            long grid_height() const { return grid_h_; }
             bool done() const { return done_; }
             // tokens() rows of output_width() floats, once done.
             const std::vector<float>& output() const { return out_; }

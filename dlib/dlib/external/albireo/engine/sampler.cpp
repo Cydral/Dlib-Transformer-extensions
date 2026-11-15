@@ -101,7 +101,6 @@ namespace albireo
                     best = v;
                 }
             }
-            last_p_ = 1.0f;
             return static_cast<int>(best);
         }
 
@@ -143,7 +142,6 @@ namespace albireo
             if (candidates_.empty())
             {
                 // Every logit is NaN.
-                last_p_ = 1.0f;
                 return 0;
             }
             std::sort(candidates_.begin(), candidates_.end(),
@@ -186,8 +184,6 @@ namespace albireo
         }
         double total = 0;
         for (size_t i = 0; i < keep; ++i) total += candidates_[i].first;
-        // The mass of the candidates, which gives the probability of the token drawn.
-        const double mass = total;
         // The candidate a draw leaves out: the draft refused, none otherwise.
         size_t excluded = keep;
         if (draft >= 0)
@@ -201,18 +197,10 @@ namespace albireo
                     break;
                 }
             std::uniform_real_distribution<double> accept(0.0, total);
-            if (accept(rng_) < p)
-            {
-                last_p_ = static_cast<float>(p / mass);
-                return draft;
-            }
+            if (accept(rng_) < p) return draft;
             // The other candidates share the mass; a draft that held all of it was kept above.
             if (excluded < keep) total -= p;
-            if (!(total > 0))
-            {
-                last_p_ = static_cast<float>(p / mass);
-                return draft;
-            }
+            if (!(total > 0)) return draft;
         }
         std::uniform_real_distribution<double> uni(0.0, total);
         const double r = uni(rng_);
@@ -223,18 +211,9 @@ namespace albireo
             if (i == excluded) continue;
             last = i;
             acc += candidates_[i].first;
-            if (r < acc)
-            {
-                last_p_ = static_cast<float>(candidates_[i].first / mass);
-                return candidates_[i].second;
-            }
+            if (r < acc) return candidates_[i].second;
         }
-        if (last == keep)
-        {
-            last_p_ = 1.0f;
-            return draft;
-        }
-        last_p_ = static_cast<float>(candidates_[last].first / mass);
+        if (last == keep) return draft;
         return candidates_[last].second;
     }
 

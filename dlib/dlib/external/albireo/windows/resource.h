@@ -10,6 +10,7 @@
 #define IDI_TRAY_BUSY 102
 #define IDI_TRAY_OFF 103
 #define IDI_TRAY_UPDATE 104
+#define IDI_PSEUDALIS 105
 
 #define IDB_ABOUT 201
 #define IDB_SIDE 202

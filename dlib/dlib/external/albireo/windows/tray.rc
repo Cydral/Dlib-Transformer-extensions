@@ -16,6 +16,7 @@ IDI_TRAY ICON "../resources/tray.ico"
 IDI_TRAY_BUSY ICON "../resources/tray-busy.ico"
 IDI_TRAY_OFF ICON "../resources/tray-off.ico"
 IDI_TRAY_UPDATE ICON "../resources/tray-update.ico"
+IDI_PSEUDALIS ICON "../../pseudalis/resources/pseudalis.ico"
 IDB_ABOUT RCDATA "../resources/about.png"
 IDB_MARK RCDATA "../resources/mark.png"
 

@@ -13,8 +13,9 @@
     The icon follows the service: its state (running, generating, stopped, update ready),
     its tooltip (model, engine, speed), and the notifications of the updates and of the
     downloads.  Its menu opens the web application, the windows of the models, of this
-    computer and the About window, chooses the accelerator, checks for updates and
-    restarts Albireo.
+    computer and the About window, chooses the accelerator, checks for updates and manages
+    the service: restarts it, stops it, which turns its start with Windows off until the
+    icon starts it again, and starts it, which turns that start back on.
 
     While the service does not answer, the icon asks the service manager of Windows what
     the service does.  A service that starts (the delayed start after the system starts,
@@ -61,7 +62,8 @@ namespace albireo
         enum command_id
         {
             CMD_OPEN = 100, CMD_MODELS, CMD_HOST, CMD_ACCEL_AUTO, CMD_ACCEL_NONE, CMD_MEASURE, CMD_CHECK_UPDATES,
-            CMD_INSTALL_UPDATE, CMD_RESTART, CMD_START_SERVICE, CMD_DOCS, CMD_ABOUT, CMD_QUIT, CMD_ACCEL_CHOICE = 300
+            CMD_INSTALL_UPDATE, CMD_RESTART, CMD_START_SERVICE, CMD_STOP_SERVICE, CMD_DOCS, CMD_ABOUT, CMD_QUIT,
+            CMD_ACCEL_CHOICE = 300
         };
 
         enum action_tag { ACT_SETTINGS = 1, ACT_MEASURE, ACT_CHECK, ACT_APPLY_UPDATE, ACT_RESTART };
@@ -148,7 +150,10 @@ namespace albireo
                     std::vector<unsigned char> buf(size);
                     QUERY_SERVICE_CONFIGW* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
                     if (QueryServiceConfigW(svc, config, size, &size))
+                    {
                         out["auto"] = config->dwStartType == SERVICE_AUTO_START;
+                        out["disabled"] = config->dwStartType == SERVICE_DISABLED;
+                    }
                 }
                 CloseServiceHandle(svc);
             }
@@ -375,12 +380,17 @@ namespace albireo
                 }
                 else if (st == "stopped")
                 {
-                    // Before its delayed start, a service that starts with the system is
-                    // stopped: the icon, started at sign in, waits for it.
+                    /*
+                        Before its delayed start, a service that starts with the system is
+                        stopped: the icon, started at sign in, waits for it.  A service stopped
+                        from the icon, which no longer starts with the system, stays stopped
+                        without a warning until the icon starts it.
+                    */
+                    const bool manual = scm.contains("auto") && !scm["auto"].as_bool(false);
                     starting = scm["auto"].as_bool(false) && !tray.seen_online && now < 15 * minute;
                     grace = starting ? 15 * minute : minute;
-                    warning = "notify_service_stopped";
-                    tip = "tip_stopped";
+                    warning = manual ? nullptr : "notify_service_stopped";
+                    tip = manual ? "tip_stopped_manual" : "tip_stopped";
                 }
                 else if (!tray.seen_online)
                 {
@@ -389,7 +399,7 @@ namespace albireo
                 }
                 const bool waiting = starting && silent < grace;
                 if (waiting) tip = "tip_starting";
-                if (!tray.warned && silent >= grace)
+                if (warning && !tray.warned && silent >= grace)
                 {
                     tray.warned = true;
                     notify(L"Albireo", tr(warning));
@@ -665,6 +675,41 @@ namespace albireo
             return acc;
         }
 
+        /*
+            The submenu of the service: its start with Windows, as the service manager gives it,
+            then Restart while the service answers, Stop while it runs and Start while it is
+            stopped.  Stop and Start go through the installer with the rights of an
+            administrator, which Windows asks for.
+        */
+        HMENU service_menu(bool on)
+        {
+            HMENU svc = CreatePopupMenu();
+            const json scm = service_manager_state();
+            const std::string state = scm["state"].as_string();
+            if (scm.contains("auto"))
+            {
+                const char* start = scm["auto"].as_bool(false) ? "tray_service_auto"
+                    : scm["disabled"].as_bool(false) ? "tray_service_disabled" : "tray_service_manual";
+                AppendMenuW(svc, MF_STRING | MF_GRAYED, 0, tr(start).c_str());
+                AppendMenuW(svc, MF_SEPARATOR, 0, nullptr);
+            }
+            const bool known = state != "missing";
+            const bool stopped = state == "stopped";
+            AppendMenuW(svc, MF_STRING | (on ? 0 : MF_GRAYED), CMD_RESTART, tr("tray_restart").c_str());
+            AppendMenuW(svc, MF_STRING | (known && !stopped ? 0 : MF_GRAYED), CMD_STOP_SERVICE,
+                tr("tray_stop_service").c_str());
+            AppendMenuW(svc, MF_STRING | (stopped ? 0 : MF_GRAYED), CMD_START_SERVICE,
+                tr("tray_start_service").c_str());
+            return svc;
+        }
+
+        // Starts or stops the service through the installer, with the rights of an administrator.
+        void run_service_command(const wchar_t* args)
+        {
+            const std::wstring setup = widen(join_path(executable_dir(), "albireo-setup.exe"));
+            ShellExecuteW(nullptr, L"runas", setup.c_str(), args, nullptr, SW_HIDE);
+        }
+
         void show_menu()
         {
             // A second message of the same click finds the menu shown and leaves it alone.
@@ -696,8 +741,7 @@ namespace albireo
             if (on && up["state"].as_string() == "ready")
                 AppendMenuW(m, MF_STRING, CMD_INSTALL_UPDATE,
                     tr("tray_install_update", { { "v", up["latest"].as_string() } }).c_str());
-            if (on) AppendMenuW(m, MF_STRING, CMD_RESTART, tr("tray_restart").c_str());
-            else AppendMenuW(m, MF_STRING, CMD_START_SERVICE, tr("tray_start_service").c_str());
+            AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(service_menu(on)), tr("tray_service").c_str());
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_DOCS, tr("tray_docs").c_str());
             AppendMenuW(m, MF_STRING, CMD_ABOUT, tr("tray_about").c_str());
@@ -734,12 +778,12 @@ namespace albireo
             case CMD_CHECK_UPDATES: post_action("/albireo/v1/updates/check", ACT_CHECK, 30); break;
             case CMD_INSTALL_UPDATE: post_action("/albireo/v1/updates/apply", ACT_APPLY_UPDATE, 30); break;
             case CMD_RESTART: post_action("/albireo/v1/restart", ACT_RESTART, 30); break;
-            case CMD_START_SERVICE:
-            {
-                const std::wstring setup = widen(join_path(executable_dir(), "albireo-setup.exe"));
-                ShellExecuteW(nullptr, L"runas", setup.c_str(), L"/service start", nullptr, SW_HIDE);
+            case CMD_START_SERVICE: run_service_command(L"/service start"); break;
+            case CMD_STOP_SERVICE:
+                // A stop holds until the icon starts the service again: the answers in progress end.
+                if (ui::message(tray.hwnd, tr("tray_stop_confirm"), MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    run_service_command(L"/service stop");
                 break;
-            }
             case CMD_DOCS: ui::open_url(widen(tray.client.base_url() + "docs/")); break;
             case CMD_ABOUT: show_about_window(tray.client); break;
             case CMD_QUIT: DestroyWindow(tray.hwnd); break;

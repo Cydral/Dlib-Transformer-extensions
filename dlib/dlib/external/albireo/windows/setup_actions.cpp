@@ -723,6 +723,28 @@ namespace setup
         return true;
     }
 
+    bool set_service_start(bool automatic, std::string& error)
+    {
+        service_handles h;
+        if (!open_service(h, SERVICE_CHANGE_CONFIG))
+        {
+            error = last_error("cannot open the service");
+            return false;
+        }
+        if (!ChangeServiceConfigW(h.svc, SERVICE_NO_CHANGE, automatic ? SERVICE_AUTO_START : SERVICE_DEMAND_START,
+                SERVICE_NO_CHANGE, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr))
+        {
+            error = last_error("cannot change the start of the service");
+            return false;
+        }
+        if (automatic)
+        {
+            SERVICE_DELAYED_AUTO_START_INFO delayed = { TRUE };
+            ChangeServiceConfig2W(h.svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
+        }
+        return true;
+    }
+
     bool register_service(const std::string& program_dir, bool keep_start_type, std::string& error)
     {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);

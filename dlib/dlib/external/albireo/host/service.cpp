@@ -825,8 +825,12 @@ namespace albireo
         {
             std::lock_guard<std::mutex> lock(server_m_);
             if (stopping_) return;
-            if (s.offline) http_cancel_all(offline_reason);
-            else http_restore();
+            /*
+                The downloads are cancelled when the offline mode starts; another save of the
+                settings leaves the requests of the offline mode, the relay and Pseudalis, going.
+            */
+            if (s.offline && !http_cancelled()) http_cancel_all(offline_reason);
+            else if (!s.offline) http_restore();
         }
         // The background tasks start or end their network work at once.
         cv_.notify_all();
@@ -2275,6 +2279,14 @@ namespace albireo
     {
         const host_settings st = settings_->get();
         json r = relay_description(st.relay);
+        // The offline mode keeps the engines of this computer and of its local network alone.
+        std::string why;
+        r["offline"] = st.offline;
+        if (st.offline && r["ready"].as_bool(false) && !relay_offline_ready(st.relay, why))
+        {
+            r["ready"] = false;
+            r["reason"] = why;
+        }
         relay_model m;
         const bool known = relay_model_of(st.relay, m);
         std::string mode = "none";
@@ -2282,6 +2294,8 @@ namespace albireo
         else if (r["enabled"].as_bool(false) && !image_model().empty()) mode = "described";
         r["image_mode"] = mode;
         r["images"] = mode != "none";
+        // Claude searches the web itself when a request asks for it (web_search), the web access allowing it.
+        r["web"] = st.relay.provider == "claude";
         if (st.relay.enabled && st.relay.pseudonymize && relay_) r["pseudalis"] = relay_->pseudonymization_status();
         return r;
     }

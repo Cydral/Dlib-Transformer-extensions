@@ -145,6 +145,12 @@ namespace setup
     bool stop_service(unsigned timeout_ms, std::string& error);
     bool start_service(std::string& error);
     /*
+        The start of the service with Windows: automatic, delayed after the start of the
+        system as the installer registers it, or manual, a service stopped from the icon of
+        the tray staying stopped until it is started from there again.
+    */
+    bool set_service_start(bool automatic, std::string& error);
+    /*
         Waits until the service runs and its process listens on the port of settings.json,
         which the service rewrites when it falls back on its last port; without the table
         of the sockets, a connection to the port serves.  A service that stops without an

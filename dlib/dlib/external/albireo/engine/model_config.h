@@ -137,7 +137,6 @@ namespace albireo
         bool is_embedding() const { return pooling != 0; }
         long kv_dim() const { return n_kv_heads * head_dim; }
         long q_dim() const { return n_heads * head_dim; }
-        long v_dim() const { return n_kv_heads * head_dim_v; }
     };
 
     // Reads the configuration of a model, or throws with the reason it cannot be served.

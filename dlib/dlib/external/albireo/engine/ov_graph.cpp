@@ -914,6 +914,7 @@ namespace albireo
                         which the cuts and the copies of the sequences use.
                     */
                     properties[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+                    if (settings_.single_precision) properties[ov::hint::inference_precision.name()] = ov::element::f32;
                 }
                 if (!settings_.weights_dir.empty()) model = spill(model);
                 compiled_ = core_.compile_model(model, settings_.device, properties);
@@ -1090,6 +1091,7 @@ namespace albireo
                   << (constant_bytes_ >> 20) << " MB of weights";
                 if (!bin_.path.empty()) o << ", weights mapped from their file";
                 if (cpu_ && fused_attention_ == 0) o << ", attention not fused";
+                if (!cpu_ && settings_.single_precision) o << ", computing in single precision";
                 o << "), " << describe(cfg_);
                 return o.str();
             }

@@ -20,6 +20,8 @@ target_compile_options(albireo-tray PRIVATE ${ALBIREO_WARNINGS})
 # The images the resources embed: the Makefile and Ninja generators follow only the files they include.
 set(tray_images about.png mark.png albireo.ico tray.ico tray-busy.ico tray-off.ico tray-update.ico)
 list(TRANSFORM tray_images PREPEND ${ALBIREO_SOURCE_DIR}/resources/)
+# The icon of Pseudalis, which the page of the relay shows beside its state.
+list(APPEND tray_images ${ALBIREO_SOURCE_DIR}/../pseudalis/resources/pseudalis.ico)
 set_source_files_properties(tray.rc PROPERTIES OBJECT_DEPENDS "${tray_images}")
 
 set(ALBIREO_WINDOWS_DIR ${CMAKE_CURRENT_SOURCE_DIR})
