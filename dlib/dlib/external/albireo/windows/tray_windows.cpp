@@ -576,11 +576,39 @@ namespace albireo
         enum
         {
             IDC_INTRO = 1000, IDC_SPACE, IDC_LIST, IDC_DETAILS, IDC_PROGRESS, IDC_STATUS, IDC_DOWNLOAD, IDC_ACTIVATE,
-            IDC_DEACTIVATE, IDC_VERIFY, IDC_DELETE, IDC_IMPORT, IDC_REFRESH, IDC_CLOSE,
+            IDC_DEACTIVATE, IDC_VERIFY, IDC_DELETE, IDC_IMPORT, IDC_REFRESH, IDC_CLOSE, IDC_TABS,
             IDM_ROLE_GENERAL = 1100, IDM_ROLE_CODE, IDM_ROLE_SECURITY, IDM_ROLE_EMBEDDING, IDM_IMPORT_FILES,
-            IDM_IMPORT_FOLDER
+            IDM_IMPORT_FOLDER,
+            IDC_R_INTRO = 1200, IDC_R_ENABLED, IDC_R_PROVIDER_LABEL, IDC_R_PROVIDER, IDC_R_URL_LABEL, IDC_R_URL,
+            IDC_R_AUTH_LABEL, IDC_R_AUTH, IDC_R_USER_LABEL, IDC_R_USER, IDC_R_SECRET_LABEL, IDC_R_SECRET,
+            IDC_R_MODEL_LABEL, IDC_R_MODEL_LIST, IDC_R_MODEL_EDIT, IDC_R_TRAITS, IDC_R_CONTEXT_LABEL, IDC_R_CONTEXT,
+            IDC_R_OUTPUT_LABEL, IDC_R_OUTPUT, IDC_R_IMAGES, IDC_R_REASONING, IDC_R_PRIVACY, IDC_R_PSEUDONYMIZE,
+            IDC_R_TAGS, IDC_R_PSEUDALIS, IDC_R_TEST, IDC_R_SAVE, IDC_R_STATUS
         };
-        enum { R_LIST = 1, R_ACTION, R_VERIFY, R_IMPORT, R_UPLOAD_DONE, R_CATALOG };
+        enum
+        {
+            R_LIST = 1, R_ACTION, R_VERIFY, R_IMPORT, R_UPLOAD_DONE, R_CATALOG, R_RELAY, R_RELAY_TEST, R_RELAY_SAVE
+        };
+
+        // The providers of the relay and its authentications, in the order of their lists.
+        const char* const relay_providers[3] = { "openai", "ollama", "claude" };
+        const char* const relay_auths[3] = { "key", "basic", "none" };
+
+        // The text of an edit field without the spaces around it, in UTF-8.
+        std::string field_text(HWND control)
+        {
+            std::string t = narrow(ui::text_of(control));
+            const size_t b = t.find_first_not_of(" \t");
+            if (b == std::string::npos) return std::string();
+            return t.substr(b, t.find_last_not_of(" \t") - b + 1);
+        }
+
+        // The index of the selection of a list, 0 when none is selected.
+        int selection(HWND combo)
+        {
+            const LRESULT i = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+            return i == CB_ERR ? 0 : static_cast<int>(i);
+        }
 
         class models_window : public tool_window
         {
@@ -597,11 +625,35 @@ namespace albireo
             // Whether the columns took the widths of their texts, and the width the texts of the last column need.
             bool fitted = false;
             int last_fit = 0;
+            /*
+                The tabs: the models of this computer (page 0) and the relay to an external engine
+                (page 1).  The bar of progress shows on the first page, while a download or an
+                import wants it.
+            */
+            HWND tabs = nullptr;
+            int page = 0;
+            bool progress_wanted = false;
+            struct relay_page
+            {
+                HWND intro = nullptr, enabled = nullptr, provider_label = nullptr, provider = nullptr;
+                HWND url_label = nullptr, url = nullptr, auth_label = nullptr, auth = nullptr, user_label = nullptr;
+                HWND user = nullptr, secret_label = nullptr, secret = nullptr, model_label = nullptr;
+                HWND model_list = nullptr, model_edit = nullptr, traits = nullptr, context_label = nullptr;
+                HWND context = nullptr, output_label = nullptr, output = nullptr, images = nullptr;
+                HWND reasoning = nullptr, privacy = nullptr, pseudonymize = nullptr, tags = nullptr;
+                HWND pseudalis = nullptr, test = nullptr, save = nullptr, status = nullptr;
+            } relay;
+            // The providers and their models, the state of Pseudalis, and the relay of the settings.
+            json relay_info, relay_saved;
+            // The models of the list of the relay, in its order.
+            std::vector<std::string> relay_models;
+            bool relay_busy = false;
 
-            models_window() { min_size = SIZE{ 760, 520 }; }
+            models_window() { min_size = SIZE{ 760, 600 }; }
 
             void build() override
             {
+                tabs = add(ui::tabs(hwnd, IDC_TABS, { tr("tab_models"), tr("tab_relay") }));
                 intro = add(ui::label(hwnd, tr("models_intro"), IDC_INTRO, SS_LEFT), ui::font_kind::normal);
                 space = add(ui::label(hwnd, L"", IDC_SPACE, SS_RIGHT), ui::font_kind::note);
                 list = add(ui::listview(hwnd, IDC_LIST));
@@ -632,21 +684,404 @@ namespace albireo
                 import = add(ui::button(hwnd, tr("btn_import"), IDC_IMPORT));
                 refresh = add(ui::button(hwnd, tr("btn_refresh"), IDC_REFRESH));
                 close = add(ui::button(hwnd, tr("btn_close"), IDC_CLOSE));
-                ShowWindow(progress, SW_HIDE);
+                show_progress(false);
+                build_relay();
                 SetTimer(hwnd, 1, 1000, nullptr);
                 update_buttons();
                 load();
+                load_relay();
+            }
+
+            // The controls of the page of the models, the bar of progress and the Close button apart.
+            std::vector<HWND> model_controls() const
+            {
+                return { intro, space, list, details, status, download, activate, deactivate, verify, remove, import,
+                    refresh };
+            }
+
+            std::vector<HWND> relay_controls() const
+            {
+                return { relay.intro, relay.enabled, relay.provider_label, relay.provider, relay.url_label, relay.url,
+                    relay.auth_label, relay.auth, relay.user_label, relay.user, relay.secret_label, relay.secret,
+                    relay.model_label, relay.model_list, relay.model_edit, relay.traits, relay.context_label,
+                    relay.context, relay.output_label, relay.output, relay.images, relay.reasoning, relay.privacy,
+                    relay.pseudonymize, relay.tags, relay.pseudalis, relay.test, relay.save, relay.status };
+            }
+
+            void show_progress(bool on)
+            {
+                progress_wanted = on;
+                ShowWindow(progress, on && page == 0 ? SW_SHOW : SW_HIDE);
+            }
+
+            void show_page(int p)
+            {
+                page = p;
+                for (HWND c : model_controls()) ShowWindow(c, page == 0 ? SW_SHOW : SW_HIDE);
+                ShowWindow(progress, page == 0 && progress_wanted ? SW_SHOW : SW_HIDE);
+                // The controls of the relay show by its layout, which hides those its provider does not take.
+                if (page != 0) relay_update();
+                else
+                    for (HWND c : relay_controls()) ShowWindow(c, SW_HIDE);
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                layout(rc.right, rc.bottom);
+            }
+
+            void build_relay()
+            {
+                relay.intro = add(ui::label(hwnd, tr("relay_intro"), IDC_R_INTRO, SS_LEFT));
+                relay.enabled = add(ui::checkbox(hwnd, tr("relay_enabled"), IDC_R_ENABLED, false));
+                relay.provider_label = add(ui::label(hwnd, tr("relay_provider"), IDC_R_PROVIDER_LABEL));
+                relay.provider = add(ui::combo(hwnd, IDC_R_PROVIDER));
+                for (const char* k : { "relay_provider_openai", "relay_provider_ollama", "relay_provider_claude" })
+                    SendMessageW(relay.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(tr(k).c_str()));
+                SendMessageW(relay.provider, CB_SETCURSEL, 0, 0);
+                relay.url_label = add(ui::label(hwnd, tr("relay_url"), IDC_R_URL_LABEL));
+                relay.url = add(ui::edit(hwnd, L"", IDC_R_URL));
+                relay.auth_label = add(ui::label(hwnd, tr("relay_auth"), IDC_R_AUTH_LABEL));
+                relay.auth = add(ui::combo(hwnd, IDC_R_AUTH));
+                for (const char* k : { "relay_auth_key", "relay_auth_basic", "relay_auth_none" })
+                    SendMessageW(relay.auth, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(tr(k).c_str()));
+                SendMessageW(relay.auth, CB_SETCURSEL, 0, 0);
+                relay.user_label = add(ui::label(hwnd, tr("relay_user"), IDC_R_USER_LABEL));
+                relay.user = add(ui::edit(hwnd, L"", IDC_R_USER));
+                relay.secret_label = add(ui::label(hwnd, tr("relay_key"), IDC_R_SECRET_LABEL));
+                relay.secret = add(ui::edit(hwnd, L"", IDC_R_SECRET, ES_PASSWORD));
+                relay.model_label = add(ui::label(hwnd, tr("relay_model"), IDC_R_MODEL_LABEL));
+                relay.model_list = add(ui::combo(hwnd, IDC_R_MODEL_LIST));
+                relay.model_edit = add(ui::combo(hwnd, IDC_R_MODEL_EDIT, true));
+                relay.traits = add(ui::label(hwnd, L"", IDC_R_TRAITS, SS_LEFT), ui::font_kind::note);
+                relay.context_label = add(ui::label(hwnd, tr("relay_context"), IDC_R_CONTEXT_LABEL));
+                relay.context = add(ui::edit(hwnd, L"131072", IDC_R_CONTEXT, ES_NUMBER));
+                relay.output_label = add(ui::label(hwnd, tr("relay_output"), IDC_R_OUTPUT_LABEL));
+                relay.output = add(ui::edit(hwnd, L"8192", IDC_R_OUTPUT, ES_NUMBER));
+                relay.images = add(ui::checkbox(hwnd, tr("relay_images"), IDC_R_IMAGES, false));
+                relay.reasoning = add(ui::checkbox(hwnd, tr("relay_reasoning"), IDC_R_REASONING, false));
+                relay.privacy = add(ui::label(hwnd, tr("relay_privacy"), IDC_R_PRIVACY, SS_LEFT));
+                relay.pseudonymize = add(ui::checkbox(hwnd, tr("relay_pseudonymize"), IDC_R_PSEUDONYMIZE, false));
+                relay.tags = add(ui::checkbox(hwnd, tr("relay_tags"), IDC_R_TAGS, false));
+                relay.pseudalis = add(ui::label(hwnd, L"", IDC_R_PSEUDALIS, SS_LEFT), ui::font_kind::note);
+                relay.test = add(ui::button(hwnd, tr("btn_test"), IDC_R_TEST));
+                relay.save = add(ui::button(hwnd, tr("btn_save"), IDC_R_SAVE));
+                relay.status = add(ui::label(hwnd, L"", IDC_R_STATUS), ui::font_kind::note);
+                for (HWND c : relay_controls()) ShowWindow(c, SW_HIDE);
+            }
+
+            std::string relay_provider() const
+            {
+                return relay_providers[std::min(selection(relay.provider), 2)];
+            }
+
+            std::string relay_auth() const
+            {
+                return relay_provider() == "openai" ? relay_auths[std::min(selection(relay.auth), 2)] : "key";
+            }
+
+            const json* provider_info(const std::string& id) const
+            {
+                for (const auto& p : relay_info["providers"].elements())
+                    if (p["id"].as_string() == id) return &p;
+                return nullptr;
+            }
+
+            // The model of the relay chosen: in the list of its provider, or typed for an engine of OpenAI.
+            std::string relay_model() const
+            {
+                if (relay_provider() == "openai") return field_text(relay.model_edit);
+                const LRESULT i = SendMessageW(relay.model_list, CB_GETCURSEL, 0, 0);
+                return i >= 0 && static_cast<size_t>(i) < relay_models.size() ? relay_models[static_cast<size_t>(i)]
+                    : std::string();
+            }
+
+            void load_relay()
+            {
+                service_client c = client;
+                request(R_RELAY, [c]() {
+                    json r = json::object(), info, set;
+                    std::string error;
+                    if (!c.get("/albireo/v1/relay", info, error)) return failed_answer(info, error);
+                    if (!c.get("/albireo/v1/settings", set, error)) return failed_answer(set, error);
+                    r["info"] = info;
+                    r["relay"] = set["relay"];
+                    return r;
+                });
+            }
+
+            void fill_relay()
+            {
+                const json& r = relay_saved;
+                SendMessageW(relay.enabled, BM_SETCHECK, r["enabled"].as_bool(false) ? BST_CHECKED : BST_UNCHECKED, 0);
+                const std::string provider = r["provider"].str("openai");
+                for (int i = 0; i < 3; ++i)
+                    if (provider == relay_providers[i]) SendMessageW(relay.provider, CB_SETCURSEL, i, 0);
+                const std::string auth = r["auth"].str("key");
+                for (int i = 0; i < 3; ++i)
+                    if (auth == relay_auths[i]) SendMessageW(relay.auth, CB_SETCURSEL, i, 0);
+                ui::set_text(relay.url, widen(r["url"].as_string()));
+                ui::set_text(relay.user, widen(r["user"].as_string()));
+                ui::set_text(relay.secret, widen(r["secret"].as_string()));
+                ui::set_text(relay.context, std::to_wstring(r["context"].as_int(131072)));
+                ui::set_text(relay.output, std::to_wstring(r["max_output"].as_int(8192)));
+                const std::pair<HWND, const char*> boxes[] = { { relay.images, "images" },
+                    { relay.reasoning, "reasoning" }, { relay.pseudonymize, "pseudonymize" }, { relay.tags, "tags" } };
+                for (const auto& b : boxes)
+                    SendMessageW(b.first, BM_SETCHECK, r[b.second].as_bool(false) ? BST_CHECKED : BST_UNCHECKED, 0);
+                fill_relay_models(r["model"].as_string());
+            }
+
+            // The models of the provider chosen, model selected when its provider offers it.
+            void fill_relay_models(const std::string& model)
+            {
+                SendMessageW(relay.model_list, CB_RESETCONTENT, 0, 0);
+                relay_models.clear();
+                const json* p = provider_info(relay_provider());
+                int chosen = 0;
+                if (p)
+                    for (const auto& m : (*p)["models"].elements())
+                    {
+                        if (m["id"].as_string() == model) chosen = static_cast<int>(relay_models.size());
+                        relay_models.push_back(m["id"].as_string());
+                        SendMessageW(relay.model_list, CB_ADDSTRING, 0,
+                            reinterpret_cast<LPARAM>(widen(m["name"].as_string()).c_str()));
+                    }
+                SendMessageW(relay.model_list, CB_SETCURSEL,
+                    relay_models.empty() ? static_cast<WPARAM>(-1) : static_cast<WPARAM>(chosen), 0);
+                if (relay_provider() == "openai") ui::set_text(relay.model_edit, widen(model));
+                relay_update();
+            }
+
+            // What the model chosen offers, as the service knows it.
+            std::wstring relay_traits() const
+            {
+                const json* p = provider_info(relay_provider());
+                if (!p) return L"";
+                for (const auto& m : (*p)["models"].elements())
+                {
+                    if (m["id"].as_string() != relay_model()) continue;
+                    std::string efforts;
+                    for (const auto& e : m["efforts"].elements())
+                        efforts += (efforts.empty() ? "" : ", ") + e.as_string();
+                    const std::string thinking = m["thinking"].as_string();
+                    std::wstring reasoning = thinking == "none" ? tr("relay_no")
+                        : efforts.empty() ? tr("relay_yes") : widen(efforts);
+                    std::wstring text = tr("relay_traits", { { "c", ui::format_decimal(m["context"].as_double(), 0) },
+                        { "o", ui::format_decimal(m["max_output"].as_double(), 0) } })
+                        + L" · " + tr("relay_traits_images") + L" " + (m["images"].as_bool(false) ? tr("relay_yes")
+                        : tr("relay_no")) + L" · " + tr("relay_traits_reasoning") + L" " + reasoning;
+                    if (relay_provider() == "ollama") text += L"\n" + tr("relay_ollama_note");
+                    return text;
+                }
+                return L"";
+            }
+
+            /*
+                Whether the key or the password of an engine of OpenAI would cross the network in clear: an
+                address in http:// that is not the computer itself.
+            */
+            bool relay_in_clear() const
+            {
+                const std::string url = field_text(relay.url);
+                if (relay_provider() != "openai" || relay_auth() == "none" || url.compare(0, 7, "http://") != 0)
+                    return false;
+                const std::string host = url.substr(7, url.find_first_of(":/", 7) - 7);
+                return host != "localhost" && host != "127.0.0.1" && url.compare(7, 5, "[::1]") != 0;
+            }
+
+            void relay_update()
+            {
+                const bool openai = relay_provider() == "openai";
+                const std::string auth = relay_auth();
+                const bool in_clear = relay_in_clear();
+                ui::set_text(relay.secret_label, auth == "basic" ? tr("relay_password") : tr("relay_key"));
+                ui::set_text(relay.traits, openai ? (in_clear ? tr("relay_http_warning") : L"") : relay_traits());
+                ui::enable(relay.tags, ui::checked(relay.pseudonymize));
+                // The state of Pseudalis once the service gave it.
+                const json& p = relay_info["pseudalis"];
+                const std::wstring missing = tr("relay_pseudalis_missing", { { "r", p["reason"].as_string() } });
+                ui::set_text(relay.pseudalis, !p.is_object() ? std::wstring()
+                    : p["found"].as_bool(false) ? tr("relay_pseudalis_found") : missing);
+                for (HWND c : { relay.test, relay.save, relay.enabled, relay.provider }) ui::enable(c, !relay_busy);
+                if (page != 1) return;
+                const bool basic = openai && auth == "basic", keyed = auth != "none";
+                const std::pair<HWND, bool> shown[] = { { relay.intro, true }, { relay.enabled, true },
+                    { relay.provider_label, true }, { relay.provider, true }, { relay.url_label, openai },
+                    { relay.url, openai }, { relay.auth_label, openai }, { relay.auth, openai },
+                    { relay.user_label, basic }, { relay.user, basic }, { relay.secret_label, keyed },
+                    { relay.secret, keyed }, { relay.model_label, true }, { relay.model_list, !openai },
+                    { relay.model_edit, openai }, { relay.traits, !openai || in_clear },
+                    { relay.context_label, openai },
+                    { relay.context, openai }, { relay.output_label, openai }, { relay.output, openai },
+                    { relay.images, openai }, { relay.reasoning, openai }, { relay.privacy, true },
+                    { relay.pseudonymize, true }, { relay.tags, true }, { relay.pseudalis, true }, { relay.test, true },
+                    { relay.save, true }, { relay.status, true } };
+                for (const auto& c : shown) ShowWindow(c.first, c.second ? SW_SHOW : SW_HIDE);
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                layout(rc.right, rc.bottom);
+            }
+
+            // The relay as the form gives it, for its test and its saving.
+            json relay_form() const
+            {
+                json r = json::object();
+                const std::string provider = relay_provider();
+                const std::string auth = relay_auth();
+                r["enabled"] = ui::checked(relay.enabled);
+                r["provider"] = provider;
+                r["url"] = provider == "openai" ? field_text(relay.url) : std::string();
+                r["model"] = relay_model();
+                r["auth"] = auth;
+                r["user"] = auth == "basic" ? field_text(relay.user) : std::string();
+                r["secret"] = auth == "none" ? std::string() : field_text(relay.secret);
+                if (provider == "openai")
+                {
+                    const long long context = std::wcstoll(ui::text_of(relay.context).c_str(), nullptr, 10);
+                    const long long output = std::wcstoll(ui::text_of(relay.output).c_str(), nullptr, 10);
+                    r["context"] = std::min<long long>(std::max<long long>(context, 1024), 1LL << 24);
+                    r["max_output"] = std::min<long long>(std::max<long long>(output, 16), 1LL << 20);
+                    r["images"] = ui::checked(relay.images);
+                    r["reasoning"] = ui::checked(relay.reasoning);
+                }
+                r["pseudonymize"] = ui::checked(relay.pseudonymize);
+                r["tags"] = ui::checked(relay.tags);
+                return r;
+            }
+
+            void relay_send(WPARAM tag)
+            {
+                relay_busy = true;
+                ui::set_text(relay.status, tag == R_RELAY_TEST ? tr("relay_testing") : L"");
+                relay_update();
+                service_client c = client;
+                const json form = relay_form();
+                request(tag, [c, form, tag]() {
+                    json r;
+                    std::string error;
+                    json changes = json::object();
+                    changes["relay"] = form;
+                    const bool sent = tag == R_RELAY_TEST ? c.send("POST", "/albireo/v1/relay/test", form, r, error, 60)
+                        : c.send("PUT", "/albireo/v1/settings", changes, r, error);
+                    return sent ? r : failed_answer(r, error);
+                });
+            }
+
+            void relay_result(WPARAM tag, const json& r)
+            {
+                if (tag == R_RELAY)
+                {
+                    if (r.contains("error") && !r.contains("info")) return;
+                    relay_info = r["info"];
+                    relay_saved = r["relay"];
+                    fill_relay();
+                    return;
+                }
+                relay_busy = false;
+                if (r.contains("error") && r["error"].is_string() && !r.contains("ok"))
+                    ui::set_text(relay.status, error_text(r));
+                else if (tag == R_RELAY_TEST && r["ok"].as_bool(false))
+                {
+                    ui::set_text(relay.status, tr("relay_test_ok", { { "n", std::to_string(r["models"].size()) } }));
+                    // The models of an engine of OpenAI fill the proposals of its field.
+                    if (relay_provider() == "openai")
+                    {
+                        const std::wstring typed = ui::text_of(relay.model_edit);
+                        SendMessageW(relay.model_edit, CB_RESETCONTENT, 0, 0);
+                        for (const auto& m : r["models"].elements())
+                            SendMessageW(relay.model_edit, CB_ADDSTRING, 0,
+                                reinterpret_cast<LPARAM>(widen(m.as_string()).c_str()));
+                        ui::set_text(relay.model_edit, typed);
+                    }
+                }
+                else if (tag == R_RELAY_TEST)
+                {
+                    ui::set_text(relay.status, tr("relay_test_failed", { { "e", r["error"].as_string() } }));
+                }
+                else
+                {
+                    ui::set_text(relay.status, tr("relay_saved"));
+                    load_relay();
+                }
+                relay_update();
+            }
+
+            void layout_relay(int w, int h, int top)
+            {
+                const int m = px(16), g = px(8), bh = px(30), row = px(34), label_w = px(190);
+                const int column = (w - 3 * m) * 3 / 5;
+                const int field_x = m + label_w, field_w = column - label_w;
+                ui::place(relay.intro, m, top, w - 2 * m, px(52));
+                int y = top + px(58);
+                ui::place(relay.enabled, m, y, column, px(24));
+                y += px(32);
+                auto field = [&](HWND label, HWND control, int width, int height) {
+                    if (!IsWindowVisible(control)) return;
+                    ui::place(label, m, y + px(4), label_w - g, px(22));
+                    ui::place(control, field_x, y, width, height);
+                    y += row;
+                };
+                field(relay.provider_label, relay.provider, field_w, px(200));
+                field(relay.url_label, relay.url, field_w, px(26));
+                field(relay.auth_label, relay.auth, std::min(field_w, px(240)), px(120));
+                field(relay.user_label, relay.user, field_w, px(26));
+                field(relay.secret_label, relay.secret, field_w, px(26));
+                field(relay.model_label, IsWindowVisible(relay.model_list) ? relay.model_list : relay.model_edit,
+                    field_w, px(240));
+                if (IsWindowVisible(relay.traits))
+                {
+                    ui::place(relay.traits, field_x, y - px(2), field_w, px(40));
+                    y += px(42);
+                }
+                field(relay.context_label, relay.context, px(120), px(26));
+                field(relay.output_label, relay.output, px(120), px(26));
+                for (HWND c : { relay.images, relay.reasoning })
+                    if (IsWindowVisible(c))
+                    {
+                        ui::place(c, field_x, y, field_w, px(24));
+                        y += px(28);
+                    }
+                // The pseudonymization beside, in the second column.
+                const int x2 = m + column + m, w2 = w - x2 - m;
+                int y2 = top + px(58);
+                ui::place(relay.privacy, x2, y2, w2, px(40));
+                y2 += px(46);
+                ui::place(relay.pseudonymize, x2, y2, w2, px(40));
+                y2 += px(44);
+                ui::place(relay.tags, x2 + px(20), y2, w2 - px(20), px(40));
+                y2 += px(46);
+                ui::place(relay.pseudalis, x2, y2, w2, px(60));
+                const int bottom = h - m - bh;
+                ui::place(relay.status, m, bottom - g - px(20), w - 2 * m, px(20));
+                int x = m;
+                for (HWND b : { relay.test, relay.save })
+                {
+                    const int bw = ui::button_width(b, px(90));
+                    ui::place(b, x, bottom, bw, bh);
+                    x += bw + g;
+                }
             }
 
             void layout(int w, int h) override
             {
                 // The actions on the selected model under the list, the window commands at the bottom.
                 const int m = px(16), g = px(8), bh = px(30);
+                // The tabs above the pages, the Close button on both.
+                ui::place(tabs, m, px(10), w - 2 * m, px(28));
+                const int top = px(46);
+                {
+                    const int bw = ui::button_width(close, px(90));
+                    ui::place(close, w - m - bw, h - m - bh, bw, bh);
+                }
+                if (page == 1)
+                {
+                    layout_relay(w, h, top);
+                    return;
+                }
                 // The introduction, then the origin and the state of the catalog.
                 // Four lines: the introduction and, offline, the origin of the models.
-                ui::place(intro, m, m, w - 2 * m - px(260), px(66));
-                ui::place(space, w - m - px(250), m, px(250), px(36));
-                const int list_top = m + px(72);
+                ui::place(intro, m, top, w - 2 * m - px(260), px(66));
+                ui::place(space, w - m - px(250), top, px(250), px(36));
+                const int list_top = top + px(72);
                 const int details_h = px(100);
                 const int bottom = h - m - bh;
                 const int status_top = bottom - g - px(20);
@@ -1022,7 +1457,7 @@ namespace albireo
                 if (d && dl && !uploading)
                 {
                     const double total = (*d)["total"].as_double(0), got = (*d)["received"].as_double(0);
-                    ShowWindow(progress, SW_SHOW);
+                    show_progress(true);
                     SendMessageW(progress, PBM_SETPOS, total > 0 ? static_cast<WPARAM>(1000 * got / total) : 0, 0);
                     const std::string done = ui::format_size(static_cast<unsigned long long>(got));
                     const std::string size = ui::format_size(static_cast<unsigned long long>(total));
@@ -1033,7 +1468,7 @@ namespace albireo
                 }
                 else if (!uploading)
                 {
-                    ShowWindow(progress, SW_HIDE);
+                    show_progress(false);
                     // The progress of a download leaves with the selection of its model.
                     if (showing_download) ui::set_text(status, L"");
                     showing_download = false;
@@ -1104,6 +1539,11 @@ namespace albireo
 
             void on_result(WPARAM tag, const json& r) override
             {
+                if (tag == R_RELAY || tag == R_RELAY_TEST || tag == R_RELAY_SAVE)
+                {
+                    relay_result(tag, r);
+                    return;
+                }
                 if (tag == R_LIST)
                 {
                     if (r.contains("error") && !r.contains("models"))
@@ -1140,7 +1580,7 @@ namespace albireo
                     const bool failed = !r["errors"].empty() || r["catalog"].contains("error")
                         || r["update"].contains("error");
                     ui::message(hwnd, import_text(r), MB_OK | (failed ? MB_ICONWARNING : MB_ICONINFORMATION));
-                    ShowWindow(progress, SW_HIDE);
+                    show_progress(false);
                     ui::set_text(status, L"");
                 }
                 update_buttons();
@@ -1275,7 +1715,7 @@ namespace albireo
                 if (files.empty()) return;
                 uploading = true;
                 busy = true;
-                ShowWindow(progress, SW_SHOW);
+                show_progress(true);
                 update_buttons();
                 service_client c = client;
                 HWND target = hwnd;
@@ -1346,7 +1786,9 @@ namespace albireo
                 if (msg == WM_NOTIFY)
                 {
                     const NMHDR* n = reinterpret_cast<NMHDR*>(lp);
-                    if (n->idFrom == IDC_LIST && n->code == LVN_ITEMCHANGED && !rows.filling)
+                    if (n->idFrom == IDC_TABS && n->code == TCN_SELCHANGE)
+                        show_page(static_cast<int>(SendMessageW(tabs, TCM_GETCURSEL, 0, 0)));
+                    else if (n->idFrom == IDC_LIST && n->code == LVN_ITEMCHANGED && !rows.filling)
                     {
                         const NMLISTVIEW* lv = reinterpret_cast<const NMLISTVIEW*>(lp);
                         const bool known = lv->iItem >= 0 && lv->iItem < static_cast<int>(rows.keys.size());
@@ -1370,10 +1812,36 @@ namespace albireo
                 return 0;
             }
 
-            void on_command(int id, int) override
+            void on_command(int id, int code) override
             {
                 switch (id)
                 {
+                case IDC_R_PROVIDER:
+                    if (code != CBN_SELCHANGE) break;
+                    {
+                        /*
+                            The stored key stands for the provider it was given for: another provider
+                            takes its own, and the stored one shows again with its provider.
+                        */
+                        const bool saved = relay_provider() == relay_saved["provider"].as_string();
+                        const std::wstring mask = widen(relay_saved["secret"].as_string());
+                        if (!saved && ui::text_of(relay.secret) == mask) ui::set_text(relay.secret, L"");
+                        if (saved && ui::text_of(relay.secret).empty()) ui::set_text(relay.secret, mask);
+                        fill_relay_models(saved ? relay_saved["model"].as_string() : std::string());
+                    }
+                    break;
+                case IDC_R_AUTH:
+                case IDC_R_MODEL_LIST:
+                    if (code == CBN_SELCHANGE) relay_update();
+                    break;
+                case IDC_R_URL:
+                    if (code == EN_CHANGE) relay_update();
+                    break;
+                case IDC_R_PSEUDONYMIZE:
+                    if (code == BN_CLICKED) relay_update();
+                    break;
+                case IDC_R_TEST: relay_send(R_RELAY_TEST); break;
+                case IDC_R_SAVE: relay_send(R_RELAY_SAVE); break;
                 case IDC_DOWNLOAD:
                     if (downloading(selected)) action("DELETE", "/albireo/v1/models/" + selected + "/download", json());
                     else action("POST", "/albireo/v1/models/" + selected + "/download", json::object());
@@ -1974,7 +2442,7 @@ namespace albireo
     void show_models_window(const service_client& client)
     {
         // Wide enough for the seven columns of the list without a horizontal scroll bar.
-        show<models_window>(client, tr("models_title"), 1040, 620, true);
+        show<models_window>(client, tr("models_title"), 1040, 680, true);
     }
 
     void show_host_window(const service_client& client)

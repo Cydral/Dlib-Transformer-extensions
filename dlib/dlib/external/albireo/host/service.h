@@ -22,6 +22,7 @@
 #include "updater.h"
 
 namespace httplib { class SSLServer; class Server; }
+namespace albireo { class relay_service; }
 
 namespace albireo
 {
@@ -137,6 +138,15 @@ namespace albireo
         std::string speech_program() const;
         updater& updates() { return *updater_; }
         engine_host& engine() { return engine_; }
+        // The relay of the inference to an external engine (relay.h), made by run().
+        relay_service& relay() { return *relay_; }
+        /*
+            The relay as the interface gives it (relay_description()), with image_mode: "sent"
+            when the images go to the external model, "described" when a model of the
+            computer describes them for it, "none" when neither can be; and with the state of
+            Pseudalis when the relay pseudonymizes.
+        */
+        json relay_status();
 
         json status();
         json engines();
@@ -378,6 +388,15 @@ namespace albireo
                   service stops.
         !*/
         bool replace_model_files(const std::string& id, const std::function<bool()>& place);
+        /*
+            Describes an image (a data URL) for the relay with a model of the engine that reads
+            images, the one of the general role first; returns false with error when none is
+            loaded, when the engine fails, or once cancelled turns true.
+        */
+        bool describe_image(const std::string& data_url, const std::atomic<bool>& cancelled, std::string& description,
+            std::string& error);
+        // The model of the engine that reads images, the one of the general role first; empty when none.
+        std::string image_model();
         json engine_config(const host_settings& s, const std::string& device) const;
         std::string engines_dir() const;
 
@@ -390,6 +409,8 @@ namespace albireo
         std::unique_ptr<model_manager> models_;
         std::unique_ptr<updater> updater_;
         engine_host engine_;
+        // Made after the settings by run(), and destroyed before the engine, which its images use.
+        std::unique_ptr<relay_service> relay_;
         // Written once by start_engines(), then read by the routes once engines_ready_ is
         // true.
         std::vector<engine_candidate> candidates_;
@@ -404,9 +425,9 @@ namespace albireo
         bool database_restarted_ = false;
 
         /*
-            Guards the server, the model manager and the updater while run() creates and
-            releases them, for stop(), which a thread of the system may call at any time, and
-            for the download workers that end after the stop (choose_background_model()).
+            Guards the server, the model manager, the updater and the relay while run() creates
+            and releases them, for stop(), which a thread of the system may call at any time,
+            and for the download workers that end after the stop (choose_background_model()).
         */
         std::mutex server_m_;
         std::unique_ptr<httplib::SSLServer> server_;

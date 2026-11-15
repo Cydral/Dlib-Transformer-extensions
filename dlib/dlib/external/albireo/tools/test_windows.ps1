@@ -392,6 +392,19 @@ if (-not $NoService) {
             else {
                 Add-Result "service embeddings" "SKIP" "no embedding model active" 0
             }
+            # The relay: its providers, its state, and the state of Pseudalis, without address nor key.
+            $relay = Invoke-RestMethod -Uri "$base/albireo/v1/relay" -TimeoutSec 30
+            $providers = @($relay.providers | ForEach-Object { "$($_.id) ($(@($_.models).Count))" })
+            $state = if ($relay.relay.ready) { "ready, $($relay.relay.provider) $($relay.relay.model)" }
+                else { "not ready: $($relay.relay.reason)" }
+            $pseudalis = if ($relay.pseudalis.found) { "Pseudalis found" }
+                else { "Pseudalis: $($relay.pseudalis.reason)" }
+            # The state of the relay names neither its address nor its key.
+            $result = "FAIL"
+            if ($providers.Count -eq 3 -and ($relay.relay | ConvertTo-Json -Depth 4) -notmatch '"(url|secret)"') {
+                $result = "PASS"
+            }
+            Add-Result "service relay" $result (($providers -join ", ") + "; $state; $pseudalis") 0
             # The voices of the speech synthesis, then a sentence read aloud by the program the service starts.
             $watch.Restart()
             $listed = Invoke-RestMethod -Uri "$base/albireo/v1/speech/voices" -TimeoutSec 10

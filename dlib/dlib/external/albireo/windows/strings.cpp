@@ -159,6 +159,116 @@ namespace albireo
                 "Hasta tres modelos responden, uno por función; una función sin modelo usa el modelo general, si no "
                 "el modelo incluido con Albireo. Las entradas de un modelo deciden los adjuntos de la aplicación "
                 "web; la búsqueda en documentos tiene su propio modelo de embeddings." } },
+            // The tabs of the window of the models, and the relay to an external engine.
+            { "tab_models", { "Models of this computer", "Modèles de cet ordinateur", "Modelle dieses Computers",
+                "Modelli di questo computer", "Modelos de este equipo" } },
+            { "tab_relay", { "External relay", "Relais externe", "Externes Relais", "Inoltro esterno",
+                "Relé externo" } },
+            { "relay_intro", {
+                "The relay sends the discussions that ask for it to an external engine, through the service, which "
+                "keeps the address and the key. The web application shows it with a red open padlock: those "
+                "discussions leave this computer, without the agent mode and the web access.",
+                "Le relais envoie les discussions qui le demandent à un moteur externe, par le service, qui garde "
+                "l'adresse et la clé. L'application web le montre par un cadenas ouvert rouge : ces discussions "
+                "quittent cet ordinateur, sans le mode agent ni l'accès web.",
+                "Das Relais sendet die Unterhaltungen, die es verlangen, über den Dienst an eine externe Engine; "
+                "der Dienst behält Adresse und Schlüssel. Die Webanwendung zeigt es mit einem roten offenen "
+                "Vorhängeschloss: Diese Unterhaltungen verlassen den Computer, ohne Agentenmodus und Webzugriff.",
+                "L'inoltro invia le conversazioni che lo chiedono a un motore esterno, tramite il servizio, che "
+                "conserva l'indirizzo e la chiave. L'applicazione web lo mostra con un lucchetto aperto rosso: "
+                "quelle conversazioni lasciano il computer, senza la modalità agente né l'accesso web.",
+                "El relé envía las conversaciones que lo piden a un motor externo, a través del servicio, que "
+                "guarda la dirección y la clave. La aplicación web lo muestra con un candado abierto rojo: esas "
+                "conversaciones salen de este equipo, sin el modo agente ni el acceso web." } },
+            { "relay_enabled", { "Turn on the relay", "Activer le relais", "Relais einschalten", "Attiva l'inoltro",
+                "Activar el relé" } },
+            { "relay_provider", { "Provider", "Fournisseur", "Anbieter", "Fornitore", "Proveedor" } },
+            { "relay_provider_openai", { "Engine of the OpenAI interface", "Moteur de l'interface OpenAI",
+                "Engine der OpenAI-Schnittstelle", "Motore dell'interfaccia OpenAI", "Motor de la interfaz OpenAI" } },
+            { "relay_provider_ollama", { "Ollama (cloud)", "Ollama (cloud)", "Ollama (Cloud)", "Ollama (cloud)",
+                "Ollama (nube)" } },
+            { "relay_provider_claude", { "Claude (Anthropic)", "Claude (Anthropic)", "Claude (Anthropic)",
+                "Claude (Anthropic)", "Claude (Anthropic)" } },
+            { "relay_url", { "Address of the interface", "Adresse de l'interface", "Adresse der Schnittstelle",
+                "Indirizzo dell'interfaccia", "Dirección de la interfaz" } },
+            { "relay_auth", { "Authentication", "Authentification", "Authentifizierung", "Autenticazione",
+                "Autenticación" } },
+            { "relay_auth_key", { "Key", "Clé", "Schlüssel", "Chiave", "Clave" } },
+            { "relay_auth_basic", { "User and password", "Utilisateur et mot de passe", "Benutzer und Passwort",
+                "Utente e password", "Usuario y contraseña" } },
+            { "relay_auth_none", { "None", "Aucune", "Keine", "Nessuna", "Ninguna" } },
+            { "relay_user", { "User", "Utilisateur", "Benutzer", "Utente", "Usuario" } },
+            { "relay_key", { "Key", "Clé", "Schlüssel", "Chiave", "Clave" } },
+            { "relay_password", { "Password", "Mot de passe", "Passwort", "Password", "Contraseña" } },
+            { "relay_model", { "Model", "Modèle", "Modell", "Modello", "Modelo" } },
+            { "relay_context", { "Context window (tokens)", "Fenêtre de contexte (jetons)", "Kontextfenster (Token)",
+                "Finestra di contesto (token)", "Ventana de contexto (tokens)" } },
+            { "relay_output", { "Tokens of an answer at most", "Jetons d'une réponse au plus",
+                "Höchstens Token einer Antwort", "Token di una risposta al massimo",
+                "Tokens de una respuesta como máximo" } },
+            { "relay_images", { "The model reads images", "Le modèle lit les images", "Das Modell liest Bilder",
+                "Il modello legge le immagini", "El modelo lee imágenes" } },
+            { "relay_reasoning", { "The model takes a reasoning effort", "Le modèle prend un effort de réflexion",
+                "Das Modell nimmt einen Denkaufwand an", "Il modello accetta uno sforzo di ragionamento",
+                "El modelo acepta un esfuerzo de razonamiento" } },
+            { "relay_traits", { "Context: {c} tokens · Answer: {o} tokens",
+                "Contexte : {c} jetons · Réponse : {o} jetons",
+                "Kontext: {c} Token · Antwort: {o} Token", "Contesto: {c} token · Risposta: {o} token",
+                "Contexto: {c} tokens · Respuesta: {o} tokens" } },
+            { "relay_traits_images", { "Images:", "Images :", "Bilder:", "Immagini:", "Imágenes:" } },
+            { "relay_traits_reasoning", { "Reasoning:", "Réflexion :", "Denken:", "Ragionamento:", "Razonamiento:" } },
+            { "relay_yes", { "yes", "oui", "ja", "sì", "sí" } },
+            { "relay_no", { "no", "non", "nein", "no", "no" } },
+            { "relay_http_warning", { "Over http://, the key or the password crosses the network in clear.",
+                "En http://, la clé ou le mot de passe traverse le réseau en clair.",
+                "Über http:// geht der Schlüssel oder das Passwort unverschlüsselt durch das Netzwerk.",
+                "Con http://, la chiave o la password attraversa la rete in chiaro.",
+                "Con http://, la clave o la contraseña cruza la red sin cifrar." } },
+            { "relay_ollama_note", { "Each request is paid per token with the credits of the account.",
+                "Chaque requête est payée au jeton avec les crédits du compte.",
+                "Jede Anfrage wird pro Token mit dem Guthaben des Kontos bezahlt.",
+                "Ogni richiesta è pagata a token con i crediti dell'account.",
+                "Cada solicitud se paga por token con los créditos de la cuenta." } },
+            { "relay_privacy", { "Before the texts leave, Pseudalis can replace their personal values; the answers get "
+                "them back on this computer.",
+                "Avant que les textes partent, Pseudalis peut remplacer leurs valeurs personnelles ; les réponses les "
+                "retrouvent sur cet ordinateur.",
+                "Bevor die Texte gehen, kann Pseudalis ihre persönlichen Werte ersetzen; die Antworten erhalten sie "
+                "auf diesem Computer zurück.",
+                "Prima che i testi partano, Pseudalis può sostituire i loro valori personali; le risposte li "
+                "ritrovano su questo computer.",
+                "Antes de que los textos salgan, Pseudalis puede sustituir sus valores personales; las respuestas los "
+                "recuperan en este equipo." } },
+            { "relay_pseudonymize", { "Pseudonymize the texts with Pseudalis (the images are described here)",
+                "Pseudonymiser les textes avec Pseudalis (les images sont décrites ici)",
+                "Texte mit Pseudalis pseudonymisieren (die Bilder werden hier beschrieben)",
+                "Pseudonimizzare i testi con Pseudalis (le immagini sono descritte qui)",
+                "Seudonimizar los textos con Pseudalis (las imágenes se describen aquí)" } },
+            { "relay_tags", { "Send the tags of the values (their substitutes alone otherwise)",
+                "Envoyer les balises des valeurs (leurs substituts seuls sinon)",
+                "Die Markierungen der Werte senden (sonst nur ihre Ersatzwerte)",
+                "Inviare i tag dei valori (altrimenti solo i loro sostituti)",
+                "Enviar las etiquetas de los valores (si no, solo sus sustitutos)" } },
+            { "relay_pseudalis_found", { "Pseudalis answers on this computer.", "Pseudalis répond sur cet ordinateur.",
+                "Pseudalis antwortet auf diesem Computer.", "Pseudalis risponde su questo computer.",
+                "Pseudalis responde en este equipo." } },
+            { "relay_pseudalis_missing", { "Pseudalis is not available ({r}): no text leaves pseudonymized without it.",
+                "Pseudalis n'est pas disponible ({r}) : aucun texte ne part pseudonymisé sans lui.",
+                "Pseudalis ist nicht verfügbar ({r}): Ohne es verlässt kein Text pseudonymisiert den Computer.",
+                "Pseudalis non è disponibile ({r}): senza di esso nessun testo parte pseudonimizzato.",
+                "Pseudalis no está disponible ({r}): sin él ningún texto sale seudonimizado." } },
+            { "btn_test", { "Test", "Tester", "Testen", "Prova", "Probar" } },
+            { "btn_save", { "Save", "Enregistrer", "Speichern", "Salva", "Guardar" } },
+            { "relay_testing", { "The engine is being asked…", "Le moteur est interrogé…", "Die Engine wird abgefragt…",
+                "Il motore viene interrogato…", "Se consulta el motor…" } },
+            { "relay_test_ok", { "The engine answers: {n} models.", "Le moteur répond : {n} modèles.",
+                "Die Engine antwortet: {n} Modelle.", "Il motore risponde: {n} modelli.",
+                "El motor responde: {n} modelos." } },
+            { "relay_test_failed", { "The test failed: {e}", "Le test a échoué : {e}",
+                "Der Test ist fehlgeschlagen: {e}",
+                "La prova non è riuscita: {e}", "La prueba falló: {e}" } },
+            { "relay_saved", { "The relay is saved.", "Le relais est enregistré.", "Das Relais ist gespeichert.",
+                "L'inoltro è salvato.", "El relé está guardado." } },
             { "col_model", { "Model", "Modèle", "Modell", "Modello", "Modelo" } },
             // The company or the organisation that produced a model.
             { "col_publisher", { "Developer", "Producteur", "Hersteller", "Produttore", "Productor" } },
@@ -210,6 +320,16 @@ namespace albireo
                 "Der Port {port} wird verwendet oder kann nicht geöffnet werden: Wählen Sie einen anderen.",
                 "La porta {port} è in uso o non può essere aperta: sceglietene un'altra.",
                 "El puerto {port} está en uso o no se puede abrir: elija otro." } },
+            { "err_relay_secret", { "The masked key of the relay applies to its saved provider, address and user only: "
+                "type the key again.",
+                "La clé masquée du relais ne vaut que pour son fournisseur, son adresse et son utilisateur "
+                "enregistrés : saisissez la clé à nouveau.",
+                "Der verdeckte Schlüssel des Relais gilt nur für seinen gespeicherten Anbieter, seine Adresse und "
+                "seinen Benutzer: Geben Sie den Schlüssel erneut ein.",
+                "La chiave nascosta dell'inoltro vale solo per il fornitore, l'indirizzo e l'utente salvati: "
+                "digitate di nuovo la chiave.",
+                "La clave oculta del relé solo vale para su proveedor, dirección y usuario guardados: escriba la "
+                "clave de nuevo." } },
             { "err_proxy_password", { "The masked password of the proxy applies to its saved address and user only: "
                 "type the password again.", "Le mot de passe masqué du proxy ne vaut que pour l'adresse et "
                 "l'utilisateur enregistrés : saisissez à nouveau le mot de passe.", "Das maskierte Kennwort des "

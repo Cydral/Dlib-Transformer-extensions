@@ -489,8 +489,8 @@ namespace albireo
             */
         public:
             graph_builder(const model_file& f, const model_config& c, bool explicit_mask, ov::element::Type kv_type,
-                bool logits)
-                : file_(f), cfg_(c), explicit_mask_(explicit_mask), kv_type_(kv_type), logits_(logits)
+                bool logits, bool beams)
+                : file_(f), cfg_(c), explicit_mask_(explicit_mask), kv_type_(kv_type), logits_(logits), beams_(beams)
             {
             }
 
@@ -503,7 +503,7 @@ namespace albireo
                 embeds_ = parameter(ov::element::f32, ov::PartialShape{1, -1, d}, input_embeds);
                 cos_ = parameter(ov::element::f32, ov::PartialShape{1, 1, -1, rot}, input_cos);
                 sin_ = parameter(ov::element::f32, ov::PartialShape{1, 1, -1, rot}, input_sin);
-                beam_ = parameter(ov::element::i32, ov::PartialShape{-1}, input_beam);
+                if (beams_) beam_ = parameter(ov::element::i32, ov::PartialShape{-1}, input_beam);
                 rows_ = parameter(ov::element::i64, ov::PartialShape{-1}, input_rows);
                 if (cfg_.n_deepstack > 0)
                     deepstack_ = parameter(ov::element::f32, ov::PartialShape{cfg_.n_deepstack, 1, -1, d},
@@ -700,7 +700,14 @@ namespace albireo
                     static_cast<size_t>(hd)}, std::vector<float>());
                 port past = std::make_shared<ov::op::v6::ReadValue>(initial, variable);
                 if (kv_type_ != ov::element::f32) past = std::make_shared<ov::op::v0::Convert>(past, ov::element::f32);
-                past = std::make_shared<ov::op::v8::Gather>(past, beam_, i64_scalar(0));
+                /*
+                    The index of the beams before the cache, the identity for the single sequence of a request,
+                    makes the plugin of the processor fuse the attention with its cache.  The GPU plugin turns the
+                    same pattern into a cache read through a table of beams, a state of its own that query_state()
+                    does not list, so that set_state cannot give that table the positions a request takes from
+                    another one: the graphs that take a mask, those of the other devices, read their cache directly.
+                */
+                if (beams_) past = std::make_shared<ov::op::v8::Gather>(past, beam_, i64_scalar(0));
                 const port all = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past, current}, 2);
                 port stored = all;
                 if (kv_type_ != ov::element::f32) stored = std::make_shared<ov::op::v0::Convert>(all, kv_type_);
@@ -834,6 +841,8 @@ namespace albireo
             const bool explicit_mask_;
             const ov::element::Type kv_type_;
             const bool logits_;
+            // Whether the graph takes the index of the beams (beam_idx) before the cache of each layer.
+            const bool beams_;
             weight_converter weights_;
             ov::ParameterVector parameters_;
             ov::SinkVector sinks_;
@@ -877,11 +886,12 @@ namespace albireo
                 if (!settings_.weights_dir.empty()) check_spill();
                 // The plugin of the processor fuses the causal attention with its cache, and the others take a mask.
                 explicit_mask_ = !cpu_ || settings_.explicit_mask;
+                beams_ = !explicit_mask_;
                 // On the processor, the variables hold half precision and the plugin its own format.
                 const ov::element::Type kv_type = ov::element::f16;
                 std::shared_ptr<ov::Model> model;
                 {
-                    graph_builder builder(*file_, cfg_, explicit_mask_, kv_type, !cfg_.is_embedding());
+                    graph_builder builder(*file_, cfg_, explicit_mask_, kv_type, !cfg_.is_embedding(), beams_);
                     model = builder.build();
                     constant_bytes_ = builder.constant_bytes();
                 }
@@ -1470,7 +1480,7 @@ namespace albireo
                     cos_.data()));
                 req.set_tensor(input_sin, ov::Tensor(ov::element::f32, ov::Shape{1, 1, Ls, static_cast<size_t>(rot)},
                     sin_.data()));
-                req.set_tensor(input_beam, ov::Tensor(ov::element::i32, ov::Shape{1}, &beam_));
+                if (beams_) req.set_tensor(input_beam, ov::Tensor(ov::element::i32, ov::Shape{1}, &beam_));
                 req.set_tensor(input_rows, ov::Tensor(ov::element::i64, ov::Shape{rows_.size()}, rows_.data()));
                 if (nds > 0)
                     req.set_tensor(input_deepstack, ov::Tensor(ov::element::f32,
@@ -1511,6 +1521,11 @@ namespace albireo
             size_t kv_budget_ = 0;
             bool cpu_ = true;
             bool explicit_mask_ = false;
+            /*
+                The graph takes the index of the beams before each cache, which the plugin of the processor fuses
+                with its attention, and the graphs that take a mask go without it (graph_builder::cache()).
+            */
+            bool beams_ = true;
             // A cut or a copy gives the plugin views of kept_ (keep()).
             bool views_ = false;
             // The file of the weights of the graph, mapped while the graph runs (spill()), declared before the

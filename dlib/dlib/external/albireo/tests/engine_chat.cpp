@@ -392,9 +392,9 @@ int main(int argc, char** argv)
 
     /*
         The OpenVINO engine reads its device from the environment when it first looks for the
-        devices, which describe() below already does.  On Windows, the engine library, whose
-        runtime of C is not the one of this program, takes its environment from the block of the
-        process, which SetEnvironmentVariableA writes before the library loads.
+        devices, which describe() below already does.  On Windows, dlib reads it from the
+        environment block of the process, which SetEnvironmentVariableA writes, and each runtime
+        of C keeps a copy of that block of its own, the one of this program included.
     */
     if (!device.empty())
     {

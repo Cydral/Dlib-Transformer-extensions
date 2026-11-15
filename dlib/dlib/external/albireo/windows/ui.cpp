@@ -275,10 +275,27 @@ namespace ui
         return c;
     }
 
-    HWND combo(HWND parent, int id)
+    HWND combo(HWND parent, int id, bool editable)
     {
-        HWND c = create(parent, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, id);
+        const DWORD kind = editable ? (CBS_DROPDOWN | CBS_AUTOHSCROLL) : CBS_DROPDOWNLIST;
+        HWND c = create(parent, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | kind, id);
         set_font(c, parent);
+        return c;
+    }
+
+    HWND tabs(HWND parent, int id, const std::vector<std::wstring>& labels)
+    {
+        HWND c = create(parent, WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPSIBLINGS | TCS_TABS, id);
+        set_font(c, parent);
+        for (size_t i = 0; i < labels.size(); ++i)
+        {
+            std::wstring text = labels[i];
+            TCITEMW item = {};
+            item.mask = TCIF_TEXT;
+            item.pszText = &text[0];
+            SendMessageW(c, TCM_INSERTITEMW, static_cast<WPARAM>(i), reinterpret_cast<LPARAM>(&item));
+        }
+        SendMessageW(c, TCM_SETCURSEL, 0, 0);
         return c;
     }
 

@@ -58,6 +58,16 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define DLIB_NPU_X86 1
 #include <immintrin.h>
@@ -95,30 +105,6 @@ namespace dlib
                     std::chrono::steady_clock::now().time_since_epoch()).count();
             }
 
-            std::string read_env (
-                const char* name,
-                bool& present
-            )
-            {
-#ifdef _MSC_VER
-                char* buf = nullptr;
-                size_t len = 0;
-                if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr)
-                {
-                    std::string value(buf);
-                    free(buf);
-                    present = true;
-                    return value;
-                }
-                present = false;
-                return std::string();
-#else
-                const char* value = std::getenv(name);
-                present = value != nullptr;
-                return value ? std::string(value) : std::string();
-#endif
-            }
-
 #ifdef _WIN32
             std::string to_utf8 (
                 const std::filesystem::path& p
@@ -127,35 +113,43 @@ namespace dlib
                 const auto s = p.u8string();
                 return std::string(s.begin(), s.end());
             }
+
+            /*
+                A variable of the environment block of the process.  Each runtime of C keeps a copy of
+                that block of its own, and a program whose runtime differs from the one of this library
+                sets the variables of a device in the block, which every module of the process reads.
+            */
+            std::wstring read_process_env (
+                const char* name,
+                bool& present
+            )
+            {
+                const std::wstring wname(name, name + std::strlen(name));
+                const DWORD size = GetEnvironmentVariableW(wname.c_str(), nullptr, 0);
+                present = size > 0;
+                std::wstring value;
+                if (size > 1)
+                {
+                    value.resize(size);
+                    const DWORD length = GetEnvironmentVariableW(wname.c_str(), &value[0], size);
+                    value.resize(length < size ? length : 0);
+                }
+                return value;
+            }
 #endif
 
-            // An environment variable holding a path, as UTF-8 whatever the code page.
-            std::string read_env_path (
+            // A variable of the environment, in UTF-8 on Windows whatever the code page.
+            std::string read_env (
                 const char* name,
                 bool& present
             )
             {
 #ifdef _WIN32
-                const std::wstring wname(name, name + std::strlen(name));
-#ifdef _MSC_VER
-                wchar_t* buf = nullptr;
-                size_t len = 0;
-                if (_wdupenv_s(&buf, &len, wname.c_str()) == 0 && buf != nullptr)
-                {
-                    const std::string value = to_utf8(std::filesystem::path(buf));
-                    free(buf);
-                    present = true;
-                    return value;
-                }
-                present = false;
-                return std::string();
+                return to_utf8(std::filesystem::path(read_process_env(name, present)));
 #else
-                const wchar_t* value = _wgetenv(wname.c_str());
+                const char* value = std::getenv(name);
                 present = value != nullptr;
-                return value ? to_utf8(std::filesystem::path(value)) : std::string();
-#endif
-#else
-                return read_env(name, present);
+                return value ? std::string(value) : std::string();
 #endif
             }
 
@@ -1848,14 +1842,14 @@ namespace dlib
             {
                 bool present = false;
 #ifdef _WIN32
-                std::string base = read_env_path("LOCALAPPDATA", present);
-                if (!present || base.empty()) base = read_env_path("TEMP", present);
+                std::string base = read_env("LOCALAPPDATA", present);
+                if (!present || base.empty()) base = read_env("TEMP", present);
                 if (!present || base.empty()) return std::string();
                 return base + "\\dlib\\npu_cache";
 #else
-                std::string base = read_env_path("XDG_CACHE_HOME", present);
+                std::string base = read_env("XDG_CACHE_HOME", present);
                 if (present && !base.empty()) return base + "/dlib/npu_cache";
-                base = read_env_path("HOME", present);
+                base = read_env("HOME", present);
                 if (!present || base.empty()) return std::string();
                 return base + "/.cache/dlib/npu_cache";
 #endif
@@ -1900,7 +1894,7 @@ namespace dlib
                 if (present && !v.empty())
                     r->operand_budget = static_cast<size_t>(std::max(0LL, std::atoll(v.c_str()))) << 20;
 
-                v = read_env_path("DLIB_NPU_CACHE_DIR", present);
+                v = read_env("DLIB_NPU_CACHE_DIR", present);
                 if (present)
                 {
                     r->cache_dir = v;

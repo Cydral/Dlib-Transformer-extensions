@@ -205,6 +205,20 @@ if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
       -d '{"role": 5}' "$MODELS_URL/$ID/deactivate"
     step "service chat after" "Paris" curl -sk --max-time 300 https://localhost:$PORT/v1/chat/completions \
       -H "Content-Type: application/json" -d "$BODY"
+    # The relay: its providers, a key kept out of settings.json and masked, and the offline mode that refuses it.
+    step "service relay providers" '"id":"claude"' curl -sk --max-time 5 https://localhost:$PORT/albireo/v1/relay
+    RELAY='{"relay": {"enabled": true, "provider": "claude", "model": "claude-opus-5-5", "secret": "sk-test-0000"}}'
+    step "service relay settings" '"ok":true' curl -sk --max-time 10 -X PUT "${ADMIN[@]}" -d "$RELAY" \
+      https://localhost:$PORT/albireo/v1/settings
+    masked() {
+      if grep -q "sk-test-0000" "$HOME_DIR/settings.json"; then echo "the key is in settings.json"; return 1; fi
+      curl -sk --max-time 5 -H "X-Albireo-Admin: $TOKEN" https://localhost:$PORT/albireo/v1/settings \
+        | grep -o '"secret":"[^"]*"'
+    }
+    step "service relay key masked" '"secret":"\*{8}"' masked
+    ASK='{"model": "albireo-relay", "messages": [{"role": "user", "content": "Hi"}]}'
+    step "service relay offline" '"code":"offline"' curl -sk --max-time 10 -H "Content-Type: application/json" \
+      -d "$ASK" https://localhost:$PORT/v1/chat/completions
     # The voices of the speech synthesis, then a sentence read aloud by the program the service starts.
     step "service speech voices" '"id":"fr-FR"' curl -sk --max-time 5 \
       https://localhost:$PORT/albireo/v1/speech/voices

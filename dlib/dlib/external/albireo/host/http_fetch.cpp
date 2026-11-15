@@ -582,6 +582,21 @@ namespace albireo
         const int max_redirections = 5;
     }
 
+    std::shared_ptr<httplib::Client> http_client(const std::string& origin, int timeout_seconds,
+        std::string& error)
+    {
+        if (cancelled)
+        {
+            error = cancelled_error();
+            return nullptr;
+        }
+        url_parts u;
+        u.origin = origin;
+        u.target = "/";
+        bool via_proxy = false;
+        return open(u, timeout_seconds, error, via_proxy);
+    }
+
     void set_http_proxy(const std::string& setting)
     {
         std::lock_guard<std::mutex> lock(proxy_m);

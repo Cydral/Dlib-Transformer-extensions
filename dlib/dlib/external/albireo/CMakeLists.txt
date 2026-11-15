@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.21 LANGUAGES C CXX)
+project(albireo VERSION 1.0.22 LANGUAGES C CXX)
 
 # The version is written in four places that must agree: project() above, the numbers of
 # common/version.h, which the version resources of the programs and of the installer carry and
@@ -682,13 +682,15 @@ if (ALBIREO_PROGRAMS)
    # The service.
    add_executable(albireo-service host/main.cpp host/service.cpp host/server.cpp host/settings.cpp host/store.cpp
       host/models.cpp host/updater.cpp host/engine_host.cpp host/http_fetch.cpp host/public_link.cpp host/crypto.cpp
-      host/certificates.cpp host/speech.cpp host/speech_text.cpp host/web_access.cpp)
+      host/certificates.cpp host/speech.cpp host/speech_text.cpp host/web_access.cpp host/relay.cpp
+      host/pseudonyms.cpp)
    target_include_directories(albireo-service PRIVATE ${CMAKE_BINARY_DIR}/generated)
    target_link_libraries(albireo-service PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
    target_compile_options(albireo-service PRIVATE ${ALBIREO_WARNINGS})
    if (WIN32)
       target_sources(albireo-service PRIVATE resources/service.rc)
-      # crypt32: the key of the server encrypted with DPAPI, the authority in the trusted roots.
+      # crypt32: the key of the server and the secret of the relay encrypted with DPAPI, the authority in the
+      # trusted roots.
       target_link_libraries(albireo-service PRIVATE winhttp crypt32)
    endif()
 
@@ -826,14 +828,16 @@ endif()
 
 if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
    # The files the service writes in its models folder and reads in its imports, the downloads and the
-   # updates from the public link, the settings and the web access, with a local server.
+   # updates from the public link, the settings, the web access and the relay, with local servers.
    add_executable(test_host tests/test_host.cpp host/models.cpp host/store.cpp host/http_fetch.cpp
-      host/public_link.cpp host/crypto.cpp host/settings.cpp host/web_access.cpp host/updater.cpp)
+      host/public_link.cpp host/crypto.cpp host/settings.cpp host/web_access.cpp host/updater.cpp
+      host/certificates.cpp host/relay.cpp host/pseudonyms.cpp)
    target_include_directories(test_host PRIVATE ${CMAKE_BINARY_DIR}/generated)
    target_link_libraries(test_host PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
    if (WIN32)
-      # The proxy of WinHTTP, which the downloads read as the service does (host/http_fetch.cpp).
-      target_link_libraries(test_host PRIVATE winhttp)
+      # The proxy of WinHTTP, which the downloads read as the service does (host/http_fetch.cpp), and DPAPI,
+      # which keeps the secret of the relay (host/certificates.cpp).
+      target_link_libraries(test_host PRIVATE winhttp crypt32)
    endif()
    target_compile_options(test_host PRIVATE ${ALBIREO_WARNINGS})
    albireo_output_dir(test_host ${CMAKE_BINARY_DIR}/tests)

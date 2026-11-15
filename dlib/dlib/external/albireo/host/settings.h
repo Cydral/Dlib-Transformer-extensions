@@ -27,6 +27,50 @@ namespace albireo
     // Whether the password of a proxy setting is proxy_password_mask.
     bool proxy_password_masked(const std::string& proxy);
 
+    // The text that stands for the key or the password of the relay in settings.json and in the
+    // answers of the administration interface; settings_store keeps the secret itself apart.
+    extern const char* const relay_secret_mask;   // "********"
+
+    struct relay_settings
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The relay of the inference (relay.h): the external engine to which the model
+                albireo-relay sends the discussions that ask for it, the models of the
+                computer staying in place for the others.
+
+                provider is "openai", an engine of the interface of OpenAI at url (its base,
+                "https://host/v1", where /chat/completions and /models lie), "ollama", the
+                cloud of Ollama, or "claude", the interface of Anthropic: the last two have their
+                address and their models in relay.cpp.  auth is "key" (a bearer key, the only
+                one of the last two), "basic" (user and secret) or "none".  context, max_output,
+                images and reasoning describe the model of an "openai" engine, which the
+                program cannot know; relay.cpp knows those of the others.
+
+                pseudonymize sends the texts through Pseudalis, the anonymization service of
+                the computer, before they leave (pseudonyms.h), with the tags of its values
+                when tags is true and their substitutes alone otherwise.
+        !*/
+        bool enabled = false;
+        std::string provider = "openai";        // openai, ollama or claude
+        std::string url;                        // openai: the base of its interface
+        std::string model;
+        std::string auth = "key";               // key, basic or none
+        std::string user;                       // basic
+        std::string secret;                     // the key or the password, kept in relay.secret
+        long context = 131072;                  // openai: the context window of the model
+        long max_output = 8192;                 // openai: the tokens of an answer at most
+        bool images = false;                    // openai: the model reads images
+        bool reasoning = false;                 // openai: the model takes reasoning_effort
+        bool pseudonymize = false;
+        bool tags = false;
+
+        // What the secret was given for: a secret never goes to another provider, address or user.
+        std::string secret_scope() const;
+        json to_json() const;                   // the secret masked
+        void from_json(const json& j);
+    };
+
     struct host_settings
     {
         /*!
@@ -72,6 +116,7 @@ namespace albireo
             new authority follows the trust of the one it replaces (certificates.h).
         */
         int trust_authority = -1;
+        relay_settings relay;
 
         /*
             The settings as settings.json and the administration interface give them, the
@@ -98,7 +143,11 @@ namespace albireo
                 password of the proxy as proxy_password_mask.  The proxy with its password
                 is kept in proxy.secret beside it, which only the service and the
                 administrators read.  A password found in settings.json, written by an
-                earlier version or by hand, moves to proxy.secret at once.
+                earlier version or by hand, moves to proxy.secret at once.  The key or the
+                password of the relay goes the same way to relay.secret, encrypted for the
+                account of the service on Windows (seal_secret()) with the provider, the
+                address and the user it was given for: settings.json that names others reads
+                no secret.
 
                 A settings.json of an earlier version that holds settings this version
                 lacks, or another provider of the search, is written again at the start
@@ -126,7 +175,7 @@ namespace albireo
         const std::string& path() const { return path_; }
 
     private:
-        // Writes proxy.secret, then settings.json; m_ is held.
+        // Writes proxy.secret and relay.secret, then settings.json; m_ is held.
         bool write();
 
         std::string path_;

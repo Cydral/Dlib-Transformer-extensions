@@ -280,49 +280,10 @@ namespace albireo
             return ok;
         }
 
-        // The form of the private key in its file: encrypted for this account on Windows.
-        bool seal_key(const std::string& pem, std::string& data)
-        {
-#if defined(_WIN32)
-            DATA_BLOB in;
-            in.cbData = static_cast<DWORD>(pem.size());
-            in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(pem.data()));
-            DATA_BLOB out = {};
-            if (!CryptProtectData(&in, L"Albireo server key", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN,
-                    &out))
-                return false;
-            data.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
-            LocalFree(out.pbData);
-            return true;
-#else
-            data = pem;
-            return true;
-#endif
-        }
-
-        bool open_key(const std::string& data, std::string& pem)
-        {
-#if defined(_WIN32)
-            DATA_BLOB in;
-            in.cbData = static_cast<DWORD>(data.size());
-            in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(data.data()));
-            DATA_BLOB out = {};
-            if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out))
-                return false;
-            pem.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
-            SecureZeroMemory(out.pbData, out.cbData);
-            LocalFree(out.pbData);
-            return true;
-#else
-            pem = data;
-            return true;
-#endif
-        }
-
         bool write_key(const std::string& path, const std::string& pem)
         {
             std::string data;
-            const bool ok = seal_key(pem, data) && write_file_restricted(path, data);
+            const bool ok = seal_secret(pem, L"Albireo server key", data) && write_file_restricted(path, data);
             wipe_secret(data);
             return ok;
         }
@@ -358,6 +319,44 @@ namespace albireo
         s.clear();
     }
 
+    bool seal_secret(const std::string& secret, const wchar_t* description, std::string& sealed)
+    {
+#if defined(_WIN32)
+        DATA_BLOB in;
+        in.cbData = static_cast<DWORD>(secret.size());
+        in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(secret.data()));
+        DATA_BLOB out = {};
+        if (!CryptProtectData(&in, description, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out))
+            return false;
+        sealed.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+        LocalFree(out.pbData);
+        return true;
+#else
+        (void)description;
+        sealed = secret;
+        return true;
+#endif
+    }
+
+    bool open_secret(const std::string& sealed, std::string& secret)
+    {
+#if defined(_WIN32)
+        DATA_BLOB in;
+        in.cbData = static_cast<DWORD>(sealed.size());
+        in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(sealed.data()));
+        DATA_BLOB out = {};
+        if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out))
+            return false;
+        secret.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+        SecureZeroMemory(out.pbData, out.cbData);
+        LocalFree(out.pbData);
+        return true;
+#else
+        secret = sealed;
+        return true;
+#endif
+    }
+
     certificate_files certificate_paths(const std::string& dir)
     {
         certificate_files f;
@@ -376,7 +375,7 @@ namespace albireo
     bool read_server_key(const std::string& dir, std::string& pem)
     {
         std::string data;
-        const bool ok = read_file(certificate_paths(dir).server_key, data, 64 * 1024) && open_key(data, pem);
+        const bool ok = read_file(certificate_paths(dir).server_key, data, 64 * 1024) && open_secret(data, pem);
         wipe_secret(data);
         return ok && !pem.empty();
     }

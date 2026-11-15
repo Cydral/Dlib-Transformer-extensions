@@ -136,6 +136,21 @@ namespace albireo
     !*/
     bool http_resolve(const std::string& host, std::vector<std::string>& addresses, std::string& error);
 
+    /*!
+        ensures
+            - Gives a client of origin ("https://host:port") made as those of the downloads: the
+              proxy that http_proxy_for() gives, the server or its proxy reached within
+              connect_seconds (its name resolved within its bounds on Windows), each wait for
+              data bounded by timeout_seconds, redirections left to the caller, and the
+              cancellation of http_cancel_all(): a request of the client about to connect once
+              the downloads are cancelled leaves it by an exception, which its caller catches
+              whatever its type.  The client registers itself with http_registration as any.
+            - Returns null with error when the server or its proxy cannot be reached, or the
+              downloads are cancelled.
+    !*/
+    std::shared_ptr<httplib::Client> http_client(const std::string& origin, int timeout_seconds,
+        std::string& error);
+
     class http_registration
     {
         /*!

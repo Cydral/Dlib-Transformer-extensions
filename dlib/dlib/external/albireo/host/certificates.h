@@ -56,6 +56,18 @@ namespace albireo
     // Erases the characters of a secret, then empties it.
     void wipe_secret(std::string& s);
 
+    /*!
+        ensures
+            - Gives in sealed the form of a secret in its file: on Windows the secret encrypted
+              with DPAPI for the account of the service, which no other account and no other
+              computer decrypts; elsewhere the secret itself, in a file that its owner alone may
+              read (write_file_restricted()).  description names the secret in the encrypted
+              data.
+            - open_secret() gives the secret of sealed back; both return false on failure.
+    !*/
+    bool seal_secret(const std::string& secret, const wchar_t* description, std::string& sealed);
+    bool open_secret(const std::string& sealed, std::string& secret);
+
     // Deletes the certificates and the keys of dir; false when one of them remains.
     bool remove_certificate_files(const std::string& dir);
 

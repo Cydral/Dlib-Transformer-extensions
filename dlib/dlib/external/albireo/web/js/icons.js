@@ -58,6 +58,9 @@ const paths = {
   toEnd: '<path d="M6 19h12M12 5v10M7.5 10.5L12 15l4.5-4.5"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M4.6 7.5h14.8M4.6 16.5h14.8"/>' +
     '<path d="M12 3c-2.6 2.5-3.9 5.5-3.9 9s1.3 6.5 3.9 9c2.6-2.5 3.9-5.5 3.9-9S14.6 5.5 12 3z"/>',
+  // A padlock, closed, and open on its right side.
+  lock: '<rect x="5" y="11" width="14" height="9.5" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/>',
+  unlock: '<rect x="5" y="11" width="14" height="9.5" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 7.7-1.6"/>',
   link: '<path d="M10.6 13.4a3.6 3.6 0 0 0 5.1 0l3.1-3.1a3.6 3.6 0 0 0-5.1-5.1l-1.3 1.3"/>' +
     '<path d="M13.4 10.6a3.6 3.6 0 0 0-5.1 0l-3.1 3.1a3.6 3.6 0 0 0 5.1 5.1l1.3-1.3"/>'
 };

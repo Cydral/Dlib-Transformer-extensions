@@ -45,6 +45,19 @@ generation_replies = dict(engine_replies, **{
                  "request for a while because the images already queued for the model hold the memory kept for them "
                  "(code engine_busy, Retry-After: 5); the Retry-After header gives the seconds to wait", ref("Error")),
 })
+# The chat completions, which the relay may also answer (albireo-relay), and its failures once it started.
+relay_replies = dict(generation_replies, **{
+    "400": reply("Invalid request; for albireo-relay, tools, sounds, several choices, or images that neither the "
+                 "external model nor a model of the computer can take (code image_input_not_supported)", ref("Error")),
+    "404": reply("Unknown or inactive model; for albireo-relay, a relay turned off or incomplete (code "
+                 "relay_unavailable)", ref("Error")),
+    "502": reply("albireo-relay, not streamed: the external engine refused the request (code relay_refused, its "
+                 "reason without the key nor the address), failed (relay_failed) or could not be reached "
+                 "(relay_unreachable)", ref("Error")),
+})
+relay_replies["503"] = reply(generation_replies["503"]["description"] + "; for albireo-relay, the offline mode (code "
+                             "offline), eight answers in progress (engine_busy), or Pseudalis away while the relay "
+                             "pseudonymizes (pseudonymization_failed)", ref("Error"))
 admin = [{"adminToken": []}]
 offline_reply = {"409": reply("Refused in offline mode", {"type": "object", "properties": {
     "ok": {"type": "boolean"}, "error": {"type": "string"}}})}
@@ -155,10 +168,13 @@ schemas = {
         "properties": {
             "model": {"type": "string",
                       "description": "A model identifier, a function (albireo-general, albireo-code, "
-                                     "albireo-security), albireo-background or auto. A function without a model "
-                                     "of its own is served by the general model; albireo-background, the work done "
-                                     "in the background (titles, summaries, memory), by the model that comes with "
-                                     "Albireo, else the general one.",
+                                     "albireo-security), albireo-background, albireo-relay or auto. A function "
+                                     "without a model of its own is served by the general model; "
+                                     "albireo-background, the work done in the background (titles, summaries, "
+                                     "memory), by the model that comes with Albireo, else the general one; "
+                                     "albireo-relay, once the relay is ready, by the external engine of the relay "
+                                     "(/albireo/v1/relay), which takes no tool, no sound and no other choice than "
+                                     "n = 1.",
                       "example": "albireo-general"},
             "messages": {"type": "array", "items": ref("Message")},
             "stream": {"type": "boolean", "default": False},
@@ -174,9 +190,12 @@ schemas = {
                           "and the model answers directly (reasoning_budget)."},
             "think": {"type": "boolean", "description": "The same setting as reasoning, under the name other "
                       "clients give it; when both are given, think applies."},
-            "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high"],
+            "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max"],
                                  "description": "none disables the reasoning; low gives it the budget of a short "
-                                                "reasoning, high lifts its bound by default (reasoning_budget)."},
+                                                "reasoning, high lifts its bound by default (reasoning_budget). "
+                                                "For albireo-relay, the level of effort of the external model among "
+                                                "those it takes (efforts in /albireo/v1/relay), its own without "
+                                                "one."},
             "reasoning_budget": {"type": "integer", "minimum": -1, "nullable": True,
                                  "description": "The tokens the reasoning may take: beyond them, the engine ends it "
                                                 "with a sentence that asks the model to answer from what it has "
@@ -371,7 +390,61 @@ schemas = {
                        "description": "The provider of /albireo/v1/web/search: wikipedia, the REST interface of "
                                       "Wikipedia; or none, which turns the search off while /albireo/v1/web/fetch "
                                       "stays available. A settings.json of an earlier version that names another "
-                                      "provider is read as wikipedia."}}},
+                                      "provider is read as wikipedia."},
+        "relay": ref("RelaySettings")}},
+    "RelaySettings": {"type": "object", "description": "The relay to an external engine, the model albireo-relay. "
+                      "A change gives the members it changes; the others stay.", "properties": {
+        "enabled": {"type": "boolean", "default": False},
+        "provider": {"type": "string", "enum": ["openai", "ollama", "claude"], "default": "openai",
+                     "description": "openai: an engine of the interface of OpenAI at url; ollama: the cloud of "
+                                    "Ollama; claude: the interface of Anthropic."},
+        "url": {"type": "string", "maxLength": 2048, "description": "openai: the base of its interface, http:// or "
+                "https://, without query, where /chat/completions and /models lie."},
+        "model": {"type": "string", "maxLength": 256},
+        "auth": {"type": "string", "enum": ["key", "basic", "none"], "default": "key",
+                 "description": "openai: a bearer key, a user and a password, or none; the others take a key."},
+        "user": {"type": "string", "maxLength": 256, "description": "basic: the user, without ':'."},
+        "secret": {"type": "string", "maxLength": 4096,
+                   "description": "The key or the password, without control character, kept in relay.secret and "
+                                  "given as ********; that value sent back keeps the stored secret when the "
+                                  "provider, the address and the user stay the same, and is refused (code "
+                                  "relay_secret) otherwise."},
+        "context": {"type": "integer", "minimum": 1024, "maximum": 16777216, "default": 131072,
+                    "description": "openai: the context window of its model."},
+        "max_output": {"type": "integer", "minimum": 16, "maximum": 1048576, "default": 8192,
+                       "description": "openai: the tokens of an answer at most."},
+        "images": {"type": "boolean", "default": False, "description": "openai: the model reads images."},
+        "reasoning": {"type": "boolean", "default": False,
+                      "description": "openai: the model takes reasoning_effort (low, medium, high)."},
+        "pseudonymize": {"type": "boolean", "default": False,
+                         "description": "The texts leave through Pseudalis, the images described on the computer."},
+        "tags": {"type": "boolean", "default": False,
+                 "description": "The values leave as their tags rather than as their substitutes alone."}}},
+    "RelayModel": {"type": "object", "properties": {
+        "id": {"type": "string"}, "name": {"type": "string"}, "context": {"type": "integer"},
+        "max_output": {"type": "integer"}, "images": {"type": "boolean"},
+        "thinking": {"type": "string", "enum": ["none", "toggle", "always"],
+                     "description": "none, turned on or off by the request, or always on."},
+        "efforts": {"type": "array", "items": {"type": "string"}},
+        "default_effort": {"type": "string", "description": "The level the model takes without one, if known."}}},
+    "RelayState": {"type": "object", "description": "The relay without its address and its secret.", "properties": {
+        "enabled": {"type": "boolean"}, "ready": {"type": "boolean"},
+        "reason": {"type": "string", "description": "What the relay lacks while it is not ready."},
+        "provider": {"type": "string"}, "provider_name": {"type": "string"}, "model": {"type": "string"},
+        "name": {"type": "string"}, "context": {"type": "integer"}, "max_output": {"type": "integer"},
+        "images": {"type": "boolean"}, "thinking": {"type": "string"},
+        "efforts": {"type": "array", "items": {"type": "string"}}, "default_effort": {"type": "string"},
+        "pseudonymize": {"type": "boolean"}, "tags": {"type": "boolean"},
+        "scope": {"type": "string", "description": "A fingerprint of the provider, the address, the authentication "
+                  "and the user of the relay, which changes with them without naming them."},
+        "image_mode": {"type": "string", "enum": ["sent", "described", "none"],
+                       "description": "The images go to the external model, are described by a model of the "
+                                      "computer that reads images, or cannot be taken."},
+        "pseudalis": {"type": "object", "description": "With the pseudonymization: whether Pseudalis answers, and "
+                      "the values kept in memory.", "properties": {
+                          "found": {"type": "boolean"}, "port": {"type": "integer"}, "reason": {"type": "string"},
+                          "memory": {"type": "object", "properties": {"texts": {"type": "integer"},
+                              "values": {"type": "integer"}, "bytes": {"type": "integer"}}}}}}},
     "WebSearchRequest": {"type": "object", "required": ["query"], "properties": {
         "query": {"type": "string", "minLength": 1, "maxLength": 400,
                   "description": "The text searched, 1 to 400 characters once the spaces at its ends are removed."},
@@ -472,7 +545,7 @@ paths = {
         "responses": dict({"200": {"description": "The completion, or a stream of chunks", "content": {
             "application/json": {"schema": ref("ChatCompletion")},
             "text/event-stream": {"schema": {"oneOf": [ref("ChatCompletionChunk"), ref("StreamError")]}}}}},
-            **generation_replies)}},
+            **relay_replies)}},
     "/v1/completions": {"post": {
         "tags": ["OpenAI"], "summary": "Text completion of a raw prompt",
         "description": "A stream gives text_completion events ended by 'data: [DONE]', or by a StreamError event "
@@ -579,6 +652,7 @@ paths = {
                                              "they answered."},
             "models_state": {"type": "object", "additionalProperties": {"type": "string"},
                              "description": "loading, ready, unloading, removing, or the error of a load."},
+            "relay": ref("RelayState"),
             "web": {"type": "object", "description": "The web access of the Web button, which the web application "
                     "reads at its start: available while the administrator leaves it on (web_access) and the "
                     "service is not offline, and the provider of /albireo/v1/web/search, wikipedia, or none when "
@@ -674,8 +748,34 @@ paths = {
                       "400": reply("A name with a separator, a colon, a control character or a leading dot (code "
                                    "invalid_license)", ref("Error")),
                       "404": reply("No such text (code license_not_found)", ref("Error"))}}},
+    "/albireo/v1/relay": {"get": {
+        "tags": ["Service"], "summary": "The providers of the relay, their models and the state of the relay",
+        "responses": {"200": reply("The providers and the relay", {"type": "object", "properties": {
+            "providers": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"}, "name": {"type": "string"}, "url": {"type": "string"},
+                "auths": {"type": "array", "items": {"type": "string"}},
+                "models": {"type": "array", "items": ref("RelayModel")}}}},
+            "relay": ref("RelayState"),
+            "pseudalis": {"type": "object", "description": "Whether Pseudalis answers on this computer, and the "
+                          "values the relay keeps in memory.", "properties": {
+                              "found": {"type": "boolean"}, "port": {"type": "integer"},
+                              "reason": {"type": "string"}, "memory": {"type": "object"}}}}})}}},
+    "/albireo/v1/relay/test": {"post": {
+        "tags": ["Administration"], "summary": "Lists the models of a provider of the relay",
+        "description": "The settings given, over those saved, reach the models route of the provider; the masked "
+                       "secret stands for the stored one under the rule of the settings.",
+        "security": admin,
+        "requestBody": json_body(ref("RelaySettings")),
+        "responses": {"200": reply("Whether the provider answered", {"type": "object", "properties": {
+            "ok": {"type": "boolean"}, "models": {"type": "array", "items": {"type": "string"}},
+            "error": {"type": "string"}}}), "400": reply("Invalid settings, or a masked secret given for another "
+                                                         "provider, address or user (code relay_secret)",
+                                                         ref("Error"))}}},
     "/albireo/v1/count": {"post": {
         "tags": ["Service"], "summary": "Tokens of messages, or of a text, for a model",
+        "description": "For albireo-relay, an estimate (estimated: true) of the tokens of the external model: as the "
+                       "general model of the computer counts them, about four bytes a token without it, in the "
+                       "context of the external model.",
         "requestBody": json_body({"type": "object", "properties": {
             "model": {"type": "string"}, "messages": {"type": "array", "items": ref("Message")},
             "tools": {"type": "array", "items": ref("Tool")}, "text": {"type": "string"}}}),

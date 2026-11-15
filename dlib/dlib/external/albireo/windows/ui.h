@@ -62,7 +62,10 @@ namespace ui
     HWND button(HWND parent, const std::wstring& text, int id, DWORD style = 0);
     HWND checkbox(HWND parent, const std::wstring& text, int id, bool checked);
     HWND edit(HWND parent, const std::wstring& text, int id, DWORD style = 0);
-    HWND combo(HWND parent, int id);
+    // A list to choose from, or with editable, a field whose list proposes values.
+    HWND combo(HWND parent, int id, bool editable = false);
+    // A strip of tabs, the first one selected.
+    HWND tabs(HWND parent, int id, const std::vector<std::wstring>& labels);
     HWND progress(HWND parent, int id);
     HWND listview(HWND parent, int id, DWORD style = 0);
 

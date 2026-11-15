@@ -382,6 +382,9 @@ a { color: var(--blue); }
 .toggle svg { width: 15px; height: 15px; }
 .toggle.on { border-color: transparent; background: var(--bg-active); color: var(--blue); font-weight: 600; }
 .toggle.on.reason { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold-strong); }
+/* The padlock of the relay: red and open while the questions of the discussion leave the computer. */
+.toggle.relay { padding: 0 9px; }
+.toggle.on.relay { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
 .toggle:disabled { opacity: 0.45; cursor: not-allowed; }
 /* On a phone, the toggles of the composer show their icons alone; their names stay for the screen readers. */
 @media (max-width: 480px) {

@@ -768,9 +768,57 @@ function announceBusy(c, busy) {
 
 // Service status and models.
 function roleModel(role) {
+  if (role === 'relay') return relayStatus() ? relayModel : null;
   const s = state.status;
   if (!s || !s.active) return null;
   return s.active[role] || s.active.general || null;
+}
+
+/*
+    The relay of the service to an external engine (status.relay), once it is ready: a discussion turns it on with the
+    padlock of the composer, red and open while its questions leave this computer.  Its model, albireo-relay, stands
+    for the external one; the agent and the web stay with the models of this computer.
+*/
+const relayModel = 'albireo-relay';
+
+function relayStatus() {
+  const s = state.status;
+  return s && s.relay && s.relay.ready ? s.relay : null;
+}
+
+/*
+    What a discussion turned the relay on for: the provider, the model, the pseudonymization and the fingerprint of
+    the address of the relay then.  Another one since turns the relay of the discussion off, until a new click.
+*/
+function relayKey(r) {
+  return [r.provider, r.model, r.pseudonymize ? 1 : 0, r.scope || ''].join('|');
+}
+
+/*
+    The function whose model answers c: its own, or 'relay' while the discussion goes to the relay.  The functions,
+    their models, their inputs and their capabilities take 'relay' as one of them.
+*/
+function chatRole(c) {
+  const r = relayStatus();
+  return c && r && c.relay === relayKey(r) ? 'relay' : (c ? c.role : 'general');
+}
+
+// The name of the external model with its provider.
+function relayName(r) {
+  return (r.name || r.model) + ' · ' + r.provider_name;
+}
+
+// The speeds of an external engine, which reads and writes far faster than the computer, for the shares of its context.
+const relayReadRate = 2000;
+const relayWriteRate = 60;
+
+function relayCapabilities() {
+  const r = relayStatus() || {};
+  const thinking = r.thinking || 'none';
+  const context = r.context || 0;
+  return { reasoning: thinking !== 'none', reasoningAlways: thinking === 'always', tools: false, context,
+    working: context, read: relayReadRate, write: relayWriteRate, relay: true,
+    efforts: Array.isArray(r.efforts) ? r.efforts : [], defaultEffort: r.default_effort || '' };
 }
 
 function modelInfo(id) {
@@ -796,6 +844,9 @@ async function readCatalog() {
 }
 
 function modelName(id) {
+  // The external model of an answer of the relay keeps the name it had then.
+  if (typeof id === 'string' && id.startsWith('relay:')) return id.slice(6);
+  if (id === relayModel) return relayStatus() ? relayName(relayStatus()) : id;
   const m = modelInfo(id);
   return m && m.name ? m.name : id;
 }
@@ -808,6 +859,7 @@ function loadedModel(id) {
 // What a model reads: "text", and "image" or "audio" for the models that read them, as the
 // engine or the catalog tells.
 function modelInputs(id) {
+  if (id === relayModel) return relayStatus() && relayStatus().images ? ['text', 'image'] : ['text'];
   const loaded = loadedModel(id);
   if (loaded && Array.isArray(loaded.inputs) && loaded.inputs.length) return loaded.inputs;
   const m = modelInfo(id);
@@ -852,6 +904,7 @@ function acceptFor(role, room) {
     deep reasoning, which its tools wait for.
 */
 function roleCapabilities(role) {
+  if (role === 'relay') return relayCapabilities();
   const id = roleModel(role);
   const loaded = loadedModel(id);
   const m = modelInfo(id);
@@ -1009,10 +1062,13 @@ async function pollStatus() {
     const s = await api.status();
     /*
         The web access and the offline mode change the Web button of the composer and the tools of the next question,
-        and a newer catalog of the service the capabilities that the list of the models gives the models.
+        a newer catalog of the service the capabilities that the list of the models gives the models, and the relay
+        the padlock of the composer and the discussions that go to it.
     */
+    const relay = (r) => r ? [r.ready, r.provider, r.model, r.pseudonymize, r.image_mode, r.thinking, r.context,
+      r.scope] : null;
     const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background, x.web, x.offline,
-      x.catalog ? x.catalog.updated : null]);
+      x.catalog ? x.catalog.updated : null, relay(x.relay)]);
     changed = !state.status || key(state.status) !== key(s);
     back = state.statusError;
     state.status = s;
@@ -1112,8 +1168,9 @@ const contextRetry = 30000;
 function contextKey(c) {
   const last = c.messages[c.messages.length - 1];
   // The tools and the reasoning that the capabilities of the model allow change the prompt, as the buttons do.
-  const caps = roleCapabilities(c.role);
-  return [c.id, c.role, roleModel(c.role), c.messages.length, last ? last.id : '',
+  const role = chatRole(c);
+  const caps = roleCapabilities(role);
+  return [c.id, role, roleModel(role), c.messages.length, last ? last.id : '',
     last && last.steps ? last.steps.length : 0, c.contextStart || 0, c.agent ? 1 : 0, c.web ? 1 : 0,
     c.reasoning ? 1 : 0, caps.tools ? 1 : 0, caps.reasoning ? 1 : 0, c.updated || 0].join('|');
 }
@@ -1122,14 +1179,15 @@ async function measureContext(c, key) {
   contextUse.pending = true;
   let tokens = 0, context = 0;
   try {
-    const caps = roleCapabilities(c.role);
+    const role = chatRole(c);
+    const caps = roleCapabilities(role);
     const set = toolSet(c, caps);
     const system = systemPrompt(c, caps, set);
-    const model = 'albireo-' + c.role;
+    const model = 'albireo-' + role;
     const text = apiMessages(c, system, null, { read: false, url: () => null });
     const r = await api.count(model, text, set.definitions);
     if (r && typeof r.tokens === 'number' && r.context) {
-      tokens = Math.round(tokenEstimate(text, r.tokens, model).of(apiMessages(c, system, null, estimateMedia(c.role))));
+      tokens = Math.round(tokenEstimate(text, r.tokens, model).of(apiMessages(c, system, null, estimateMedia(role))));
       context = r.context;
     }
   } catch (e) {
@@ -1144,7 +1202,7 @@ async function measureContext(c, key) {
 function renderContextLine() {
   if (!ui.contextLine) return;
   const c = state.view === 'chat' ? state.current : null;
-  const ready = !!(c && serviceReady() && roleModel(c.role));
+  const ready = !!(c && serviceReady() && roleModel(chatRole(c)));
   const waiting = ready && contextUse.id === c.id && Date.now() - contextUse.failed < contextRetry;
   if (ready && !contextUse.pending && !generations.has(c.id) && !waiting) {
     const key = contextKey(c);
@@ -3338,7 +3396,7 @@ function renderWelcome() {
   if (state.statusError) notice = h('div', { class: 'error-box' }, t('serviceDown'));
   else if (state.status && !roleModel(c.role)) notice = h('div', { class: 'error-box' }, t('noModel'));
   // With the agent on, what it does and the tools it has.
-  const caps = roleCapabilities(c.role);
+  const caps = roleCapabilities(chatRole(c));
   const agent = c.agent && toolsAvailable(caps, c.reasoning && caps.reasoning)
     ? h('div', { class: 'agent-note' }, h('span', { html: icon('tool') }), h('span', null, t('agentHelp'))) : null;
   ui.content.replaceChildren(h('div', { class: 'welcome' },
@@ -3639,10 +3697,10 @@ function editMessage(c, m, index, el) {
     const pictures = attachments.filter((a) => a.kind === 'image');
     chips.replaceChildren(...pictures.map((a) => imageThumb(a, { list: pictures, onremove: () => remove(a) })),
       ...attachments.filter((a) => a.kind !== 'image').map((a) => attachmentChip(a, true, () => remove(a))));
-    fileInput.accept = acceptFor(c.role, room());
+    fileInput.accept = acceptFor(chatRole(c), room());
   };
   const add = async (files) => {
-    const added = await readFiles(files, c.role, room());
+    const added = await readFiles(files, chatRole(c), room());
     for (const a of added) if (a.kind === 'image') prepared.add(a.id);
     attachments = attachments.concat(added);
     showChips();
@@ -4188,34 +4246,89 @@ function toolElement(tc, number) {
   return wrap;
 }
 
+/*
+    The padlock of the relay, shown while the relay of the service is ready: closed while the discussion is answered on
+    this computer, red and open, with the name of the external model, while its questions leave it.
+*/
+function renderRelayButton(c) {
+  if (!ui.relayButton) return;
+  const r = relayStatus();
+  ui.relayButton.classList.toggle('hidden', !r);
+  if (!r) return;
+  const on = chatRole(c) === 'relay';
+  const label = on ? r.name || r.model : '';
+  if (ui.relayButton.dataset.on !== String(on) || ui.relayButton.dataset.label !== label) {
+    ui.relayButton.dataset.on = String(on);
+    ui.relayButton.dataset.label = label;
+    ui.relayButton.innerHTML = icon(on ? 'unlock' : 'lock') + (on ? '<span>' + escapeHtml(label) + '</span>' : '');
+  }
+  ui.relayButton.classList.toggle('on', on);
+  ui.relayButton.setAttribute('aria-pressed', String(on));
+  let title = t(on ? 'relayOn' : 'relayOff', { model: relayName(r) });
+  if (r.pseudonymize) title += ' ' + t('relayPseudonymized');
+  if (r.image_mode === 'described') title += ' ' + t('relayImagesDescribed');
+  ui.relayButton.title = title;
+  ui.relayButton.setAttribute('aria-label', title);
+}
+
+// The levels of effort of the external model of c, its default first.
+function effortMenu(anchor, c, caps) {
+  const pick = async (level) => {
+    c.effort = level;
+    renderComposerState();
+    if (c.messages.length) await persist(c);
+    refreshViews();
+  };
+  const def = caps.defaultEffort ? t('effortDefaultIs', { level: t('effort_' + caps.defaultEffort) })
+    : t('effortDefault');
+  const entries = [{ label: def, checked: !caps.efforts.includes(c.effort), action: () => pick('') }];
+  for (const level of caps.efforts) {
+    entries.push({ label: t('effort_' + level), checked: c.effort === level, action: () => pick(level) });
+  }
+  showMenu(anchor, entries);
+}
+
 // Composer.
 function renderComposerState() {
   if (!ui.input) return;
   const c = state.current;
-  const caps = roleCapabilities(c ? c.role : 'general');
+  const role = chatRole(c);
+  const caps = roleCapabilities(role);
   const reasoning = !!(c && c.reasoning && caps.reasoning);
   // The agent and the web of a model that can reason come with its deep reasoning (toolsAvailable()).
   const ready = toolsAvailable(caps, reasoning);
   const agent = !!(c && c.agent && ready);
-  ui.reasonButton.classList.toggle('on', reasoning);
-  ui.reasonButton.setAttribute('aria-pressed', String(reasoning));
+  renderRelayButton(c);
+  /*
+      An external model that takes levels of effort has them in the menu of the button of the reasoning, its default
+      first; the other models have their deep reasoning turned on or off.
+  */
+  const efforts = caps.relay && caps.efforts.length > 0;
+  const level = efforts && c && caps.efforts.includes(c.effort) ? c.effort : '';
+  const label = efforts ? t('effort') + ' · ' + (level ? t('effort_' + level) : t('effortDefault')) : t('reasoning');
+  if (ui.reasonButton.dataset.label !== label) {
+    ui.reasonButton.dataset.label = label;
+    ui.reasonButton.innerHTML = icon('spark') + '<span>' + escapeHtml(label) + '</span>';
+  }
+  ui.reasonButton.classList.toggle('on', efforts ? !!level : reasoning);
+  ui.reasonButton.setAttribute('aria-pressed', String(efforts ? !!level : reasoning));
   ui.reasonButton.disabled = !caps.reasoning;
   // A model trained to reason before every answer answers directly without the button, as the other models do.
-  ui.reasonButton.title = t('reasoningHint');
+  ui.reasonButton.title = efforts ? t('effortHint') : t('reasoningHint');
   ui.agentButton.classList.toggle('on', agent);
   ui.agentButton.setAttribute('aria-pressed', String(agent));
   ui.agentButton.disabled = !ready;
-  ui.agentButton.title = ready ? t('agentHint') : caps.tools ? t('agentNeedsReasoning') : t('agentNoTools');
+  ui.agentButton.title = ready ? t('agentHint') : caps.relay ? t('relayNoTools')
+    : caps.tools ? t('agentNeedsReasoning') : t('agentNoTools');
   // The Web button is off and disabled, with the reason as its title, while the model calls no tool, while a model
   // that can reason lacks its deep reasoning, or while the service gives no web access.
-  const reason = webUnavailable(caps, reasoning);
+  const reason = caps.relay ? t('relayNoTools') : webUnavailable(caps, reasoning);
   const webOn = !!(c && c.web && !reason);
   ui.webButton.classList.toggle('on', webOn);
   ui.webButton.setAttribute('aria-pressed', String(webOn));
   ui.webButton.disabled = !!reason;
   ui.webButton.title = reason || t('webHint');
   // The attachments the model of the function reads, the images while the context has places for them.
-  const role = c ? c.role : 'general';
   const room = imageRoom(c);
   if (ui.fileInput) ui.fileInput.accept = acceptFor(role, room);
   if (ui.attachButton) {
@@ -4278,7 +4391,7 @@ function autoGrow() {
 */
 async function addPending(files) {
   const c = state.current;
-  let added = await readFiles(files, c ? c.role : 'general', imageRoom(c));
+  let added = await readFiles(files, chatRole(c), imageRoom(c));
   const key = draftKey(c);
   const shown = state.current === c || (key !== '' && draftKey(state.current) === key);
   const draft = shown || !key ? null : drafts.get(key) || { text: storedDraft(key), files: [] };
@@ -4492,7 +4605,7 @@ const indexWait = 15000;
 // How the model reads the documents of a question: whole while they fit in their share of the working context and
 // in their time of reading, searched beyond.
 function attachmentModes(c, m) {
-  const limit = wholeTokens(roleCapabilities(c.role), attachmentShare, attachmentSeconds);
+  const limit = wholeTokens(roleCapabilities(chatRole(c)), attachmentShare, attachmentSeconds);
   for (const a of m.attachments || []) {
     if (!a.mode) a.mode = estimateTokens(a.text) <= limit ? 'whole' : 'search';
   }
@@ -4505,7 +4618,7 @@ function attachmentModes(c, m) {
     stops the vectors of the documents, then searched by their words, and the search.
 */
 async function prepareQuestion(c, m, signal) {
-  const caps = roleCapabilities(c.role);
+  const caps = roleCapabilities(chatRole(c));
   const owners = [];
   attachmentModes(c, m);
   for (const a of m.attachments || []) {
@@ -5412,10 +5525,10 @@ function answerElement(c, m) {
 */
 async function runTurn(c, abort, turn) {
   const g = generationOf(c);
-  // The function, the reasoning and the agent of the answer stay those of its start.
-  const role = c.role;
+  // The function, the reasoning and the agent of the answer stay those of its start, the relay included.
+  const role = chatRole(c);
   const model = roleModel(role);
-  turn.model = model || '';
+  turn.model = role === 'relay' ? 'relay:' + relayName(relayStatus()) : model || '';
   const signal = abort.signal;
   const caps = roleCapabilities(role);
   const reasoning = !!(c.reasoning && caps.reasoning);
@@ -5489,6 +5602,8 @@ async function runTurn(c, abort, turn) {
         turn.promptTokens = fitted.tokens;
       }
       const body = { model: 'albireo-' + role, messages: fitted.messages, reasoning };
+      // The level of effort of an external model chosen for the discussion.
+      if (caps.relay && caps.efforts.includes(c.effort)) body.reasoning_effort = c.effort;
       if (stepTools) body.tools = stepTools;
       if (state.settings.temperature != null) body.temperature = state.settings.temperature;
       if (state.settings.topP != null) body.top_p = state.settings.topP;
@@ -6642,7 +6757,8 @@ function cancelWarmup(id) {
 */
 async function warmBeginning(c) {
   if (!c || deleted.has(c.id) || generations.has(c.id) || !c.messages.length || !serviceReady()) return;
-  if (!roleModel(c.role)) return;
+  // The external engine of the relay keeps its prompts itself.
+  if (!roleModel(c.role) || chatRole(c) === 'relay') return;
   cancelWarmup(c.id);
   const abort = new AbortController();
   warmups.set(c.id, abort);
@@ -7335,8 +7451,13 @@ function buildLayout() {
   ui.fileInput = fileInput;
   ui.reasonButton = h('button', {
     class: 'toggle reason', type: 'button', title: t('reasoningHint'), html: icon('spark') + '<span>' + escapeHtml(t('reasoning')) + '</span>',
-    onclick: async () => {
+    onclick: async (e) => {
       const c = state.current;
+      const caps = roleCapabilities(chatRole(c));
+      if (caps.relay && caps.efforts.length) {
+        effortMenu(e.currentTarget, c, caps);
+        return;
+      }
       c.reasoning = !c.reasoning;
       // The agent and the web of a model that can reason end with its deep reasoning.
       if (!c.reasoning) {
@@ -7373,6 +7494,25 @@ function buildLayout() {
       refreshViews();
     }
   });
+  /*
+      The relay of the discussion shown, off in every new discussion: the padlock opens, red, while its questions go to
+      the external model, and the agent and the web stay with the models of this computer.
+  */
+  ui.relayButton = h('button', {
+    class: 'toggle relay hidden', type: 'button', 'aria-pressed': 'false',
+    onclick: async () => {
+      const c = state.current;
+      const r = relayStatus();
+      c.relay = chatRole(c) === 'relay' || !r ? '' : relayKey(r);
+      if (c.relay) {
+        c.agent = false;
+        c.web = false;
+      }
+      renderComposerState();
+      if (c.messages.length) await persist(c);
+      refreshViews();
+    }
+  });
   // What the agent mode and the web access do, and the tools they give, from a button beside them.
   ui.agentHelp = h('button', {
     class: 'help-button', type: 'button', title: t('agentHelpTitle'), 'aria-label': t('agentHelpTitle'),
@@ -7383,7 +7523,7 @@ function buildLayout() {
   ui.attachButton = iconButton('clip', t('attach'), () => fileInput.click());
   const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, h('div', { class: 'row' },
     ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, ui.webButton, ui.agentHelp,
-    h('span', { class: 'grow' }), ui.sendButton));
+    h('span', { class: 'grow' }), ui.relayButton, ui.sendButton));
   for (const ev of ['dragenter', 'dragover']) composer.addEventListener(ev, (e) => { e.preventDefault(); composer.classList.add('drag'); });
   for (const ev of ['dragleave', 'drop']) composer.addEventListener(ev, () => composer.classList.remove('drag'));
   composer.addEventListener('drop', (e) => {

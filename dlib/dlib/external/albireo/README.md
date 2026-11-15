@@ -28,6 +28,7 @@ application, the description of the interface and the list of the programs of Wi
 - [Settings](#settings)
 - [Interfaces](#interfaces)
 - [Web access](#web-access)
+- [Relay to an external engine](#relay-to-an-external-engine)
 - [Models](#models)
 - [Models that come with Albireo](#models-that-come-with-albireo)
 - [Computers without network](#computers-without-network)
@@ -202,7 +203,12 @@ pass asks for; the host computes the embeddings of the tokens and the cosines an
 positions, whatever the frequency adjustments and the multimodal positions of the model (Qwen3-VL
 and its DeepStack slices included). The keys and values of each sequence live in the variables of an
 inference request of its own, which the plugin of the processor fuses with the attention of each
-layer; a sequence cut or copied reads its variables and writes the part kept back, so that the
+layer, the graph giving it the index of the beams before the cache of each layer, the identity for
+the single sequence of a request. The graphs that take the causal mask as an input, those of the
+graphics processor, read their cache directly: the plugin of the graphics processor turns that index
+into a table of beams of its own, which `query_state()` does not list, so that `set_state()` could
+not give it to a request that takes the positions of another one, and the copies of the sequences
+failed. A sequence cut or copied reads its variables and writes the part kept back, so that the
 drafts of the answers are off with the graph, and its passes take 2048 tokens, the plugin attending
 one token at a time to a pass that follows another. Answers written together run one inference each,
 each reading all the weights, where the processor runtime computes their tokens in one pass that
@@ -1235,8 +1241,8 @@ cmake --build build-albireo-win -j
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, the refusals of the tools, of the offline mode and of a missing key, and a log that names no key and no value) |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`, written to the environment block of the process, which dlib reads on Windows whatever the runtime of C of the program), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` |
 | `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input. `test_ov_graph model.gguf [device] [threads] [f16\|u8\|f16-mask\|u8-mask] [prompt] [chunk] [steps]` |
 
@@ -1253,20 +1259,21 @@ bash dlib/dlib/external/albireo/tools/test_linux.sh
 powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\test_windows.ps1
 ```
 
-They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q8_0.gguf` by
-default and skip the steps whose model or build tree is missing. The Linux script runs a service
-offline in a data folder of its own, on the port `ALBIREO_TEST_PORT` (18443 by default), sends it
-the model through the upload route, checks that the route of the paths refuses a plain file, runs
-the tests of the service (`test_host`), asks a question through the OpenAI interface, gives the code
-function to the model and takes it back, the model keeping its general function, checks the
-refusal of a function the model does not serve, of an unknown function and of a function that is
-no text, asks the question again and has a sentence read aloud; the Windows script asks the
-installed service a question, the vectors of two
-texts and a sentence read aloud, and tests the OpenVINO and CUDA engines when their trees exist
-(`-Device GPU` or `-Device NPU` for `test_offload`, CPU by default). Both have a sentence read by
-`albireo-speech` of the build tree. The engine steps of the Windows script run with the `PATH` of
-the service, System32 and the Windows folder only; the Linux script gives the service 30 seconds
-to stop, then kills it. Their exit code is the number of failed steps.
+They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q8_0.gguf` by default
+and skip the steps whose model or build tree is missing. The Linux script runs a service offline in
+a data folder of its own, on the port `ALBIREO_TEST_PORT` (18443 by default), sends it the model
+through the upload route, checks that the route of the paths refuses a plain file, runs the tests of
+the service (`test_host`), asks a question through the OpenAI interface, gives the code function to
+the model and takes it back, the model keeping its general function, checks the refusal of a
+function the model does not serve, of an unknown function and of a function that is no text, asks
+the question again, gives the relay a key, which `settings.json` never holds and the settings mask,
+and has the relay refused offline, then has a sentence read aloud; the Windows script asks the
+installed service a question, the vectors of two texts, the state of the relay without its address
+nor its key, and a sentence read aloud, and tests the OpenVINO and CUDA engines when their trees
+exist (`-Device GPU` or `-Device NPU` for `test_offload`, CPU by default). Both have a sentence read
+by `albireo-speech` of the build tree. The engine steps of the Windows script run with the `PATH` of
+the service, System32 and the Windows folder only; the Linux script gives the service 30 seconds to
+stop, then kills it. Their exit code is the number of failed steps.
 
 ## Installation
 
@@ -1417,6 +1424,7 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port`; the settings give the password as `********`, kept in `proxy.secret` |
 | `web_access`    | true    | the web access of the Web button, `false` turns it off (see [Web access](#web-access)) |
 | `web_search`    | `wikipedia` | provider of the search: `wikipedia`, or `none` to turn the search off |
+| `relay`         |         | the relay to an external engine, off by default (see [Relay to an external engine](#relay-to-an-external-engine)); its key or password is given as `********`, kept in `relay.secret` |
 | `active`        |         | the model of each function: `general`, `code`, `security`, `embedding`     |
 
 ## Interfaces
@@ -1711,6 +1719,127 @@ searched or the address asked, a link that opens in a new tab (`target="_blank"`
 a page too large, a type not read, a site that does not answer or the offline mode, reaches the
 model as the result of the call, with the message of the service, and changes nothing else in the
 page.
+
+## Relay to an external engine
+
+The model `albireo-relay` of the interface sends a discussion to an external engine that the
+settings name, through the service ([`host/relay.h`](host/relay.h)): the service then serves as a
+proxy between the web application, or any client of its interface, and the external engine, whose
+address and key the clients never see. The other models keep the engine of the computer, and the
+discussions keep it until they turn the relay on. Three providers are known:
+
+| Provider | Address | Authentication | Models |
+|----------|---------|----------------|--------|
+| `openai` | the base of an interface of OpenAI, `http://` or `https://`, inside or outside the network | a key (`Authorization: Bearer`), a user and a password (`Basic`), or none | the model typed, or one that the Test button lists; its context window, the tokens of its answers, its images and its reasoning effort set in the tray, 131072, 8192, no and no by default |
+| `ollama` | `https://ollama.com/v1`, interface of OpenAI | a key | five models of the cloud of Ollama, below |
+| `claude` | `https://api.anthropic.com/v1/messages` | a key (`x-api-key`) | the seven latest models of Anthropic, below |
+
+Ollama ended its free plan on 31 August 2026: an account without subscription, Pay as you go, pays
+each request by its tokens with the credits it bought. The relay offers the models of the lowest
+prices per token of its table ([ollama.com/pricing](https://ollama.com/pricing)), under the names
+of its interface:
+
+| Model | Context | Images | Reasoning |
+|-------|---------|--------|-----------|
+| `gpt-oss:20b`, `gpt-oss:120b` | 131072 | no | always, effort `low`, `medium`, `high` |
+| `gemma4:31b` | 262144 | yes | turned on or off |
+| `nemotron-3-super` | 262144 | no | turned on or off |
+| `glm-5.3-flash` | 1000000 | yes | always, effort `low`, `high`, `max` |
+
+The models of Anthropic are the seven latest that every key reaches, the newest first:
+`claude-fable-5-2`, `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`,
+`claude-opus-5` and `claude-sonnet-5`, each with a context of 1000000 tokens, answers of 128000
+tokens at most, images, and the efforts `low`, `medium`, `high`, `xhigh` and `max`; Mythos 5.2,
+whose access needs an application to Anthropic, is left out. The relay asks for the reasoning in its
+summary (`"thinking": {"type": "adaptive", "display": "summarized"}`), which these models omit
+otherwise, gives the level of effort of the discussion in `output_config.effort`, the model choosing
+its own without one, sends the system messages apart, the images as blocks of base64 and the tokens
+of the answer in `max_tokens`, 64000 when the request gives none, and never `temperature`, `top_p`
+nor `top_k`, which these models refuse.
+
+| Setting of `relay` | Default | Meaning |
+|--------------------|---------|---------|
+| `enabled` | false | the relay offered to the discussions |
+| `provider` | `openai` | `openai`, `ollama` or `claude` |
+| `url` | `""` | `openai`: the base of its interface, where `/chat/completions` and `/models` lie |
+| `model` | `""` | the model of the provider |
+| `auth`, `user`, `secret` | `key` | `openai`: `key`, `basic` or `none`; the others take a key |
+| `context`, `max_output`, `images`, `reasoning` | 131072, 8192, false, false | `openai`: what its model offers |
+| `pseudonymize` | false | the texts leave through Pseudalis |
+| `tags` | false | the values leave as their tags rather than as their substitutes alone |
+
+The key or the password is written to `relay.secret` beside `settings.json`, encrypted with DPAPI
+for the account of the service on Windows, with the provider, the address and the user it was
+given for: the settings and the answers of the administration interface give it as `********`,
+which stands for it with that provider, that address and that user only, so that a change of them
+asks for the key again and a `settings.json` edited to name another server reads no key. A key in
+clear in `settings.json` moves to `relay.secret` at the next start. The key goes in the headers of
+the requests alone, never in a log, an answer or an error.
+
+The requests follow the proxy of the downloads, end with the offline mode, which the relay then
+refuses, and with the stop of the service; eight answers run at once at most. The relay takes the
+chat completions alone, and refuses the tools, the sounds and several choices: the agent mode and
+the web access stay with the models of the computer. The sampling of a request passes as numbers
+alone, and its stop sequences, texts, only without pseudonymization. A refusal of the external
+engine ends the answer with its reason (the key, the model, the limits of the account), the key, the
+user and the address it may quote masked; an answer sent whole despite the stream is read as one,
+and a page of another kind, the sign-in page of a proxy for instance, ends the answer with an error.
+Its tokens stay out of the usage of the engine of the computer; the log gives one line per answer,
+its provider, its model and its tokens, never its texts. The failures of the external engine answer
+502 to a request that is not streamed, a Pseudalis away 503, and images that nothing can take 400. A
+key sent to an address in `http://` other than the computer itself crosses the network in clear,
+which the tray says.
+
+| Route | Answer |
+|-------|--------|
+| `POST /v1/chat/completions` with `"model": "albireo-relay"` | the answer of the external engine, whole or streamed, its reasoning in `reasoning_content`; `reasoning_effort` gives the level of effort among those of the model, `reasoning` turns on or off the reasoning of a model that takes no level |
+| `GET /v1/models` | `albireo-relay` once the relay is ready, with its provider, its model, its inputs and its context |
+| `GET /albireo/v1/relay` | the providers, their models with their traits, the state of the relay and of Pseudalis, without address nor key |
+| `POST /albireo/v1/relay/test` | administration: the models of the provider that the given settings reach, the mask standing for the stored key under the same rule |
+| `POST /albireo/v1/count` | for `albireo-relay`, the tokens as the general model of the computer counts them, about four bytes a token without it, and the context of the external model |
+| `GET /albireo/v1/status` | `relay`: its state, its model and its traits, `image_mode`, `sent`, `described` or `none`, and `scope`, a fingerprint of its provider, address, authentication and user that names none of them |
+
+The Models window of the tray has two tabs, the models of the computer and the relay, whose page
+sets the provider, its address, its authentication, its model and the pseudonymization, tests the
+connection and saves them. In the web application, a ready relay puts a padlock beside the Send
+button: closed while the discussion is answered on the computer, red and open, with the name of the
+external model, while its questions leave the computer. The discussion keeps its choice for the
+provider, the model, the address and the pseudonymization it was made for, another one since asking
+for a new click; the button of the reasoning becomes a menu of the levels of effort of the external
+model when it takes some, its default first; the Agent and Web buttons are disabled. The images go
+to the external model when it reads them and the pseudonymization is off; otherwise the model of the
+computer that reads images, the one of the general function first, describes each of them, its text
+copied in full, and the description takes its place, kept for the next turns of the discussion.
+
+### Pseudonymization through Pseudalis
+
+With `pseudonymize`, each text of a request, the system messages and the earlier answers included,
+leaves through Pseudalis, the anonymization service of the same computer
+([`host/pseudonyms.h`](host/pseudonyms.h)), found as Pseudalis finds Albireo: its data folder
+recorded by its installer (`DataDir` of `HKLM\Software\Pseudalis`), its port in its `settings.json`
+(8444 by default) and its local authority (`certificates\pseudalis-authority.crt`), which checks its
+certificate on 127.0.0.1. The folder, its certificates, its authority and its settings must belong
+to SYSTEM or the administrators, so that no other account puts a service of its own on the path of
+the texts. `/v1/text/anonymize` replaces each personal value by its substitute, of the same form,
+or by its tag (`tags`), and `/v1/text/restore` gives the value of each of them back. A Pseudalis
+missing, busy beyond two minutes or failing ends the request with its reason: no text then leaves
+in clear. The images never leave: the model of the computer describes them, and their descriptions
+leave pseudonymized as the texts.
+
+The table of the substitutes and of their values lives in the memory of the service alone and is
+never written: 16384 values and 4 MB at most, with the protected forms of 4096 texts and 32 MB, the
+least recently used going first when room is needed, and what stays unused for two hours forgotten,
+the values erased from memory before their place is freed. A message sent again at the next turn of
+its discussion is served from that table without Pseudalis, and protected again once one of its
+values went. The answer of the external engine gets its values back as it streams, its reasoning
+too: a substitute is found whole, the longest first, and between the boundaries of words when it
+begins or ends with a letter or a digit; the words of a substitute of several words are found alone
+too when they have four bytes or more and stand for one word of one value only, so that a person
+named by the surname alone gets the surname back; the text of a tag is found as the tag. A chunk
+gives back what precedes the substitutes that its end may begin, which the next one completes. The
+answer restores the substitutes of its own request only. A cancelled answer stops its request to
+Pseudalis. Turning the relay or its pseudonymization off empties the table and the descriptions of
+the images.
 
 ## Models
 
@@ -2063,6 +2192,14 @@ size and its SHA-256, and run it in update mode at their next start.
   the proxy are files with restricted rights, and the data folder grants writing to the
   administrators and the service only: on Windows, the service secures it again at each start,
   and the import folder too when another account could write in it.
+- The relay sends out of the computer only the discussions that turn it on, to the provider of the
+  settings, which the administrator alone changes; as the rest of the interface, which takes no key,
+  it serves every program and every account of the computer once it is ready, at the cost of the
+  account of the provider. Its key stays in `relay.secret`, encrypted with DPAPI on Windows, bound
+  to the provider, the address and the user it was given for, and goes in the headers of its
+  requests alone. With the pseudonymization, Pseudalis must answer from a data folder of SYSTEM or
+  the administrators, or no text leaves; the values of the substitutes stay in the memory of the
+  service, bounded, forgotten after two hours, and restore the answers of their own requests only.
 - A database the service cannot open as SQLite, or whose pages fail the check of its start, is set
   aside as `albireo.db.corrupt-<time>`, and a new one records again the models of the models
   folder; a database opened read only is opened again at the next write that fails, and a database

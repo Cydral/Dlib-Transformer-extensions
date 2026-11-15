@@ -87,25 +87,32 @@ namespace albireo
         }
 #endif
 
+        /*
+            Sets a variable of the environment.  On Windows, dlib reads the variables of its devices
+            from the environment block of the process, which every module shares, and the runtime of C
+            of this library keeps a copy of its own: both take the value.
+        */
+        void set_environment(const char* name, const std::string& value)
+        {
+#if defined(_WIN32)
+            const std::wstring wname = widen(name);
+            const std::wstring wvalue = widen(value);
+            _wputenv_s(wname.c_str(), wvalue.c_str());
+            SetEnvironmentVariableW(wname.c_str(), wvalue.c_str());
+#else
+            setenv(name, value.c_str(), 1);
+#endif
+        }
+
         // Sets a variable of the environment, unless it is already set: the variables
         // of the user take precedence over the configuration.
         void default_environment(const char* name, const std::string& value)
         {
 #if defined(_WIN32)
-            const std::wstring wname = widen(name);
-            if (_wgetenv(wname.c_str())) return;
-            _wputenv_s(wname.c_str(), widen(value).c_str());
+            if (GetEnvironmentVariableW(widen(name).c_str(), nullptr, 0) > 0) return;
+            set_environment(name, value);
 #else
             setenv(name, value.c_str(), 0);
-#endif
-        }
-
-        void set_environment(const char* name, const std::string& value)
-        {
-#if defined(_WIN32)
-            _wputenv_s(widen(name).c_str(), widen(value).c_str());
-#else
-            setenv(name, value.c_str(), 1);
 #endif
         }
 
