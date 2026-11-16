@@ -312,7 +312,9 @@ the record gives the originals back.
   (`fe80::1%eth0`); the restoration gives each value back as it was written.
 - The values of these columns are learned as values of their types: a client named in a comment of the
   same file takes the tag of the value of its column, whose body is that substitute. The other columns
-  are read as before, their names typing them when they are labels (`ville`, `telephone`).
+  are read as before, their names typing them when they are labels (`ville`, `telephone`), written
+  apart, joined by an underscore, in camel case or, for the commonest names of database columns, in one
+  word (`first_name`, `FirstName`, `lastname`).
 - The record of the file keeps each substitute with the tag it stands for, as for a file protected
   without tags: its copies give back the original, a copy edited on the drive its values, while the
   record lasts. Without record, the report says that they cannot come back (`"restorable": false`).
@@ -404,7 +406,8 @@ processed, `refused\`.
   network or on a client while held.
   The files and texts of the interface processed at once are bounded by the processors and the memory
   (half the processors, 2 to 8): a request that finds no free slot within a minute gets 503 and
-  `Retry-After`. A body larger than its route takes is refused before it is read (413).
+  `Retry-After`. A body larger than its route takes is refused before it is read (413), and so is a
+  body sent in chunks, which declares no length (411).
 - An archive or an Office document may decompress 64 times its size at most, from 16 MB to 2 GB, all
   levels together, and each part of an Office document 32 times the document at most, from 32 MB: a
   small file that would hold gigabytes of text is refused. A text is analyzed in pieces of 64 KB, so

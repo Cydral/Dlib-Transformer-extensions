@@ -2131,6 +2131,144 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_record_labels_and_cut_names()
+    {
+        // Labels in camel case and in one word, as records and exports write them.
+        {
+            pii_detector detector;
+            DLIB_TEST(detector.label_type("firstName") == pii_type::person);
+            DLIB_TEST(detector.label_type("LastName") == pii_type::person);
+            DLIB_TEST(detector.label_type("FIRSTNAME") == pii_type::person);
+            DLIB_TEST(detector.label_type("familyName:") == pii_type::person);
+            DLIB_TEST(detector.label_type("ZIPCode") == pii_type::location);
+            DLIB_TEST(detector.label_type("postalCode") == pii_type::location);
+            DLIB_TEST(detector.label_type("phoneNumber") == pii_type::phone);
+            DLIB_TEST(detector.label_type("dateOfBirth") == pii_type::date);
+            DLIB_TEST(detector.label_type("NomDeNaissance") == pii_type::person);
+            DLIB_TEST(detector.label_type("IDNumber") == pii_type::identifier);
+            DLIB_TEST(detector.label_type("companyName") == pii_type::organization);
+            DLIB_TEST(detector.label_type("userID") == pii_type::identifier);
+            DLIB_TEST(detector.label_type("IPAddress") == pii_type::ipv4);
+            // A single lower case letter before a capital opens no word of its own.
+            DLIB_TEST(detector.label_type("eMail") == pii_type::email);
+            DLIB_TEST(detector.label_type("first_name") == pii_type::person);
+            DLIB_TEST(detector.label_type("fileName") == pii_type::none);
+            DLIB_TEST(detector.label_type("displayName") == pii_type::none);
+            DLIB_TEST(detector.label_type("McDonald") == pii_type::none);
+
+            auto entities = [&](const string& text) {
+                detector.begin_document();
+                detector.learn(text);
+                return detector.detect(text);
+            };
+            // The header of an export types its columns.
+            string text = "FirstName;LastName;City;ZipCode\n"
+                          "Ilario;Venturi;Melun;77000\n"
+                          "Annick;Kervella;Brest;29200\n"
+                          "Odile;Marchetti;Lyon;69003\n";
+            std::vector<pii_entity> e = entities(text);
+            for (const char* v : { "Ilario", "Venturi", "Annick", "Kervella", "Odile", "Marchetti" })
+                DLIB_TEST_MSG(found(e, text, pii_type::person, v), v);
+            for (const char* v : { "Melun", "77000", "Brest", "29200", "Lyon", "69003" })
+                DLIB_TEST_MSG(found(e, text, pii_type::location, v), v);
+            DLIB_TEST(!covered(e, text, "FirstName") && !covered(e, text, "ZipCode"));
+            text = "firstname,lastname,city\nIlario,Venturi,Melun\nAnnick,Kervella,Brest\n";
+            e = entities(text);
+            for (const char* v : { "Ilario", "Venturi", "Annick", "Kervella" })
+                DLIB_TEST_MSG(found(e, text, pii_type::person, v), v);
+            DLIB_TEST(found(e, text, pii_type::location, "Melun") && found(e, text, pii_type::location, "Brest"));
+            // The keys of a record.
+            text = "lastName: Marchetti\ngivenName: Odile\npostalCode: 69003\nuserID: omarchetti69\n";
+            e = entities(text);
+            DLIB_TEST(found(e, text, pii_type::person, "Marchetti"));
+            DLIB_TEST(found(e, text, pii_type::person, "Odile"));
+            DLIB_TEST(found(e, text, pii_type::location, "69003"));
+            DLIB_TEST(found(e, text, pii_type::identifier, "omarchetti69"));
+
+            // A CSV file whose header is written that way: every cell of its typed columns is protected.
+            const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x43')));
+            pii_detector csv_detector;
+            document_anonymizer a(p, csv_detector);
+            const string csv = "CustomerId;FirstName;LastName;City;ZipCode;Status\r\n"
+                               "C-20417;Ilario;Venturi;Melun;77000;actif\r\n"
+                               "C-20418;Annick;Kervella;Brest;29200;actif\r\n";
+            document_report report;
+            const string out = a.anonymize(csv, document_format::delimited, report, "clients.csv");
+            for (const char* v : { "Ilario", "Venturi", "Annick", "Kervella", "Melun", "Brest", "77000", "29200",
+                                   "C-20417", "C-20418" })
+                DLIB_TEST_MSG(out.find(v) == string::npos, v);
+            DLIB_TEST(out.find("CustomerId;FirstName;LastName;City;ZipCode;Status") == 0);
+            DLIB_TEST(out.find(";actif") != string::npos);
+            document_report back;
+            DLIB_TEST(a.restore(out, document_format::delimited, back, "clients.csv") == csv);
+        }
+
+        /* A name read by a recognizer, a part of which another value takes, keeps its other
+           words replaced. */
+        auto fixed = std::make_shared<std::vector<pii_span>>();
+        pii_detector detector;
+        detector.add_recognizer([fixed](const string&) { return *fixed; });
+        auto span = [](const string& text, const string& value, size_t nth, const string& label, double confidence) {
+            size_t p = text.find(value);
+            for (size_t k = 0; k < nth && p != string::npos; ++k) p = text.find(value, p + 1);
+            pii_span s;
+            s.begin = p;
+            s.end = p + value.size();
+            s.label = label;
+            s.confidence = confidence;
+            return s;
+        };
+        auto read = [&](const string& text, const std::vector<pii_span>& spans) {
+            *fixed = spans;
+            detector.begin_document();
+            detector.learn(text);
+            return detector.detect(text);
+        };
+        // The family name read as a town on its own line is replaced as a place wherever it is written.
+        string text = "cn: Ilario Venturi\nsn: Venturi\n";
+        std::vector<pii_entity> e = read(text, { span(text, "Ilario", 0, "GIVEN_NAME", 0.86),
+                                                 span(text, "Venturi", 0, "FAMILY_NAME", 0.62),
+                                                 span(text, "Venturi", 1, "CITY", 0.95) });
+        DLIB_TEST(found(e, text, pii_type::person, "Ilario"));
+        size_t replaced = 0;
+        for (const pii_entity& x : e)
+            if (text.substr(x.begin, x.end - x.begin).find("Venturi") != string::npos) ++replaced;
+        DLIB_TEST(replaced == 2);
+        // An organisation read at the end of a name.
+        text = "Suivi : Maelle Kerbrat Novexa, lundi.";
+        e = read(text, { span(text, "Maelle Kerbrat Novexa", 0, "FAMILY_NAME", 0.6),
+                         span(text, "Novexa", 0, "ORGANIZATION", 0.95) });
+        DLIB_TEST(found(e, text, pii_type::organization, "Novexa"));
+        DLIB_TEST(found(e, text, pii_type::person, "Maelle Kerbrat"));
+        // The words left are kept from the first to the last that may be a part of a name.
+        text = "Présents : le Professeur Maelle de Kerbrat Novexa.";
+        e = read(text, { span(text, "Professeur Maelle de Kerbrat Novexa", 0, "FAMILY_NAME", 0.6),
+                         span(text, "Novexa", 0, "ORGANIZATION", 0.95) });
+        DLIB_TEST(covered(e, text, "Maelle") && covered(e, text, "Kerbrat"));
+        // A common word left alone names nobody.
+        text = "Réunion du Service Novexa demain.";
+        e = read(text, { span(text, "Service Novexa", 0, "FAMILY_NAME", 0.6),
+                         span(text, "Novexa", 0, "ORGANIZATION", 0.95) });
+        DLIB_TEST(found(e, text, pii_type::organization, "Novexa"));
+        DLIB_TEST(!covered(e, text, "Service"));
+        // A name that nothing cuts is unchanged.
+        text = "Suivi : Maelle Kerbrat, lundi.";
+        e = read(text, { span(text, "Maelle Kerbrat", 0, "FAMILY_NAME", 0.6) });
+        DLIB_TEST(found(e, text, pii_type::person, "Maelle Kerbrat"));
+        /* A common word left after a first name, where a family name could stand, names nobody; a
+           word that is no common word stays replaced. */
+        detector.add_person_name("Kerbrat Maelle");
+        text = "Notes : Kerbrat Maelle Suite du dossier.";
+        e = read(text, { span(text, "Maelle Suite", 0, "FAMILY_NAME", 0.6) });
+        DLIB_TEST(found(e, text, pii_type::person, "Kerbrat Maelle"));
+        DLIB_TEST(!covered(e, text, "Suite"));
+        text = "Notes : Kerbrat Maelle Tregarvan, lundi.";
+        e = read(text, { span(text, "Maelle Tregarvan", 0, "FAMILY_NAME", 0.6) });
+        DLIB_TEST(covered(e, text, "Kerbrat") && covered(e, text, "Tregarvan"));
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_learned_places()
     {
         /* A country or a state stays readable when a recognizer reads it as a place, and a
@@ -4224,6 +4362,7 @@ namespace
             print_spinner();
             test_known_names();
             test_learned_organizations();
+            test_record_labels_and_cut_names();
             test_learned_places();
             print_spinner();
             test_partial_dates();

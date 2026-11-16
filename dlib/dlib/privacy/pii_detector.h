@@ -238,8 +238,24 @@ namespace dlib
 
         inline std::string normalize_label(const std::string& raw)
         {
+            /* "firstName", "DateOfBirth" and "ZIPCode" read "first name", "date of birth" and "zip
+               code", as the keys of records and the headers of exports write them: a capital
+               letter opens a word after a lower case letter, and before one when capitals precede
+               it. A single lower case letter opens no word of its own: "eMail" stays whole. */
+            auto upper = [](char c) { return c >= 'A' && c <= 'Z'; };
+            auto lower = [](char c) { return c >= 'a' && c <= 'z'; };
+            std::string spaced;
+            spaced.reserve(raw.size() + 4);
+            for (std::size_t i = 0; i < raw.size(); ++i)
+            {
+                if (i >= 2 && upper(raw[i]) &&
+                    ((lower(raw[i - 1]) && (lower(raw[i - 2]) || upper(raw[i - 2]))) ||
+                     (upper(raw[i - 1]) && upper(raw[i - 2]) && i + 1 < raw.size() && lower(raw[i + 1]))))
+                    spaced.push_back(' ');
+                spaced.push_back(raw[i]);
+            }
             // "first_name" reads "first name".
-            std::string key = fold_key(raw);
+            std::string key = fold_key(spaced);
             for (char& c : key)
                 if (c == '_') c = ' ';
             std::string cleaned;
@@ -852,27 +868,59 @@ namespace dlib
                 else
                     taken[m.first] = m.second;
             }
-            for (candidate x : c)
-            {
-                if (overlaps(taken, x.b, x.e)) continue;
+            auto accept = [&](candidate x) {
                 if ((x.type == pii_type::person || x.type == pii_type::organization || x.type == pii_type::location) &&
                     regulation_only(text, t, x.b, x.e))
-                    continue;
+                    return;
                 // Words that name nothing, whatever reads them, unless the user, a label or the place says so.
                 if (!x.kept && !x.exact && generic_span(text, t, x.b, x.e, x.type))
-                    continue;
+                    return;
                 // A piece of a reference in capitals and digits names no person and no place.
                 if (!x.kept && !x.exact && (x.type == pii_type::person || x.type == pii_type::location) &&
                     inside_reference(t, x.b, x.e))
-                    continue;
+                    return;
                 // An organisation opened by generic words starts at its head noun: "Politique de sauvegarde
                 // du ministère de la Pêche".
                 if (!x.kept && !x.exact && x.type == pii_type::organization) x.b = generic_opening(text, t, x.b, x.e);
                 if (!allowed_.empty() &&
                     allowed_.count(privacy_impl::fold_key(privacy_impl::cp_substr(t, text, x.b, x.e))))
-                    continue;
+                    return;
                 accepted.push_back(x);
                 taken[x.b] = x.e;
+            };
+            for (const candidate& x : c)
+            {
+                if (!overlaps(taken, x.b, x.e))
+                {
+                    accept(x);
+                    continue;
+                }
+                /* A name that a recognizer read, a part of which another value took: the words left
+                   stay replaced. The given name of "cn: Ilario Venturi" is not left readable because
+                   "Venturi" is a town elsewhere in the document, nor the name of "Venturi (DSI)"
+                   because "DSI" is an organisation. */
+                if (!x.learned || x.type != pii_type::person) continue;
+                for (const auto& part : free_name_words(t, words, taken, x.b, x.e))
+                {
+                    /* The words left pass the checks of a span read alone, and one of them at least
+                       is no common word: after a first name, where a family name could stand, a common
+                       word alone is what the recognizer read too far ("Suite", "GESEHEN"). */
+                    if (spurious_learned_span(text, t, part.first, part.second, x.type, false)) continue;
+                    bool proper = false;
+                    for (const auto& w : span_words(t, part.first, part.second))
+                    {
+                        const std::string key =
+                            privacy_impl::fold_key(privacy_impl::cp_substr(t, text, w.first, w.second));
+                        if (!common_word_or_compound(key) || privacy_impl::first_names().count(key)) proper = true;
+                    }
+                    if (!proper) continue;
+                    candidate rest = x;
+                    rest.b = part.first;
+                    rest.e = part.second;
+                    rest.strong = false;
+                    rest.exact = false;
+                    accept(rest);
+                }
             }
             join_given_and_family_names(text, t, taken, accepted);
             attach_name_edges(t, words, taken, accepted);
@@ -969,6 +1017,38 @@ namespace dlib
             if (it == taken.begin()) return false;
             --it;
             return it->second > b;
+        }
+
+        /* The runs of words of [b, e) that no accepted value holds, each from its first to its
+           last word that may be a part of a name: a capitalized word of two letters at least
+           that is no civility, title, particle or function word. */
+        static std::vector<std::pair<std::size_t, std::size_t>> free_name_words(
+            const utf8_text& t, const std::vector<word_token>& words, const std::map<std::size_t, std::size_t>& taken,
+            std::size_t b, std::size_t e)
+        {
+            using namespace privacy_impl;
+            std::vector<std::pair<std::size_t, std::size_t>> runs;
+            auto name_word = [&](const word_token& w) {
+                return w.e - w.b >= 2 && is_upper(t.cps[w.b]) && !civility_words().count(w.key) &&
+                       !person_titles().count(w.key) && !person_particles().count(w.key) &&
+                       !function_words().count(w.key);
+            };
+            auto w = std::lower_bound(words.begin(), words.end(), b,
+                [](const word_token& x, std::size_t pos) { return x.b < pos; });
+            while (w != words.end() && w->e <= e)
+            {
+                if (overlaps(taken, w->b, w->e)) { ++w; continue; }
+                auto last = w;
+                while (last + 1 != words.end() && (last + 1)->e <= e && !overlaps(taken, (last + 1)->b, (last + 1)->e))
+                    ++last;
+                auto first = w;
+                auto end = last;
+                while (first != end && !name_word(*first)) ++first;
+                while (end != first && !name_word(*end)) --end;
+                if (name_word(*first)) runs.push_back(std::make_pair(first->b, end->e));
+                w = last + 1;
+            }
+            return runs;
         }
 
         /* True if a civility right before b, or a name label before a colon, announces the value

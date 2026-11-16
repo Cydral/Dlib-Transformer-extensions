@@ -258,6 +258,11 @@ namespace pseudalis
             if (!origin.empty() && !is_local_origin(origin, port))
                 return refuse(403, "cross-origin requests are refused");
             /*
+                A body is taken with its length alone: sent in chunks, it declares none, and would
+                be read up to the largest file the settings can allow, whatever its route takes.
+            */
+            if (req.has_header("Transfer-Encoding")) return refuse(411, "the length of the body is required");
+            /*
                 A body larger than its route takes is refused before it is read: the files up to
                 the size of the settings, a JSON body up to 16 MB.
             */

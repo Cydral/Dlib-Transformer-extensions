@@ -395,7 +395,11 @@ namespace dlib
                    Floc'h", unless the first name is also a common word, as "Tan" in "Tan
                    Law", or the name a word of an address, as "Milan CEDEX"), and a family
                    name written in capitals joins the first name that follows it ("LE
-                   FLOC'H Anne").
+                   FLOC'H Anne"). A name they read, a part of which another value takes,
+                   keeps its other words replaced when they may be parts of a name: the
+                   given name of "cn: Ilario Venturi" where "Venturi" is a town elsewhere
+                   in the document, the name of "Maelle Kerbrat Novexa" where "Novexa" is
+                   an organisation; a common word left alone names nobody.
 
                 The detector is a recall-oriented filter. Its output is meant to be
                 pseudonymized, and a residual-risk audit of the protected document is
@@ -642,6 +646,12 @@ namespace dlib
                   "E-mail", "N° allocataire", "Phone No.", "first_name"), returns the type
                   of the values it introduces, otherwise pii_type::none. Document handlers
                   use it on table cells and column headers.
+                - The words of a label may be joined by underscores, written in camel case
+                  ("firstName", "DateOfBirth", "ZIPCode": a capital letter opens a word
+                  after a lower case letter, and before one when capitals precede it) or,
+                  for the commonest names of database columns, in one word ("firstname",
+                  "lastname", "zipcode"). A single lower case letter opens no word of its
+                  own: "eMail" reads "email".
         !*/
 
         std::size_t learned_name_count() const;

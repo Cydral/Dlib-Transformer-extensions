@@ -10,8 +10,9 @@
 # Default build folder: build-pseudalis-linux at the root of the repository.  The tests of the
 # engine and of the host run first; the service then runs in a data folder of its own, on port
 # 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a CSV file,
-# a name and the archive of a folder as the web application sends it, then files and a folder
-# through its drive, whose originals come back through the interface, an archive extracted on the
+# a name and the archive of a folder as the web application sends it, refuses a body sent in
+# chunks, then anonymizes and restores files and a folder through its drive, whose originals
+# come back through the interface, an archive extracted on the
 # drive, an archive whose original was forgotten coming back and the copies of a file, saves the
 # settings as the web application does, imposes terms, makes room for newer originals, restores from
 # their tags an archive whose picture was forgotten and a text written elsewhere from anonymized
@@ -79,6 +80,12 @@ if [ $ready -eq 1 ]; then
     python3 -c 'import json, sys; print(json.dumps({"text": json.load(sys.stdin)["text"]}))')
   step "text restored" "jean.dupont@exemple.fr" api -X POST -H "Content-Type: application/json" \
     --data "$PROTECTED" "$URL/v1/text/restore"
+  # A body sent in chunks declares no length, which the limit of its route needs: it is refused.
+  CHUNKED=$(api -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+    -H "Transfer-Encoding: chunked" --data "{\"text\": \"$TEXT\"}" "$URL/v1/text/anonymize")
+  if [ "$CHUNKED" = 411 ]; then record "body in chunks" PASS "refused (411)"
+  else record "body in chunks" FAIL "HTTP $CHUNKED"
+  fi
   printf 'nom;prenom;email;telephone\nDupont;Jean;jean.dupont@exemple.fr;06 12 34 56 78\n' > "$WORK/sample.csv"
   api -X POST --data-binary @"$WORK/sample.csv" -o "$WORK/sample.anon.csv" "$URL/v1/anonymize?name=sample.csv"
   step "file anonymized" '\[\[EMAIL:' cat "$WORK/sample.anon.csv"

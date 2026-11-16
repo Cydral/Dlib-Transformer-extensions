@@ -884,7 +884,16 @@ namespace dlib
                 {"staatsangehorigkeit", pii_type::nationality}, {"nationalitat", pii_type::nationality},
                 {"staatsburgerschaft", pii_type::nationality}, {"coordinate gps", pii_type::geolocation},
                 {"coordenadas gps", pii_type::geolocation}, {"gps-koordinaten", pii_type::geolocation},
-                {"koordinaten", pii_type::geolocation}
+                {"koordinaten", pii_type::geolocation},
+                // The same labels in one word, as the columns of a database and the keys of a record are named.
+                {"firstname", pii_type::person}, {"lastname", pii_type::person}, {"fullname", pii_type::person},
+                {"givenname", pii_type::person}, {"familyname", pii_type::person}, {"middlename", pii_type::person},
+                {"birthdate", pii_type::date}, {"dateofbirth", pii_type::date}, {"zipcode", pii_type::location},
+                {"postalcode", pii_type::location}, {"phonenumber", pii_type::phone},
+                {"emailaddress", pii_type::email}, {"companyname", pii_type::organization},
+                {"streetaddress", pii_type::address}, {"user name", pii_type::identifier},
+                {"userid", pii_type::identifier}, {"customerid", pii_type::identifier},
+                {"employeeid", pii_type::identifier}
             };
             return m;
         }

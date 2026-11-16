@@ -130,7 +130,18 @@
         ./slm_document_anonymizer_ex train-tagger pii-data/train.tsv --dev pii-data/dev.tsv
             --examples 100000 --threads 4 --out pii_tagger.dat
             trains the tagger afresh, in minutes; --cache 5 trains about three times
-            faster with about six times the memory.
+            faster with about six times the memory. --c, --loss, --bits and --epsilon set
+            the C of the SVM, the cost of a missed entity token, the size of the feature
+            hash and the stopping tolerance of the solver.
+        ./slm_document_anonymizer_ex tune-tagger pii-data/train.tsv --dev pii-data/dev.tsv
+            --trials 20 --cache 5 --log trials.tsv
+            searches the C and the entity loss of the tagger with dlib::find_max_global():
+            each trial trains a tagger on the same draw of examples and scores it on the
+            development set, alone and inside the detector. The command prints the best
+            settings as the train-tagger line that uses them; a search started again
+            with the same --log goes on from the trials it holds. A development set
+            whose values the training did not see (the test_unseen split of another
+            --seed) scores what the settings generalize to.
         ./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv
             --init embedded --lr 0.0005 --steps 10000 --out pii_span.dat
             continues the training of the span model compiled into the program; mix
@@ -147,8 +158,8 @@
 
     Built with -DANONYMIZER_ESSENTIALS_ONLY=1, the program keeps the round trip of
     protection, keygen, anonymize, restore, scan and text, with the recognizers compiled
-    into it, and leaves out detect, train-tagger, train-model, evaluate and embed with
-    their options: the build given to the people who only protect and restore documents,
+    into it, and leaves out detect, train-tagger, tune-tagger, train-model, evaluate and
+    embed with their options: the build given to the people who only protect and restore documents,
     such as a standalone executable for Windows. The default, 0, builds every command.
 
         g++ -std=c++14 -O2 -DNDEBUG -DDLIB_NO_GUI_SUPPORT -DANONYMIZER_ESSENTIALS_ONLY=1
@@ -180,13 +191,16 @@
 #include <dlib/base64.h>
 #include <dlib/cmd_line_parser.h>
 #include <dlib/dir_nav.h>
+#include <dlib/global_optimization.h>
 #include <dlib/zip.h>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -236,7 +250,7 @@
     (-DANONYMIZER_ESSENTIALS_ONLY=1), it builds a program limited to the round trip of
     protection, for the people who only protect and restore documents: keygen, anonymize,
     restore, scan and text, with the recognizers compiled into it. detect, train-tagger,
-    train-model, evaluate and embed are not compiled, nor the training options and the
+    tune-tagger, train-model, evaluate and embed are not compiled, nor the training options and the
     options that load, leave out or tune a recognizer. */
 #ifndef ANONYMIZER_ESSENTIALS_ONLY
 #  define ANONYMIZER_ESSENTIALS_ONLY 0
@@ -249,7 +263,10 @@ using namespace dlib;
 
 namespace
 {
-    enum class command { anonymize, restore, scan, text, keygen, detect, train_tagger, train_model, evaluate, embed };
+    enum class command
+    {
+        anonymize, restore, scan, text, keygen, detect, train_tagger, tune_tagger, train_model, evaluate, embed
+    };
 
     const char separator =
 #if defined(_WIN32)
@@ -800,21 +817,21 @@ namespace
     /* The models of the detector: those given with --tagger and --model, each read from its
        file independently of the other, and otherwise those compiled into the program;
        --no-tagger and --no-model leave one out. */
-    recognizers load_recognizers(const command_line_parser& parser)
+    recognizers load_recognizers(const command_line_parser& parser, bool with_tagger = true)
     {
         recognizers r;
 #if ANONYMIZER_ESSENTIALS_ONLY
         (void)parser;
-        const bool use_tagger = true, use_model = true;
+        const bool use_tagger = with_tagger, use_model = true;
 #else
-        if (parser.option("tagger"))
+        if (with_tagger && parser.option("tagger"))
         {
             r.tagger = std::make_shared<pii_sequence_tagger>();
             deserialize(parser.option("tagger").argument()) >> *r.tagger;
         }
         if (parser.option("model"))
             r.model = std::make_shared<span_model>(load_span_model(parser.option("model").argument()));
-        const bool use_tagger = !parser.option("no-tagger"), use_model = !parser.option("no-model");
+        const bool use_tagger = with_tagger && !parser.option("no-tagger"), use_model = !parser.option("no-model");
 #endif
         if (!r.tagger && use_tagger && !embedded_tagger().empty())
         {
@@ -879,28 +896,44 @@ namespace
              << overlap.overall.recall() << ", f1 " << overlap.overall.f1() << "\n";
     }
 
+    // The options of the solver that train-tagger and tune-tagger share.
+    bool read_tagger_options(const command_line_parser& parser, pii_tagger_training_options& options)
+    {
+        options.max_iterations = get_option(parser, "iterations", 400UL);
+        options.num_threads = get_option(parser, "threads", 2UL);
+        options.max_cache_size = get_option(parser, "cache", 0UL);
+        options.epsilon = get_option(parser, "epsilon", options.epsilon);
+        options.verbose = parser.option("verbose");
+        if (options.max_iterations == 0 || options.num_threads == 0 || !(options.epsilon > 0))
+        {
+            cerr << "--iterations and --threads must be at least 1, --epsilon positive.\n";
+            return false;
+        }
+        return true;
+    }
+
     int train_tagger(const command_line_parser& parser)
     {
         if (parser.number_of_arguments() != 2 || !parser.option("out"))
         {
-            cerr << "Usage: train-tagger train.tsv --out tagger.dat [--dev dev.tsv] [--examples N] [--c C] "
-                 << "[--iterations N] [--threads N] [--cache N]\n";
+            cerr << "Usage: train-tagger train.tsv --out tagger.dat [--dev dev.tsv] [--examples N] [--c C] [--loss L] "
+                 << "[--bits N] [--epsilon E] [--iterations N] [--threads N] [--cache N]\n";
             return 1;
         }
         const unsigned long seed = get_option(parser, "seed", 1UL);
         pii_tagger_training_options options;
-        options.c = get_option(parser, "c", 10.0);
-        options.max_iterations = get_option(parser, "iterations", 400UL);
-        options.num_threads = get_option(parser, "threads", 2UL);
-        options.max_cache_size = get_option(parser, "cache", 0UL);
-        options.verbose = parser.option("verbose");
-        if (options.c <= 0 || options.max_iterations == 0 || options.num_threads == 0)
+        if (!read_tagger_options(parser, options)) return 1;
+        options.c = get_option(parser, "c", options.c);
+        options.entity_loss = get_option(parser, "loss", options.entity_loss);
+        options.hash_bits = get_option(parser, "bits", options.hash_bits);
+        if (!(options.c > 0) || !(options.entity_loss >= 0) || options.hash_bits < 10 || options.hash_bits > 26)
         {
-            cerr << "--c must be positive, --iterations and --threads at least 1.\n";
+            cerr << "--c must be positive, --loss zero or more, --bits between 10 and 26.\n";
             return 1;
         }
         const std::vector<pii_example> train = load_examples(parser[1], get_option(parser, "examples", 20000UL), seed);
-        cout << "Training the sequence tagger on " << train.size() << " examples (C = " << options.c << ")\n";
+        cout << "Training the sequence tagger on " << train.size() << " examples (C = " << options.c << ", entity loss "
+             << options.entity_loss << ", " << options.hash_bits << " hash bits, epsilon " << options.epsilon << ")\n";
         const auto start = chrono::steady_clock::now();
         pii_sequence_tagger tagger;
         tagger.train(train, options);
@@ -1162,6 +1195,254 @@ namespace
         return 0;
     }
 
+    // One training of the search, with its scores on the development set.
+    struct tagger_trial
+    {
+        double c = 0;
+        double entity_loss = 0;
+        unsigned long hash_bits = 0;
+        pii_score alone;        // the tagger alone, exact spans with their fine label
+        pii_score detector;     // the rules and the recognizers together, every category
+        double seconds = 0;
+    };
+
+    /* Searches the settings of the tagger with dlib::find_max_global(), the global optimizer
+       that dlib's automatic trainers rely on (auto_train_rbf_classifier()). Each trial trains a
+       tagger on the same draw of examples, with a value of C, of the loss of a missed entity
+       token and of the size of the feature hash, and scores it on the development set: alone,
+       on its exact spans, and inside the detector, with the rules and the span model, on every
+       category at the level at which values are replaced. The search maximizes the F1 of
+       --objective.
+
+       The search moves the logarithm of C itself. find_max_global() also searches on a
+       logarithmic scale a variable whose bounds span three decades, but it reads the known
+       evaluations it is given on the linear scale: with the logarithm taken here, the trials
+       read back from --log lie on the scale that is searched, and a search that finds its
+       log goes on from the trials it holds, with either objective since the log keeps both
+       scores. */
+    int tune_tagger(const command_line_parser& parser, const recognizers& r, const pii_detector_options& dopt,
+                    double min_confidence, double tagger_min_confidence)
+    {
+        if (parser.number_of_arguments() != 2 || !parser.option("dev"))
+        {
+            cerr << "Usage: tune-tagger train.tsv --dev dev.tsv [--examples N] [--dev-examples N] [--trials N] "
+                 << "[--minutes M] [--c-range LOW HIGH] [--loss-range LOW HIGH] [--bits-range LOW HIGH] "
+                 << "[--objective tagger|detector] [--log trials.tsv] [--epsilon E] [--iterations N] [--threads N] "
+                 << "[--cache N]\n";
+            return 1;
+        }
+        pii_tagger_training_options base;
+        if (!read_tagger_options(parser, base)) return 1;
+        const unsigned long seed = get_option(parser, "seed", 1UL);
+        const unsigned long trials = get_option(parser, "trials", 20UL);
+        const double minutes = get_option(parser, "minutes", 0.0);
+        const bool by_detector = get_option(parser, "objective", "tagger") == "detector";
+
+        // The bounds of C, of the entity loss and of the hash bits; a setting whose bounds meet is not moved.
+        double low[3] = { 1, 1, static_cast<double>(base.hash_bits) };
+        double high[3] = { 1000, 4, static_cast<double>(base.hash_bits) };
+        const char* ranges[3] = { "c-range", "loss-range", "bits-range" };
+        try
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (!parser.option(ranges[k])) continue;
+                low[k] = sa = parser.option(ranges[k]).argument(0);
+                high[k] = sa = parser.option(ranges[k]).argument(1);
+            }
+        }
+        catch (std::exception&)
+        {
+            cerr << "--c-range, --loss-range and --bits-range take two numbers.\n";
+            return 1;
+        }
+        if (!(low[0] > 0) || !(low[1] >= 0) || low[2] < 10 || high[2] > 26 || low[2] != std::floor(low[2]) ||
+            high[2] != std::floor(high[2]) || low[0] > high[0] || low[1] > high[1] || low[2] > high[2] ||
+            (low[1] > 0 && high[1] / low[1] >= 1000) || trials == 0 || minutes < 0)
+        {
+            cerr << "The bounds of C are positive, those of the entity loss zero or more and less than three "
+                 << "decades apart, those of the hash bits whole numbers between 10 and 26, each range given low "
+                 << "then high; --trials is at least 1.\n";
+            return 1;
+        }
+        // The variables of the search: the logarithm of C, the entity loss, the hash bits.
+        std::vector<int> moved;
+        for (int k = 0; k < 3; ++k)
+            if (low[k] < high[k]) moved.push_back(k);
+        auto to_search = [](int k, double value) { return k == 0 ? std::log10(value) : value; };
+        auto from_search = [](int k, double x) {
+            return k == 0 ? std::pow(10.0, x) : (k == 2 ? std::floor(x + 0.5) : x);
+        };
+
+        const string dev_name = parser.option("dev").argument();
+        const std::vector<pii_example> train = load_examples(parser[1], get_option(parser, "examples", 10000UL), seed);
+        const std::vector<pii_example> dev = load_examples(dev_name, get_option(parser, "dev-examples", 2000UL), seed);
+        if (train.empty() || dev.empty())
+        {
+            cerr << "The training set and the development set must hold examples.\n";
+            return 1;
+        }
+        std::vector<std::vector<pii_span>> fine_truth, coarse_truth;
+        for (const pii_example& ex : dev)
+        {
+            fine_truth.push_back(ex.spans);
+            coarse_truth.push_back(coarsen_pii_spans(ex.text, ex.spans));
+        }
+
+        /* The log: a line that describes the search, then a line for each trial. Trials are read
+           back only from a log of the same search, on the same data. */
+        ostringstream header;
+        header << "# tune-tagger: " << train.size() << " examples of " << parser[1] << ", " << dev.size() << " of "
+               << dev_name << ", seed " << seed << ", epsilon " << base.epsilon << ", " << base.max_iterations
+               << " iterations, confidences " << min_confidence << " and " << tagger_min_confidence
+               << "; C, entity loss, hash bits, then true positives, false positives and false negatives of the "
+               << "tagger alone and of the detector, seconds";
+        const string log_name = get_option(parser, "log", "");
+        std::vector<tagger_trial> done;
+        bool log_opened = false;
+        if (!log_name.empty())
+        {
+            ifstream in(log_name);
+            string line;
+            if (in && getline(in, line))
+            {
+                if (line != header.str())
+                {
+                    cerr << log_name << " is the log of another search: give another --log or remove it.\n";
+                    return 1;
+                }
+                log_opened = true;
+                while (getline(in, line))
+                {
+                    istringstream fields(line);
+                    tagger_trial t;
+                    if (fields >> t.c >> t.entity_loss >> t.hash_bits >> t.alone.true_positives >>
+                        t.alone.false_positives >> t.alone.false_negatives >> t.detector.true_positives >>
+                        t.detector.false_positives >> t.detector.false_negatives >> t.seconds)
+                        done.push_back(t);
+                }
+            }
+        }
+        auto objective = [&](const tagger_trial& t) { return by_detector ? t.detector.f1() : t.alone.f1(); };
+        auto show = [&](const tagger_trial& t) {
+            cout << "C " << t.c << ", entity loss " << t.entity_loss << ", " << t.hash_bits
+                 << " hash bits: tagger alone f1 " << t.alone.f1() << " (precision " << t.alone.precision()
+                 << ", recall " << t.alone.recall() << "), detector f1 " << t.detector.f1() << " (precision "
+                 << t.detector.precision() << ", recall " << t.detector.recall() << "), trained in " << t.seconds
+                 << " s" << endl;
+        };
+
+        auto run = [&](double c, double entity_loss, unsigned long hash_bits) {
+            pii_tagger_training_options options = base;
+            options.c = c;
+            options.entity_loss = entity_loss;
+            options.hash_bits = hash_bits;
+            tagger_trial t;
+            t.c = c;
+            t.entity_loss = entity_loss;
+            t.hash_bits = hash_bits;
+            const auto start = chrono::steady_clock::now();
+            const std::shared_ptr<pii_sequence_tagger> tagger = std::make_shared<pii_sequence_tagger>();
+            tagger->train(train, options);
+            t.seconds = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+            std::vector<std::vector<pii_span>> predicted;
+            for (const pii_example& ex : dev) predicted.push_back(tagger->find(ex.text));
+            t.alone = evaluate_pii_spans(fine_truth, predicted, span_match::exact, pii_fine_labels()).overall;
+            // The detector with the tagger of this trial in place of any other.
+            recognizers with = r;
+            with.tagger = tagger;
+            pii_detector combined(dopt);
+            configure(parser, combined);
+            attach(with, combined, min_confidence, tagger_min_confidence);
+            predicted.clear();
+            for (const pii_example& ex : dev) predicted.push_back(detector_spans(combined, ex.text));
+            t.detector = evaluate_pii_spans(coarse_truth, predicted, span_match::exact, std::vector<string>()).overall;
+            cout << "trial " << done.size() + 1 << ": ";
+            show(t);
+            if (!log_name.empty())
+            {
+                ofstream out(log_name, ios::app);
+                if (!log_opened) out << header.str() << "\n";
+                log_opened = true;
+                out << setprecision(12) << t.c << "\t" << t.entity_loss << "\t" << t.hash_bits << "\t"
+                    << t.alone.true_positives << "\t" << t.alone.false_positives << "\t" << t.alone.false_negatives
+                    << "\t" << t.detector.true_positives << "\t" << t.detector.false_positives << "\t"
+                    << t.detector.false_negatives << "\t" << t.seconds << "\n";
+                if (!out) cerr << "Cannot write " << log_name << "\n";
+            }
+            done.push_back(t);
+            return t;
+        };
+
+        cout << "Searching the settings of the tagger on " << train.size() << " examples, scored on " << dev.size()
+             << " (" << (by_detector ? "detector" : "tagger alone") << ", " << trials << " trials";
+        if (!done.empty()) cout << ", " << done.size() << " read from " << log_name;
+        cout << ")" << endl;
+
+        /* A new search first measures the default settings when the bounds hold them; settings
+           that do not move are measured once. */
+        const pii_tagger_training_options defaults;
+        const double start_values[3] = { defaults.c, defaults.entity_loss, static_cast<double>(base.hash_bits) };
+        bool start_inside = true;
+        for (int k = 0; k < 3; ++k)
+            if (start_values[k] < low[k] || start_values[k] > high[k]) start_inside = false;
+        if (done.empty() && (start_inside || moved.empty()))
+        {
+            const double* first = start_inside ? start_values : low;
+            run(first[0], first[1], static_cast<unsigned long>(first[2]));
+        }
+
+        if (!moved.empty() && done.size() < trials)
+        {
+            matrix<double,0,1> lower(static_cast<long>(moved.size())), upper(static_cast<long>(moved.size()));
+            std::vector<bool> integer;
+            for (std::size_t v = 0; v < moved.size(); ++v)
+            {
+                lower(static_cast<long>(v)) = to_search(moved[v], low[moved[v]]);
+                upper(static_cast<long>(v)) = to_search(moved[v], high[moved[v]]);
+                integer.push_back(moved[v] == 2);
+            }
+            // The trials already made, those of the log included, that lie within the bounds.
+            std::vector<function_evaluation> known;
+            for (const tagger_trial& t : done)
+            {
+                const double values[3] = { t.c, t.entity_loss, static_cast<double>(t.hash_bits) };
+                bool inside = true;
+                for (int k = 0; k < 3; ++k)
+                    if (values[k] < low[k] || values[k] > high[k]) inside = false;
+                if (!inside) continue;
+                matrix<double,0,1> x(static_cast<long>(moved.size()));
+                for (std::size_t v = 0; v < moved.size(); ++v)
+                    x(static_cast<long>(v)) = std::min(upper(static_cast<long>(v)),
+                        std::max(lower(static_cast<long>(v)), to_search(moved[v], values[moved[v]])));
+                known.push_back(function_evaluation(x, objective(t)));
+            }
+            auto trial = [&](const matrix<double,0,1>& x) {
+                double values[3] = { low[0], low[1], low[2] };
+                for (std::size_t v = 0; v < moved.size(); ++v)
+                    values[moved[v]] = from_search(moved[v], x(static_cast<long>(v)));
+                return objective(run(values[0], values[1], static_cast<unsigned long>(values[2])));
+            };
+            const std::chrono::nanoseconds budget = minutes > 0
+                ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(minutes * 60))
+                : FOREVER;
+            // A difference of F1 under 0.0005 is not worth refining: the search then explores elsewhere.
+            find_max_global(trial, lower, upper, integer, max_function_calls(trials - done.size()), budget, 0.0005,
+                            known);
+        }
+
+        const tagger_trial* best = nullptr;
+        for (const tagger_trial& t : done)
+            if (!best || objective(t) > objective(*best)) best = &t;
+        if (!best) return 0;
+        cout << "\nBest of " << done.size() << " trials: ";
+        show(*best);
+        cout << "train-tagger " << parser[1] << " --dev " << dev_name << " --c " << setprecision(6) << best->c
+             << " --loss " << best->entity_loss << " --bits " << best->hash_bits << " --epsilon " << base.epsilon
+             << " --iterations " << base.max_iterations << " --out pii_tagger.dat\n";
+        return 0;
+    }
+
     /* For any text: is there personal data, where, and what. Each line gives the begin and
        end byte offsets, the type keyword (the fine label for the recognizers), the
        confidence and the value. */
@@ -1261,13 +1542,32 @@ int main(int argc, char** argv)
         parser.add_option("out", "File the trained model is written to.", 1);
         parser.add_option("dev", "Development set evaluated after training.", 1);
         parser.add_option("examples", "Number of examples drawn at random from the training or test set (0: all). "
-                          "Default: 20000 for train-tagger, all otherwise.", 1);
+                          "Default: 20000 for train-tagger, 10000 for tune-tagger, all otherwise.", 1);
         parser.add_option("seed", "Random seed of the example draw and of the span model training. Default: 1.", 1);
         parser.add_option("c", "Tagger: SVM C. Default: 10.", 1);
+        parser.add_option("loss", "Tagger: cost of a wrong label on a token of an entity, a wrong label elsewhere "
+                          "costing 1. Default: 2.", 1);
+        parser.add_option("bits", "Tagger: bits of the feature hash, between 10 and 26. Default: 20.", 1);
+        parser.add_option("epsilon", "Tagger: stopping tolerance of the solver, on the mean loss of an example. "
+                          "Default: 0.05.", 1);
         parser.add_option("iterations", "Tagger: cutting plane iterations. Default: 400.", 1);
         parser.add_option("threads", "Tagger: threads. Default: 2.", 1);
         parser.add_option("cache", "Tagger: labelings the solver keeps per example; 5 trains about three times "
                           "faster with about six times the memory. Default: 0.", 1);
+        parser.add_option("trials", "tune-tagger: trainings of the search, those read from --log included. "
+                          "Default: 20.", 1);
+        parser.add_option("minutes", "tune-tagger: time after which no new training starts (0: no limit). "
+                          "Default: 0.", 1);
+        parser.add_option("dev-examples", "tune-tagger: examples drawn from the development set (0: all). "
+                          "Default: 2000.", 1);
+        parser.add_option("c-range", "tune-tagger: bounds of C, searched on a logarithmic scale. Default: 1 1000.", 2);
+        parser.add_option("loss-range", "tune-tagger: bounds of the entity loss. Default: 1 4.", 2);
+        parser.add_option("bits-range", "tune-tagger: bounds of the hash bits; the default keeps 20, since each bit "
+                          "more doubles the model and the memory of its training.", 2);
+        parser.add_option("objective", "tune-tagger: the F1 to maximize, of the tagger alone on its exact spans "
+                          "(tagger, the default) or of the detector with the trial tagger (detector).", 1);
+        parser.add_option("log", "tune-tagger: file each trial is appended to; a search that finds it goes on from "
+                          "its trials.", 1);
         parser.add_option("size", "Span model size: tiny or small. Default: small.", 1);
         parser.add_option("steps", "Span model: optimizer steps. Default: 20000.", 1);
         parser.add_option("batch", "Span model: windows per step. Default: 32.", 1);
@@ -1292,8 +1592,10 @@ int main(int argc, char** argv)
                                  "patterns",
                                  "tagger", "model", "min-confidence", "tagger-min-confidence", "dates", "date-order",
                                  "out-dir", "out", "dev",
-                                 "examples", "seed", "c", "iterations", "threads", "cache", "size", "steps", "batch",
-                                 "lr", "optimizer", "init", "evaluate-every" };
+                                 "examples", "seed", "c", "loss", "bits", "epsilon", "iterations", "threads", "cache",
+                                 "trials", "minutes", "dev-examples", "c-range", "loss-range", "bits-range",
+                                 "objective", "log", "size", "steps", "batch", "lr", "optimizer", "init",
+                                 "evaluate-every" };
 #endif
         parser.check_one_time_options(single);
         const char* key_sources[] = { "key", "passphrase-env", "irreversible" };
@@ -1311,6 +1613,8 @@ int main(int argc, char** argv)
         parser.check_option_arg_range("size", sizes);
         const char* optimizers[] = { "adamw", "adam-atan2" };
         parser.check_option_arg_range("optimizer", optimizers);
+        const char* objectives[] = { "tagger", "detector" };
+        parser.check_option_arg_range("objective", objectives);
 #endif
 
         if (parser.option("h") || parser.option("help") || parser.number_of_arguments() == 0)
@@ -1328,6 +1632,7 @@ int main(int argc, char** argv)
                  << "  keygen        Create a new key file.\n"
 #if !ANONYMIZER_ESSENTIALS_ONLY
                  << "  train-tagger  Train the sequence tagger on a dataset (slm_tools/build_pii_dataset.py).\n"
+                 << "  tune-tagger   Search the settings of the tagger with dlib::find_max_global().\n"
                  << "  train-model   Train the span model on such a dataset.\n"
                  << "  evaluate      Score the rules, the recognizers and the whole detector on a test set.\n"
                  << "  embed         Write the header that compiles the recognizers into the program.\n"
@@ -1347,6 +1652,7 @@ int main(int argc, char** argv)
 #if !ANONYMIZER_ESSENTIALS_ONLY
         else if (verb == "detect") cmd = command::detect;
         else if (verb == "train-tagger") cmd = command::train_tagger;
+        else if (verb == "tune-tagger") cmd = command::tune_tagger;
         else if (verb == "train-model") cmd = command::train_model;
         else if (verb == "evaluate") cmd = command::evaluate;
         else if (verb == "embed") cmd = command::embed;
@@ -1391,12 +1697,16 @@ int main(int argc, char** argv)
         const double min_confidence = get_option(parser, "min-confidence", 0.5);
         const double tagger_min_confidence = get_option(parser, "tagger-min-confidence", 0.9);
 #endif
-        // Restoring and creating a key detect nothing, and load no model.
+        // Restoring and creating a key detect nothing, and load no model; the search of the
+        // settings of the tagger trains the taggers it scores.
         const bool restoring_only = cmd == command::restore || cmd == command::keygen ||
                                     (cmd == command::text && parser.option("restore"));
-        const recognizers learned = restoring_only ? recognizers() : load_recognizers(parser);
+        const recognizers learned =
+            restoring_only ? recognizers() : load_recognizers(parser, cmd != command::tune_tagger);
 #if !ANONYMIZER_ESSENTIALS_ONLY
         if (cmd == command::evaluate) return evaluate(parser, learned, dopt, min_confidence, tagger_min_confidence);
+        if (cmd == command::tune_tagger)
+            return tune_tagger(parser, learned, dopt, min_confidence, tagger_min_confidence);
 #endif
 
         pii_detector detector(dopt);
