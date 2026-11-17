@@ -8,7 +8,7 @@
 #   bash dlib/dlib/external/pseudalis/tools/test_linux.sh [build folder]
 #
 # Default build folder: build-pseudalis-linux at the root of the repository.  The tests of the
-# engine and of the host run first; the service then runs in a data folder of its own, on port
+# engine, of the host and of the publication run first; the service then runs in a data folder of its own, on port
 # 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a CSV file,
 # a name and the archive of a folder as the web application sends it, refuses a body sent in
 # chunks, then anonymizes and restores files and a folder through its drive, whose originals
@@ -55,6 +55,8 @@ step "configuration" "Generating done|Build files" cmake -S "$SOURCE" -B "$BUILD
 step "build" "." cmake --build "$BUILD" --parallel "$(nproc)"
 step "engine tests" "all tests passed" "$BUILD/bin/test_engine"
 step "host tests" "all tests passed" "$BUILD/bin/test_host"
+# The publication of a version, with a chain of the website and a hosting played on this computer.
+step "publication" "all tests passed" python3 "$SOURCE/tests/test_publish_release.py" "$BUILD/bin/pseudalis-sign"
 
 HOME_DIR=$WORK/home
 mkdir -p "$HOME_DIR"

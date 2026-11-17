@@ -124,6 +124,8 @@ int main()
         CHECK(host_settings::from_json(s.to_json()).removed_days == 90);
         // The place of the publication of the build stays out of the file and of the answers.
         CHECK(!s.to_json().contains("feed_url") && host_settings::from_json(s.to_json()).feed_url == default_feed_url);
+        // The feed of the build lies on the website, at the address that answers without redirection.
+        CHECK(std::string(default_feed_url) == "https://cydral-technology.eu/files/pseudalis/feed.json");
         s.feed_url = "https://example.org/feed.json";
         CHECK(host_settings::from_json(s.to_json()).feed_url == "https://example.org/feed.json");
         // The tags by default: written unless the setting says otherwise, a file of a version before keeping them.

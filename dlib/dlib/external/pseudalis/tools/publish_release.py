@@ -1,15 +1,16 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
 r"""
-Publishes a version of Pseudalis on GitHub: puts its installer in dist/pseudalis of the
-repository, beside the update feed that announces it, written and signed.
+Publishes a version of Pseudalis on the website: puts its installer in dist/pseudalis of this
+copy of the repository, beside the update feed that announces it, written and signed, has the
+chain of the website publish the three files, then checks what the website serves.
 
     python3 publish_release.py [<pseudalis-setup.exe>] --key <private key>
                                [--notes <notes.json>] [--sign <pseudalis-sign>]
-                               [--dist <folder>] [--dry-run] [--push [--wait <seconds>]]
+                               [--site <folder>] [--dist <folder>] [--dry-run] [--wait <seconds>]
+    python3 publish_release.py --check [--dist <folder>] [--wait <seconds>]
     python3 publish_release.py --check-key --key <private key> [--sign <pseudalis-sign>]
     python3 publish_release.py --create-key --key <private key> [--sign <pseudalis-sign>]
-    python3 publish_release.py --check [--dist <folder>] [--wait <seconds>]
 
 The installer is by default the one that tools/build_windows.ps1 makes in the copy of the
 repository of the production chain on Windows, %USERPROFILE%\work\Dlib-Transformer-extensions,
@@ -17,22 +18,27 @@ read under WSL (/mnt/c/Users/<user>/work/Dlib-Transformer-extensions/build-pseud
 installer named elsewhere is refused unless --any-folder is given.
 
 The version is that of common/version.h, which must also be the version the installer carries
-in its resources.  The installer is copied into <dist> (dist/pseudalis of the repository by
-default) as pseudalis-setup-<version>.exe, and the installers of the other versions leave it:
-the repository holds the installer its feed names, the earlier ones staying in its history.
-GitHub refuses the files of 100 MB and more and warns from 50 MB: an installer of 95 MB or more
-is refused, one of 50 MB or more announced.  The feed names the installer by its file beside it,
-with its size and its SHA-256; the program writes it, signs it with pseudalis-sign, checks the
-signature with the public key of the sources, which the programs embed, and puts the installer,
-then the signature and the feed in place of the published ones.  A failure before that leaves
-the published files as they are.
+in its resources.  The installer is copied into <dist> (dist/pseudalis of this copy by default)
+as pseudalis-setup-<version>.exe, and the installers of the other versions leave it.  The feed
+names the installer by its file beside it, with its size and its SHA-256; the program writes it
+with LF ends of line, signs it with pseudalis-sign, checks the signature with the public key of
+the sources, which the programs embed, and puts the installer, then the signature and the feed
+in place of the former ones.  A failure before that leaves the folder as it is.  Git ignores
+these three files (dist/pseudalis/.gitignore): the repository holds the sources alone.
 
---push then commits the folder and pushes it, after checking first that the branch follows its
-remote one and lags behind it in nothing, and that the folder holds no change of its own; it ends
-once GitHub serves the feed and its signature as they were written, and the installer by its size
-and its SHA-256, which is what the installed copies read (within --wait seconds, 900 by default:
-GitHub keeps its answers in cache for some minutes).  Without --push, the program prints the
-commands that publish the folder.  --check makes that last check alone, for the folder as it is.
+The website alone carries the files to its hosting.  Its chain lies in <site>
+(~/work/cydral-website by default) and takes the feed, its signature and the installer in the
+copy of the repository that PRODUCTS_REPO of its deploy.conf names: the program stops, before
+it writes anything, unless that copy is the one whose <dist> it fills.  It then runs
+tools/site.sh status and tools/site.sh publish from <site>, on the terminal of the publisher,
+where the chain may ask for the password of the hosting, and stops when one of the two ends
+with an error.  The program opens no session with the hosting, and it neither reads, keeps nor
+passes on its password.
+
+The publication ends once the website serves the feed and its signature as they were written,
+and the installer by its size and its SHA-256, at the address the installed copies read, that
+of the feed in host/settings.cpp (within --wait seconds, 300 by default).  --check makes that
+last check alone, for the folder as it is.
 
 --check-key checks, before the installer is even built, that the private key signs what the
 public key of the sources verifies: a feed signed with another key would be ignored by every
@@ -44,9 +50,9 @@ alone: they ignore the feeds of the new one until they are installed again.
 
 notes.json holds the release notes by language,
 {"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}.  --dry-run checks the
-installer, the version and the notes and prints what would be done, without writing anything.
-pseudalis-sign is searched in build-pseudalis/bin and build-pseudalis-linux/bin of the
-repository, then in the PATH.
+installer, the version, the notes and the folder of the website, and prints what would be done:
+it writes nothing and publishes nothing.  pseudalis-sign is searched in build-pseudalis/bin and
+build-pseudalis-linux/bin of the repository, then in the PATH.
 """
 import argparse
 import glob
@@ -55,11 +61,13 @@ import http.client
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,13 +77,12 @@ import make_feed  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", ".."))
 DIST = os.path.join(ROOT, "dist", "pseudalis")
+# The folder of the chain of the website on the system of the publisher.
+SITE = os.path.join("~", "work", "cydral-website")
 # The public key of the feed, which the programs embed when it is there at their configuration.
 PUBLIC_KEY = os.path.join(HERE, "..", "resources", "feed-public-key.pem")
 # The address of the feed that the programs read, in host/settings.cpp.
 SETTINGS = os.path.join(HERE, "..", "host", "settings.cpp")
-# The limits of GitHub for a file of a repository, with a margin under the refusal.
-REFUSED_BYTES = 95 << 20
-WARNED_BYTES = 50 << 20
 
 
 # The copy of the repository of the production chain on Windows, under its profile folder.
@@ -159,15 +166,7 @@ def check_newer(feed_path, version):
         raise RuntimeError("the feed already announces %s, later than %s" % (published, version))
 
 
-def check_size(size):
-    if size >= REFUSED_BYTES:
-        raise RuntimeError("the installer weighs %.1f MB: GitHub refuses the files of 100 MB and more" %
-                           (size / 1048576.0))
-    if size >= WARNED_BYTES:
-        print("warning: the installer weighs %.1f MB: GitHub warns from 50 MB" % (size / 1048576.0))
-
-
-def publish(installer, dist, name, sha, feed, signer, key):
+def write_release(installer, dist, name, sha, feed, signer, key):
     """Puts the installer and the signed feed in dist, the installers of the other versions leaving
     it; returns the names of those that left."""
     feed_path = os.path.join(dist, "feed.json")
@@ -232,27 +231,54 @@ def create_key(signer, key):
         shutil.rmtree(temp, ignore_errors=True)
 
 
-def git(*args):
-    """The output of git run in the repository; raises RuntimeError with its message when it fails."""
-    r = subprocess.run(["git", "-C", ROOT] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                       universal_newlines=True)
-    if r.returncode != 0:
-        raise RuntimeError("git %s: %s" % (" ".join(args), r.stdout.strip()))
-    return r.stdout.strip()
+def site_setting(conf, name):
+    """The value deploy.conf gives the setting name, read as the chain of the website reads it: lines
+    KEY=value, a comment after a space and #, the double quotes around a value left out."""
+    value = ""
+    with open(conf, encoding="utf-8") as f:
+        for line in f:
+            key, _, rest = line.rstrip("\r\n").partition("=")
+            if "".join(key.split()) != name:
+                continue
+            rest = re.split(r"\s#", rest, 1)[0].strip()
+            if rest.endswith('"'):
+                rest = rest[:-1]
+            if rest.startswith('"'):
+                rest = rest[1:]
+            value = rest
+    return value
 
 
-def check_repository(rel):
-    """Raises RuntimeError unless a push can carry the publication: a branch that follows a remote
-    one and lags behind it in nothing, and a folder of the publication without changes of its own."""
-    if git("rev-parse", "--abbrev-ref", "HEAD") == "HEAD":
-        raise RuntimeError("the repository is on no branch")
-    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-    git("fetch", "--quiet")
-    behind = int(git("rev-list", "--count", "HEAD..@{u}"))
-    if behind:
-        raise RuntimeError("the branch lags %d commit(s) behind %s: pull first" % (behind, upstream))
-    if git("status", "--porcelain", "--", rel):
-        raise RuntimeError("%s holds changes of its own: commit or remove them first" % rel)
+def check_site(site, dist):
+    """The folder of the chain of the website, checked: raises RuntimeError unless it holds the chain
+    and takes the files of the publication in the copy of the repository whose dist is the folder
+    written here."""
+    site = os.path.realpath(os.path.expanduser(site))
+    if not os.path.isfile(os.path.join(site, "tools", "site.sh")):
+        raise RuntimeError("no chain of the website in %s (tools/site.sh): give its folder with --site" % site)
+    conf = os.path.join(site, "deploy.conf")
+    if not os.path.isfile(conf):
+        raise RuntimeError("%s is missing: tools/site.sh setup writes it" % conf)
+    repo = site_setting(conf, "PRODUCTS_REPO")
+    clone = os.path.dirname(os.path.dirname(os.path.realpath(dist)))
+    setup = "run tools/site.sh setup --repo %s in %s" % (shlex.quote(clone), site)
+    if not repo:
+        raise RuntimeError("%s names no copy of the repository (PRODUCTS_REPO): %s" % (conf, setup))
+    if os.path.realpath(os.path.join(site, repo, "dist", "pseudalis")) != os.path.realpath(dist):
+        raise RuntimeError("the website takes its files in %s (PRODUCTS_REPO of %s), not in the copy written "
+                           "here: %s" % (repo, conf, setup))
+    return site
+
+
+def site_chain(site, command):
+    """Runs tools/site.sh command from the folder of the website, on the terminal of the publisher:
+    nothing of it is read here, and the chain asks what it needs there.  Raises RuntimeError when
+    it ends with an error."""
+    print()
+    print("== website: tools/site.sh %s (in %s)" % (command, site))
+    code = subprocess.run(["bash", "tools/site.sh", command], cwd=site).returncode
+    if code != 0:
+        raise RuntimeError("tools/site.sh %s ended with code %d: nothing more is published" % (command, code))
 
 
 def published_address():
@@ -264,10 +290,21 @@ def published_address():
     return m.group(1)
 
 
-def fetch(url, limit):
+class no_redirection(urllib.request.HTTPRedirectHandler):
+    """The files are read at the address of the programs itself: a redirection is an error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def open_url(url, agent, method="GET", timeout=60):
+    request = urllib.request.Request(url, headers={"User-Agent": agent}, method=method)
+    return urllib.request.build_opener(no_redirection).open(request, timeout=timeout)
+
+
+def fetch(url, limit, agent):
     """The body of url, of limit bytes at most, read as the programs read it."""
-    request = urllib.request.Request(url, headers={"User-Agent": "pseudalis-publish"})
-    with urllib.request.urlopen(request, timeout=60) as r:
+    with open_url(url, agent) as r:
         data = r.read(limit + 1)
     if len(data) > limit:
         raise RuntimeError("%s is larger than expected" % os.path.basename(url))
@@ -275,10 +312,11 @@ def fetch(url, limit):
 
 
 def check_online(dist, wait):
-    """Waits until GitHub serves the feed and its signature of dist as they are, then checks the
-    installer it serves against the feed; raises RuntimeError past wait seconds."""
+    """Waits until the website serves the feed and its signature of dist as they are, then checks the
+    installer it serves against the feed, its announced size first; raises RuntimeError past wait
+    seconds."""
     if not os.path.isfile(os.path.join(dist, "feed.json")) or not os.path.isfile(os.path.join(dist, "feed.json.sig")):
-        raise RuntimeError("%s holds no signed feed: no version is published there yet" % dist)
+        raise RuntimeError("%s holds no signed feed: no version is published from there yet" % dist)
     with open(os.path.join(dist, "feed.json"), "rb") as f:
         feed = f.read()
     with open(os.path.join(dist, "feed.json.sig"), "rb") as f:
@@ -286,32 +324,47 @@ def check_online(dist, wait):
     stable = json.loads(feed.decode("utf-8"))["channels"]["stable"]
     version, installer = stable["version"], stable["installer"]
     base = published_address()
+    # The requests carry the name the programs of the version give themselves.
+    agent = "Pseudalis/%s" % version
     deadline = time.time() + wait
     seen = "nothing read yet"
     while True:
         try:
-            served = fetch(base + "/feed.json", 1 << 20)
-            if served == feed and fetch(base + "/feed.json.sig", 4096) == sig:
+            served = fetch(base + "/feed.json", 1 << 20, agent)
+            if served == feed and fetch(base + "/feed.json.sig", 4096, agent) == sig:
                 break
-            seen = "an earlier feed"
+            seen = "another feed or another signature"
+        except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                raise RuntimeError("the website redirects the address of the feed (HTTP %d): the programs read "
+                                   "%s/feed.json itself" % (e.code, base))
+            seen = str(e)
         except (OSError, http.client.HTTPException, RuntimeError) as e:
             seen = str(e)
         if time.time() >= deadline:
-            raise RuntimeError("GitHub does not serve the feed of version %s after %d seconds (%s)" %
+            raise RuntimeError("the website does not serve the feed of version %s after %d seconds (%s)" %
                                (version, wait, seen))
-        time.sleep(20)
+        time.sleep(10)
+    address = base + "/" + installer["file"]
     h = hashlib.sha256()
     size = 0
-    request = urllib.request.Request(base + "/" + installer["file"], headers={"User-Agent": "pseudalis-publish"})
-    with urllib.request.urlopen(request, timeout=120) as r:
-        for block in iter(lambda: r.read(1 << 20), b""):
-            size += len(block)
-            if size > installer["size"]:
-                break
-            h.update(block)
+    try:
+        with open_url(address, agent, method="HEAD") as r:
+            announced = r.headers.get("Content-Length")
+        if announced != str(installer["size"]):
+            raise RuntimeError("the website announces an installer of %s bytes, where the feed of version %s names "
+                               "%d" % (announced, version, installer["size"]))
+        with open_url(address, agent, timeout=120) as r:
+            for block in iter(lambda: r.read(1 << 20), b""):
+                size += len(block)
+                if size > installer["size"]:
+                    break
+                h.update(block)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("the website does not serve %s (HTTP %d)" % (installer["file"], e.code))
     if size != installer["size"] or h.hexdigest() != installer["sha256"]:
-        raise RuntimeError("GitHub serves another installer than the one the feed of version %s names" % version)
-    print("GitHub serves version %s: the feed, its signature and the installer of %d bytes" % (version, size))
+        raise RuntimeError("the website serves another installer than the one the feed of version %s names" % version)
+    print("the website serves version %s: the feed, its signature and the installer of %d bytes" % (version, size))
 
 
 def main():
@@ -320,17 +373,17 @@ def main():
     p.add_argument("--key", help="private key of the feed")
     p.add_argument("--notes")
     p.add_argument("--sign")
+    p.add_argument("--site", default=SITE, help="folder of the chain of the website")
     p.add_argument("--dist", default=DIST)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--push", action="store_true")
     p.add_argument("--check", action="store_true")
     p.add_argument("--check-key", action="store_true")
     p.add_argument("--create-key", action="store_true")
-    p.add_argument("--wait", type=int, default=900)
+    p.add_argument("--wait", type=int, default=300)
     p.add_argument("--any-folder", action="store_true", help="take an installer of another copy than the one of "
                    "the production chain")
     a = p.parse_args()
-    # The steps print in their order, before the messages of pseudalis-sign and of git.
+    # The steps print in their order, before the messages of pseudalis-sign and of the website.
     sys.stdout.reconfigure(line_buffering=True)
     if a.check_key or a.check or a.create_key:
         try:
@@ -368,49 +421,38 @@ def main():
         notes = make_feed.read_notes(a.notes, feed_path, version)
         name = installer_name(version)
         size = os.path.getsize(a.installer)
-        check_size(size)
         sha = make_feed.sha256_of(a.installer)
         feed = make_feed.make_feed(version, a.installer, None, notes, size, sha, file=name)
         check_newer(feed_path, version)
-        rel = os.path.relpath(a.dist, ROOT).replace(os.sep, "/")
+        # What can fail before anything is written, the folder of the website and the key, is checked first.
+        site = check_site(a.site, a.dist)
         print("version %s, installer of %d bytes, SHA-256 %s" % (version, size, sha))
-        print("published in %s: %s, feed.json, feed.json.sig" % (rel, name))
+        print("folder of the publication, %s: %s, feed.json, feed.json.sig" % (a.dist, name))
+        print("chain of the website, %s: tools/site.sh status, then tools/site.sh publish" % site)
         if a.dry_run:
-            print("dry run: nothing written")
+            print("dry run: nothing written, nothing published")
             return 0
         if not a.key:
             raise RuntimeError("--key names the private key that signs the feed")
         signer = find_signer(a.sign)
-        # What can fail before anything is written, the key and the repository, is checked first.
         check_key(signer, a.key)
-        if a.push:
-            check_repository(rel)
         os.makedirs(a.dist, exist_ok=True)
-        left = publish(a.installer, a.dist, name, sha, feed, signer, a.key)
+        left = write_release(a.installer, a.dist, name, sha, feed, signer, a.key)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1
     for other in left:
-        print("removed from %s: %s" % (rel, other))
-    commit = 'git commit -m "Publish version %s of Pseudalis" -- %s' % (version, rel)
-    check = "python3 %s --check" % os.path.relpath(os.path.abspath(__file__), ROOT).replace(os.sep, "/")
-    if not a.push:
-        print()
-        print("git add %s" % rel)
-        print(commit)
-        print("git push")
-        return 0
+        print("removed from %s: %s" % (a.dist, other))
+    check = "python3 %s --check" % shlex.quote(os.path.abspath(__file__))
+    if os.path.realpath(a.dist) != os.path.realpath(DIST):
+        check += " --dist %s" % shlex.quote(a.dist)
     # What remains to run when a step fails, the files of the folder being written.
-    remaining = "git add %s && %s && git push && %s" % (rel, commit, check)
+    remaining = "(cd %s && tools/site.sh publish) && %s" % (shlex.quote(site), check)
     try:
-        git("add", "--", rel)
-        # The same version published again with the same notes on the same day gives the same files.
-        if subprocess.run(["git", "-C", ROOT, "diff", "--cached", "--quiet", "--", rel]).returncode != 0:
-            git("commit", "-m", "Publish version %s of Pseudalis" % version, "--", rel)
-        remaining = "git push && %s" % check
-        git("push")
-        print("version %s pushed" % version)
+        site_chain(site, "status")
+        site_chain(site, "publish")
         remaining = check
+        print()
         check_online(a.dist, a.wait)
     except (OSError, ValueError, KeyError, RuntimeError, http.client.HTTPException) as e:
         print("error: %s" % e, file=sys.stderr)

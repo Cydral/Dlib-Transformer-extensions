@@ -6,8 +6,8 @@ Writes the update feed of Pseudalis for a new version.
     python3 make_feed.py <output feed.json> <version> <installer> <name beside the feed> [<notes.json>]
 
 The installer is the pseudalis-setup.exe of the version, which must carry that version in its
-version resource; the name is the one it takes beside the feed, in dist/pseudalis of the
-repository: pseudalis-setup-<version>.exe.
+version resource; the name is the one it takes beside the feed, in the folder of the
+publication: pseudalis-setup-<version>.exe.
 
 notes.json holds the release notes by language, {"en": "...", "fr": "...", ...}; the service
 shows the notes of the language of the user, else the English ones.  Without it, the notes of
@@ -15,10 +15,9 @@ the output feed are kept when that feed already describes the version, and the n
 read "Pseudalis <version>".
 
 The feed is then signed with pseudalis-sign (sign <private key> feed.json), and the feed, its
-signature and the installer are published in dist/pseudalis of the repository, which GitHub
-serves.  The services that read the feed download the installer beside it in the background,
-check its size and its SHA-256, and install it at their next start.  publish_release.py runs
-these steps.
+signature and the installer are published together on the website.  The services that read the
+feed download the installer beside it in the background, check its size and its SHA-256, and
+install it at their next start.  publish_release.py runs these steps.
 """
 
 import hashlib

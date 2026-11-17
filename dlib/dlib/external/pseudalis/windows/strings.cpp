@@ -177,8 +177,8 @@ namespace pseudalis
                 "Auf diesem System wendet die Paketverwaltung die Aktualisierungen an.",
                 "Su questo sistema, il gestore dei pacchetti applica gli aggiornamenti.",
                 "En este sistema, el gestor de paquetes aplica las actualizaciones." } },
-            { "btn_project", { "Project page", "Page du projet", "Projektseite", "Pagina del progetto",
-                "Página del proyecto" } },
+            { "btn_website", { "Website", "Site web", "Website", "Sito web", "Sitio web" } },
+            { "btn_project", { "Source code", "Code source", "Quellcode", "Codice sorgente", "Código fuente" } },
             { "btn_close", { "Close", "Fermer", "Schließen", "Chiudi", "Cerrar" } },
             { "about_built", { "Based on the open source Dlib-Transformer-extensions library",
                 "Reposant sur la bibliothèque open source Dlib-Transformer-extensions",
@@ -762,8 +762,6 @@ namespace pseudalis
                 "Anonymisierung der personenbezogenen Daten von Dokumenten auf diesem Computer: Nichts verlässt ihn.",
                 "Anonimizzazione dei dati personali dei documenti, su questo computer: nulla ne esce.",
                 "Anonimización de los datos personales de los documentos, en este equipo: nada sale de él." } },
-            { "about_written", { "Written by {a}", "Écrit par {a}", "Geschrieben von {a}", "Scritto da {a}",
-                "Escrito por {a}" } },
             { "about_license", { "The Community edition is free and open source software, distributed under the "
                 "Boost Software License 1.0.",
                 "L'édition Community est un logiciel libre et open source, distribué sous la licence Boost Software "

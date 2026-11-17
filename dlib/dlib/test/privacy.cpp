@@ -2269,6 +2269,154 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_labelled_columns()
+    {
+        /* The header of a column has the last word on the type of its values: a recognizer that
+           reads a first name as a town in a whole row, after a number, leaves it a person in its
+           cell, and a town read alone as a street stays a place. */
+        auto reads = std::make_shared<std::vector<std::pair<string, string>>>();
+        auto recognizer = [reads](const string& t) {
+            std::vector<pii_span> out;
+            // A row is read whole, its cells joined by tabulations; a cell is read alone.
+            const bool row = t.find('\t') != string::npos;
+            for (const auto& v : *reads)
+            {
+                const bool in_rows = v.second == "CITY";
+                if (row != in_rows) continue;
+                for (size_t p = t.find(v.first); p != string::npos; p = t.find(v.first, p + 1))
+                {
+                    pii_span s;
+                    s.begin = p;
+                    s.end = p + v.first.size();
+                    s.label = v.second;
+                    s.confidence = 0.9;
+                    out.push_back(s);
+                }
+            }
+            return out;
+        };
+        *reads = { { "Sophie", "CITY" }, { "Colombo", "CITY" }, { "Angers", "STREET_ADDRESS" },
+                   { "12 rue des Lilas", "STREET_ADDRESS" } };
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x43')));
+        auto cells_of = [](const string& out, size_t row) {
+            std::vector<string> rows, cells;
+            size_t at = 0;
+            for (size_t q = out.find("\r\n"); q != string::npos; at = q + 2, q = out.find("\r\n", at))
+                rows.push_back(out.substr(at, q - at));
+            DLIB_TEST(row < rows.size());
+            at = 0;
+            const string& r = rows[row];
+            for (size_t q = r.find(';'); ; at = q + 1, q = r.find(';', at))
+            {
+                cells.push_back(r.substr(at, q == string::npos ? string::npos : q - at));
+                if (q == string::npos) break;
+            }
+            return cells;
+        };
+        auto tagged = [](const string& cell, const string& keyword) {
+            return cell.compare(0, 3 + keyword.size(), "[[" + keyword + ":") == 0 && cell.find("]]") == cell.size() - 2;
+        };
+        for (const char* header : { "CustomerNumber;FirstName;LastName;City", "Numero;Prenom;Nom;Ville" })
+        {
+            pii_detector detector;
+            detector.add_recognizer(recognizer);
+            document_anonymizer a(p, detector);
+            const string csv = string(header) + "\r\n"
+                               "100003;Sophie;Colombo;Angers\r\n"
+                               "100004;Ilario;Venturi;Melun\r\n"
+                               "100005;Sophie;Kervella;12 rue des Lilas\r\n";
+            document_report report;
+            const string out = a.anonymize(csv, document_format::delimited, report, "clients.csv");
+            DLIB_TEST_MSG(out.find(header) == 0, out);
+            for (size_t row = 1; row <= 3; ++row)
+            {
+                const std::vector<string> cells = cells_of(out, row);
+                DLIB_TEST_MSG(cells.size() == 4 && tagged(cells[1], "PERSON") && tagged(cells[2], "PERSON"), out);
+            }
+            DLIB_TEST_MSG(tagged(cells_of(out, 1)[3], "LOCATION") && tagged(cells_of(out, 2)[3], "LOCATION"), out);
+            // A street with its number keeps the reading of the recognizer.
+            DLIB_TEST_MSG(tagged(cells_of(out, 3)[3], "ADDRESS"), out);
+            document_report back;
+            DLIB_TEST(a.restore(out, document_format::delimited, back, "clients.csv") == csv);
+        }
+
+        // Without a header, the row keeps what it taught: the label alone decides otherwise.
+        {
+            pii_detector detector;
+            detector.add_recognizer(recognizer);
+            detection_context person, place;
+            person.label = pii_type::person;
+            place.label = pii_type::location;
+            detector.begin_document();
+            detector.learn("Sophie", person);
+            detector.learn("100003\tSophie\tColombo");
+            std::vector<pii_entity> e = detector.detect("Sophie", person);
+            DLIB_TEST(e.size() == 1 && e[0].type == pii_type::person);
+            e = detector.detect("Sophie");
+            DLIB_TEST(e.size() == 1 && e[0].type == pii_type::location);
+            e = detector.detect("Angers", place);
+            DLIB_TEST(e.size() == 1 && e[0].type == pii_type::location);
+            e = detector.detect("Angers");
+            DLIB_TEST(e.size() == 1 && e[0].type == pii_type::address);
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void test_label_after_a_name()
+    {
+        /* The words that open the label of the next field name it: a recognizer that reads them as
+           a family name after a first name leaves them readable, whether a label announces the
+           first name or not, and whether they would join it or stay alone. */
+        auto recognizer = [](const string& t) {
+            static const std::pair<const char*, const char*> reads[] = {
+                { "Léonie", "GIVEN_NAME" }, { "Née", "FAMILY_NAME" }, { "Imane", "GIVEN_NAME" },
+                { "Nata", "FAMILY_NAME" }, { "Sesso", "FAMILY_NAME" }, { "Jonas", "GIVEN_NAME" },
+                { "Geboren", "FAMILY_NAME" }, { "Alice", "GIVEN_NAME" }, { "DOB", "FAMILY_NAME" },
+                { "Born", "FAMILY_NAME" }, { "Ville", "FAMILY_NAME" } };
+            std::vector<pii_span> out;
+            for (const auto& v : reads)
+            {
+                const string value = v.first;
+                for (size_t p = t.find(value); p != string::npos; p = t.find(value, p + 1))
+                {
+                    pii_span s;
+                    s.begin = p;
+                    s.end = p + value.size();
+                    s.label = v.second;
+                    s.confidence = 0.85;
+                    out.push_back(s);
+                }
+            }
+            return out;
+        };
+        pii_detector detector;
+        detector.add_recognizer(recognizer);
+        struct sample { const char* text; const char* name; const char* label; };
+        const sample samples[] = {
+            { "Nom : Delchet  Prénom : Léonie  Née le : 05-03-1991", "Léonie", "Née" },
+            { "Cognome: Boudiaf  Nome: Imane  Nata il: 23.01.1966", "Imane", "Nata" },
+            { "Cognome: Boudiaf  Nome: Imane  Sesso: F", "Imane", "Sesso" },
+            { "Name: Weber  Vorname: Jonas  Geboren am: 05.03.1991", "Jonas", "Geboren" },
+            { "Surname: Baker  First name: Alice  DOB: 05/03/1991", "Alice", "DOB" },
+            { "Surname: Baker  First name: Alice  Born on: 05/03/1991", "Alice", "Born" },
+            { "Nom : Delchet  Prénom : Léonie  Ville : Brest", "Léonie", "Ville" },
+            { "Léonie  Née le : 05-03-1991", "Léonie", "Née" },
+            { "Jonas  Geboren am: 05.03.1991", "Jonas", "Geboren" } };
+        for (const sample& s : samples)
+        {
+            const string text = s.text;
+            const std::vector<pii_entity> e = detector.detect(text);
+            DLIB_TEST_MSG(found(e, text, pii_type::person, s.name), text);
+            DLIB_TEST_MSG(!covered(e, text, s.label), text);
+        }
+        // Without the colon that closes a label, the recognizer keeps its reading.
+        const string text = "Alice Born a signé le registre.";
+        DLIB_TEST(found(detector.detect(text), text, pii_type::person, "Alice Born"));
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_learned_places()
     {
         /* A country or a state stays readable when a recognizer reads it as a place, and a
@@ -2674,6 +2822,20 @@ namespace
         e = entities(text);
         DLIB_TEST(found(e, text, pii_type::location, "Carnac"));
         DLIB_TEST(found(e, text, pii_type::person, "Séverin"));
+        // The place of birth after its date on one line, whatever the document says of the town elsewhere.
+        text = "NOM : CHARET\tPRÉNOM : Daphné\nNée le : 08.09.1956\tà : DAKAR\n\nMme Charet vit à Dakar.";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::location, "DAKAR") && found(e, text, pii_type::person, "Daphné"));
+        text = "COGNOME: VIANELLO\tNOME: Carlo\nNato il: 05/01/2004\ta: PESCHICI\nCodice fiscale: sconosciuto";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::location, "PESCHICI") && found(e, text, pii_type::person, "VIANELLO"));
+        text = "Nata il: 05/01/2004\na: Rora";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::location, "Rora"));
+        // A recipient after "À :" stays a person away from a date of birth.
+        text = "De : Yann Le Goff\nÀ : Solène Moreno\nObjet : réunion";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::person, "Solène Moreno"));
 
         // Companies.
         text = "Contrat avec SAS Iroise et SELARL Martin, puis Zorvane Finance, Williams & Sons, Martin et Fils "
@@ -4363,6 +4525,8 @@ namespace
             test_known_names();
             test_learned_organizations();
             test_record_labels_and_cut_names();
+            test_labelled_columns();
+            test_label_after_a_name();
             test_learned_places();
             print_spinner();
             test_partial_dates();

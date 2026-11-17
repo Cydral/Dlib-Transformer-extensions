@@ -822,7 +822,7 @@ namespace dlib
             scan_english_bodies(t, words, c);
             scan_persons(text, t, words, c);
             scan_aliases(t, words, c);
-            scan_terms(t, words, c);
+            scan_terms(text, t, words, c);
             scan_doc_acronyms(t, words, c);
             scan_cued_references(t, words, c);
             scan_board_numbers(t, words, c);
@@ -904,8 +904,11 @@ namespace dlib
                 {
                     /* The words left pass the checks of a span read alone, and one of them at least
                        is no common word: after a first name, where a family name could stand, a common
-                       word alone is what the recognizer read too far ("Suite", "GESEHEN"). */
-                    if (spurious_learned_span(text, t, part.first, part.second, x.type, false)) continue;
+                       word alone is what the recognizer read too far ("Suite", "GESEHEN"), and the
+                       words that open the label of the next field name it ("Nata il:"). */
+                    if (spurious_learned_span(text, t, part.first, part.second, x.type, false) ||
+                        opens_field_label(text, t, part.first, part.second))
+                        continue;
                     bool proper = false;
                     for (const auto& w : span_words(t, part.first, part.second))
                     {
@@ -5574,12 +5577,37 @@ namespace dlib
             return end;
         }
 
+        /* Whether the words that start at b, with those of [b, e) among them, make the label of a
+           field that a colon closes on their line: "Née" in "Prénom : Léonie  Née le : 05-03-1991",
+           "Geboren" in "Vorname: Jonas  Geboren am: 05.03.1991", "DOB" in "First name: Alice  DOB:
+           05/03/1991". Such words name the next field, whatever a recognizer reads in them. */
+        static bool opens_field_label(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e)
+        {
+            using namespace privacy_impl;
+            if (e <= b || e > t.size() || (b > 0 && is_word_char(t.cps[b - 1]))) return false;
+            // The colon that closes the label, after its words and the marks scan_labels() accepts before it.
+            std::size_t c = e;
+            while (c < t.size() && c - b <= 48 && t.cps[c] != ':' && t.cps[c] != 0xFF1A)
+            {
+                const char32_t ch = t.cps[c];
+                if (!is_word_char(ch) && ch != ' ' && ch != 0xA0 && ch != '.' && ch != '\'' && ch != 0x2019 &&
+                    !is_hyphen(ch) && ch != ')' && ch != 0xB0 && ch != 0xBA && ch != '*')
+                    return false;
+                ++c;
+            }
+            if (c >= t.size() || (t.cps[c] != ':' && t.cps[c] != 0xFF1A)) return false;
+            if (c + 1 < t.size() && t.cps[c + 1] == '/') return false;
+            return span_words(t, b, c).size() <= 5 &&
+                   lookup_label(normalize_label(cp_substr(t, text, b, c))) != pii_type::none;
+        }
+
         /* A piece of a learned recognizer that names nothing and would spoil the name it is
            merged with, made of whole words: a greeting alone ("Bonsoir" in "Bonsoir Maëlys"), a
            field label alone unless it ends the name of a place ("City" in "Quebec City", after a
            piece of the same type), function words that are no particle of a name ("Votre") and
-           a common word in lower case ("commande"). Pieces of words, particles and logins are
-           judged once merged by spurious_learned_span(). */
+           a common word in lower case ("commande"), and the words that open the label of the next
+           field ("Née" before "le :"). Pieces of words, particles and logins are judged once
+           merged by spurious_learned_span(). */
         bool spurious_learned_piece(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
                                     pii_type type, bool after_same_type) const
         {
@@ -5602,6 +5630,7 @@ namespace dlib
             }
             if (all_particles) return false;
             if (all_function) return true;
+            if (opens_field_label(text, t, b, e)) return true;
             if (technical_words(text, t, words)) return true;
             // In capitals, a technical acronym, or a heading of common words: "KPI", "SQL", "WLAN",
             // "DENUNCIA", "LEBENSLAUF", "LA ARRENDADORA".
@@ -7517,6 +7546,14 @@ namespace dlib
                 return true;
             };
             const std::size_t rule_candidates = out.size();
+            // Whether the street of a labelled address ends on the line of r, a comma before it.
+            auto after_street = [&](const candidate& r) {
+                for (std::size_t j = 0; j < rule_candidates; ++j)
+                    if (out[j].kept && out[j].type == pii_type::address && out[j].e <= r.b && r.b - out[j].e <= 4 &&
+                        same_line(t, out[j].e, r.b))
+                        return true;
+                return false;
+            };
             for (std::size_t k = 0; k < rule_candidates; ++k)
             {
                 const candidate& r = out[k];
@@ -7542,6 +7579,17 @@ namespace dlib
                         (person_label || announced_person(text, t, r.b)) &&
                         !firm_or_street_words(text, t, merged[p].b, merged[p].e))
                         merged[p].type = pii_type::person;
+                    /* A place that a label or the header of its column announces stays a place
+                       when the piece read inside it is an address with no number and no type of
+                       street: "Angers" in a column headed "Ville". What follows the street of an
+                       address is no such place: "Urbanizacion Los Pinos" in "Domicilio: 31 Princes
+                       Street, Urbanizacion Los Pinos". */
+                    if (r.kept && r.type == pii_type::location && merged[p].type == pii_type::address &&
+                        within(r, merged[p]) && !firm_or_street_words(text, t, merged[p].b, merged[p].e) &&
+                        std::none_of(t.cps.begin() + merged[p].b, t.cps.begin() + merged[p].e,
+                                     [](char32_t ch) { return is_ascii_digit(ch); }) &&
+                        !after_street(r))
+                        merged[p].type = pii_type::location;
                     if (merged[p].type != r.type) continue;
                     strong[p] = strong[p] || r.strong;
                     confidence[p] = std::max(confidence[p], r.confidence);
@@ -7928,9 +7976,12 @@ namespace dlib
             /* A label without value ("Nom :" before a tab, or alone on its line) types the
                next segment of its line, or the next line. */
             pii_type pending = pii_type::none;
-            // "Ne le : 12/03/1980" then "a : Rennes": the place of birth, not a recipient.
+            /* "Ne le : 12/03/1980" then "a : Rennes", on the next line or after a tabulation on the
+               same one ("Nato il: 05/01/2004", a tabulation, "a: Peschici"): the place of birth, not
+               a recipient. */
             static const std::unordered_set<std::string> birth_labels = make_phrase_set(
-                "ne le|nee le|date de naissance|date of birth|dob|birth date");
+                "ne le|nee le|date de naissance|date of birth|dob|birth date|nato il|nata il|data di nascita|"
+                "data nascita");
             bool birth_line = false, previous_birth_line = false;
             std::size_t line_start = 0;
             while (line_start < n)
@@ -7987,8 +8038,8 @@ namespace dlib
                             const std::string norm = normalize_label(cp_substr(t, text, words[first].b, c));
                             pii_type type = lookup_label(norm);
                             if (type == pii_type::none) continue;
+                            if (norm == "a" && (previous_birth_line || birth_line)) type = pii_type::location;
                             if (birth_labels.count(norm)) birth_line = true;
-                            if (norm == "a" && previous_birth_line) type = pii_type::location;
                             if (header_only.count(norm) && words[first].b != seg_first) continue;
                             labels.push_back(found_label{ words[first].b, c, type });
                             value_floor = c + 1;
@@ -9568,10 +9619,23 @@ namespace dlib
 
         /* Terms of the document lexicon and of the user dictionary, looked up by their first
            word: the cost follows the number of words of the text, not that of the terms. */
-        void scan_terms(const utf8_text& t, const std::vector<word_token>& words, std::vector<candidate>& out) const
+        void scan_terms(const std::string& text, const utf8_text& t, const std::vector<word_token>& words,
+                        std::vector<candidate>& out) const
         {
             if (doc_terms_.empty() && terms_.empty()) return;
             const std::vector<word_token> tokens = term_tokens(t, words);
+            /* A person that a label, the header of its column or the user names stays one where the
+               document remembers its words as a place or an organisation read elsewhere, as a whole
+               row may give a first name after a number ("100003" then "Sophie", read as a postal
+               code and its town); the words of a firm or of a street keep that reading. */
+            std::vector<std::pair<std::size_t, std::size_t>> named;
+            for (const candidate& x : out)
+                if (x.kept && x.strong && x.type == pii_type::person) named.push_back(std::make_pair(x.b, x.e));
+            auto named_person = [&](std::size_t b, std::size_t e) {
+                for (const auto& n : named)
+                    if (n.first <= b && e <= n.second) return !firm_or_street_words(text, t, b, e);
+                return false;
+            };
             auto matches = [&](const std::vector<std::string>& keys, std::size_t k) {
                 if (k + keys.size() > tokens.size()) return false;
                 for (std::size_t m = 1; m < keys.size(); ++m)
@@ -9589,9 +9653,11 @@ namespace dlib
                 // Document terms need the capital letter of a proper noun.
                 if (d != doc_term_index_.end() && tokens[k].shape != 0)
                     for (std::size_t index : d->second)
-                        if (matches(doc_terms_[index].first, k))
-                            add(out, tokens[k].b, tokens[k + doc_terms_[index].first.size() - 1].e,
-                                doc_terms_[index].second, 0.85);
+                    {
+                        if (!matches(doc_terms_[index].first, k)) continue;
+                        const std::size_t e = tokens[k + doc_terms_[index].first.size() - 1].e;
+                        if (!named_person(tokens[k].b, e)) add(out, tokens[k].b, e, doc_terms_[index].second, 0.85);
+                    }
                 const auto u = term_index_.find(tokens[k].key);
                 if (u != term_index_.end())
                     for (std::size_t index : u->second)

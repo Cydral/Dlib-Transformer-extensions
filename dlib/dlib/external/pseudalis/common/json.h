@@ -25,7 +25,7 @@ namespace pseudalis
             WHAT THIS OBJECT REPRESENTS
                 A JSON value: null, boolean, number, string, array or object.  It is the
                 document type exchanged between the host, the inference engines, the web
-                interface and the GitHub feed.
+                interface and the update feed.
 
                 Objects keep their members in insertion order, so a document written by
                 dump() lists its members in the order the program set them.  Numbers

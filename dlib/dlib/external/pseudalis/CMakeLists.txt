@@ -16,7 +16,34 @@
 # drives working as folders without letters, for the tests (tools/test_linux.sh).
 
 cmake_minimum_required(VERSION 3.16)
-project(pseudalis VERSION 1.0.12 LANGUAGES C CXX)
+
+# The version is the one of common/version.h, read here: its three numbers, which its text must
+# spell, and which the description of the interface repeats (web/openapi.json).  A change of one of
+# the two files configures the build again.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+   ${CMAKE_CURRENT_LIST_DIR}/common/version.h ${CMAKE_CURRENT_LIST_DIR}/web/openapi.json)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/common/version.h PSEUDALIS_VERSION_HEADER)
+set(PSEUDALIS_VERSION_NUMBERS "")
+foreach (part MAJOR MINOR PATCH)
+   if (NOT PSEUDALIS_VERSION_HEADER MATCHES "#define PSEUDALIS_VERSION_${part} ([0-9]+)")
+      message(FATAL_ERROR "common/version.h defines no PSEUDALIS_VERSION_${part}")
+   endif()
+   list(APPEND PSEUDALIS_VERSION_NUMBERS ${CMAKE_MATCH_1})
+endforeach()
+string(REPLACE ";" "." PSEUDALIS_VERSION_NUMBERS "${PSEUDALIS_VERSION_NUMBERS}")
+if (NOT PSEUDALIS_VERSION_HEADER MATCHES "#define PSEUDALIS_VERSION \"([0-9.]+)\"" OR
+    NOT CMAKE_MATCH_1 STREQUAL PSEUDALIS_VERSION_NUMBERS)
+   message(FATAL_ERROR "common/version.h: PSEUDALIS_VERSION does not spell its numbers, ${PSEUDALIS_VERSION_NUMBERS}")
+endif()
+file(READ ${CMAKE_CURRENT_LIST_DIR}/web/openapi.json PSEUDALIS_INTERFACE)
+if (NOT PSEUDALIS_INTERFACE MATCHES "\"title\": \"Pseudalis interface\",[ \r\n]*\"version\": \"([0-9.]+)\"" OR
+    NOT CMAKE_MATCH_1 STREQUAL PSEUDALIS_VERSION_NUMBERS)
+   message(FATAL_ERROR "web/openapi.json does not give version ${PSEUDALIS_VERSION_NUMBERS} of common/version.h")
+endif()
+unset(PSEUDALIS_VERSION_HEADER)
+unset(PSEUDALIS_INTERFACE)
+
+project(pseudalis VERSION ${PSEUDALIS_VERSION_NUMBERS} LANGUAGES C CXX)
 
 option(PSEUDALIS_TESTS "Build the test programs" ON)
 

@@ -532,6 +532,7 @@ namespace dlib
                 {"residant", pii_type::location}, {"habitant a", pii_type::location},
                 {"date de naissance", pii_type::date}, {"ne le", pii_type::date}, {"nee le", pii_type::date},
                 {"date of birth", pii_type::date}, {"dob", pii_type::date}, {"birth date", pii_type::date},
+                {"born on", pii_type::date}, {"born in", pii_type::location},
                 {"telephone", pii_type::phone}, {"tel", pii_type::phone}, {"mobile", pii_type::phone},
                 {"portable", pii_type::phone}, {"fax", pii_type::phone}, {"phone", pii_type::phone},
                 {"cell", pii_type::phone}, {"numero de telephone", pii_type::phone}, {"phone number", pii_type::phone},

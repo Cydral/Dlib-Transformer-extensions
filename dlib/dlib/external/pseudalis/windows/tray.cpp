@@ -722,12 +722,12 @@ namespace pseudalis
             return out;
         }
 
-        // The About window: the banner, the version, the author, the license.
-        enum { IDC_A_TITLE = 3000, IDC_A_TEXT, IDC_A_PROJECT, IDC_A_CLOSE };
+        // The About window: the banner, the version, the license, the website and the sources.
+        enum { IDC_A_TITLE = 3000, IDC_A_TEXT, IDC_A_WEBSITE, IDC_A_PROJECT, IDC_A_CLOSE };
 
         struct about_state
         {
-            HWND title = nullptr, text = nullptr, project = nullptr, close = nullptr;
+            HWND title = nullptr, text = nullptr, website = nullptr, project = nullptr, close = nullptr;
             HBITMAP art = nullptr;
             int art_w = 0, art_h = 0;
         } about;
@@ -755,7 +755,9 @@ namespace pseudalis
             ui::place(about.text, m, y, cw - 2 * m, ch - y - bh - 2 * m);
             const int bw = ui::px(w, 110);
             ui::place(about.close, cw - m - bw, ch - m - bh, bw, bh);
-            ui::place(about.project, m, ch - m - bh, ui::px(w, 150), bh);
+            const int lw = ui::px(w, 150);
+            ui::place(about.website, m, ch - m - bh, lw, bh);
+            ui::place(about.project, m + lw + ui::px(w, 8), ch - m - bh, lw, bh);
         }
 
         LRESULT CALLBACK about_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
@@ -768,10 +770,11 @@ namespace pseudalis
                 const std::wstring body = tr("about_version", { { "p", PSEUDALIS_FULL_NAME },
                     { "v", PSEUDALIS_VERSION } }) + L"\n"
                     + tr("about_purpose") + L"\n\n"
-                    + tr("about_written", { { "a", PSEUDALIS_AUTHOR_NAME " (" PSEUDALIS_AUTHOR_EMAIL ")" } }) + L"\n"
                     + tr("about_built") + L"\n\n"
-                    + widen(PSEUDALIS_COPYRIGHT) + L"\n" + tr("about_license");
+                    + widen(PSEUDALIS_COPYRIGHT) + L"\n" + tr("about_license") + L"\n\n"
+                    + widen(PSEUDALIS_WEBSITE_URL ", " PSEUDALIS_CONTACT_EMAIL);
                 about.text = ui::label(w, body, IDC_A_TEXT);
+                about.website = ui::button(w, tr("btn_website"), IDC_A_WEBSITE);
                 about.project = ui::button(w, tr("btn_project"), IDC_A_PROJECT);
                 about.close = ui::button(w, tr("btn_close"), IDC_A_CLOSE, BS_DEFPUSHBUTTON);
                 about_layout(w);
@@ -782,7 +785,7 @@ namespace pseudalis
                 return 0;
             case WM_DPICHANGED:
             {
-                for (HWND c : { about.text, about.project, about.close })
+                for (HWND c : { about.text, about.website, about.project, about.close })
                     SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(ui::font(w, ui::font_kind::normal)), TRUE);
                 SendMessageW(about.title, WM_SETFONT, reinterpret_cast<WPARAM>(ui::font(w, ui::font_kind::title)),
                     TRUE);
@@ -817,6 +820,7 @@ namespace pseudalis
             case WM_COMMAND:
                 switch (LOWORD(wp))
                 {
+                case IDC_A_WEBSITE: ui::open_url(widen(PSEUDALIS_WEBSITE_URL)); break;
                 case IDC_A_PROJECT: ui::open_url(widen(PSEUDALIS_PROJECT_URL)); break;
                 case IDC_A_CLOSE:
                 case IDCANCEL: DestroyWindow(w); break;

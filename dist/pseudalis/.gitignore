@@ -1,0 +1,8 @@
+# The files of a publication, written here by tools/publish_release.py of Pseudalis and carried to the
+# hosting by the chain of the website: the repository holds the sources alone.
+feed.json
+feed.json.sig
+feed.json.new
+feed.json.new.sig
+pseudalis-setup-*.exe
+pseudalis-setup-*.exe.partial

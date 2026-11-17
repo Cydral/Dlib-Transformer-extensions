@@ -20,7 +20,7 @@ namespace pseudalis
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The updates of the programs.  The feed is a JSON document published at
-                feed_url, the folder dist/pseudalis of the repository on GitHub, with a
+                feed_url, in the folder of Pseudalis on the website, with a
                 detached signature (ECDSA P-256 over its exact bytes, feed_url + ".sig"); a
                 feed whose signature does not verify against the key built into the programs
                 is ignored.  When it announces a newer version, its installer is downloaded

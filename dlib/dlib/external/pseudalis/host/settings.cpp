@@ -9,8 +9,7 @@
 
 namespace pseudalis
 {
-    const char* const default_feed_url =
-        "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/pseudalis/feed.json";
+    const char* const default_feed_url = "https://cydral-technology.eu/files/pseudalis/feed.json";
 
     namespace
     {

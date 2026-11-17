@@ -1,7 +1,7 @@
 Pseudalis Community
-Copyright (C) 2026 Cydral Technology
-Written by Aldric Pierrain (cydraltechnology@gmail.com), based on the open source
-Dlib-Transformer-extensions library.
+Copyright (C) 2026 Cydral Technology, France
+Based on the open source Dlib-Transformer-extensions library.
+https://cydral-technology.eu, contact@cydral-technology.eu
 
 Pseudalis Community is free and open source software, distributed under the Boost
 Software License, Version 1.0:

@@ -11,7 +11,7 @@
 
 namespace pseudalis
 {
-    // The update feed, in the folder dist/pseudalis of the repository on GitHub, beside the installer it names.
+    // The update feed, in the folder of Pseudalis on the website, beside the installer it names.
     extern const char* const default_feed_url;
 
     struct host_settings

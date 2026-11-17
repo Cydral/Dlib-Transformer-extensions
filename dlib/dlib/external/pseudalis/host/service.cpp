@@ -459,7 +459,6 @@ namespace pseudalis
         j["edition"] = PSEUDALIS_EDITION;
         j["version"] = PSEUDALIS_VERSION;
         j["copyright"] = PSEUDALIS_COPYRIGHT;
-        j["author"] = PSEUDALIS_AUTHOR_NAME;
         j["started"] = iso_time(started_);
         j["port"] = port_;
         j["language"] = language();

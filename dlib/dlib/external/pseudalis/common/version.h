@@ -3,12 +3,18 @@
 #ifndef PSEUDALIS_COMMON_VERSION_H_
 #define PSEUDALIS_COMMON_VERSION_H_
 
-// Version of the Pseudalis programs and engines, compared by the update feed and by the
-// installer over an installation.
+/*
+    Version of the Pseudalis programs and engines, compared by the update feed and by the
+    installer over an installation.  The three numbers go into the version resources of the
+    programs, which the installer reads, and the text into their messages: a new version changes
+    the four lines together.  A compilation stops when the text does not spell the numbers (at the
+    end of this file), and the configuration of the build, which reads the version here, stops
+    for the same reason (CMakeLists.txt).
+*/
 #define PSEUDALIS_VERSION_MAJOR 1
 #define PSEUDALIS_VERSION_MINOR 0
-#define PSEUDALIS_VERSION_PATCH 11
-#define PSEUDALIS_VERSION "1.0.12"
+#define PSEUDALIS_VERSION_PATCH 13
+#define PSEUDALIS_VERSION "1.0.13"
 
 #define PSEUDALIS_PRODUCT_NAME "Pseudalis"
 /*
@@ -24,9 +30,30 @@
 #ifndef PSEUDALIS_FULL_NAME
 #define PSEUDALIS_FULL_NAME "Pseudalis Community"
 #endif
-#define PSEUDALIS_AUTHOR_NAME "Aldric Pierrain"
-#define PSEUDALIS_AUTHOR_EMAIL "cydraltechnology@gmail.com"
-#define PSEUDALIS_COPYRIGHT "Copyright (C) 2026 Cydral Technology"
+#define PSEUDALIS_COPYRIGHT "Copyright (C) 2026 Cydral Technology, France"
+// The website, where the versions are published, and the address to write to.
+#define PSEUDALIS_WEBSITE_URL "https://cydral-technology.eu"
+#define PSEUDALIS_CONTACT_EMAIL "contact@cydral-technology.eu"
+// The sources.
 #define PSEUDALIS_PROJECT_URL "https://github.com/Cydral/Dlib-Transformer-extensions"
+
+#if defined(__cplusplus) && !defined(RC_INVOKED)
+namespace pseudalis
+{
+    namespace version_impl
+    {
+        constexpr bool same_text(const char* a, const char* b)
+        {
+            return *a == *b && (*a == '\0' || same_text(a + 1, b + 1));
+        }
+    }
+}
+#define PSEUDALIS_VERSION_TEXT_(x) #x
+#define PSEUDALIS_VERSION_TEXT(x) PSEUDALIS_VERSION_TEXT_(x)
+static_assert(pseudalis::version_impl::same_text(PSEUDALIS_VERSION,
+                  PSEUDALIS_VERSION_TEXT(PSEUDALIS_VERSION_MAJOR) "." PSEUDALIS_VERSION_TEXT(PSEUDALIS_VERSION_MINOR)
+                  "." PSEUDALIS_VERSION_TEXT(PSEUDALIS_VERSION_PATCH)),
+              "common/version.h: PSEUDALIS_VERSION does not spell PSEUDALIS_VERSION_MAJOR, MINOR and PATCH");
+#endif
 
 #endif // PSEUDALIS_COMMON_VERSION_H_

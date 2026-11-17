@@ -271,7 +271,13 @@ namespace pseudalis
             c->set_read_timeout(timeout_seconds, 0);
             c->set_write_timeout(timeout_seconds, 0);
             c->set_keep_alive(false);
-            c->set_default_headers({ { "User-Agent", std::string(PSEUDALIS_PRODUCT_NAME) + "/" + PSEUDALIS_VERSION } });
+            /*
+                The files of the publication are asked as they are published: their signatures and
+                their hashes cover their exact bytes, and a range counts the bytes of the file, so
+                the server is told to encode nothing on the way.
+            */
+            c->set_default_headers({ { "User-Agent", std::string(PSEUDALIS_PRODUCT_NAME) + "/" + PSEUDALIS_VERSION },
+                { "Accept-Encoding", "identity" } });
             return c;
         }
 

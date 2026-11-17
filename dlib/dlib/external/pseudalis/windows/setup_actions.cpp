@@ -1291,16 +1291,17 @@ namespace setup
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "pseudalis-setup.exe")) + L"\"";
         str(L"DisplayName", widen(PSEUDALIS_FULL_NAME));
         str(L"DisplayVersion", widen(PSEUDALIS_VERSION));
-        str(L"Publisher", widen(PSEUDALIS_AUTHOR_NAME));
+        // The entry names no publisher: the one that a version before 1.0.13 wrote there leaves it.
+        RegDeleteValueW(k, L"Publisher");
         str(L"DisplayIcon", widen(join_path(program_dir, "pseudalis-tray.exe")) + L",0");
         str(L"InstallLocation", dir);
         str(L"UninstallString", setup + L" /uninstall");
         str(L"QuietUninstallString", setup + L" /uninstall /silent");
-        str(L"URLInfoAbout", widen(PSEUDALIS_PROJECT_URL));
+        str(L"URLInfoAbout", widen(PSEUDALIS_WEBSITE_URL));
         str(L"HelpLink", widen(PSEUDALIS_PROJECT_URL));
-        str(L"Comments", L"Protection of the personal data of documents, written by " + widen(PSEUDALIS_AUTHOR_NAME) +
-            L", based on the open source Dlib-Transformer-extensions library");
-        str(L"Contact", widen(PSEUDALIS_AUTHOR_EMAIL));
+        str(L"Comments", L"Protection of the personal data of documents, based on the open source "
+            L"Dlib-Transformer-extensions library");
+        str(L"Contact", widen(PSEUDALIS_CONTACT_EMAIL));
         time_t now = time(nullptr);
         tm t;
         gmtime_s(&t, &now);

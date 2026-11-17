@@ -8,11 +8,13 @@ application and interface. It is built on [`dlib/privacy`](../../privacy.h) and 
 trained for the example [`slm_document_anonymizer_ex`](../../../examples/slm_document_anonymizer_ex.cpp),
 which its engines carry.
 
-Pseudalis Community, the edition published here, is written by Aldric Pierrain, Copyright (C) 2026
-Cydral Technology, and distributed under the Boost Software License 1.0
+Pseudalis Community, the edition published here, is free and open source software, Copyright (C) 2026
+Cydral Technology, France, distributed under the Boost Software License 1.0
 ([`resources/license.txt`](resources/license.txt)). It installs no driver: its drive is a folder of its
 data folder, which the service watches and Windows shows under its letter. The installer of each version
-lies in [`dist/pseudalis`](../../../../dist/pseudalis), where anyone downloads it.
+is published on the website of Cydral Technology, [cydral-technology.eu](https://cydral-technology.eu),
+whose downloads page gives its size and its SHA-256; contact@cydral-technology.eu is the address to
+write to.
 
 The architecture of the product, its four detection devices, its format-preserving encryption and the
 measures of its recognizers are described in
@@ -314,7 +316,9 @@ the record gives the originals back.
   same file takes the tag of the value of its column, whose body is that substitute. The other columns
   are read as before, their names typing them when they are labels (`ville`, `telephone`), written
   apart, joined by an underscore, in camel case or, for the commonest names of database columns, in one
-  word (`first_name`, `FirstName`, `lastname`).
+  word (`first_name`, `FirstName`, `lastname`). The label of a column of names or of places has the last
+  word on the type of its values: a first name that a whole row gives as a town, after a number, stays a
+  person under `FirstName`, and a town read alone as a street stays a place under `City`.
 - The record of the file keeps each substitute with the tag it stands for, as for a file protected
   without tags: its copies give back the original, a copy edited on the drive its values, while the
   record lasts. Without record, the report says that they cannot come back (`"restorable": false`).
@@ -550,14 +554,19 @@ is left out.
 
 ## Publishing a version
 
-A version is published on GitHub alone, in [`dist/pseudalis`](../../../../dist/pseudalis): its
-installer, `pseudalis-setup-<version>.exe`, which anyone downloads there, and the update feed that names
-it, with its signature (ECDSA P-256), which the installed copies read there. The programs check the
-signature with the public key of `resources/feed-public-key.pem`, built into them. The publisher makes
-the pair once, on Linux, the private key in a folder of its own outside the repository, readable by its
-owner alone, and commits the public key before the installer is built; the copies installed before trust
-the former key alone, and are installed again by hand. A copy of the private key kept apart is the only
-way to publish an update that the installed copies take.
+A version is published on the website of Cydral Technology, under
+`https://cydral-technology.eu/files/pseudalis/`: its installer, `pseudalis-setup-<version>.exe`, which
+anyone downloads from the downloads page of the website, and the update feed that names it, with its
+signature (ECDSA P-256), which the installed copies read there. The repository holds the sources alone.
+The three files are written in [`dist/pseudalis`](../../../../dist/pseudalis) of the copy of the
+repository of the publisher, where Git ignores them, and the chain of the website, a folder of its own
+beside the repository (`~/work/cydral-website`), takes them there: it alone carries files to the hosting.
+
+The programs check the signature with the public key of `resources/feed-public-key.pem`, built into them.
+The publisher makes the pair once, on Linux, the private key in a folder of its own outside the
+repository, readable by its owner alone, and commits the public key before the installer is built; the
+copies installed before trust the former key alone, and are installed again by hand. A copy of the
+private key kept apart is the only way to publish an update that the installed copies take.
 
 ```
 python3 dlib/dlib/external/pseudalis/tools/publish_release.py --create-key --key ~/keys/pseudalis-feed-signing.key
@@ -567,15 +576,18 @@ Each version goes through three steps, each on the system that holds what it nee
 first failure:
 
 1. Linux: the sources change and are tested there (`tools/test_linux.sh`), the key is checked, then the
-   sources are committed and pushed. `PSEUDALIS_VERSION` of [`common/version.h`](common/version.h)
-   increases for each version that the installed copies are to receive: a feed that announces the
-   version a copy holds installs nothing.
+   sources are committed and pushed. The version of [`common/version.h`](common/version.h), its three
+   numbers and the text that spells them, increases for each version that the installed copies are to
+   receive, with the version of [`web/openapi.json`](web/openapi.json): a feed that announces the version
+   a copy holds installs nothing, and the build stops when the numbers, the text and the description of
+   the interface disagree.
 2. Windows, in the copy of the production chain, `%USERPROFILE%\work\Dlib-Transformer-extensions`:
    the installer is built from the sources pushed, tested and installed in place
    (`tools/build_windows.ps1 -Tests -Install`), which prints its size, its SHA-256 and its path under WSL.
-3. Linux, where the private key lies: the installer of that copy, which Linux reads under
-   `/mnt/c/Users/<user>/work`, goes into `dist/pseudalis` with the feed written and signed for it, then
-   both are committed and pushed, and the publication ends once GitHub serves them.
+3. Linux, where the private key and the chain of the website lie: the installer of that copy, which Linux
+   reads under `/mnt/c/Users/<user>/work`, goes into `dist/pseudalis` with the feed written and signed for
+   it, the chain of the website publishes the three files, and the publication ends once the website
+   serves them.
 
 ```
 bash dlib/dlib/external/pseudalis/tools/test_linux.sh &&
@@ -589,7 +601,7 @@ Set-Location $env:USERPROFILE\work\Dlib-Transformer-extensions; git pull --ff-on
 
 ```
 git pull --ff-only &&
-python3 dlib/dlib/external/pseudalis/tools/publish_release.py --key ~/keys/pseudalis-feed-signing.key --notes notes.json --push
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py --key ~/keys/pseudalis-feed-signing.key --notes notes.json
 ```
 
 Without an installer named, `publish_release.py` takes the one of the copy of the production chain,
@@ -597,22 +609,31 @@ Without an installer named, `publish_release.py` takes the one of the copy of th
 refuses an installer of another folder unless `--any-folder` is given.
 
 `publish_release.py` checks that the installer carries the version of
-[`common/version.h`](common/version.h), that the feed announces no later one, that the installer stays
-under the limits of GitHub (it refuses 95 MB and more, and warns from 50 MB) and that the key is the one
-of the public key of the sources, copies the installer as `pseudalis-setup-<version>.exe`, writes the
-feed with its name, its size, its SHA-256 and the notes of each language
-(`{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`), signs it, checks the signature
-with the public key of the sources, then puts the installer, the signature and the feed in place of the
-published ones; the installers of the earlier versions leave the folder and stay in the history of the
-repository. With `--push`, it first checks that the branch lags behind its remote one in nothing, then
-commits and pushes the folder, and ends once GitHub serves the feed and its signature as they were
-written and the installer by its size and its SHA-256, as the installed copies will read them; a step
-that fails prints the commands that end the publication, and `--check` makes the last check again. A
-failure before the writing leaves the published files as they are, and `--dry-run` checks everything
-without writing. The services read the feed and its signature on GitHub five minutes after their start,
-then every day, check the signature, download the installer beside the feed in the background, check its
-size and its SHA-256, and install it at the next start of the service, or at once from the menu of the
-icon. Their messages and logs never name the places they read.
+[`common/version.h`](common/version.h), that the feed announces no later one, that the key is the one of
+the public key of the sources, and that the chain of the website (`--site`, `~/work/cydral-website` by
+default) takes its files in this copy of the repository (`PRODUCTS_REPO` of its `deploy.conf`, which
+`tools/site.sh setup --repo <copy>` records). It then copies the installer as
+`pseudalis-setup-<version>.exe`, writes the feed with its name, its size, its SHA-256 and the notes of
+each language (`{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`), with LF ends of line,
+signs it, checks the signature with the public key of the sources, and puts the installer, the signature
+and the feed in place of the former ones; the installers of the earlier versions leave the folder. A
+failure before the writing leaves the folder as it is.
+
+The program then runs `tools/site.sh status` and `tools/site.sh publish` from the folder of the website,
+on the terminal of the publisher, where the chain asks for the password of the hosting when it needs it:
+the program opens no session with the hosting, and it neither reads, keeps nor passes on that password.
+It stops when the chain ends with an error. It ends once the website serves the feed and its signature
+as they were written, and the installer by the size it announces, then by its size and its SHA-256, at
+the address the installed copies read; a redirection there is an error, the address being written
+without `www`. A step that fails prints the commands that end the publication, `--check` makes the last
+check again, and `--dry-run` checks everything without writing or publishing anything.
+
+The services read the feed and its signature on the website five minutes after their start, then every
+day, check the signature, download the installer beside the feed in the background, check its size and
+its SHA-256, and install it at the next start of the service, or at once from the menu of the icon. Their
+messages and logs never name the places they read. The copies of a version before 1.0.13 read the
+repository, where the feed no longer lies: they are updated once by hand, with the installer of the
+website.
 
 ## Editions and licenses
 

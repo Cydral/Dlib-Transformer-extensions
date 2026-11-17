@@ -262,7 +262,10 @@ namespace dlib
                    Zurich", "00-238 Warszawa", "1015 CJ Amsterdam", "Tel Aviv 6688116",
                    "Tokyo 153-0063", "Dublin D02 X285"), a place taking the department or
                    postal code written in brackets after it ("Quimper (29)", "Brest
-                   (29200)"), from "né à", "domicilié à", "originaire de", and from the place
+                   (29200)"), from "né à", "domicilié à", "originaire de", from the label "à
+                   :" or "a:" after a date of birth, on the next line or after a tabulation
+                   on the same one ("Née le : 08.09.1956", then "à : Dakar"; "Nato il:
+                   05/01/2004", then "a: Peschici"), and from the place
                    before the date of a letter ("Rennes, le 12 mars 2024"). User names come
                    from logs and chats ("user=jdupont", "[10:42] jdupont:", "opened by
                    jdupont"). A capitalized word that a conjunction or an ampersand joins to
@@ -388,7 +391,12 @@ namespace dlib
                    civility, a name label or the label of its column (context.label)
                    announces stays a person when they read it as an organisation, a place
                    or an address with no word of a firm or of a street ("Nom : LE
-                   FLOC'H"), a first name joins the family name that follows it with a
+                   FLOC'H"), and when the document remembers its words as a place or an
+                   organisation read elsewhere, as a whole row of a table may give a first
+                   name after a number ("100003" then "Sophie", read as a postal code and
+                   its town); a place that a label announces stays a place when they read
+                   it as an address with no number and no type of street ("Angers" under
+                   "Ville"); a first name joins the family name that follows it with a
                    capitalized particle, whatever type they give it ("Yann" and "Le
                    Floc'h"), a first name alone that they read as an organisation or a
                    place joins the family name that follows it ("Nolwenn" and "Le
@@ -495,7 +503,10 @@ namespace dlib
                   address ("212 doublons", while "9e étage" and "220 broadway" stay) and,
                   for persons, places and organisations, function words alone
                   ("Votre"), a greeting, a closing or a field label alone ("Bonsoir",
-                  "Cordialement", "Nom"), a common word in lower case ("commande"), a
+                  "Cordialement", "Nom"), the words that open the label of the next field,
+                  which a colon closes on their line ("Née" in "Prénom : Léonie  Née le :",
+                  "Geboren" in "Vorname: Jonas  Geboren am:", "DOB" in "First name: Alice
+                  DOB:"), a common word in lower case ("commande"), a
                   common word, or a compound of common words, that opens its text, its
                   line, a cell or a sentence, alone or before words in lower case, unless
                   it is a first name, a known organisation or one of the towns among the
