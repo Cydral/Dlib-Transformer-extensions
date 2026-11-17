@@ -1,14 +1,14 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
 r"""
-Publishes a version of Pseudalis on the website: puts its installer in dist/pseudalis of this
-copy of the repository, beside the update feed that announces it, written and signed, has the
-chain of the website publish the three files, then checks what the website serves.
+Publishes a version of Pseudalis on the website: puts its installer in the folder of the chain of
+the website that holds the files of Pseudalis, beside the update feed that announces it, written
+and signed, has the chain publish the three files, then checks what the website serves.
 
     python3 publish_release.py [<pseudalis-setup.exe>] --key <private key>
                                [--notes <notes.json>] [--sign <pseudalis-sign>]
-                               [--site <folder>] [--dist <folder>] [--dry-run] [--wait <seconds>]
-    python3 publish_release.py --check [--dist <folder>] [--wait <seconds>]
+                               [--site <folder>] [--deposit] [--dry-run] [--wait <seconds>]
+    python3 publish_release.py --check [--site <folder>] [--wait <seconds>]
     python3 publish_release.py --check-key --key <private key> [--sign <pseudalis-sign>]
     python3 publish_release.py --create-key --key <private key> [--sign <pseudalis-sign>]
 
@@ -17,23 +17,28 @@ repository of the production chain on Windows, %USERPROFILE%\work\Dlib-Transform
 read under WSL (/mnt/c/Users/<user>/work/Dlib-Transformer-extensions/build-pseudalis/bin); an
 installer named elsewhere is refused unless --any-folder is given.
 
+The chain of the website lies in <site> (~/work/cydral-website by default).  It publishes the
+files of its folder releases/files under files/ of the website, which gives the files of each
+product the same layout, files/<product>/dist/: the folder of the publication is
+<site>/releases/files/pseudalis/dist, served as files/pseudalis/dist/.  The repository holds
+the sources alone, and nothing of a publication is written in it.
+
 The version is that of common/version.h, which must also be the version the installer carries
-in its resources.  The installer is copied into <dist> (dist/pseudalis of this copy by default)
-as pseudalis-setup-<version>.exe, and the installers of the other versions leave it.  The feed
+in its resources.  The installer is copied into the folder of the publication as
+pseudalis-setup-<version>.exe, and the installers of the other versions leave it.  The feed
 names the installer by its file beside it, with its size and its SHA-256; the program writes it
 with LF ends of line, signs it with pseudalis-sign, checks the signature with the public key of
 the sources, which the programs embed, and puts the installer, then the signature and the feed
-in place of the former ones.  A failure before that leaves the folder as it is.  Git ignores
-these three files (dist/pseudalis/.gitignore): the repository holds the sources alone.
+in place of the former ones.  A failure before that leaves the folder as it is, and the files
+being written bear names that start with a dot, which the chain does not publish.
 
-The website alone carries the files to its hosting.  Its chain lies in <site>
-(~/work/cydral-website by default) and takes the feed, its signature and the installer in the
-copy of the repository that PRODUCTS_REPO of its deploy.conf names: the program stops, before
-it writes anything, unless that copy is the one whose <dist> it fills.  It then runs
-tools/site.sh status and tools/site.sh publish from <site>, on the terminal of the publisher,
-where the chain may ask for the password of the hosting, and stops when one of the two ends
-with an error.  The program opens no session with the hosting, and it neither reads, keeps nor
-passes on its password.
+The website alone carries the files to its hosting.  The program runs tools/site.sh status and
+tools/site.sh publish from <site>, on the terminal of the publisher, where the chain may ask
+for the password of the hosting, and stops when one of the two ends with an error.  The program
+opens no session with the hosting, and it neither reads, keeps nor passes on its password.
+--deposit stops once the three files are written: the chain of the website publishes them when
+the publisher runs it (tools/site.sh publish from <site>), with the files of another product
+for instance, and --check then ends the publication.
 
 The publication ends once the website serves the feed and its signature as they were written,
 and the installer by its size and its SHA-256, at the address the installed copies read, that
@@ -76,9 +81,10 @@ sys.path.insert(0, HERE)
 import make_feed  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", ".."))
-DIST = os.path.join(ROOT, "dist", "pseudalis")
-# The folder of the chain of the website on the system of the publisher.
+# The folder of the chain of the website on the system of the publisher and, in it, the folder of
+# the publication: the chain serves releases/files/<path> as files/<path> of the website.
 SITE = os.path.join("~", "work", "cydral-website")
+PUBLICATION = ("releases", "files", "pseudalis", "dist")
 # The public key of the feed, which the programs embed when it is there at their configuration.
 PUBLIC_KEY = os.path.join(HERE, "..", "resources", "feed-public-key.pem")
 # The address of the feed that the programs read, in host/settings.cpp.
@@ -168,11 +174,12 @@ def check_newer(feed_path, version):
 
 def write_release(installer, dist, name, sha, feed, signer, key):
     """Puts the installer and the signed feed in dist, the installers of the other versions leaving
-    it; returns the names of those that left."""
+    it; returns the names of those that left.  The files being written bear hidden names, which the
+    chain of the website does not publish: an interruption leaves nothing that it would take."""
     feed_path = os.path.join(dist, "feed.json")
     target = os.path.join(dist, name)
-    partial = target + ".partial"
-    new = feed_path + ".new"
+    partial = os.path.join(dist, "." + name + ".partial")
+    new = os.path.join(dist, ".feed.json.new")
     try:
         shutil.copyfile(installer, partial)
         if make_feed.sha256_of(partial) != sha:
@@ -231,43 +238,16 @@ def create_key(signer, key):
         shutil.rmtree(temp, ignore_errors=True)
 
 
-def site_setting(conf, name):
-    """The value deploy.conf gives the setting name, read as the chain of the website reads it: lines
-    KEY=value, a comment after a space and #, the double quotes around a value left out."""
-    value = ""
-    with open(conf, encoding="utf-8") as f:
-        for line in f:
-            key, _, rest = line.rstrip("\r\n").partition("=")
-            if "".join(key.split()) != name:
-                continue
-            rest = re.split(r"\s#", rest, 1)[0].strip()
-            if rest.endswith('"'):
-                rest = rest[:-1]
-            if rest.startswith('"'):
-                rest = rest[1:]
-            value = rest
-    return value
-
-
-def check_site(site, dist):
-    """The folder of the chain of the website, checked: raises RuntimeError unless it holds the chain
-    and takes the files of the publication in the copy of the repository whose dist is the folder
-    written here."""
+def check_site(site):
+    """The folder of the chain of the website and, in it, the folder of the publication; raises
+    RuntimeError unless site holds the chain and the folder where it takes the files it publishes."""
     site = os.path.realpath(os.path.expanduser(site))
     if not os.path.isfile(os.path.join(site, "tools", "site.sh")):
         raise RuntimeError("no chain of the website in %s (tools/site.sh): give its folder with --site" % site)
-    conf = os.path.join(site, "deploy.conf")
-    if not os.path.isfile(conf):
-        raise RuntimeError("%s is missing: tools/site.sh setup writes it" % conf)
-    repo = site_setting(conf, "PRODUCTS_REPO")
-    clone = os.path.dirname(os.path.dirname(os.path.realpath(dist)))
-    setup = "run tools/site.sh setup --repo %s in %s" % (shlex.quote(clone), site)
-    if not repo:
-        raise RuntimeError("%s names no copy of the repository (PRODUCTS_REPO): %s" % (conf, setup))
-    if os.path.realpath(os.path.join(site, repo, "dist", "pseudalis")) != os.path.realpath(dist):
-        raise RuntimeError("the website takes its files in %s (PRODUCTS_REPO of %s), not in the copy written "
-                           "here: %s" % (repo, conf, setup))
-    return site
+    if not os.path.isdir(os.path.join(site, *PUBLICATION[:2])):
+        raise RuntimeError("the chain of the website has no folder %s in %s: tools/site.sh setup makes it" %
+                           ("/".join(PUBLICATION[:2]), site))
+    return site, os.path.join(site, *PUBLICATION)
 
 
 def site_chain(site, command):
@@ -342,8 +322,8 @@ def check_online(dist, wait):
         except (OSError, http.client.HTTPException, RuntimeError) as e:
             seen = str(e)
         if time.time() >= deadline:
-            raise RuntimeError("the website does not serve the feed of version %s after %d seconds (%s)" %
-                               (version, wait, seen))
+            raise RuntimeError("the website does not serve the feed of version %s at %s/feed.json after %d seconds "
+                               "(%s)" % (version, base, wait, seen))
         time.sleep(10)
     address = base + "/" + installer["file"]
     h = hashlib.sha256()
@@ -364,7 +344,8 @@ def check_online(dist, wait):
         raise RuntimeError("the website does not serve %s (HTTP %d)" % (installer["file"], e.code))
     if size != installer["size"] or h.hexdigest() != installer["sha256"]:
         raise RuntimeError("the website serves another installer than the one the feed of version %s names" % version)
-    print("the website serves version %s: the feed, its signature and the installer of %d bytes" % (version, size))
+    print("the website serves version %s under %s: the feed, its signature and the installer of %d bytes" %
+          (version, base, size))
 
 
 def main():
@@ -374,7 +355,8 @@ def main():
     p.add_argument("--notes")
     p.add_argument("--sign")
     p.add_argument("--site", default=SITE, help="folder of the chain of the website")
-    p.add_argument("--dist", default=DIST)
+    p.add_argument("--deposit", action="store_true", help="write the files of the publication and leave the "
+                   "chain of the website to the publisher")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--check", action="store_true")
     p.add_argument("--check-key", action="store_true")
@@ -400,7 +382,7 @@ def main():
                 check_key(find_signer(a.sign), a.key)
                 print("%s signs what the public key of the sources verifies" % a.key)
             if a.check:
-                check_online(a.dist, a.wait)
+                check_online(check_site(a.site)[1], a.wait)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.CalledProcessError,
                 http.client.HTTPException) as e:
             print("error: %s" % e, file=sys.stderr)
@@ -417,18 +399,19 @@ def main():
         if not os.path.isfile(a.installer):
             raise RuntimeError("no installer at %s: build it on Windows first (tools/build_windows.ps1)" % a.installer)
         version = source_version()
-        feed_path = os.path.join(a.dist, "feed.json")
+        # The folder of the website, then the key, are checked before anything is written.
+        site, dist = check_site(a.site)
+        feed_path = os.path.join(dist, "feed.json")
         notes = make_feed.read_notes(a.notes, feed_path, version)
         name = installer_name(version)
         size = os.path.getsize(a.installer)
         sha = make_feed.sha256_of(a.installer)
         feed = make_feed.make_feed(version, a.installer, None, notes, size, sha, file=name)
         check_newer(feed_path, version)
-        # What can fail before anything is written, the folder of the website and the key, is checked first.
-        site = check_site(a.site, a.dist)
         print("version %s, installer of %d bytes, SHA-256 %s" % (version, size, sha))
-        print("folder of the publication, %s: %s, feed.json, feed.json.sig" % (a.dist, name))
-        print("chain of the website, %s: tools/site.sh status, then tools/site.sh publish" % site)
+        print("folder of the publication, %s: %s, feed.json, feed.json.sig" % (dist, name))
+        print("chain of the website, %s: %s" % (site, "left to the publisher (--deposit)" if a.deposit else
+                                                "tools/site.sh status, then tools/site.sh publish"))
         if a.dry_run:
             print("dry run: nothing written, nothing published")
             return 0
@@ -436,24 +419,28 @@ def main():
             raise RuntimeError("--key names the private key that signs the feed")
         signer = find_signer(a.sign)
         check_key(signer, a.key)
-        os.makedirs(a.dist, exist_ok=True)
-        left = write_release(a.installer, a.dist, name, sha, feed, signer, a.key)
+        os.makedirs(dist, exist_ok=True)
+        left = write_release(a.installer, dist, name, sha, feed, signer, a.key)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1
     for other in left:
-        print("removed from %s: %s" % (a.dist, other))
+        print("removed from %s: %s" % (dist, other))
     check = "python3 %s --check" % shlex.quote(os.path.abspath(__file__))
-    if os.path.realpath(a.dist) != os.path.realpath(DIST):
-        check += " --dist %s" % shlex.quote(a.dist)
-    # What remains to run when a step fails, the files of the folder being written.
+    if site != os.path.realpath(os.path.expanduser(SITE)):
+        check += " --site %s" % shlex.quote(site)
+    # What remains to run once the files of the folder are written, after --deposit or a step that fails.
     remaining = "(cd %s && tools/site.sh publish) && %s" % (shlex.quote(site), check)
+    if a.deposit:
+        print("the chain of the website publishes these files when it is run; the publication ends with: %s" %
+              remaining)
+        return 0
     try:
         site_chain(site, "status")
         site_chain(site, "publish")
         remaining = check
         print()
-        check_online(a.dist, a.wait)
+        check_online(dist, a.wait)
     except (OSError, ValueError, KeyError, RuntimeError, http.client.HTTPException) as e:
         print("error: %s" % e, file=sys.stderr)
         print("the publication ends, once the cause is removed, with: %s" % remaining, file=sys.stderr)

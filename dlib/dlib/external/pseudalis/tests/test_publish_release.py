@@ -2,9 +2,9 @@
 # License: Boost Software License   See LICENSE.txt for the full license.
 """
 Tests of tools/publish_release.py on one computer.  The chain of the website is a script that
-records what it is asked and copies the files of the publication into a folder, which a local
-server plays as the hosting; the installer is a program made here, that carries nothing but its
-version resource.
+records what it is asked and copies the files of the publication, which it takes in its own
+folder, into another one, which a local server plays as the hosting; the installer is a program
+made here, that carries nothing but its version resource.
 
     python3 test_publish_release.py <pseudalis-sign>
 """
@@ -63,18 +63,17 @@ def program_with_version(version):
 
 SITE_SCRIPT = r"""#!/usr/bin/env bash
 # Plays the chain of the website: records the command and the folder it runs in, asks a word on
-# the terminal before it publishes, then copies the files of the publication into the hosting.
+# the terminal before it publishes, then copies the files of releases/files, as they lie there,
+# into the hosting.
 set -eu
 printf '%s %s\n' "$1" "$PWD" >> calls.log
 if [ -f "fail-$1" ]; then exit 3; fi
 if [ "$1" = publish ]; then
-  repo=$(sed -n 's/^PRODUCTS_REPO=//p' deploy.conf | sed 's/[[:space:]]\{1,\}#.*$//; s/^"//; s/"$//')
   IFS= read -r word || word=""
   printf 'asked %s\n' "$word" >> calls.log
   echo "website: publishing"
-  mkdir -p hosting/files/pseudalis
-  cp "$repo"/dist/pseudalis/feed.json "$repo"/dist/pseudalis/feed.json.sig \
-    "$repo"/dist/pseudalis/pseudalis-setup-*.exe hosting/files/pseudalis/
+  rm -rf hosting/files
+  cp -r releases/files hosting/files
 fi
 """
 
@@ -132,18 +131,14 @@ def main():
     signer = os.path.abspath(sys.argv[1])
     version = publish_release.source_version()
     work = tempfile.mkdtemp(prefix="pseudalis-publication-")
-    dist = os.path.join(work, "repo", "dist", "pseudalis")
     site = os.path.join(work, "site")
-    hosted = os.path.join(site, "hosting", "files", "pseudalis")
+    # The folder of the publication in the chain, and the folder the hosting serves at the same path.
+    dist = os.path.join(site, "releases", "files", "pseudalis", "dist")
+    hosted = os.path.join(site, "hosting", "files", "pseudalis", "dist")
     calls = os.path.join(site, "calls.log")
-    os.makedirs(dist)
     os.makedirs(os.path.join(site, "tools"))
     os.makedirs(os.path.join(site, "hosting"))
     write(os.path.join(site, "tools", "site.sh"), SITE_SCRIPT.encode("utf-8"))
-    conf = os.path.join(site, "deploy.conf")
-    good_conf = ('# Settings of the website.\nSITE_URL=https://example.org\nPRODUCTS_REPO="%s"   # the repository\n'
-                 % os.path.join(work, "repo")).encode("utf-8")
-    write(conf, good_conf)
     key = os.path.join(work, "keys", "feed.key")
     public = os.path.join(work, "feed-public-key.pem")
     os.makedirs(os.path.dirname(key))
@@ -156,7 +151,7 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(
         hosting, directory=os.path.join(site, "hosting")))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    address = "http://127.0.0.1:%d/files/pseudalis" % server.server_address[1]
+    address = "http://127.0.0.1:%d/files/pseudalis/dist" % server.server_address[1]
     # The requests to this computer go straight to it, whatever proxy the system names.
     env = dict(os.environ, no_proxy="127.0.0.1", NO_PROXY="127.0.0.1")
 
@@ -172,59 +167,91 @@ def main():
         with open(calls, encoding="utf-8") as f:
             return f.read().splitlines()
 
-    common = [installer, "--any-folder", "--key", key, "--sign", signer, "--dist", dist, "--site", site,
-              "--notes", notes, "--wait", "1"]
+    common = [installer, "--any-folder", "--key", key, "--sign", signer, "--notes", notes, "--wait", "1",
+              "--site", site]
+    check_alone = ["--check", "--site", site, "--wait", "1"]
     try:
         # The program made here is read as the installer of its version.
         check(make_feed.installer_version(installer) == version, "the version resource of the test installer is read")
 
-        # The settings of the website, read as its chain reads them.
-        sample = os.path.join(work, "sample.conf")
-        write(sample, b'#PRODUCTS_REPO=/commented\n PRODUCTS_REPO = "/first"\nMODELS=default\n'
-                      b'PRODUCTS_REPO=/a folder/of the repo   # the last one counts\n')
-        check(publish_release.site_setting(sample, "PRODUCTS_REPO") == "/a folder/of the repo",
-              "a setting keeps its spaces, without its comment, the last line counting")
-        check(publish_release.site_setting(sample, "MODELS") == "default" and
-              publish_release.site_setting(sample, "ALBIREO_SPACE") == "", "a setting without quotes, a missing one")
+        # The chain of the website must be there, with the folder where it takes the files it publishes.
+        code, out = run(common[:-1] + [os.path.join(work, "nowhere")])
+        check(code == 1 and "no chain of the website" in out, "a folder without the chain stops the publication")
+        code, out = run(common)
+        check(code == 1 and "no folder releases/files" in out and "tools/site.sh setup" in out,
+              "a chain without its folder of files stops the publication: %s" % out)
+        check(not os.path.exists(os.path.join(site, "releases")) and called() == [],
+              "a publication stopped there writes nothing")
+        os.makedirs(os.path.join(site, "releases", "files", "albireo", "dist"))
+        write(os.path.join(site, "releases", "files", "albireo", "dist", "albireo-setup-online-9.9.9.exe"), b"another")
+        real_site = os.path.realpath(site)
+        check(publish_release.check_site(site) == (real_site, os.path.join(real_site, "releases", "files", "pseudalis",
+                                                                           "dist")),
+              "the folder of the publication has the layout of the website in the chain")
 
         # A dry run writes nothing and publishes nothing.
         code, out = run(common + ["--dry-run"])
         check(code == 0 and "dry run: nothing written, nothing published" in out, "the dry run ends well: %s" % out)
-        check(os.listdir(dist) == [] and called() == [], "the dry run writes nothing and runs no chain")
-
-        # The website must take its files in the copy written.
-        write(conf, b"PRODUCTS_REPO=" + os.path.join(work, "elsewhere").encode("utf-8") + b"\n")
-        code, out = run(common)
-        check(code == 1 and "PRODUCTS_REPO" in out and "tools/site.sh setup --repo" in out,
-              "another copy of the repository stops the publication: %s" % out)
-        write(conf, b"MODELS=default\n")
-        code, out = run(common)
-        check(code == 1 and "names no copy of the repository" in out, "no copy named stops the publication")
-        check(os.listdir(dist) == [] and called() == [], "a publication stopped there writes nothing")
-        write(conf, good_conf)
-        code, out = run(common[:8] + ["--site", os.path.join(work, "nowhere")] + common[10:])
-        check(code == 1 and "no chain of the website" in out, "a folder without the chain stops the publication")
+        check(not os.path.exists(dist) and called() == [], "the dry run writes nothing and runs no chain")
 
         # An installer of another version is refused.
         other = os.path.join(work, "other.exe")
         write(other, program_with_version("0.0.1"))
         code, out = run([other] + common[1:])
         check(code == 1 and "installs version 0.0.1" in out, "the installer of another version is refused: %s" % out)
-        check(os.listdir(dist) == [], "a refused installer writes nothing")
+        check(not os.path.exists(dist), "a refused installer writes nothing")
+
+        # A writing that fails leaves the folder as it was, and the files being written bear hidden names,
+        # which the chain does not publish.  The signing program played here lists the folder, then fails.
+        os.makedirs(dist)
+        write(os.path.join(dist, "pseudalis-setup-0.9.0.exe"), b"an earlier installer")
+        name = "pseudalis-setup-%s.exe" % version
+        listing = os.path.join(work, "listing")
+        failing = os.path.join(work, "failing-sign")
+        write(failing, ('#!/bin/sh\nls -A "$(dirname "$3")" > "%s"\nexit 1\n' % listing).encode("utf-8"))
+        os.chmod(failing, 0o755)
+        try:
+            publish_release.write_release(installer, dist, name, make_feed.sha256_of(installer), {"channels": {}},
+                                          failing, key)
+            check(False, "a signature that fails stops the writing")
+        except subprocess.CalledProcessError:
+            pass
+        check(os.listdir(dist) == ["pseudalis-setup-0.9.0.exe"], "a writing that fails leaves the folder as it "
+              "was: %s" % os.listdir(dist))
+        written = sorted(read(listing).decode("utf-8").split())
+        check(written == [".feed.json.new", "." + name + ".partial", "pseudalis-setup-0.9.0.exe"],
+              "the files being written bear hidden names: %s" % written)
+
+        # The files written alone: the chain is left to the publisher, who is told how the publication ends.
+        code, out = run(common + ["--deposit"])
+        check(code == 0 and called() == [], "the files are written without the chain: %s" % out)
+        check(sorted(os.listdir(dist)) == ["feed.json", "feed.json.sig", name], "the folder holds the three files, "
+              "the earlier installer gone: %s" % sorted(os.listdir(dist)))
+        check("(cd %s && tools/site.sh publish) && " % real_site in out and "--check --site %s" % real_site in out,
+              "the commands that end the publication are given: %s" % out)
+        code, out = run(check_alone[:-1] + ["0"])
+        check(code == 1 and "does not serve the feed" in out, "files that the chain has not published are not online")
 
         # The publication: the files written, the chain run in its folder, the hosting checked.
-        write(os.path.join(dist, "pseudalis-setup-0.9.0.exe"), b"an earlier installer")
+        write(os.path.join(dist, "pseudalis-setup-0.9.1.exe"), b"another earlier installer")
+        # The chain of the website links into its folder the installers it finds elsewhere: such a link leaves
+        # with the earlier versions, the file it names stays, and a link to a file that is gone leaves too.
+        elsewhere = os.path.join(work, "pseudalis-setup-0.9.2.exe")
+        write(elsewhere, b"an installer kept elsewhere")
+        os.symlink(elsewhere, os.path.join(dist, "pseudalis-setup-0.9.2.exe"))
+        os.symlink(os.path.join(work, "gone.exe"), os.path.join(dist, "pseudalis-setup-0.9.3.exe"))
         hosting.seen = []
         code, out = run(common, terminal="word-of-the-terminal\n")
         check(code == 0 and "the website serves version %s" % version in out, "the publication ends well: %s" % out)
-        real_site = os.path.realpath(site)
         check(called() == ["status " + real_site, "publish " + real_site, "asked word-of-the-terminal"],
               "the chain runs status, then publish, in its folder, the terminal its own: %s" % called())
         check("website: publishing" in out, "the chain writes on the terminal of the publisher")
         check("word-of-the-terminal" not in out, "the program shows nothing of what the chain is told")
-        name = "pseudalis-setup-%s.exe" % version
         check(sorted(os.listdir(dist)) == ["feed.json", "feed.json.sig", name], "the folder holds the three files, "
               "the earlier installer gone: %s" % sorted(os.listdir(dist)))
+        check(os.listdir(os.path.join(site, "releases", "files", "albireo", "dist")) ==
+              ["albireo-setup-online-9.9.9.exe"], "the files of another product stay as they are")
+        check(read(elsewhere) == b"an installer kept elsewhere", "a linked installer leaves as a link, its file kept")
         feed = read(os.path.join(dist, "feed.json"))
         stable = json.loads(feed.decode("utf-8"))["channels"]["stable"]
         check(b"\r" not in feed and feed.endswith(b"}\n"), "the feed has LF ends of line")
@@ -238,30 +265,30 @@ def main():
               "the hosting holds the files of the folder")
         check(hosting.seen and all(agent == "Pseudalis/%s" % version for _, _, agent in hosting.seen),
               "the requests carry the name of the programs: %s" % hosting.seen)
-        check(("HEAD", "/files/pseudalis/" + name, "Pseudalis/%s" % version) in hosting.seen,
+        check(("HEAD", "/files/pseudalis/dist/" + name, "Pseudalis/%s" % version) in hosting.seen,
               "the size the hosting announces is asked before the installer")
 
         # The check alone, then against a hosting that serves something else.
-        code, out = run(["--check", "--dist", dist, "--wait", "1"])
+        code, out = run(check_alone)
         check(code == 0 and "the website serves version" in out, "the check alone ends well: %s" % out)
         saved = read(os.path.join(hosted, "feed.json"))
         write(os.path.join(hosted, "feed.json"), saved + b" ")
-        code, out = run(["--check", "--dist", dist, "--wait", "1"])
+        code, out = run(check_alone)
         check(code == 1 and "does not serve the feed" in out, "another feed on the hosting is an error: %s" % out)
         write(os.path.join(hosted, "feed.json"), saved)
         saved = read(os.path.join(hosted, name))
         write(os.path.join(hosted, name), saved[:-1])
-        code, out = run(["--check", "--dist", dist, "--wait", "1"])
+        code, out = run(check_alone)
         check(code == 1 and "announces an installer" in out, "another size on the hosting is an error: %s" % out)
         write(os.path.join(hosted, name), saved[:-1] + bytes([saved[-1] ^ 1]))
-        code, out = run(["--check", "--dist", dist, "--wait", "1"])
+        code, out = run(check_alone)
         check(code == 1 and "serves another installer" in out, "another installer of the same size is an error")
         write(os.path.join(hosted, name), saved)
         os.remove(os.path.join(hosted, name))
-        code, out = run(["--check", "--dist", dist, "--wait", "1"])
+        code, out = run(check_alone)
         check(code == 1 and "does not serve %s" % name in out, "a missing installer is an error: %s" % out)
         write(os.path.join(hosted, name), saved)
-        code, out = run(["--check", "--dist", dist, "--wait", "1"], base=address.replace("/files/", "/moved/files/"))
+        code, out = run(check_alone, base=address.replace("/files/", "/moved/files/"))
         check(code == 1 and "redirects" in out, "a redirection is an error: %s" % out)
 
         # A chain that fails stops the publication, which says how it ends.
@@ -286,6 +313,11 @@ def main():
         code, out = run(common)
         check(code == 1 and "already announces 99.0.0" in out, "a later version announced stops the publication")
         write(os.path.join(dist, "feed.json"), saved)
+
+        # The address checked is that of the feed of the service, in the layout the website gives to the
+        # files of each product, files/<product>/dist.
+        check(publish_release.published_address() == "https://cydral-technology.eu/files/pseudalis/dist",
+              "the publication is checked under files/pseudalis/dist: %s" % publish_release.published_address())
 
         # The program has no part in the transfer: nothing in it names a session or a password file.
         with open(os.path.join(TOOLS, "publish_release.py"), encoding="utf-8") as f:

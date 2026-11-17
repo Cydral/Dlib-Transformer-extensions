@@ -9,7 +9,7 @@
 
 namespace pseudalis
 {
-    const char* const default_feed_url = "https://cydral-technology.eu/files/pseudalis/feed.json";
+    const char* const default_feed_url = "https://cydral-technology.eu/files/pseudalis/dist/feed.json";
 
     namespace
     {

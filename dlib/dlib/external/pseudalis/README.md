@@ -555,12 +555,15 @@ is left out.
 ## Publishing a version
 
 A version is published on the website of Cydral Technology, under
-`https://cydral-technology.eu/files/pseudalis/`: its installer, `pseudalis-setup-<version>.exe`, which
-anyone downloads from the downloads page of the website, and the update feed that names it, with its
-signature (ECDSA P-256), which the installed copies read there. The repository holds the sources alone.
-The three files are written in [`dist/pseudalis`](../../../../dist/pseudalis) of the copy of the
-repository of the publisher, where Git ignores them, and the chain of the website, a folder of its own
-beside the repository (`~/work/cydral-website`), takes them there: it alone carries files to the hosting.
+`https://cydral-technology.eu/files/pseudalis/dist/`, the layout the website gives to the files of each
+product (`files/<product>/dist/`): its installer, `pseudalis-setup-<version>.exe`, which anyone downloads
+from the downloads page of the website, and the update feed that names it, with its signature (ECDSA
+P-256), which the installed copies read there. The repository holds the sources alone: nothing of a
+publication is written in it.
+The three files are written in the chain of the website, a folder of its own beside the repository
+(`~/work/cydral-website`), whose folder `releases/files` has the layout of `files/` of the website: they
+go into `releases/files/pseudalis/dist`. The chain publishes them from there, and it alone carries files
+to the hosting.
 
 The programs check the signature with the public key of `resources/feed-public-key.pem`, built into them.
 The publisher makes the pair once, on Linux, the private key in a folder of its own outside the
@@ -585,9 +588,9 @@ first failure:
    the installer is built from the sources pushed, tested and installed in place
    (`tools/build_windows.ps1 -Tests -Install`), which prints its size, its SHA-256 and its path under WSL.
 3. Linux, where the private key and the chain of the website lie: the installer of that copy, which Linux
-   reads under `/mnt/c/Users/<user>/work`, goes into `dist/pseudalis` with the feed written and signed for
-   it, the chain of the website publishes the three files, and the publication ends once the website
-   serves them.
+   reads under `/mnt/c/Users/<user>/work`, goes into the folder of the publication with the feed written
+   and signed for it, the chain of the website publishes the three files, and the publication ends once
+   the website serves them.
 
 ```
 bash dlib/dlib/external/pseudalis/tools/test_linux.sh &&
@@ -610,14 +613,15 @@ refuses an installer of another folder unless `--any-folder` is given.
 
 `publish_release.py` checks that the installer carries the version of
 [`common/version.h`](common/version.h), that the feed announces no later one, that the key is the one of
-the public key of the sources, and that the chain of the website (`--site`, `~/work/cydral-website` by
-default) takes its files in this copy of the repository (`PRODUCTS_REPO` of its `deploy.conf`, which
-`tools/site.sh setup --repo <copy>` records). It then copies the installer as
+the public key of the sources, and that the chain of the website is there (`--site`,
+`~/work/cydral-website` by default) with its folder `releases/files`, which `tools/site.sh setup` makes.
+It then copies the installer into `releases/files/pseudalis/dist` as
 `pseudalis-setup-<version>.exe`, writes the feed with its name, its size, its SHA-256 and the notes of
 each language (`{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`), with LF ends of line,
 signs it, checks the signature with the public key of the sources, and puts the installer, the signature
 and the feed in place of the former ones; the installers of the earlier versions leave the folder. A
-failure before the writing leaves the folder as it is.
+failure before the writing leaves the folder as it is, and the files being written bear names that start
+with a dot, which the chain of the website does not publish.
 
 The program then runs `tools/site.sh status` and `tools/site.sh publish` from the folder of the website,
 on the terminal of the publisher, where the chain asks for the password of the hosting when it needs it:
@@ -626,14 +630,20 @@ It stops when the chain ends with an error. It ends once the website serves the 
 as they were written, and the installer by the size it announces, then by its size and its SHA-256, at
 the address the installed copies read; a redirection there is an error, the address being written
 without `www`. A step that fails prints the commands that end the publication, `--check` makes the last
-check again, and `--dry-run` checks everything without writing or publishing anything.
+check again, and `--dry-run` checks everything without writing or publishing anything. `--deposit` stops
+once the three files are written and prints the same commands: the chain of the website then publishes
+them when the publisher runs it, with the files of another product for instance. A computer that did not
+publish the version receives the three files from the hosting with `tools/site.sh take online` of the
+chain of the website.
 
 The services read the feed and its signature on the website five minutes after their start, then every
 day, check the signature, download the installer beside the feed in the background, check its size and
 its SHA-256, and install it at the next start of the service, or at once from the menu of the icon. Their
 messages and logs never name the places they read. The copies of a version before 1.0.13 read the
 repository, where the feed no longer lies: they are updated once by hand, with the installer of the
-website.
+website. Those of 1.0.13 read `files/pseudalis/` of the website, one folder above, which the website
+answers with the files of `dist/` themselves, without a redirection: they receive the later versions as
+the others do.
 
 ## Editions and licenses
 
