@@ -28,7 +28,10 @@
     the address of a file on a content server, valid for a few hours.  The password of the link
     goes with each request.  It is built into the service from a file outside the repository,
     read at the configuration (ALBIREO_PUBLIC_LINK_PASSWORD_FILE in CMakeLists.txt), and kept
-    masked in the program.  A service built without that file reaches the link without password.
+    masked in the program.  A service built without that file reaches the link without password:
+    while the link is protected, each of its requests fails with the answer of the interface and
+    the words "and this build carries no password for it", the catalog and the models come from
+    their official addresses, and the updates, which the space alone serves, cannot be read.
 
     No message names the link, its code, its password, the address of its interface or of a
     content server, or a host of pCloud: a failure names the file in the publication space and
@@ -87,7 +90,10 @@ namespace albireo
     // The path in the space of a file of the model id published at url: models/<id>/<file name of url>.
     std::string public_link_model_path(const std::string& id, const std::string& url);
 
-    // The message with the query of each address it quotes left out.
+    /*
+        The message with the query of each address it quotes left out; a space, a tab, an end of line or a
+        quotation mark ends an address.
+    */
     std::string without_queries(const std::string& message);
 
     /*!

@@ -418,11 +418,11 @@ namespace albireo
 
         /*
             Resolves host within connect_seconds, giving up at once when the downloads are
-            cancelled.  Returns the resolution with its addresses, or null: with error when the
-            name is not resolved, without error when the system lacks the functions of a
-            bounded resolution, the name being then left to the client.
+            cancelled, unless cancellable is false.  Returns the resolution with its addresses,
+            or null: with error when the name is not resolved, without error when the system
+            lacks the functions of a bounded resolution, the name being then left to the client.
         */
-        std::unique_ptr<lookup> lookup_bounded(const std::string& host, std::string& error)
+        std::unique_ptr<lookup> lookup_bounded(const std::string& host, std::string& error, bool cancellable = true)
         {
             error.clear();
             // Functions of Windows 8 and later, absent from the headers of MinGW.
@@ -443,8 +443,9 @@ namespace albireo
                 &l->overlapped, nullptr, &l->handle);
             if (rc == WSA_IO_PENDING)
             {
-                const HANDLE waits[2] = { l->overlapped.hEvent, cancel_event() };
-                const DWORD w = WaitForMultipleObjects(2, waits, FALSE, static_cast<DWORD>(connect_seconds) * 1000);
+                const HANDLE waits[2] = { l->overlapped.hEvent, cancellable ? cancel_event() : nullptr };
+                const DWORD w = WaitForMultipleObjects(cancellable ? 2 : 1, waits, FALSE,
+                    static_cast<DWORD>(connect_seconds) * 1000);
                 if (w != WAIT_OBJECT_0)
                 {
                     cancel(&l->handle);
@@ -494,19 +495,30 @@ namespace albireo
 #endif
         }
 
-        // The text of an IPv4 or IPv6 address of a resolution, empty for another family.
-        std::string numeric_address(const sockaddr* a)
+        /*
+            The text of an IPv4 or IPv6 address of a resolution, empty for another family; with
+            zone, an IPv6 address of a scope keeps its zone, the interface a connection leaves by
+            ("fe80::1%12").
+        */
+        std::string numeric_address(const sockaddr* a, bool zone = false)
         {
             char text[INET6_ADDRSTRLEN] = {};
             const void* bytes = nullptr;
+            unsigned long scope = 0;
             if (a && a->sa_family == AF_INET) bytes = &reinterpret_cast<const sockaddr_in*>(a)->sin_addr;
-            else if (a && a->sa_family == AF_INET6) bytes = &reinterpret_cast<const sockaddr_in6*>(a)->sin6_addr;
+            else if (a && a->sa_family == AF_INET6)
+            {
+                const sockaddr_in6* v6 = reinterpret_cast<const sockaddr_in6*>(a);
+                bytes = &v6->sin6_addr;
+                scope = static_cast<unsigned long>(v6->sin6_scope_id);
+            }
             if (!bytes || !inet_ntop(a->sa_family, bytes, text, sizeof(text))) return std::string();
-            return text;
+            return zone && scope != 0 ? std::string(text) + "%" + std::to_string(scope) : std::string(text);
         }
 
         // Resolves host with getaddrinfo(), which answers in the time of the resolver of the system.
-        bool resolve_unbounded(const std::string& host, std::vector<std::string>& addresses, std::string& error)
+        bool resolve_unbounded(const std::string& host, std::vector<std::string>& addresses, std::string& error,
+            bool zone = false)
         {
             addrinfo hints = {};
             hints.ai_family = AF_UNSPEC;
@@ -520,7 +532,7 @@ namespace albireo
             }
             for (const addrinfo* a = list; a; a = a->ai_next)
             {
-                const std::string text = numeric_address(a->ai_addr);
+                const std::string text = numeric_address(a->ai_addr, zone);
                 if (!text.empty()) addresses.push_back(text);
             }
             freeaddrinfo(list);
@@ -696,6 +708,35 @@ namespace albireo
             error = cancelled_error();
             return false;
         }
+        if (addresses.empty())
+        {
+            error = "the name has no address";
+            return false;
+        }
+        return true;
+    }
+
+    bool http_resolve_local(const std::string& host, std::vector<std::string>& addresses, std::string& error)
+    {
+        addresses.clear();
+#if defined(_WIN32)
+        std::unique_ptr<lookup> l = lookup_bounded(host, error, false);
+        if (l)
+        {
+            for (const ADDRINFOEXW* a = l->result; a; a = a->ai_next)
+            {
+                const std::string text = numeric_address(a->ai_addr, true);
+                if (!text.empty()) addresses.push_back(text);
+            }
+            free_lookup(l);
+        }
+        else if (!error.empty() || !resolve_unbounded(host, addresses, error, true))
+        {
+            return false;
+        }
+#else
+        if (!resolve_unbounded(host, addresses, error, true)) return false;
+#endif
         if (addresses.empty())
         {
             error = "the name has no address";

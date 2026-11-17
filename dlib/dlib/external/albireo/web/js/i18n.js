@@ -28,6 +28,7 @@ const texts = {
     relayImagesDescribed: 'Images sent as descriptions.',
     relayNoTools: 'Reserved for the models of this computer',
     relayWebHint: 'Claude searches the web for this discussion; Anthropic bills each search.',
+    relayWebPseudonymized: 'Off while Pseudalis pseudonymizes the relay: the searches would look for its substitutes.',
     effort: 'Effort', effortDefault: 'Default', effortDefaultIs: 'Default ({level})',
     effortHint: 'The effort the external model puts into its reasoning and its answer',
     effort_low: 'Low', effort_medium: 'Medium', effort_high: 'High', effort_xhigh: 'Very high', effort_max: 'Maximum',
@@ -78,8 +79,33 @@ const texts = {
     copyFailed: 'The text could not be copied to the clipboard.',
     errStorage: 'The browser refused to save the change.',
     errStorageFull: 'The storage of the browser is full, and the change could not be saved.',
+    storageDeleted: 'The browser deleted the database of Albireo during this visit. This tab still holds ' +
+      '{discussions} and {projects} in memory: save them again before closing or reloading it.',
+    storageSaveAgain: 'Save them again',
+    storageSavedAgain: '{discussions} and {projects} saved again in the database of the browser.',
+    storageClosed: 'The browser closed the database of Albireo and does not open it again ({reason}). Nothing is ' +
+      'saved for now; the discussions of this tab stay in its memory: export them before closing it.',
+    storageUnopened: 'The database of this browser for {origin} cannot be opened or read ({reason}). The ' +
+      'discussions and the projects it holds are not shown, and what this visit writes may not be kept. Albireo ' +
+      'deleted nothing.',
+    storageExportCopy: 'Export the backup copy',
+    storageEmptied: 'The database of this browser lost {discussions} and {projects} that the backup copy of ' +
+      'Albireo still holds, last changed on {date}: the browser deleted or rebuilt its database.',
+    storageRestore: 'Restore them', storageRestored: '{discussions} and {projects} restored from the backup copy.',
+    storageRestoredPartly: '{discussions} and {projects} restored from the backup copy. Copies that could not be ' +
+      'read, which stay in it: {count}.',
+    storageRestoreFailed: 'The backup copy could not be restored.',
+    storageDropCopy: 'Delete the backup copy',
+    storageDropCopyText: 'The discussions and the projects that only the backup copy holds will be deleted for good.',
+    copyState: 'Backup copy in this browser:', copyHolds: '{discussions}, {projects}, {images}',
+    copyUnavailable: 'not available in this browser',
+    backupReminder: 'The discussions and the projects are kept in this browser only, which may delete them. Last ' +
+      'external backup: {date}. Export them to a file.',
+    backupReminderNever: 'The discussions and the projects are kept in this browser only, which may delete them. ' +
+      'No external backup was made yet. Export them to a file.',
+    backupNow: 'Export now', backupLater: 'Later', backupState: 'Last external backup:', backupNone: 'none yet',
     memoryRewritten: 'Memory rewritten in the language of the interface.',
-    storageState: 'Storage of this browser:', storagePersistent: 'kept by the browser',
+    storageState: 'Storage of this browser for {origin}:', storagePersistent: 'kept by the browser',
     storageNotPersistent: 'may be cleared by the browser when the disk runs short of space',
     storageUnknown: 'state unknown', storageEstimate: '{used} used of {quota} available',
     storageHint: 'The browser may delete these data when the disk runs short of space. Export them regularly with ' +
@@ -259,7 +285,6 @@ const texts = {
       'it had.',
     toolSkipped: 'not run',
     aboutText: 'Albireo Community Edition runs language models locally, on the processor, the graphics processor or the neural processor of this computer, based on the open source Dlib-Transformer-extensions library.',
-    createdBy: 'Created by {author}', 
     thirdParty: 'Third-party components', apiDocs: 'Interface documentation', close: 'Close', confirm: 'Confirm',
     licensesTitle: 'Components and licenses',
     licensesIntro: 'Albireo works without network: the libraries, programs and models it relies on are installed ' +
@@ -334,6 +359,7 @@ const texts = {
     relayImagesDescribed: 'Images envoyées en description.',
     relayNoTools: 'Réservé aux modèles de cet ordinateur',
     relayWebHint: 'Claude cherche sur le web pour cette discussion ; Anthropic facture chaque recherche.',
+    relayWebPseudonymized: 'Inactif tant que Pseudalis pseudonymise le relais : les recherches porteraient sur ses substituts.',
     effort: 'Effort', effortDefault: 'Par défaut', effortDefaultIs: 'Par défaut ({level})',
     effortHint: 'L\'effort que le modèle externe met dans sa réflexion et sa réponse',
     effort_low: 'Faible', effort_medium: 'Moyen', effort_high: 'Élevé', effort_xhigh: 'Très élevé', effort_max: 'Maximal',
@@ -388,8 +414,38 @@ const texts = {
     copyFailed: 'Le texte n\'a pas pu être copié dans le presse-papiers.',
     errStorage: 'Le navigateur a refusé d\'enregistrer la modification.',
     errStorageFull: 'Le stockage du navigateur est plein, et la modification n\'a pas pu être enregistrée.',
+    storageDeleted: 'Le navigateur a supprimé la base de données d\'Albireo pendant cette visite. Cet onglet garde ' +
+      'encore en mémoire {discussions} et {projects} : réenregistrez-les avant de le fermer ou de le recharger.',
+    storageSaveAgain: 'Les réenregistrer',
+    storageSavedAgain: '{discussions} et {projects} réenregistrés dans la base de données du navigateur.',
+    storageClosed: 'Le navigateur a fermé la base de données d\'Albireo et ne la rouvre pas ({reason}). Rien n\'est ' +
+      'enregistré pour l\'instant ; les discussions de cet onglet restent dans sa mémoire : exportez-les avant ' +
+      'de le fermer.',
+    storageUnopened: 'La base de données de ce navigateur pour {origin} ne s\'ouvre pas ou ne se lit pas ({reason}). ' +
+      'Les discussions et les projets qu\'elle contient ne s\'affichent pas, et ce que cette visite écrit peut ' +
+      'ne pas être conservé. Albireo n\'a rien supprimé.',
+    storageExportCopy: 'Exporter la copie de secours',
+    storageEmptied: 'La base de données de ce navigateur a perdu {discussions} et {projects} que la copie de ' +
+      'secours d\'Albireo contient encore, modifiés pour la dernière fois le {date} : le navigateur a supprimé ou ' +
+      'recréé sa base.',
+    storageRestore: 'Les restaurer',
+    storageRestored: '{discussions} et {projects} restaurés depuis la copie de secours.',
+    storageRestoredPartly: '{discussions} et {projects} restaurés depuis la copie de secours. Copies illisibles, ' +
+      'qui y restent : {count}.',
+    storageRestoreFailed: 'La copie de secours n\'a pas pu être restaurée.',
+    storageDropCopy: 'Supprimer la copie de secours',
+    storageDropCopyText: 'Les discussions et les projets que seule la copie de secours contient seront supprimés ' +
+      'définitivement.',
+    copyState: 'Copie de secours dans ce navigateur :', copyHolds: '{discussions}, {projects}, {images}',
+    copyUnavailable: 'indisponible dans ce navigateur',
+    backupReminder: 'Les discussions et les projets ne sont conservés que dans ce navigateur, qui peut les effacer. ' +
+      'Dernière sauvegarde externe : {date}. Exportez-les dans un fichier.',
+    backupReminderNever: 'Les discussions et les projets ne sont conservés que dans ce navigateur, qui peut les ' +
+      'effacer. Aucune sauvegarde externe n\'a encore été faite. Exportez-les dans un fichier.',
+    backupNow: 'Exporter maintenant', backupLater: 'Plus tard', backupState: 'Dernière sauvegarde externe :',
+    backupNone: 'aucune pour l\'instant',
     memoryRewritten: 'Mémoire réécrite dans la langue de l\'interface.',
-    storageState: 'Stockage de ce navigateur :', storagePersistent: 'conservé par le navigateur',
+    storageState: 'Stockage de ce navigateur pour {origin} :', storagePersistent: 'conservé par le navigateur',
     storageNotPersistent: 'peut être effacé par le navigateur quand le disque manque de place',
     storageUnknown: 'état inconnu', storageEstimate: '{used} utilisés sur {quota} disponibles',
     storageHint: 'Le navigateur peut effacer ces données quand le disque manque de place. Exportez-les ' +
@@ -579,7 +635,6 @@ const texts = {
       'les résultats obtenus.',
     toolSkipped: 'non exécuté',
     aboutText: 'Albireo Community Edition exécute des modèles de langage localement, sur le processeur, le processeur graphique ou le processeur neuronal de cet ordinateur, en reposant sur la bibliothèque open source Dlib-Transformer-extensions.',
-    createdBy: 'Créé par {author}', 
     thirdParty: 'Composants tiers', apiDocs: 'Documentation de l\'interface', close: 'Fermer', confirm: 'Confirmer',
     licensesTitle: 'Composants et licences',
     licensesIntro: 'Albireo fonctionne sans réseau : les bibliothèques, les programmes et les modèles sur lesquels ' +
@@ -657,6 +712,7 @@ const texts = {
     relayImagesDescribed: 'Bilder als Beschreibung gesendet.',
     relayNoTools: 'Den Modellen dieses Computers vorbehalten',
     relayWebHint: 'Claude durchsucht für diese Unterhaltung das Web; Anthropic berechnet jede Suche.',
+    relayWebPseudonymized: 'Aus, solange Pseudalis das Relais pseudonymisiert: Die Suchen würden seine Ersatzwerte suchen.',
     effort: 'Aufwand', effortDefault: 'Standard', effortDefaultIs: 'Standard ({level})',
     effortHint: 'Der Aufwand, den das externe Modell in sein Denken und seine Antwort steckt',
     effort_low: 'Niedrig', effort_medium: 'Mittel', effort_high: 'Hoch', effort_xhigh: 'Sehr hoch', effort_max: 'Maximal',
@@ -711,8 +767,38 @@ const texts = {
     copyFailed: 'Der Text konnte nicht in die Zwischenablage kopiert werden.',
     errStorage: 'Der Browser hat das Speichern der Änderung abgelehnt.',
     errStorageFull: 'Der Speicher des Browsers ist voll, und die Änderung konnte nicht gespeichert werden.',
+    storageDeleted: 'Der Browser hat die Datenbank von Albireo während dieses Besuchs gelöscht. Dieser Tab hält noch ' +
+      '{discussions} und {projects} im Speicher: Speichern Sie sie erneut, bevor Sie ihn schließen oder neu laden.',
+    storageSaveAgain: 'Erneut speichern',
+    storageSavedAgain: '{discussions} und {projects} erneut in der Datenbank des Browsers gespeichert.',
+    storageClosed: 'Der Browser hat die Datenbank von Albireo geschlossen und öffnet sie nicht wieder ({reason}). ' +
+      'Im Moment wird nichts gespeichert; die Unterhaltungen dieses Tabs bleiben in seinem Speicher: Exportieren ' +
+      'Sie sie, bevor Sie ihn schließen.',
+    storageUnopened: 'Die Datenbank dieses Browsers für {origin} lässt sich nicht öffnen oder lesen ({reason}). Die ' +
+      'darin gespeicherten Unterhaltungen und Projekte werden nicht angezeigt, und was dieser Besuch schreibt, ' +
+      'bleibt möglicherweise nicht erhalten. Albireo hat nichts gelöscht.',
+    storageExportCopy: 'Sicherungskopie exportieren',
+    storageEmptied: 'Die Datenbank dieses Browsers hat {discussions} und {projects} verloren, die die ' +
+      'Sicherungskopie von Albireo noch enthält, zuletzt geändert am {date}: Der Browser hat seine Datenbank ' +
+      'gelöscht oder neu angelegt.',
+    storageRestore: 'Wiederherstellen',
+    storageRestored: '{discussions} und {projects} aus der Sicherungskopie wiederhergestellt.',
+    storageRestoredPartly: '{discussions} und {projects} aus der Sicherungskopie wiederhergestellt. Unlesbare ' +
+      'Kopien, die darin bleiben: {count}.',
+    storageRestoreFailed: 'Die Sicherungskopie konnte nicht wiederhergestellt werden.',
+    storageDropCopy: 'Sicherungskopie löschen',
+    storageDropCopyText: 'Die Unterhaltungen und Projekte, die nur die Sicherungskopie enthält, werden endgültig ' +
+      'gelöscht.',
+    copyState: 'Sicherungskopie in diesem Browser:', copyHolds: '{discussions}, {projects}, {images}',
+    backupReminder: 'Die Unterhaltungen und Projekte werden nur in diesem Browser aufbewahrt, der sie löschen kann. ' +
+      'Letzte externe Sicherung: {date}. Exportieren Sie sie in eine Datei.',
+    backupReminderNever: 'Die Unterhaltungen und Projekte werden nur in diesem Browser aufbewahrt, der sie löschen ' +
+      'kann. Bisher wurde keine externe Sicherung erstellt. Exportieren Sie sie in eine Datei.',
+    backupNow: 'Jetzt exportieren', backupLater: 'Später', backupState: 'Letzte externe Sicherung:',
+    backupNone: 'noch keine',
+    copyUnavailable: 'in diesem Browser nicht verfügbar',
     memoryRewritten: 'Das Gedächtnis wurde in der Sprache der Oberfläche neu geschrieben.',
-    storageState: 'Speicher dieses Browsers:', storagePersistent: 'vom Browser dauerhaft aufbewahrt',
+    storageState: 'Speicher dieses Browsers für {origin}:', storagePersistent: 'vom Browser dauerhaft aufbewahrt',
     storageNotPersistent: 'kann vom Browser gelöscht werden, wenn der Speicherplatz knapp wird',
     storageUnknown: 'Zustand unbekannt', storageEstimate: '{used} belegt von {quota} verfügbar',
     storageHint: 'Der Browser kann diese Daten löschen, wenn der Speicherplatz knapp wird. Exportieren Sie sie ' +
@@ -898,7 +984,6 @@ const texts = {
       'mit den erhaltenen Ergebnissen antwortet.',
     toolSkipped: 'nicht ausgeführt',
     aboutText: 'Albireo Community Edition führt Sprachmodelle lokal aus, auf dem Prozessor, dem Grafikprozessor oder dem neuronalen Prozessor dieses Computers, auf Basis der Open-Source-Bibliothek Dlib-Transformer-extensions.',
-    createdBy: 'Erstellt von {author}', 
     thirdParty: 'Komponenten von Drittanbietern', apiDocs: 'Dokumentation der Schnittstelle', close: 'Schließen', confirm: 'Bestätigen',
     licensesTitle: 'Komponenten und Lizenzen',
     licensesIntro: 'Albireo arbeitet ohne Netzwerk: Die Bibliotheken, Programme und Modelle, auf denen es beruht, ' +
@@ -973,6 +1058,7 @@ const texts = {
     relayImagesDescribed: 'Immagini inviate come descrizione.',
     relayNoTools: 'Riservato ai modelli di questo computer',
     relayWebHint: 'Claude cerca sul web per questa conversazione; Anthropic fattura ogni ricerca.',
+    relayWebPseudonymized: 'Inattivo finché Pseudalis pseudonimizza l\'inoltro: le ricerche cercherebbero i suoi sostituti.',
     effort: 'Sforzo', effortDefault: 'Predefinito', effortDefaultIs: 'Predefinito ({level})',
     effortHint: 'Lo sforzo che il modello esterno mette nel ragionamento e nella risposta',
     effort_low: 'Basso', effort_medium: 'Medio', effort_high: 'Alto', effort_xhigh: 'Molto alto', effort_max: 'Massimo',
@@ -1025,8 +1111,36 @@ const texts = {
     copyFailed: 'Non è stato possibile copiare il testo negli appunti.',
     errStorage: 'Il browser ha rifiutato di salvare la modifica.',
     errStorageFull: 'Lo spazio del browser è pieno, e la modifica non è stata salvata.',
+    storageDeleted: 'Il browser ha eliminato il database di Albireo durante questa visita. Questa scheda conserva ' +
+      'ancora in memoria {discussions} e {projects}: salvali di nuovo prima di chiuderla o ricaricarla.',
+    storageSaveAgain: 'Salva di nuovo',
+    storageSavedAgain: '{discussions} e {projects} salvati di nuovo nel database del browser.',
+    storageClosed: 'Il browser ha chiuso il database di Albireo e non lo riapre ({reason}). Per ora non viene ' +
+      'salvato nulla; le conversazioni di questa scheda restano nella sua memoria: esportale prima di chiuderla.',
+    storageUnopened: 'Il database di questo browser per {origin} non si apre o non si legge ({reason}). Le ' +
+      'conversazioni e i progetti che contiene non vengono mostrati, e ciò che questa visita scrive potrebbe non ' +
+      'essere conservato. Albireo non ha eliminato nulla.',
+    storageExportCopy: 'Esporta la copia di riserva',
+    storageEmptied: 'Il database di questo browser ha perso {discussions} e {projects} che la copia di riserva di ' +
+      'Albireo contiene ancora, modificati l\'ultima volta il {date}: il browser ha eliminato o ricreato il suo ' +
+      'database.',
+    storageRestore: 'Ripristina', storageRestored: '{discussions} e {projects} ripristinati dalla copia di riserva.',
+    storageRestoredPartly: '{discussions} e {projects} ripristinati dalla copia di riserva. Copie illeggibili, ' +
+      'che vi restano: {count}.',
+    storageRestoreFailed: 'Non è stato possibile ripristinare la copia di riserva.',
+    storageDropCopy: 'Elimina la copia di riserva',
+    storageDropCopyText: 'Le conversazioni e i progetti che solo la copia di riserva contiene saranno eliminati ' +
+      'definitivamente.',
+    copyState: 'Copia di riserva in questo browser:', copyHolds: '{discussions}, {projects}, {images}',
+    backupReminder: 'Le conversazioni e i progetti sono conservati solo in questo browser, che può cancellarli. ' +
+      'Ultimo salvataggio esterno: {date}. Esportali in un file.',
+    backupReminderNever: 'Le conversazioni e i progetti sono conservati solo in questo browser, che può ' +
+      'cancellarli. Nessun salvataggio esterno è stato ancora fatto. Esportali in un file.',
+    backupNow: 'Esporta ora', backupLater: 'Più tardi', backupState: 'Ultimo salvataggio esterno:',
+    backupNone: 'nessuno per ora',
+    copyUnavailable: 'non disponibile in questo browser',
     memoryRewritten: 'Memoria riscritta nella lingua dell\'interfaccia.',
-    storageState: 'Archiviazione di questo browser:', storagePersistent: 'conservata dal browser',
+    storageState: 'Archiviazione di questo browser per {origin}:', storagePersistent: 'conservata dal browser',
     storageNotPersistent: 'può essere cancellata dal browser quando il disco ha poco spazio',
     storageUnknown: 'stato sconosciuto', storageEstimate: '{used} usati su {quota} disponibili',
     storageHint: 'Il browser può cancellare questi dati quando il disco ha poco spazio. Esportali regolarmente con ' +
@@ -1213,7 +1327,6 @@ const texts = {
       'risponda con i risultati ottenuti.',
     toolSkipped: 'non eseguito',
     aboutText: 'Albireo Community Edition esegue modelli linguistici in locale, sul processore, sul processore grafico o sul processore neurale di questo computer, basandosi sulla libreria open source Dlib-Transformer-extensions.',
-    createdBy: 'Creato da {author}', 
     thirdParty: 'Componenti di terze parti', apiDocs: 'Documentazione dell\'interfaccia', close: 'Chiudi', confirm: 'Conferma',
     licensesTitle: 'Componenti e licenze',
     licensesIntro: 'Albireo funziona senza rete: le librerie, i programmi e i modelli su cui si basa sono installati ' +
@@ -1288,6 +1401,7 @@ const texts = {
     relayImagesDescribed: 'Imágenes enviadas como descripción.',
     relayNoTools: 'Reservado a los modelos de este equipo',
     relayWebHint: 'Claude busca en la web para esta conversación; Anthropic factura cada búsqueda.',
+    relayWebPseudonymized: 'Inactivo mientras Pseudalis seudonimiza el relé: las búsquedas buscarían sus sustitutos.',
     effort: 'Esfuerzo', effortDefault: 'Predeterminado', effortDefaultIs: 'Predeterminado ({level})',
     effortHint: 'El esfuerzo que el modelo externo pone en su razonamiento y su respuesta',
     effort_low: 'Bajo', effort_medium: 'Medio', effort_high: 'Alto', effort_xhigh: 'Muy alto', effort_max: 'Máximo',
@@ -1339,8 +1453,36 @@ const texts = {
     copyFailed: 'No se pudo copiar el texto al portapapeles.',
     errStorage: 'El navegador rechazó guardar el cambio.',
     errStorageFull: 'El almacenamiento del navegador está lleno, y el cambio no se pudo guardar.',
+    storageDeleted: 'El navegador eliminó la base de datos de Albireo durante esta visita. Esta pestaña conserva ' +
+      'aún en memoria {discussions} y {projects}: guárdelos de nuevo antes de cerrarla o recargarla.',
+    storageSaveAgain: 'Guardar de nuevo',
+    storageSavedAgain: '{discussions} y {projects} guardados de nuevo en la base de datos del navegador.',
+    storageClosed: 'El navegador cerró la base de datos de Albireo y no la vuelve a abrir ({reason}). Por ahora no ' +
+      'se guarda nada; las conversaciones de esta pestaña permanecen en su memoria: expórtelas antes de cerrarla.',
+    storageUnopened: 'La base de datos de este navegador para {origin} no se abre o no se puede leer ({reason}). ' +
+      'Las conversaciones y los proyectos que contiene no se muestran, y lo que esta visita escriba puede no ' +
+      'conservarse. Albireo no ha eliminado nada.',
+    storageExportCopy: 'Exportar la copia de seguridad',
+    storageEmptied: 'La base de datos de este navegador perdió {discussions} y {projects} que la copia de ' +
+      'seguridad de Albireo aún contiene, modificados por última vez el {date}: el navegador eliminó o recreó su ' +
+      'base de datos.',
+    storageRestore: 'Restaurar', storageRestored: '{discussions} y {projects} restaurados desde la copia de seguridad.',
+    storageRestoredPartly: '{discussions} y {projects} restaurados desde la copia de seguridad. Copias ilegibles, ' +
+      'que permanecen en ella: {count}.',
+    storageRestoreFailed: 'No se pudo restaurar la copia de seguridad.',
+    storageDropCopy: 'Eliminar la copia de seguridad',
+    storageDropCopyText: 'Las conversaciones y los proyectos que solo contiene la copia de seguridad se eliminarán ' +
+      'definitivamente.',
+    copyState: 'Copia de seguridad en este navegador:', copyHolds: '{discussions}, {projects}, {images}',
+    backupReminder: 'Las conversaciones y los proyectos solo se conservan en este navegador, que puede borrarlos. ' +
+      'Última copia externa: {date}. Expórtelos a un archivo.',
+    backupReminderNever: 'Las conversaciones y los proyectos solo se conservan en este navegador, que puede ' +
+      'borrarlos. Todavía no se ha hecho ninguna copia externa. Expórtelos a un archivo.',
+    backupNow: 'Exportar ahora', backupLater: 'Más tarde', backupState: 'Última copia externa:',
+    backupNone: 'ninguna por ahora',
+    copyUnavailable: 'no disponible en este navegador',
     memoryRewritten: 'Memoria reescrita en el idioma de la interfaz.',
-    storageState: 'Almacenamiento de este navegador:', storagePersistent: 'conservado por el navegador',
+    storageState: 'Almacenamiento de este navegador para {origin}:', storagePersistent: 'conservado por el navegador',
     storageNotPersistent: 'el navegador puede borrarlo cuando falte espacio en el disco',
     storageUnknown: 'estado desconocido', storageEstimate: '{used} usados de {quota} disponibles',
     storageHint: 'El navegador puede borrar estos datos cuando falte espacio en el disco. Expórtelos con regularidad ' +
@@ -1527,7 +1669,6 @@ const texts = {
       'resultados obtenidos.',
     toolSkipped: 'no ejecutado',
     aboutText: 'Albireo Community Edition ejecuta modelos de lenguaje localmente, en el procesador, el procesador gráfico o el procesador neuronal de este ordenador, basándose en la biblioteca de código abierto Dlib-Transformer-extensions.',
-    createdBy: 'Creado por {author}', 
     thirdParty: 'Componentes de terceros', apiDocs: 'Documentación de la interfaz', close: 'Cerrar', confirm: 'Confirmar',
     licensesTitle: 'Componentes y licencias',
     licensesIntro: 'Albireo funciona sin red: las bibliotecas, los programas y los modelos en los que se basa se ' +

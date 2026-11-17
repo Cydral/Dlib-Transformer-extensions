@@ -4,16 +4,19 @@
     Checks and measures the OpenVINO graph of a model (engine/ov_graph.h) against the
     processor runtime.
 
-        test_ov_graph model.gguf [device] [threads] [f16|u8][-mask][-f32] [prompt] [chunk] [steps]
+        test_ov_graph model.gguf [device] [threads] [f16|u8][-mask][-f32][-dq] [prompt] [chunk] [steps]
 
     device is a device of OpenVINO, CPU by default; threads the threads of both runtimes,
     those of the machine by default; f16 or u8 the keys and values of the graph (half
     precision by default), -mask giving the processor the graph of the other devices, whose
-    attention takes the causal mask as an input, and -f32 having the other devices compute in
-    single precision rather than in half precision.  The program reads a text of prompt tokens
-    (512) by passes of chunk tokens (256), then writes steps tokens (32) one at a time, each
-    step reading the next token of the text, through the processor runtime with keys and
-    values in half precision, which is the reference, then through the graph:
+    attention takes the causal mask as an input, -f32 having the other devices compute in
+    single precision rather than in half precision, and -dq leaving the plugin of the other
+    devices its default, which rounds the inputs of the products of the long passes of a
+    prompt to 8 bits and which the graph turns off (ov_graph_settings::dynamic_quantization).
+    The program reads a text of prompt tokens (512) by passes of chunk tokens (256), then
+    writes steps tokens (32) one at a time, each step reading the next token of the text,
+    through the processor runtime with keys and values in half precision, which is the
+    reference, then through the graph:
         1. the logits of the last token of each pass and of each step, compared as
            distributions: the share of steps where both runtimes give the same most
            probable token, and the divergence of the distribution of the graph from the
@@ -288,7 +291,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::printf("usage: test_ov_graph model.gguf [device] [threads] [f16|u8][-mask][-f32] [prompt] [chunk] "
+        std::printf("usage: test_ov_graph model.gguf [device] [threads] [f16|u8][-mask][-f32][-dq] [prompt] [chunk] "
             "[steps]\n");
         return 2;
     }
@@ -301,6 +304,7 @@ int main(int argc, char** argv)
         const bool kv_half = kv.compare(0, 2, "u8") != 0;
         const bool explicit_mask = kv.find("-mask") != std::string::npos;
         const bool single_precision = kv.find("-f32") != std::string::npos;
+        const bool dynamic_quantization = kv.find("-dq") != std::string::npos;
         const long prompt = argc > 5 ? std::max(2L, std::atol(argv[5])) : 512;
         const long chunk = argc > 6 ? std::max(1L, std::atol(argv[6])) : 256;
         const long steps = argc > 7 ? std::max(1L, std::atol(argv[7])) : 32;
@@ -351,6 +355,7 @@ int main(int argc, char** argv)
         settings.kv_half = kv_half;
         settings.explicit_mask = explicit_mask;
         settings.single_precision = single_precision;
+        settings.dynamic_quantization = dynamic_quantization;
         settings.threads = threads;
         // The folder of the system for temporary files, where the graph writes its weights and deletes them.
         const char* temp = std::getenv("TEMP");

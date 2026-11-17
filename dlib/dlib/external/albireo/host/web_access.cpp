@@ -731,7 +731,7 @@ namespace albireo
         std::string wikimedia_user_agent()
         {
             return std::string(ALBIREO_PRODUCT_NAME) + "/" + ALBIREO_VERSION + " (" + ALBIREO_PROJECT_URL + "; "
-                + ALBIREO_AUTHOR_EMAIL + ")";
+                + ALBIREO_CONTACT_EMAIL + ")";
         }
 
         web_reply failure(int status, const std::string& code, const std::string& message,

@@ -9,11 +9,12 @@ machine, and nothing asks for an account.
 
 ![A question about a chart in the web application of Albireo, answered by the model that comes with it](docs/images/chat.png)
 
-Albireo was created by Aldric Pierrain (cydraltechnology@gmail.com). Its name is that
-of a double star of the constellation Cygnus, one gold and one blue, which its icon draws. This
-version is the Community Edition: the installer, the About windows of the icon and of the web
-application, the description of the interface and the list of the programs of Windows name it
-"Albireo Community Edition".
+Albireo is published by Cydral Technology (https://www.cydral-technology.eu,
+contact@cydral-technology.eu). Its name is that of a double star of the constellation Cygnus, one
+gold and one blue, which its icon draws. This version is the Community Edition: the installer, the
+About windows of the icon and of the web application, the description of the interface and the
+list of the programs of Windows name it "Albireo Community Edition", with Cydral Technology as its
+publisher.
 
 ## Contents
 
@@ -55,6 +56,11 @@ application, the description of the interface and the list of the programs of Wi
   and keeps a memory of the user, written in the language of the interface whatever the language
   of the discussions. The application asks the browser to keep its database, and its settings
   show whether the browser does and the room used, with the advice of a regular export otherwise.
+  It keeps a second copy of the discussions, of the projects, of the settings and of the images
+  outside of that database, and a banner tells when the browser closed, deleted or does not open
+  the database, with the actions that save the discussions of the open tab again or restore the
+  copy. Every ten days without an export, another banner reminds the user to export them to a
+  file.
 - **Documents** attached to a message or to a project: Word, Excel, PowerPoint, OpenDocument,
   PDF, RTF, HTML, text, CSV, Markdown and source code. The browser extracts the text of every page
   of a document, of every sheet of a workbook in the order of its tabs, and of every slide of a
@@ -257,6 +263,12 @@ runtime, and writes the answers more slowly as the threads grow:
 | 4       | 120.7 / 84.3  | 40.5 / 77.9   | 9.51 / 10.87  |
 | 2       | 52.1 / 45.4   | 19.6 / 41.2   | 6.65 / 6.70   |
 
+The engine takes every physical core by default (`threads`), the efficient cores with the
+performance cores: on that processor, the processor runtime reads and writes faster on its 24 cores
+than on 8 threads at each stage of the table (19.48 tokens per second against 15.25 for the steps).
+A processor whose efficient cores are slower may write faster on its performance cores alone, which
+`threads` sets and `bench_runtime model.gguf <threads>` measures.
+
 On 24 threads of that machine, Qwen3 0.6B Q4_K_M read its first pass at 1172 to 1290 tokens per
 second with the graph against 1304 to 1354, its later passes at 317 to 428 against 1063 to 1088, and
 wrote at 38.9 to 43.3 against 80.6 to 87.7; three answers of Qwen3-VL 4B written at once came at
@@ -266,6 +278,35 @@ holds the weights in its own layout: the process committed 3.7 GB more with the 
 the graph took 9 to 16 seconds to build at each load. On the graphics processor of that machine,
 Qwen3 0.6B read its passes faster with the graph (1614 and 1408 against 1376 and 1075) and wrote at
 less than half the speed of the processor runtime (36.4 against 81.6).
+
+The plugin of the graphics processors rounds the inputs in half precision of its products to 8 bits
+(dynamic quantization) unless a graph sets `dynamic_quantization_group_size` to 0, by default on the
+Core Ultra processors since OpenVINO 2024.5. In its version 2026.4.1, the graphics processors with
+systolic arrays (XMX) get one scale per token, from a pass of the plugin that quantizes the inputs
+of the products of compressed weights whose width is a multiple of 32, in the passes of more than 64
+tokens, with groups of 128 values for 8-bit weights from Xe2 on. The others get one scale per group
+of 32 values, from the kernel of the 4-bit products of an integrated graphics processor, which
+quantizes its inputs in the passes of more than 240 tokens, the steps and the shorter passes keeping
+theirs (`execution_config.cpp`, `transformations_pipeline.cpp`,
+`fully_connected_kernel_bf_tiled.cpp`). On the graphics processor of that machine, Qwen3-VL 4B
+departed from the processor runtime at the last token of the first pass of 256 tokens of the test,
+where the processor runtime gave its most probable token at 0.999 and the graph another at 0.756,
+while its steps agreed, as did every row in single precision.
+
+A replay of that pass with numpy, the sums of that kernel in half precision as the plugin computes
+them, measures it against single precision. With the quantization by groups of 32 values, the hidden
+state of the median row after the last layer leaves its value by 2.6% of its norm and that of the
+last row by 11% to 25%, over four runs whose embeddings a relative noise of 1e-4 separates; three of
+them keep the prediction of that row within a divergence of 0.006 and one gives another token
+(divergence 1.1). Without the quantization, the same four runs leave these values by 1.3% and by 6%
+to 13%, and keep that prediction within 0.002. With one scale per token for the inputs of every
+product, replayed in single precision, half of the rows leave their value by a quarter of their norm
+and more, and that row takes another token (divergence above 10). The graph multiplies the unsigned
+4-bit values of Q4_K and adds the product of the negated minimums with the sums of the inputs; the
+first is about twice the whole product (median over the products of that model), and the rounding of
+its inputs is not cancelled by the second. The graph sets `dynamic_quantization_group_size` to 0 on
+these devices, and `test_ov_graph` leaves the plugin its default with `-dq`, to measure what it
+changes.
 
 The measures of version 1.0.20 came from a Xeon whose AVX-512, AVX512-FP16 and AMX the plugin of
 OpenVINO used, the processor runtime keeping to AVX2 and AVX-VNNI: on two of its cores, Qwen3-VL 4B
@@ -308,7 +349,22 @@ computes 8. On two cores, Qwen3 0.6B read a prompt of 512 tokens at 230 tokens p
 AVX-VNNI against 126 on floats, and at 154 against 125 with AVX2; a prompt of 2,048 tokens at 164
 against 102, and at 121 against 98. On 24 threads, Qwen3-VL 4B read a prompt of 2,048 tokens at 141
 tokens per second with AVX-VNNI against 95 on floats, and at 132 against 94 with AVX2, the attention
-of the prompt taking a larger share of its time. The rounding of the activations moved the logits of
+of the prompt taking a larger share of its time.
+Product by product on two cores, best of two runs (matrices of 1,024 to 9,728 rows and columns in
+Q4_K and Q6_K, AVX-VNNI and AVX2), the panels take less time than the integer kernels of the
+generation from five tokens on, 7 to 27 % less at eight tokens and 29 to 53 % less at 64, and the
+products of floats take 1.2 to 2.8 times as long as the panels from five to 64 tokens; the widest
+matrix in Q6_K, with AVX-VNNI, stays level with the integer kernels from five to eight tokens. The
+threshold stays at eight tokens, which leaves the answers of a pass seven tokens with their drafts
+(below): at five, a draft would hold three tokens at most, under its four by default.
+On the same cores and sizes, the passes of Q8_0 compute on floats without VNNI, as do those of a
+matrix whose width is no multiple of 256: with AVX2, the products of floats of Q8_0 take up to 26 %
+more time than the integer kernels at eight tokens, stay within a tenth of them at nine and ten
+tokens, and take less time from twelve tokens on, 22 to 38 % less at 64. In the portable engine,
+built by GCC, where every pass of eight tokens or more computes on floats, these products take at
+eight tokens less than a third of the time of the integer kernels of Q6_K, and stay within 6 % of
+those of Q4_K and within 19 % of those of Q8_0.
+The rounding of the activations in the panels moved the logits of
 a text of 47 tokens from those of the reference by a mean divergence of 2.4e-3 (KL), the order of
 the integer kernels of the generation, against 5e-7 on floats, and the answers to 162 prompts of 50
 to 400 tokens drawn from this file began with the same token as on floats; each token of a pass gets
@@ -318,6 +374,10 @@ bit for bit with dlib; the work buffers lie on lines of 64 bytes.
 These paths keep each result within the tolerances of the tests, and the numbers of a pass
 depend on its size: at temperature 0, the first answer to a prompt, whose last token is read
 within the whole prompt, may differ from the next ones, which take the prompt from the cache.
+The numbers also follow the compiler of a build, which chooses where a product and its sum fuse into
+one instruction: GCC and Clang fuse them by default on the processors that have it, Visual Studio
+2022 under `/fp:contract` or `/fp:fast`, which the build of Albireo does not set, so that the builds
+of an engine by two compilers agree within these tolerances, the last bits of their numbers apart.
 The keys and values live in pages of 256 positions, one sequence per request, in 8 bits by default
 (`kv_type`): groups of 32 values that share a scale in half precision, 34 bytes against 64 in half
 precision ([`engine/kv_cache.h`](engine/kv_cache.h)). The keys are rotated before their rounding,
@@ -761,6 +821,62 @@ images waiting to be sent, while another discussion is shown, and "New chat" kee
 first question creates the discussion: the texts stay across a reload of the page in the storage of
 the browser (`localStorage`, one key per discussion, removed once its question is sent or the
 discussion deleted), the files for the tab, and an incognito discussion keeps none.
+
+The discussions, the projects, the passages of their documents, the images and the preferences are
+kept by the browser, in its IndexedDB database for the address of the service
+(`https://localhost:8443` by default, [`web/js/store.js`](web/js/store.js)); the service keeps none
+of them. Another browser, another profile, or another address of the same service (`127.0.0.1`,
+another port) has a database of its own, and the Data tab of the settings names the address. A
+browser deletes the database of an address whole when the user clears the data of the site, and
+when the disk runs short while the browser does not keep the database (the Data tab tells whether
+it does). Chromium, the engine of Chrome and of Edge, also does when it finds one of the files of
+the database damaged (64 bytes changed, a cut log or a removed file in the checks of this
+application), and starts again with an empty database, without an error. A connection the browser
+closed during a visit refuses every change until the database is opened again. The application
+therefore:
+
+- keeps a second copy of the discussions, of the projects, of the settings and of the images in the
+  cache storage of the same address ([`web/js/backup.js`](web/js/backup.js)), which the browser
+  keeps in other files than the database: a record saved is copied, a record deleted leaves the
+  copy with its images, the deletion of everything empties it, and an incognito discussion never
+  reaches it;
+- marks with a setting the database the copy follows, once that database holds every discussion
+  and every project of the copy, with their images that the browser reads there: a start brings
+  the copy in line with a database that carries the mark, where a copy without its record is a
+  deletion the copy missed, while the database the browser creates in place of a deleted one
+  carries none and leaves the copy as it is, whatever it holds;
+- shows a banner at its start when the copy holds discussions or projects that such a new database
+  lacks, or holds in a later state, with their number and the time of the latest: one button
+  restores them, with their images and the settings, another exports the copy and a third deletes
+  it; they stay offered at each start until the user decides, an earlier state saved or imported
+  meanwhile leaving them as they are, while a later state of one of them saved in the new database
+  takes its place and a deletion by the user removes it; the restoration tells the copies it could
+  not read, which stay in the copy, and a new database that lacks settings or images alone takes
+  them back from the copy;
+- opens the database again when the browser closed it during a visit, and compares it with what
+  the tab holds: when discussions or projects are missing, a banner offers to save them again from
+  the tab, their images from the copy, or to export them with those images, and the tab keeps,
+  shows and edits them from its memory through the changes of the other tabs; when the database
+  does not open again, the banner says so with the error of the browser, and the export holds what
+  the tab keeps;
+- says in a banner, with the error of the browser and the address, when the database does not
+  open or cannot be read at its start, where the lists stay empty, exports the copy, and refuses
+  the deletion of everything, which could not reach the database;
+- keeps in the lists of the tab a discussion whose save the browser refused, saves it again after
+  a delay that grows up to five minutes, and has the browser ask before the page is left while
+  discussions live in the tab only.
+
+The copy guards against the loss of the database alone: the data of the site cleared by the user,
+by a rule of an organization (the policies `BrowsingDataLifetime` and `ClearBrowsingDataOnExitList`
+of Chrome and of Edge, for instance) or by the browser when the disk runs short leave with the
+database, the copy included. The copy takes about as much room again as the discussions, the
+projects and the images in the storage the browser grants the address. The export of the Data tab
+is the copy that leaves the browser, and the application asks for it: a banner reminds the user to
+export once discussions or projects changed since the last export and that export is ten days old,
+or, without any export yet, once the oldest of them is; "Export now" writes the file and "Later"
+postpones the reminder by a day. An imported file that holds every stored discussion and project
+counts as the export it is, the deletion of everything forgets the last export, and the Data tab
+tells the time of the last export.
 
 The fields where the user writes for the model, the composer, a question being edited, the global
 instructions of the settings, the instructions of a project and the memory, draw their markdown as
@@ -1250,8 +1366,8 @@ cmake --build build-albireo-win -j
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, the 8192 tokens of an answer of the relay of a document before version 3 read 16384, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, an account without credit, the substitutes left in the answer for a check, an address without `/v1` or with the path of an operation reaching the interface at `/v1`, the codes, statuses and messages of the failures of the test, the refusals of the tools, of the offline mode and of a missing key, offline an engine of this computer answering with Pseudalis while the downloads are cancelled and the providers of the Internet and the public addresses refused before any connection, and a log that names no key and no value) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`, written to the environment block of the process, which dlib reads on Windows whatever the runtime of C of the program), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
-| `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni` |
-| `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input, and `-f32` has the other devices compute in single precision rather than in half precision; a comparison whose largest divergence exceeds 0.1 names its pass or step and the most probable tokens of both runtimes with their probabilities. `test_ov_graph model.gguf [device] [threads] [f16\|u8][-mask][-f32] [prompt] [chunk] [steps]` |
+| `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni`; the sequences that advance together start from the first tokens of the prompt, 64 at most, and their number is the size of the passes their steps measure |
+| `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input, `-f32` has the other devices compute in single precision rather than in half precision, and `-dq` leaves their plugin its default, which rounds the inputs of the products of the long passes of a prompt to 8 bits; a comparison whose largest divergence exceeds 0.1 names its pass or step and the most probable tokens of both runtimes with their probabilities. `test_ov_graph model.gguf [device] [threads] [f16\|u8][-mask][-f32][-dq] [prompt] [chunk] [steps]` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
@@ -1424,7 +1540,7 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `v2ram`         | true    | extended device memory of the CUDA engine                                  |
 | `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; a size lets the copies of the weights go beyond the card into it; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
 | `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
-| `threads`       | 0       | threads of the engine, 0 for the physical cores                           |
+| `threads`       | 0       | threads of the engine, 0 for the physical cores, performance and efficient alike |
 | `context`       | 0       | context of the models, 0 for the trained one, brought down when the memory the system can commit cannot hold its keys and values |
 | `max_sequences` | 4       | requests computed together per model                                      |
 | `kv_mb`         | 0       | memory of the keys and values, 0 for two contexts within the memory the system can commit, a reserve left |
@@ -1599,7 +1715,7 @@ The setting `web_search` names the provider of the search:
   each result an article of that Wikipedia with its excerpt, its markup removed, or else its
   description. The requests carry the User-Agent that the policy of Wikimedia asks for, with a
   contact: `Albireo/<version> (https://github.com/Cydral/Dlib-Transformer-extensions;
-  cydraltechnology@gmail.com)`. Wikimedia limits the rate of the anonymous requests per minute
+  contact@cydral-technology.eu)`. Wikimedia limits the rate of the anonymous requests per minute
   and per client, 200 requests a minute for a client that names itself so and 10 for a client
   known by its address alone, limits introduced in 2026 that may change, and the computers behind
   one public address share them. The route reports the limit with 429 (`rate_limited`) and the
@@ -1794,11 +1910,12 @@ In the offline mode, which keeps the computer away from the Internet, the relay 
 engine of this computer or of its local network alone: `localhost`, a name under `.localhost`, an
 address that is not public (loopback, private, link-local), or a name of the network whose every
 address is so, which each request resolves before it connects, directly, to an address it checked
-(IPv4 first), without the proxy and outside the cancellation of the downloads that the offline mode
-holds; Pseudalis, on the same computer, still pseudonymizes. Ollama and Claude, which need the
-Internet, and an engine at a public address are then not ready: the padlock leaves the web
-application, `albireo-relay` leaves `/v1/models`, the request answers with the reason, and the tray
-says it on the page of the relay. Nothing is sent before these checks.
+(IPv4 first), the resolution taking about ten seconds at most on Windows, without the proxy and
+outside the cancellation of the downloads that the offline mode holds; Pseudalis, on the same
+computer, still pseudonymizes. Ollama and Claude, which need the Internet, and an engine at a public
+address are then not ready: the padlock leaves the web application, `albireo-relay` leaves
+`/v1/models`, the request answers with the reason, and the tray says it on the page of the relay.
+Nothing is sent before these checks.
 
 The address of an `openai` engine holds a host and a port alone, a user, a query or a fragment
 beside the host being refused. Its base is the address typed, the path of an operation pasted with
@@ -1826,11 +1943,13 @@ With Claude, the Web button of a discussion of the relay has the external model 
 itself: the request carries `"web_search": true`, which the relay turns into the tool
 `web_search_20250305` of Anthropic, five searches at most per answer, each billed by Anthropic ($10
 per 1000 searches, beside the tokens of the results). The query of each search comes with the
-reasoning (`web_search: ...`), the sources that a text cites follow it as links naming their
-domain, the error of a search comes with the reasoning too, and the usage of the answer gives
+reasoning (`web_search: ...`), the sources that a text cites follow it as links naming their domain,
+the error of a search comes with the reasoning too, and the usage of the answer gives
 `web_search_requests`. The web access of the settings allows it, as it does the Web button of the
-models of the computer; the other providers take no search. With the pseudonymization, Claude
-searches from the texts it received, their substitutes included.
+models of the computer; the other providers take no search. While the relay pseudonymizes, the
+search is refused (400 `web_search_pseudonymized`) and the Web button stays off with its reason:
+Pseudalis replaces the names, the places and the organisations before they leave, and the searches
+would look for its substitutes.
 
 | Route | Answer |
 |-------|--------|
@@ -1855,12 +1974,13 @@ open, with the name of the external model, while its questions leave the compute
 keeps its choice for the provider, the model, the address and the pseudonymization it was made for,
 another one since asking for a new click; the button of the reasoning becomes a menu of the levels
 of effort of the external model when it takes some, its default first; the Agent button is disabled,
-and the Web button searches the web through Claude alone, a choice that holds for the model it was
-made for, so that a relay that lapses hands no search of the web to a model of the computer. The
-images go to the external model when it reads them and the pseudonymization is off; otherwise the
-model of the computer that reads images, the one of the general function first, describes each of
-them, its text copied in full, and the description takes its place, kept for the next turns of the
-discussion.
+and the Web button searches the web through Claude alone, off while the relay pseudonymizes, a
+choice that holds for the model it was made for, so that a relay that lapses hands no search of the
+web to a model of the computer. An answer of the relay shows the name of the external model below it
+from its first moment, as the answers of the models of the computer show theirs. The images go to
+the external model when it reads them and the pseudonymization is off; otherwise the model of the
+computer that reads images, the one of the general function first, describes each of them, its text
+copied in full, and the description takes its place, kept for the next turns of the discussion.
 
 ### Pseudonymization through Pseudalis
 
@@ -2194,8 +2314,12 @@ repository keeps the signed feed and catalog that the publisher places in the li
 The password is read at the configuration from `ALBIREO_PUBLIC_LINK_PASSWORD_FILE`, by default
 `keys\albireo-public-link.txt` in the folder of the user (`~/keys` on Linux), outside the
 repository, and built into the service masked; a service built without that file reaches the link
-without password, which the link refuses while it is protected. The tools of the publisher read the
-same file, or the variable `ALBIREO_PUBLIC_LINK_PASSWORD`.
+without password, which the link refuses while it is protected. Such a build, that of a copy of the
+repository without the file of its publisher, says so at its start ("publication space: set, without
+password") and in each refusal ("and this build carries no password for it"): its catalog and its
+models come from their official addresses, with a warning in the log at each read, and its updates,
+which the space alone serves, fail, so that `check_updates` is best turned off there. The tools of
+the publisher read the same file, or the variable `ALBIREO_PUBLIC_LINK_PASSWORD`.
 
 [`tools/publish_release.py`](tools/publish_release.py) writes the feed of a version from its
 installer without models: it checks that the installer carries the version of
@@ -2346,6 +2470,7 @@ size and its SHA-256, and run it in update mode at their next start.
 | `C:\ProgramData\Albireo\engine-cache`  | compiled graphs of OpenVINO, file of the extended memory, weights of the graphs of OpenVINO while their models are loaded (`graphs`) |
 | `C:\ProgramData\Albireo\logs`          | logs of the service and of the installer                     |
 | `C:\ProgramData\Albireo\updates`       | installer of the next version, with the signed feed that announced it |
+| profile of the browser of each user    | discussions, projects, passages, images and preferences of the web application (IndexedDB of `https://localhost:8443`), and the copy of all of them but the passages (cache storage of the same address) |
 
 The data folder is the one the installer recorded (`DataDir` under `HKLM\Software\Albireo`),
 `C:\ProgramData\Albireo` by default, which may be chosen at the installation; `ALBIREO_HOME`

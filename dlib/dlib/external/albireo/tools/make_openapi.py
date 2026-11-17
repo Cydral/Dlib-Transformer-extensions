@@ -48,8 +48,10 @@ generation_replies = dict(engine_replies, **{
 # The chat completions, which the relay may also answer (albireo-relay), and its failures once it started.
 relay_replies = dict(generation_replies, **{
     "400": reply("Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the "
-                 "external model nor a model of the computer can take (code image_input_not_supported), or a search "
-                 "of the web asked of another provider than Claude (web_search_not_supported)", ref("Error")),
+                 "external model nor a model of the computer can take (code image_input_not_supported), a search "
+                 "of the web asked of another provider than Claude (web_search_not_supported) or while the relay "
+                 "pseudonymizes, the searches then looking for the substitutes of Pseudalis "
+                 "(web_search_pseudonymized)", ref("Error")),
     "403": reply("albireo-relay: a search of the web asked while the web access of the settings is off (code "
                  "web_access_off)", ref("Error")),
     "404": reply("Unknown or inactive model; for albireo-relay, a relay turned off, incomplete or out of reach of "
@@ -208,7 +210,8 @@ schemas = {
             "web_search": {"type": "boolean", "description": "albireo-relay with Claude: the external model searches "
                            "the web, five searches at most, which Anthropic bills; its queries come with the "
                            "reasoning, its sources as links after the texts that cite them, and usage gives "
-                           "web_search_requests. The web access of the settings allows it."},
+                           "web_search_requests. The web access of the settings allows it, and the "
+                           "pseudonymization of the relay refuses it."},
             "reasoning_budget": {"type": "integer", "minimum": -1, "nullable": True,
                                  "description": "The tokens the reasoning may take: beyond them, the engine ends it "
                                                 "with a sentence that asks the model to answer from what it has "
@@ -455,7 +458,7 @@ schemas = {
         "keep_substitutes": {"type": "boolean", "description": "With the pseudonymization, the answers keep the "
                              "substitutes."},
         "web": {"type": "boolean", "description": "The external model searches the web when a request asks for it "
-                "(web_search): Claude."},
+                "(web_search): Claude, unless the relay pseudonymizes."},
         "offline": {"type": "boolean", "description": "The offline mode, which keeps an engine of the interface of "
                     "OpenAI on this computer or its local network alone: ready is false for the other providers and "
                     "for a public address."},
@@ -618,7 +621,10 @@ paths = {
             "product": {"type": "string", "example": "Albireo"},
             "edition": {"type": "string", "description": "The edition, Community Edition."},
             "version": {"type": "string"},
-            "author": {"type": "string"}, "email": {"type": "string"}, "copyright": {"type": "string"},
+            "publisher": {"type": "string", "example": "Cydral Technology"},
+            "website": {"type": "string", "description": "The site of the publisher."},
+            "contact": {"type": "string", "description": "The address of the contact of the publisher."},
+            "copyright": {"type": "string"},
             "project": {"type": "string", "description": "The address of the source code of Albireo."},
             "settings": {"type": "object", "description": "The settings of the service that the web application "
                          "follows, such as the language of the interface.", "properties": {
@@ -1041,8 +1047,8 @@ doc = {
                        "browser, and a body of more than 8 MB while four such bodies are being read (503, with a "
                        "Retry-After header).",
         "license": {"name": "Boost Software License 1.0", "url": "https://www.boost.org/LICENSE_1_0.txt"},
-        "contact": {"name": "Aldric Pierrain", "email": "cydraltechnology@gmail.com",
-                    "url": "https://github.com/Cydral/Dlib-Transformer-extensions"}},
+        "contact": {"name": "Cydral Technology", "email": "contact@cydral-technology.eu",
+                    "url": "https://www.cydral-technology.eu"}},
     "servers": [{"url": "/"}],
     "tags": [{"name": "OpenAI", "description": "Compatible with the OpenAI interface"},
              {"name": "Service", "description": "State of the service"},

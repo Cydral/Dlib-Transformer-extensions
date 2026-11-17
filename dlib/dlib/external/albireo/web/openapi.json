@@ -2,16 +2,16 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Albireo Community Edition local interface",
-  "version": "1.0.23",
+  "version": "1.0.24",
   "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, albireo-background the model that comes with Albireo, or the default model of the catalog that stands for it, which the web application uses for its work in the background, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.\n\nRequests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, DELETE and OPTIONS take no body (400). While the JSON bodies being read at once hold the values of their budget, a route that reads one answers 503 with the code busy and a Retry-After of 2 seconds. An answer being written whose model has no memory left for its keys and values ends with the error code out_of_memory.\n\nBefore any route, the server refuses, as plain text: a request whose Host header names another server than this computer (421), a request whose Origin header names another origin than the local server (403), so that no web site drives the service through a browser, and a body of more than 8 MB while four such bodies are being read (503, with a Retry-After header).",
   "license": {
    "name": "Boost Software License 1.0",
    "url": "https://www.boost.org/LICENSE_1_0.txt"
   },
   "contact": {
-   "name": "Aldric Pierrain",
-   "email": "cydraltechnology@gmail.com",
-   "url": "https://github.com/Cydral/Dlib-Transformer-extensions"
+   "name": "Cydral Technology",
+   "email": "contact@cydral-technology.eu",
+   "url": "https://www.cydral-technology.eu"
   }
  },
  "servers": [
@@ -99,7 +99,7 @@
       }
      },
      "400": {
-      "description": "Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the external model nor a model of the computer can take (code image_input_not_supported), or a search of the web asked of another provider than Claude (web_search_not_supported)",
+      "description": "Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the external model nor a model of the computer can take (code image_input_not_supported), a search of the web asked of another provider than Claude (web_search_not_supported) or while the relay pseudonymizes, the searches then looking for the substitutes of Pseudalis (web_search_pseudonymized)",
       "content": {
        "application/json": {
         "schema": {
@@ -454,11 +454,17 @@
           "version": {
            "type": "string"
           },
-          "author": {
-           "type": "string"
+          "publisher": {
+           "type": "string",
+           "example": "Cydral Technology"
           },
-          "email": {
-           "type": "string"
+          "website": {
+           "type": "string",
+           "description": "The site of the publisher."
+          },
+          "contact": {
+           "type": "string",
+           "description": "The address of the contact of the publisher."
           },
           "copyright": {
            "type": "string"
@@ -3050,7 +3056,7 @@
        },
        "web_search": {
         "type": "boolean",
-        "description": "albireo-relay with Claude: the external model searches the web, five searches at most, which Anthropic bills; its queries come with the reasoning, its sources as links after the texts that cite them, and usage gives web_search_requests. The web access of the settings allows it."
+        "description": "albireo-relay with Claude: the external model searches the web, five searches at most, which Anthropic bills; its queries come with the reasoning, its sources as links after the texts that cite them, and usage gives web_search_requests. The web access of the settings allows it, and the pseudonymization of the relay refuses it."
        },
        "reasoning_budget": {
         "type": "integer",
@@ -3888,7 +3894,7 @@
      },
      "web": {
       "type": "boolean",
-      "description": "The external model searches the web when a request asks for it (web_search): Claude."
+      "description": "The external model searches the web when a request asks for it (web_search): Claude, unless the relay pseudonymizes."
      },
      "offline": {
       "type": "boolean",

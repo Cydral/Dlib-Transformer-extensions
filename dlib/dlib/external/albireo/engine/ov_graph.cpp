@@ -914,6 +914,15 @@ namespace albireo
                         which the cuts and the copies of the sequences use.
                     */
                     properties[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+                    /*
+                        Without this property, the plugin of the graphics processors rounds the inputs in half
+                        precision of its products to 8 bits, by token with systolic arrays and by groups of 32
+                        values in the passes of more than 240 tokens without: Qwen3-VL 4B departed from the
+                        processor runtime at the last token of a pass of 256 tokens, its steps agreeing, and agreed
+                        everywhere in single precision (ov_graph_settings::dynamic_quantization).
+                    */
+                    if (!settings_.dynamic_quantization)
+                        properties[ov::hint::dynamic_quantization_group_size.name()] = static_cast<uint64_t>(0);
                     if (settings_.single_precision) properties[ov::hint::inference_precision.name()] = ov::element::f32;
                 }
                 if (!settings_.weights_dir.empty()) model = spill(model);
@@ -1092,6 +1101,8 @@ namespace albireo
                 if (!bin_.path.empty()) o << ", weights mapped from their file";
                 if (cpu_ && fused_attention_ == 0) o << ", attention not fused";
                 if (!cpu_ && settings_.single_precision) o << ", computing in single precision";
+                if (!cpu_ && settings_.dynamic_quantization)
+                    o << ", the inputs of the passes in 8 bits as the plugin chooses";
                 o << "), " << describe(cfg_);
                 return o.str();
             }

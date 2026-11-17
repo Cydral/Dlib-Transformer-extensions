@@ -138,6 +138,15 @@ namespace albireo
 
     /*!
         ensures
+            - Resolves the name host as http_resolve() does, within the same bound on Windows,
+              whether the downloads are cancelled or not: the offline mode resolves so the names
+              of the engines of its local network.  An IPv6 address of a scope keeps its zone
+              ("fe80::1%12").
+    !*/
+    bool http_resolve_local(const std::string& host, std::vector<std::string>& addresses, std::string& error);
+
+    /*!
+        ensures
             - Gives a client of origin ("https://host:port") made as those of the downloads: the
               proxy that http_proxy_for() gives, the server or its proxy reached within
               connect_seconds (its name resolved within its bounds on Windows), each wait for

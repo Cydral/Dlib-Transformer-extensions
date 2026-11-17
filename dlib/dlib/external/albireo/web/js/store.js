@@ -7,7 +7,17 @@
     their instructions and documents, the passages of the documents with their vectors for
     the document search, the images of the discussions and of the projects, and the
     preferences.  Nothing is sent anywhere; an incognito discussion never reaches this module.
+
+    The browser may close this database under the application, when it deletes the data of the
+    origin or finds one of their files damaged: the next access then opens it again, and the
+    application is told (watchClosed).  Each change of a discussion, of a project, of a setting or
+    of an image is copied outside of the database (backup.js), from which the records come back
+    when the browser lost the database (copyFound, restoreCopy).  A setting marks the database
+    the copy follows (followedKey): the database the browser creates in place of a deleted one
+    lacks it, which tells the records it lost from the records deleted in it.
 */
+
+import * as backup from './backup.js';
 
 const DB_NAME = 'albireo';
 const DB_VERSION = 3;
@@ -29,6 +39,32 @@ let opening = null;
 */
 let blocked = null;
 
+// What the application asked to be told when the browser closes the database (watchClosed).
+let closedListener = null;
+
+/*
+    Calls listener each time the browser closes the database under the application, as it does when it
+    deletes the data of the origin or finds them damaged.  The next access opens the database again.
+*/
+export function watchClosed(listener) {
+  closedListener = listener;
+}
+
+/*
+    Lets go of a connection the browser no longer answers on, when one of its accesses failed because the
+    connection was closing: the next access opens the database again.
+*/
+export function forget() {
+  const d = db;
+  db = null;
+  if (!d) return;
+  try {
+    d.close();
+  } catch (e) {
+    // The connection is already closed.
+  }
+}
+
 export function open() {
   if (db) return Promise.resolve(db);
   if (blocked) return Promise.reject(blocked);
@@ -36,11 +72,21 @@ export function open() {
     opening = connect().then((d) => {
       /*
           When a newer version of the application upgrades the database in another tab, this tab
-          lets it go and opens it again at its next access.
+          lets it go and opens it again at its next access.  A change to no version is the deletion
+          of the database, by the tools of the browser for instance: the application is told, as
+          for a database the browser closed.
       */
-      d.onversionchange = () => {
+      d.onversionchange = (e) => {
         d.close();
-        if (db === d) db = null;
+        const held = db === d;
+        if (held) db = null;
+        if (held && e.newVersion === null && closedListener) closedListener();
+      };
+      // The browser closed the connection itself: the database was deleted, or one of its files failed.
+      d.onclose = () => {
+        if (db !== d) return;
+        db = null;
+        if (closedListener) closedListener();
       };
       db = d;
       return d;
@@ -98,6 +144,11 @@ function store(name, mode) {
   return db.transaction(name, mode).objectStore(name);
 }
 
+// True when the request of the setting of the mark (followedKey), read in a transaction, found the mark.
+function marked(r) {
+  return !!r.result && r.result.value === true;
+}
+
 // The end of a transaction.
 function completed(tx) {
   return new Promise((resolve, reject) => {
@@ -127,7 +178,15 @@ export async function getConversation(id) {
 
 export async function putConversation(c) {
   await open();
-  return request(store('conversations', 'readwrite').put(c));
+  const tx = db.transaction(['conversations', 'settings'], 'readwrite');
+  const mark = tx.objectStore('settings').get(followedKey);
+  const r = tx.objectStore('conversations').put(c);
+  // The copy holds the discussion as the database receives it here, whatever changes it before the copy is written.
+  const shot = backup.snapshot(c, c.updated);
+  const key = await request(r);
+  // Beside a database the copy does not follow, a later state the copy holds stays (copyFound).
+  backup.putSnapshot('conversations', c.id, shot, !marked(mark));
+  return key;
 }
 
 /*
@@ -137,15 +196,24 @@ export async function putConversation(c) {
 */
 export async function updateConversations(fn, id) {
   await open();
-  const tx = db.transaction('conversations', 'readwrite');
+  const tx = db.transaction(['conversations', 'settings'], 'readwrite');
+  const mark = tx.objectStore('settings').get(followedKey);
   const r = tx.objectStore('conversations').openCursor(id == null ? null : IDBKeyRange.only(id));
+  const changed = [];
   r.onsuccess = () => {
     const c = r.result;
     if (!c) return;
-    if (fn(c.value)) c.update(c.value);
+    const value = c.value;
+    if (fn(value)) {
+      c.update(value);
+      changed.push(value);
+    }
     c.continue();
   };
   await completed(tx);
+  for (const value of changed) {
+    backup.putSnapshot('conversations', value.id, backup.snapshot(value, value.updated), !marked(mark));
+  }
 }
 
 /*
@@ -154,10 +222,17 @@ export async function updateConversations(fn, id) {
     pruneImages).
 */
 export async function deleteConversation(id) {
+  /*
+      The copy forgets the discussion and its images first, whatever the database answers, and the discussion again
+      once the database did, for a save of the discussion that was on its way to the copy.
+  */
+  backup.remove('conversations', id);
+  backup.removeImagesOf(id);
   await open();
   const tx = db.transaction('conversations', 'readwrite');
   tx.objectStore('conversations').delete(id);
   await completed(tx);
+  backup.remove('conversations', id);
   await deleteChunks('owner', id);
   await deleteImages(id);
 }
@@ -176,26 +251,43 @@ export async function getProject(id) {
 
 export async function putProject(p) {
   await open();
-  return request(store('projects', 'readwrite').put(p));
+  const tx = db.transaction(['projects', 'settings'], 'readwrite');
+  const mark = tx.objectStore('settings').get(followedKey);
+  const r = tx.objectStore('projects').put(p);
+  const shot = backup.snapshot(p, p.updated);
+  const key = await request(r);
+  backup.putSnapshot('projects', p.id, shot, !marked(mark));
+  return key;
 }
 
 export async function deleteProject(id) {
+  // The copy forgets the project and its images first, whatever the database answers (deleteConversation).
+  backup.remove('projects', id);
+  backup.removeImagesOf(id);
   await open();
   /*
       The discussions of the project stay, outside of any project.  They change in place, in one
       transaction with the deletion of the project, through the index of their projects.
   */
-  const tx = db.transaction(['conversations', 'projects'], 'readwrite');
+  const tx = db.transaction(['conversations', 'projects', 'settings'], 'readwrite');
+  const mark = tx.objectStore('settings').get(followedKey);
   const r = tx.objectStore('conversations').index('project').openCursor(IDBKeyRange.only(id));
+  const changed = [];
   r.onsuccess = () => {
     const c = r.result;
     if (!c) return;
-    c.value.projectId = null;
-    c.update(c.value);
+    const value = c.value;
+    value.projectId = null;
+    c.update(value);
+    changed.push(value);
     c.continue();
   };
   tx.objectStore('projects').delete(id);
   await completed(tx);
+  backup.remove('projects', id);
+  for (const value of changed) {
+    backup.putSnapshot('conversations', value.id, backup.snapshot(value, value.updated), !marked(mark));
+  }
   await deleteChunks('owner', id);
   await deleteImages(id);
 }
@@ -295,6 +387,7 @@ export async function putImages(records) {
   const s = tx.objectStore('images');
   for (const r of records) s.put(r);
   await completed(tx);
+  for (const r of records) backup.putImage(r);
 }
 
 export async function getImage(id) {
@@ -320,17 +413,22 @@ export async function imageKeys(owner) {
 
 // Deletes the images of an owner.
 export async function deleteImages(owner) {
+  // The copy finds the images of the owner itself: the database may have lost them, or may not answer.
+  backup.removeImagesOf(owner);
   await open();
   const tx = db.transaction('images', 'readwrite');
   const s = tx.objectStore('images');
   const r = s.index('owner').openKeyCursor(IDBKeyRange.only(owner));
+  const ids = [];
   r.onsuccess = () => {
     const c = r.result;
     if (!c) return;
+    ids.push(c.primaryKey);
     s.delete(c.primaryKey);
     c.continue();
   };
   await completed(tx);
+  for (const id of ids) backup.removeImage(id);
 }
 
 export async function deleteImageIds(ids) {
@@ -340,6 +438,7 @@ export async function deleteImageIds(ids) {
   const s = tx.objectStore('images');
   for (const id of ids) s.delete(id);
   await completed(tx);
+  for (const id of ids) backup.removeImage(id);
 }
 
 // The images stored: {count, bytes}, the bytes of the images and of their thumbnails.
@@ -388,9 +487,20 @@ export async function getSettings() {
   return s;
 }
 
+/*
+    Puts a setting.  It reaches the copy from the database the copy follows only (followedKey): beside a new
+    database, the settings of the copy are those of the database the browser deleted, and wait there for their
+    restoration (copyFound, restoreCopy).
+*/
 export async function setSetting(key, value) {
   await open();
-  return request(store('settings', 'readwrite').put({ key, value }));
+  const tx = db.transaction('settings', 'readwrite');
+  const s = tx.objectStore('settings');
+  const mark = s.get(followedKey);
+  const r = s.put({ key, value });
+  await completed(tx);
+  if (mark.result && mark.result.value === true) backup.put('settings', key, { value }, 0);
+  return r.result;
 }
 
 /*
@@ -403,15 +513,19 @@ export async function setSettings(values, unless) {
   const tx = db.transaction('settings', 'readwrite');
   const s = tx.objectStore('settings');
   let put = false;
+  let followed = false;
   const r = s.getAll();
   r.onsuccess = () => {
     const now = {};
     for (const row of r.result) now[row.key] = row.value;
+    followed = now[followedKey] === true;
     if (unless && unless(now)) return;
     for (const key of Object.keys(values)) s.put({ key, value: values[key] });
     put = true;
   };
   await completed(tx);
+  // As for one setting (setSetting): the copy takes the settings of the database it follows.
+  if (put && followed) for (const key of Object.keys(values)) backup.put('settings', key, { value: values[key] }, 0);
   return put;
 }
 
@@ -458,7 +572,9 @@ export async function exportAll() {
   (await allConversations()).forEach((c, i) => parts.push((i ? ',' : '') + JSON.stringify(c)));
   parts.push('],"projects":[');
   (await allProjects()).forEach((p, i) => parts.push((i ? ',' : '') + JSON.stringify(p)));
-  parts.push('],"settings":' + JSON.stringify(await getSettings()) + ',"images":[');
+  const settings = await getSettings();
+  delete settings[followedKey];
+  parts.push('],"settings":' + JSON.stringify(settings) + ',"images":[');
   const records = await request(store('images', 'readonly').getAll());
   let first = true;
   for (const r of records) {
@@ -573,14 +689,329 @@ export async function importAll(data) {
 }
 
 /*
+    The setting that marks the database the copy follows.  A database receives it once it holds every discussion
+    and every project of the copy, with every image of theirs that the browser reads in the copy (copyFound), and
+    the copy follows each of its changes from then on: what such a database lacks was deleted in it.  The database
+    the browser creates after it deleted that one carries no mark: what the copy holds beyond it was lost.  The
+    mark stays out of the copy and of the exports.  A database that carries the mark and went back to an earlier
+    state, its last changes lost when the browser stopped, is followed as it is: the copies of those changes leave
+    at the next start.
+*/
+const followedKey = 'copyFollows';
+
+// The keys of the settings the copy leaves out: those that only one visit of the browser needs, and the mark.
+const uncopied = /Lease$|^copyFollows$/;
+
+/*
     Deletes every discussion, project, passage and image and puts the settings of reset, in one transaction; the other
     settings stay.
 */
 export async function clearAll(reset) {
+  // A database that does not open refuses here, before the copy is touched.
+  await open();
+  /*
+      The copy is emptied first.  The transaction then marks the database it empties as the one the copy follows:
+      what a copy the browser refused to delete still holds leaves at the next comparison (alignCopy), and is never
+      offered again.
+  */
+  await backup.clear();
   await open();
   const names = ['conversations', 'projects', 'chunks', 'images'];
   const tx = db.transaction(names.concat(['settings']), 'readwrite');
   for (const name of names) tx.objectStore(name).clear();
   for (const key of Object.keys(reset || {})) tx.objectStore('settings').put({ key, value: reset[key] });
+  tx.objectStore('settings').put({ key: followedKey, value: true });
   await completed(tx);
+  await copySettings();
+}
+
+// Copies the settings of the database that the copy lacks or holds with another value.
+async function copySettings() {
+  await open();
+  const rows = await request(store('settings', 'readonly').getAll());
+  const copied = await backup.settings() || {};
+  for (const row of rows) {
+    if (uncopied.test(row.key)) continue;
+    const has = Object.prototype.hasOwnProperty.call(copied, row.key);
+    if (has && JSON.stringify(copied[row.key]) === JSON.stringify(row.value)) continue;
+    backup.put('settings', row.key, { value: row.value }, 0);
+  }
+}
+
+/*
+    The identifiers of the discussions, of the projects and of the images stored, {conversations, projects, images},
+    and followed, true for a database that carries the mark of the copy (followedKey), all read in one transaction.
+*/
+export async function keys() {
+  await open();
+  const tx = db.transaction(['conversations', 'projects', 'images', 'settings'], 'readonly');
+  const read = (name) => request(tx.objectStore(name).getAllKeys());
+  const [conversations, projects, images, mark] = await Promise.all([
+    read('conversations'), read('projects'), read('images'), request(tx.objectStore('settings').get(followedKey))
+  ]);
+  return {
+    conversations: new Set(conversations), projects: new Set(projects), images: new Set(images),
+    followed: !!mark && mark.value === true
+  };
+}
+
+/*
+    Writes records back into the database: {conversations, projects, settings}, the discussions and the projects as
+    lists, the settings as an object.  A stored record as recent as the one given stays, so that the copy of
+    another tab that answered since is kept; the settings given are put as they are.  Returns the numbers of
+    discussions and of projects written, {conversations, projects}.
+*/
+export async function putBack(records) {
+  await open();
+  const tx = db.transaction(['conversations', 'projects', 'settings'], 'readwrite');
+  const mark = tx.objectStore('settings').get(followedKey);
+  const written = { conversations: [], projects: [] };
+  for (const name of ['conversations', 'projects']) {
+    const s = tx.objectStore(name);
+    for (const value of records[name] || []) {
+      const r = s.get(value.id);
+      r.onsuccess = () => {
+        if (r.result && (r.result.updated || 0) >= (value.updated || 0)) return;
+        s.put(value);
+        written[name].push(value);
+      };
+    }
+  }
+  const settings = records.settings || {};
+  for (const key of Object.keys(settings)) {
+    if (!uncopied.test(key)) tx.objectStore('settings').put({ key, value: settings[key] });
+  }
+  await completed(tx);
+  for (const name of ['conversations', 'projects']) {
+    for (const value of written[name]) {
+      backup.putSnapshot(name, value.id, backup.snapshot(value, value.updated), !marked(mark));
+    }
+  }
+  for (const key of Object.keys(settings)) {
+    if (!uncopied.test(key)) backup.put('settings', key, { value: settings[key] }, 0);
+  }
+  return { conversations: written.conversations.length, projects: written.projects.length };
+}
+
+/*
+    What the copy holds and a new database lacks: {conversations, projects, updated, settings}, the numbers of the
+    discussions and of the projects, the time of the latest of them, and the number of settings taken back; null
+    without any, and for a database the copy follows (followedKey).  The discussions and the projects that the copy
+    holds beyond a database without the mark, or in a later state than it, were lost with the database the browser
+    deleted: they stay in the copy until the user restores them or deletes the copy (restoreCopy, clearCopy).  The
+    new database changes the copy of one of them in two cases only: it saves that record in a later state than the
+    copy holds, which then takes its place, or the user deletes that record.  A database without the mark that
+    lacks none of them takes back
+    the images of the copy that belong to its records, then receives the mark with the settings of the copy that it
+    lacks: the first start of this version, a copy the browser emptied, the end of a restoration, and a database
+    deleted while it held neither discussion nor project.  The mark is given in the transaction that reads the
+    database, so that it never reaches another database than the one compared, and is withheld while an image of
+    the copy that the browser reads could not be stored: the copy then stays as it is.  The list of the copy is
+    read before that transaction.
+*/
+export async function copyFound() {
+  const held = await backup.list();
+  if (!held) return null;
+  if ((await keys()).followed) return null;
+  const kept = held.settings.size ? await backup.settings() : null;
+  // null when the database refused an image: the comparison goes on, and the mark waits.
+  const unread = await bringImages(held).catch(() => null);
+  await open();
+  const tx = db.transaction(['conversations', 'projects', 'images', 'settings'], 'readwrite');
+  const found = { conversations: 0, projects: 0, updated: 0, settings: 0 };
+  let followed = false;
+  const owners = new Set();
+  let images = null;
+  let pending = 3;
+  const settings = tx.objectStore('settings');
+  const compared = () => {
+    pending -= 1;
+    if (pending || found.conversations + found.projects > 0 || !unread) return;
+    // An image of a stored record that the copy alone holds: the mark waits for it.
+    for (const [id, owner] of held.images) if (owners.has(owner) && !images.has(id) && !unread.has(id)) return;
+    const present = settings.getAllKeys();
+    present.onsuccess = () => {
+      const has = new Set(present.result);
+      for (const key of Object.keys(kept || {})) {
+        if (has.has(key) || uncopied.test(key)) continue;
+        settings.put({ key, value: kept[key] });
+        found.settings += 1;
+      }
+      settings.put({ key: followedKey, value: true });
+    };
+  };
+  const mark = settings.get(followedKey);
+  mark.onsuccess = () => {
+    followed = marked(mark);
+    if (followed) return;
+    for (const name of ['conversations', 'projects']) {
+      const r = tx.objectStore(name).getAll();
+      r.onsuccess = () => {
+        const times = new Map(r.result.map((x) => [x.id, Number(x.updated) || 0]));
+        for (const id of times.keys()) owners.add(id);
+        for (const [id, time] of held[name]) {
+          if (times.has(id) && times.get(id) >= time) continue;
+          found[name] += 1;
+          found.updated = Math.max(found.updated, time);
+        }
+        compared();
+      };
+    }
+    const k = tx.objectStore('images').getAllKeys();
+    k.onsuccess = () => {
+      images = new Set(k.result);
+      compared();
+    };
+  };
+  await completed(tx);
+  return !followed && found.conversations + found.projects + found.settings > 0 ? found : null;
+}
+
+// The numbers of the records of the copy, {conversations, projects, images}; null without a copy.
+export async function copyCounts() {
+  const held = await backup.list();
+  if (!held) return null;
+  return { conversations: held.conversations.size, projects: held.projects.size, images: held.images.size };
+}
+
+/*
+    Brings the records of the copy back into the database: the discussions, the projects and the settings (putBack),
+    then the images the database lacks.  Returns {conversations, projects, images}, the numbers written, unread,
+    the number of discussions and of projects of the copy that could not be read, which stay in it, and settings,
+    the settings of the copy; null when the copy cannot be read.
+*/
+export async function restoreCopy() {
+  const held = await backup.list();
+  const records = await backup.records();
+  if (!held || !records) return null;
+  const clean = {
+    conversations: records.conversations.map(cleanConversation).filter(Boolean),
+    projects: records.projects.map(cleanProject).filter(Boolean), settings: records.settings
+  };
+  const unread = Math.max(0, held.conversations.size - clean.conversations.length)
+    + Math.max(0, held.projects.size - clean.projects.length);
+  const written = await putBack(clean);
+  const images = await restoreImages();
+  return Object.assign(written, { images, unread, settings: clean.settings });
+}
+
+/*
+    Stores again the images of the copy held, as its list gave it, that the database lacks and whose owner, a
+    discussion or a project, is stored.  Returns the identifiers of those the browser could not read in the copy;
+    restored.count is the number stored.  A refusal of the database is thrown.
+*/
+async function bringImages(held, restored) {
+  const unread = new Set();
+  if (!held.images.size) return unread;
+  const stored = await keys();
+  for (const [id, owner] of held.images) {
+    if (stored.images.has(id) || !(stored.conversations.has(owner) || stored.projects.has(owner))) continue;
+    const record = await backup.image(id);
+    if (!record) {
+      unread.add(id);
+      continue;
+    }
+    await open();
+    const tx = db.transaction('images', 'readwrite');
+    tx.objectStore('images').put(record);
+    await completed(tx);
+    if (restored) restored.count += 1;
+  }
+  return unread;
+}
+
+/*
+    Stores again the images of the copy that the database lacks and whose owner, a discussion or a project, is
+    stored.  Returns their number.
+*/
+export async function restoreImages() {
+  const held = await backup.list();
+  const restored = { count: 0 };
+  if (held) await bringImages(held, restored);
+  return restored.count;
+}
+
+/*
+    An export (exportAll) built without the database, for one that does not open or lost its records: the
+    discussions, the projects and the settings of records, {conversations, projects, settings}, those of the copy
+    without them, and the images of the copy.  null without a copy.
+*/
+export async function exportCopy(records) {
+  const held = await backup.list();
+  const own = records || await backup.records();
+  if (!held || !own) return null;
+  const parts = ['{"format":"albireo-export","version":1,"exported":' + Date.now() + ',"conversations":['];
+  own.conversations.forEach((c, i) => parts.push((i ? ',' : '') + JSON.stringify(c)));
+  parts.push('],"projects":[');
+  own.projects.forEach((p, i) => parts.push((i ? ',' : '') + JSON.stringify(p)));
+  parts.push('],"settings":' + JSON.stringify(own.settings) + ',"images":[');
+  /*
+      The images of the discussions and of the projects exported: the copy may still hold those of a record deleted
+      while the database did not answer.
+  */
+  const owners = new Set(own.conversations.concat(own.projects).map((x) => x.id));
+  let first = true;
+  for (const [id, owner] of held.images) {
+    if (!owners.has(owner)) continue;
+    const r = await backup.image(id);
+    if (!r) continue;
+    const { blob, thumb, ...rest } = r;
+    const picture = Object.assign(rest, { data: await dataUrlOf(blob), thumbnail: await dataUrlOf(thumb) });
+    parts.push((first ? '' : ',') + JSON.stringify(picture));
+    first = false;
+  }
+  parts.push(']}');
+  return new Blob(parts, { type: 'application/json' });
+}
+
+/*
+    Brings the copy in line with the database it follows, once the lists were read at the start of a visit: lists is
+    {conversations, projects}, the records as read, of which the identifiers and the times count, taken at the call.
+    The records the copy lacks or holds with another time are copied, each read again from the database when it is
+    copied, so that a change made meanwhile is the one kept; so are the settings whose copy differs and the images
+    the copy lacks.  A change that keeps the time of its record, a title or a pin for instance, and whose copy the
+    browser refused or the end of the visit left behind, waits for the next change of that record.  The copies of
+    records and of images the database no longer holds leave: they are listed before the database is read for that
+    step, so that a record another tab saves meanwhile, in the database then in the copy, never counts as a copy
+    without a record.  A database without the mark (followedKey) leaves the copy as it is, at the start and again
+    at the step that removes copies, which reads the mark and the identifiers in one transaction: the database the
+    browser creates in place of a deleted one never empties the copy.
+*/
+export async function alignCopy(lists) {
+  const listed = {};
+  for (const name of ['conversations', 'projects']) {
+    listed[name] = (lists[name] || []).map((x) => ({ id: x.id, updated: Number(x.updated) || 0 }));
+  }
+  const held = await backup.list();
+  if (!held) return;
+  const stored = await keys();
+  if (!stored.followed) return;
+  for (const name of ['conversations', 'projects']) {
+    for (const entry of listed[name]) {
+      if (held[name].get(entry.id) === entry.updated) continue;
+      await open();
+      const value = await request(store(name, 'readonly').get(entry.id));
+      if (value) await backup.put(name, value.id, value, value.updated);
+    }
+  }
+  await copySettings();
+  for (const id of stored.images) {
+    if (held.images.has(id)) continue;
+    await open();
+    const record = await request(store('images', 'readonly').get(id));
+    if (record) await backup.putImage(record);
+  }
+  const copied = await backup.list();
+  if (!copied) return;
+  const now = await keys();
+  if (!now.followed) return;
+  for (const name of ['conversations', 'projects']) {
+    for (const id of copied[name].keys()) if (!now[name].has(id)) await backup.removeListed(name, id);
+  }
+  for (const id of copied.parts) if (!now.images.has(id)) await backup.removeImage(id);
+}
+
+// Empties the copy of the records, the database staying as it is; false when the browser refused.
+export function clearCopy() {
+  return backup.clear();
 }

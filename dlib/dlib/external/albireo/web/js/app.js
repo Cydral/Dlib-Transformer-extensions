@@ -194,7 +194,9 @@ const defaults = {
   maxTokens: 0, sendOnEnter: true, systemPrompt: '', sidebar: true,
   memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', memoryPinned: '',
   memoryReset: 0,
-  storagePersisted: null
+  storagePersisted: null,
+  // The time of the last export of everything, and the time until which its reminder waits (backupDue).
+  exportedAt: 0, exportLater: 0
 };
 
 /*
@@ -202,7 +204,9 @@ const defaults = {
     user and the global instructions, since the discussions taught or gave them.
 */
 const clearedSettings = {
-  memory: '', memoryPinned: '', memoryUpdated: 0, memoryLanguage: '', userName: '', systemPrompt: ''
+  memory: '', memoryPinned: '', memoryUpdated: 0, memoryLanguage: '', userName: '', systemPrompt: '',
+  // The export of the deleted records no longer counts for the reminder of the backup (backupDue).
+  exportedAt: 0, exportLater: 0
 };
 
 /*
@@ -332,15 +336,538 @@ function copyText(text) {
 
 /*
     A change the database of the browser refused, for instance on a full disk.  The user is told
-    at most once every few seconds, and the work goes on with the copies in memory.
+    at most once every few seconds, and the work goes on with the copies in memory.  A refusal that
+    comes from a connection the browser closed leads to the check of the database (databaseClosed),
+    whose banner then tells what happened; the banner of a database that does not answer stands for
+    the refusals that follow.
 */
 let storageWarned = 0;
+// The check of the database in progress after the browser closed it (databaseClosed), null without one.
+let databaseCheck = null;
+
+// True for the refusal of an access on a connection to the database that the browser closed or is closing.
+function closedConnection(e) {
+  return !!e && e.name === 'InvalidStateError' && /IDBDatabase|database|usable/i.test(e.message || '');
+}
 
 function storageFailed(e) {
   console.warn('Albireo: the database of the browser refused a change', e);
+  if (closedConnection(e)) {
+    // The check tells what the database lost; when it lost nothing, the refused change itself is told.
+    store.forget();
+    databaseClosed().then(() => { if (!dbState.state) refusalTold(e); });
+    return;
+  }
+  // The banner tells that the database does not answer, now or once its check ends.
+  if (unanswering() || databaseCheck) return;
+  refusalTold(e);
+}
+
+function refusalTold(e) {
   if (Date.now() - storageWarned < 15000) return;
   storageWarned = Date.now();
   toast(t(e && e.name === 'QuotaExceededError' ? 'errStorageFull' : 'errStorage'), true);
+}
+
+/*
+    The database of the browser during this visit.  state is '' while it answers; 'deleted' once the browser deleted
+    discussions or projects that this tab still holds; 'closed' once the browser closed it and refuses to open it
+    again; 'unopened' when it could not be opened or read at the start; 'emptied' when the copy of the records
+    (store.js) holds discussions or projects that a new database lacks.  reason is the error of the browser, found
+    what the copy holds for 'emptied', and busy is true while an action of the banner runs.
+*/
+const dbState = { state: '', reason: '', found: null, busy: false };
+
+// The discussions whose last save the database refused, saved again once it answers.
+const unsaved = new Set();
+let unsavedTimer = null;
+
+// True while the database does not answer: the browser closed it for good, or it did not open at the start.
+function unanswering() {
+  return dbState.state === 'closed' || dbState.state === 'unopened';
+}
+
+// True while this tab holds discussions or projects that the database lacks, deleted by the browser or out of reach.
+function holdingAlone() {
+  return dbState.state === 'deleted' || dbState.state === 'closed';
+}
+
+/*
+    The discussion of identifier id that this tab holds while the database lacks it: its last save was refused, or
+    the browser deleted or closed the database.  null otherwise.
+*/
+function heldConversation(id) {
+  if (!unsaved.has(id) && !holdingAlone()) return null;
+  return state.conversations.find((x) => x.id === id) || null;
+}
+
+// The error of the browser as the banner shows it: its name, with its message when it has one.
+function reasonOf(e) {
+  if (!e) return '';
+  const name = typeof e.name === 'string' ? e.name : '';
+  const message = typeof e.message === 'string' ? e.message : '';
+  return message && name ? name + ': ' + message : name || message || String(e);
+}
+
+function setDatabaseState(value, e) {
+  dbState.state = value;
+  dbState.reason = value ? reasonOf(e) : '';
+  if (value !== 'emptied') dbState.found = null;
+  guardLeaving();
+  renderDatabaseBanner();
+  renderBackupBanner();
+}
+
+/*
+    The discussion c as the database stores it: without the answer being written, which is saved once it ends,
+    whole.
+*/
+function recordOf(c) {
+  const g = generations.get(c.id);
+  const live = g && g.turn;
+  if (!live || !c.messages.includes(live)) return c;
+  return Object.assign({}, c, { messages: c.messages.filter((x) => x !== live) });
+}
+
+/*
+    The records this tab holds that the database stores, {conversations, projects}: the discussions that have
+    messages, the incognito and the deleted ones left out, each as the copy that answers or is shown, and the projects.
+*/
+function heldRecords() {
+  const byId = new Map();
+  const add = (c) => {
+    if (c && !c.incognito && !deleted.has(c.id) && Array.isArray(c.messages) && c.messages.length) byId.set(c.id, c);
+  };
+  state.conversations.forEach(add);
+  add(state.current);
+  for (const g of generations.values()) add(g.c);
+  const conversations = Array.from(byId.values(), recordOf).filter((c) => c.messages.length);
+  return { conversations, projects: state.projects.slice() };
+}
+
+// The settings of this tab as the database stores them.
+function heldSettings() {
+  const out = {};
+  for (const key of Object.keys(defaults)) out[key] = state.settings[key];
+  return out;
+}
+
+// The number of discussions whose save is still refused, those deleted since left out.
+function unsavedLeft() {
+  for (const id of Array.from(unsaved)) if (deleted.has(id)) unsaved.delete(id);
+  return unsaved.size;
+}
+
+// True while leaving the page would lose discussions or projects that only this tab holds.
+function leavingLoses() {
+  if (unsavedLeft()) return true;
+  if (!holdingAlone()) return false;
+  const held = heldRecords();
+  return held.conversations.length + held.projects.length > 0;
+}
+
+function warnBeforeLeaving(e) {
+  if (!leavingLoses()) return;
+  e.preventDefault();
+  e.returnValue = '';
+}
+
+// The browser asks before the page is left or reloaded, while that would lose records (leavingLoses).
+let leavingGuarded = false;
+function guardLeaving() {
+  const on = !!unsavedLeft() || holdingAlone();
+  if (on === leavingGuarded) return;
+  leavingGuarded = on;
+  if (on) window.addEventListener('beforeunload', warnBeforeLeaving);
+  else window.removeEventListener('beforeunload', warnBeforeLeaving);
+}
+
+/*
+    Saves again, a little later, the discussions the database refused, while it answers and they remain: after
+    retryDelay milliseconds, a delay that doubles up to five minutes while the saves keep failing, or at once when
+    now is true.  These saves tell nothing: the first refusal was told, by a toast or by the banner of a database
+    that does not answer, and the browser asks before the page is left.  A database that does not answer is not
+    asked: its check starts the saves again once it does (checkDatabase).
+*/
+let retryDelay = 20000;
+function retryUnsavedLater(now) {
+  if (now && unsavedTimer) {
+    clearTimeout(unsavedTimer);
+    unsavedTimer = null;
+  }
+  if (unsavedTimer || !unsaved.size) return;
+  unsavedTimer = setTimeout(async () => {
+    unsavedTimer = null;
+    if (unanswering()) return;
+    const before = unsaved.size;
+    for (const id of Array.from(unsaved)) {
+      const live = generations.get(id);
+      const c = live ? live.c : state.current && state.current.id === id ? state.current
+        : state.conversations.find((x) => x.id === id);
+      if (!c || deleted.has(id)) unsaved.delete(id);
+      else await persist(c, true);
+    }
+    guardLeaving();
+    retryDelay = unsaved.size < before ? 20000 : Math.min(retryDelay * 2, 300000);
+    retryUnsavedLater();
+  }, now ? 0 : retryDelay);
+}
+
+/*
+    The browser closed the database under this tab, or refused an access because it was closing it.  The database is
+    opened again and compared with what this tab holds: when it lacks discussions or projects, the browser deleted
+    them, and the banner offers to save them again; when it does not open, the banner tells so.  One check runs at
+    a time.
+*/
+function databaseClosed() {
+  if (dbState.state === 'unopened') return Promise.resolve();
+  if (dbState.busy) {
+    // The action of the banner in progress ends first (actionEnded).
+    closedMeanwhile = true;
+    return Promise.resolve();
+  }
+  if (!databaseCheck) databaseCheck = checkDatabase().finally(() => { databaseCheck = null; });
+  return databaseCheck;
+}
+
+// True when the browser closed the database while an action of the banner ran.
+let closedMeanwhile = false;
+
+// The end of an action of the banner: the database is checked when the browser closed it meanwhile.
+function actionEnded() {
+  dbState.busy = false;
+  if (!closedMeanwhile) return;
+  closedMeanwhile = false;
+  databaseClosed();
+}
+
+async function checkDatabase() {
+  let stored = null;
+  let failure = null;
+  // The browser may still be closing the connections of the origin: the database is asked a few times.
+  for (let attempt = 0; attempt < 5 && !stored; ++attempt) {
+    if (attempt) await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+    try {
+      stored = await store.keys();
+    } catch (e) {
+      failure = e;
+      store.forget();
+    }
+  }
+  if (!stored) {
+    console.warn('Albireo: the browser closed its database and does not open it again', failure);
+    setDatabaseState('closed', failure);
+    return;
+  }
+  const held = heldRecords();
+  const lost = held.conversations.filter((c) => !stored.conversations.has(c.id) && !unsaved.has(c.id)).length
+    + held.projects.filter((x) => !stored.projects.has(x.id)).length;
+  if (lost) {
+    console.warn('Albireo: the browser deleted records of its database that this tab still holds');
+    setDatabaseState('deleted');
+    retryUnsavedLater(true);
+    return;
+  }
+  if (dbState.state !== 'emptied') setDatabaseState('');
+  retryUnsavedLater(true);
+  // The database holds what this tab holds: the copy of the records may hold more, when the database is a new one.
+  followCopy();
+}
+
+// Saves again the discussions, the projects and the settings this tab holds, after the browser deleted them.
+async function saveHeldAgain() {
+  if (dbState.busy) return;
+  dbState.busy = true;
+  renderDatabaseBanner();
+  try {
+    const held = heldRecords();
+    await store.putBack({ conversations: held.conversations, projects: held.projects, settings: heldSettings() });
+    /*
+        The images come back from the copy of the records, which the database of the browser does not hold.  A
+        refusal is told, and the copy keeps them: the database is not marked as the one the copy follows without
+        them (store.js, copyFound).
+    */
+    await store.restoreImages().catch((e) => {
+      console.warn('Albireo: the images of the copy could not be stored again', e);
+      refusalTold(e);
+    });
+    unsaved.clear();
+    actionEnded();
+    setDatabaseState('');
+    // The copy follows the database again, or offers what it holds beyond this tab.
+    await followCopy();
+    broadcast({ type: 'lists' });
+    broadcast({ type: 'storage' });
+    toast(t('storageSavedAgain', {
+      discussions: tn('discussionsCount', held.conversations.length),
+      projects: tn('projectsCount', held.projects.length)
+    }), false, 6000);
+    // The passages of the documents left with the database: the documents are indexed again.
+    indexProjects();
+    for (const c of held.conversations) indexAttachments(liveCopy(c)).catch(() => {});
+  } catch (e) {
+    console.warn('Albireo: the records of this tab could not be saved again', e);
+    actionEnded();
+    if (e && e.name === 'QuotaExceededError') {
+      // The database answers and lacks room: the banner stays, with its offer.
+      renderDatabaseBanner();
+      toast(t('errStorageFull'), true);
+    } else {
+      setDatabaseState('closed', e);
+    }
+  }
+}
+
+/*
+    The file of an export that holds what this tab keeps in memory, for a database that no longer answers.  The
+    images, which left with the database, come from the copy of the records when the browser keeps one.
+*/
+async function exportHeld() {
+  const held = heldRecords();
+  const records = { conversations: held.conversations, projects: held.projects, settings: heldSettings() };
+  const blob = await store.exportCopy(records).catch(() => null);
+  download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', blob || JSON.stringify(Object.assign({
+    format: 'albireo-export', version: 1, exported: Date.now()
+  }, records, { images: [] })), 'application/json');
+}
+
+// The file of an export built from the copy of the records, for a database that does not open.
+async function exportCopy() {
+  const blob = await store.exportCopy().catch(() => null);
+  if (!blob) {
+    toast(t('exportFailed', { reason: t('copyUnavailable') }), true);
+    return;
+  }
+  download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', blob, 'application/json');
+}
+
+// Opens the database again after the browser refused; a database that could not be opened at the start is read anew.
+async function retryDatabase() {
+  if (dbState.busy) return;
+  if (dbState.state === 'unopened') {
+    location.reload();
+    return;
+  }
+  store.forget();
+  await databaseClosed();
+}
+
+/*
+    Reads the settings again from the database, after the copy of the records gave some of them back, shows them
+    and tells them to the other tabs, which read theirs before.
+*/
+async function settingsRestored() {
+  state.settings = Object.assign({}, defaults, await store.getSettings());
+  for (const key of Object.keys(defaults)) broadcast({ type: 'setting', key, value: state.settings[key] });
+  applyTheme();
+  await languageChanged(true);
+}
+
+/*
+    Compares the copy of the records with the database: at the start once the lists were read, and after each action
+    of this tab or of another one that brings records back or deletes the copy.  The banner offers to restore the
+    discussions and the projects that the copy holds and a new database lacks; without any, the banner of that offer
+    leaves, whole() is called when given, and the copy is brought in line with the database.  One comparison runs
+    at a time.
+*/
+let copyCheck = Promise.resolve();
+function followCopy(whole) {
+  const run = async () => {
+    if (dbState.state === 'unopened') return;
+    try {
+      const found = await store.copyFound();
+      if (found && found.conversations + found.projects > 0) {
+        // A banner that tells more, a database deleted under this tab or closed, stays.
+        if (dbState.state && dbState.state !== 'emptied') return;
+        dbState.found = found;
+        console.warn('Albireo: the copy of the records holds discussions or projects that the database lost', found);
+        setDatabaseState('emptied');
+        return;
+      }
+      if (dbState.state === 'emptied') setDatabaseState('');
+      // A new database that lost settings alone took them back from the copy: this tab reads and shows them.
+      if (found && found.settings) await settingsRestored();
+      if (whole) whole();
+      await store.alignCopy({ conversations: state.conversations, projects: state.projects });
+    } catch (e) {
+      console.warn('Albireo: the copy of the records could not be checked', e);
+    }
+  };
+  copyCheck = copyCheck.then(run, run);
+  return copyCheck;
+}
+
+// Brings back the records of the copy that the database lost, and draws the application with them.
+async function restoreFromCopy() {
+  if (dbState.busy) return;
+  dbState.busy = true;
+  renderDatabaseBanner();
+  try {
+    const r = await store.restoreCopy();
+    if (!r) throw new Error('the copy cannot be read');
+    const held = { conversations: state.conversations, projects: state.projects };
+    await reloadLists();
+    keepHeld(held);
+    keepOwnCopies();
+    actionEnded();
+    setDatabaseState('');
+    // The copy follows the database from here, or still offers the records that could not be read.
+    await followCopy();
+    broadcast({ type: 'lists' });
+    broadcast({ type: 'storage' });
+    await settingsRestored();
+    toast(t(r.unread ? 'storageRestoredPartly' : 'storageRestored', {
+      discussions: tn('discussionsCount', r.conversations), projects: tn('projectsCount', r.projects),
+      count: r.unread
+    }), !!r.unread, r.unread ? 12000 : 6000);
+    // As after an import: the documents are indexed, the images described and the discussions named.
+    indexProjects();
+    for (const c of state.conversations) indexAttachments(c).catch(() => {});
+    describePending();
+    namePending();
+  } catch (e) {
+    console.warn('Albireo: the copy of the records could not be restored', e);
+    actionEnded();
+    renderDatabaseBanner();
+    toast(t('storageRestoreFailed'), true);
+  }
+}
+
+// Deletes the copy of the records the database lost, once the user confirmed, and copies the database anew.
+async function dropCopy() {
+  if (dbState.busy) return;
+  if (!await confirmDialog(t('storageDropCopy'), t('storageDropCopyText'))) return;
+  if (!await store.clearCopy()) {
+    toast(t('errStorage'), true);
+    return;
+  }
+  setDatabaseState('');
+  await followCopy();
+  broadcast({ type: 'storage' });
+}
+
+// The banner of the state of the database: what happened, and the actions that keep or bring back the records.
+function renderDatabaseBanner() {
+  const el = ui.databaseBanner;
+  if (!el) return;
+  el.classList.toggle('hidden', !dbState.state);
+  if (!dbState.state) {
+    delete el.dataset.shown;
+    el.replaceChildren();
+    return;
+  }
+  const button = (label, action, primary) => h('button', {
+    class: 'button small' + (primary ? ' primary' : ''), type: 'button', disabled: dbState.busy, onclick: action
+  }, label);
+  const held = heldRecords();
+  const counts = (n, p) => ({ discussions: tn('discussionsCount', n), projects: tn('projectsCount', p) });
+  let text = '';
+  let actions = [];
+  if (dbState.state === 'deleted') {
+    // Once this tab holds nothing more, the database is compared again and the banner leaves.
+    if (!held.conversations.length && !held.projects.length && !dbState.busy) databaseClosed();
+    text = t('storageDeleted', counts(held.conversations.length, held.projects.length));
+    actions = [button(t('storageSaveAgain'), saveHeldAgain, true), button(t('exportAll'), exportHeld)];
+  } else if (dbState.state === 'closed') {
+    text = t('storageClosed', { reason: dbState.reason });
+    actions = [button(t('retry'), retryDatabase, true), button(t('exportAll'), exportHeld)];
+  } else if (dbState.state === 'unopened') {
+    text = t('storageUnopened', { reason: dbState.reason, origin: location.origin });
+    actions = [button(t('retry'), retryDatabase, true), button(t('storageExportCopy'), exportCopy)];
+  } else if (dbState.state === 'emptied') {
+    const f = dbState.found || { conversations: 0, projects: 0, updated: 0 };
+    text = t('storageEmptied', Object.assign(counts(f.conversations, f.projects), {
+      date: f.updated ? new Date(f.updated).toLocaleString(language()) : '-'
+    }));
+    actions = [button(t('storageRestore'), restoreFromCopy, true), button(t('storageExportCopy'), exportCopy),
+      button(t('storageDropCopy'), dropCopy)];
+  }
+  // The banner is drawn again when what it tells changed only, so that its buttons stay under the pointer.
+  const shown = [dbState.state, dbState.busy, text].join('\n');
+  if (el.dataset.shown === shown) return;
+  el.dataset.shown = shown;
+  fill(el, h('span', { class: 'banner-icon', html: icon('info') }), h('span', { class: 'banner-text' }, text),
+    h('span', { class: 'banner-actions' }, actions));
+}
+
+/*
+    The external backup.  The discussions and the projects live in this browser alone, which may delete them, and
+    only an export leaves it: a banner asks for one when discussions or projects changed since the last export and
+    that export is backupEvery old, or, without any export yet, when the oldest of them is.  "Later" postpones the
+    banner by backupPostponed.  An imported file that holds every stored record counts as the export it is
+    (dataTab), and the deletion of everything forgets the last export (clearedSettings).
+*/
+const backupEvery = 10 * 86400000;
+const backupPostponed = 86400000;
+
+/*
+    The time of the last export when the banner of the backup is due, 0 without any export; null while it is not
+    due, and while the banner of the database tells a state that comes first.  A record changed when its time
+    moved: a change that keeps the time of its record, a title or a pin for instance, waits for the next one.
+*/
+function backupDue() {
+  if (dbState.state) return null;
+  const records = state.conversations.concat(state.projects);
+  if (!records.length) return null;
+  const last = Number(state.settings.exportedAt) || 0;
+  const now = Date.now();
+  let changed = 0;
+  let oldest = now;
+  for (const r of records) {
+    changed = Math.max(changed, Number(r.updated) || Number(r.created) || 0);
+    oldest = Math.min(oldest, Number(r.created) || Number(r.updated) || now);
+  }
+  // Nothing changed since the last export, which still holds everything.
+  if (changed <= last) return null;
+  if (now - (last || oldest) < backupEvery || now < (Number(state.settings.exportLater) || 0)) return null;
+  return last;
+}
+
+function renderBackupBanner() {
+  const el = ui.backupBanner;
+  if (!el) return;
+  const last = backupDue();
+  el.classList.toggle('hidden', last === null);
+  if (last === null) {
+    delete el.dataset.shown;
+    el.replaceChildren();
+    return;
+  }
+  const text = last ? t('backupReminder', { date: new Date(last).toLocaleDateString(language()) })
+    : t('backupReminderNever');
+  // As the banner of the database: drawn again when its text changed only.
+  if (el.dataset.shown === text) return;
+  el.dataset.shown = text;
+  fill(el, h('span', { class: 'banner-icon', html: icon('info') }), h('span', { class: 'banner-text' }, text),
+    h('span', { class: 'banner-actions' },
+      h('button', { class: 'button small primary', type: 'button', onclick: exportEverything }, t('backupNow')),
+      h('button', { class: 'button small', type: 'button', onclick: postponeBackup }, t('backupLater'))));
+}
+
+/*
+    Exports everything the database stores to a file, from the Data tab of the settings or from the banner of the
+    backup, and keeps the time of this export, from which the next reminder counts.  Returns whether the file was
+    given to the browser.
+*/
+async function exportEverything() {
+  // The time kept is the one before the records are read: a record saved meanwhile counts as changed since.
+  const at = Date.now();
+  try {
+    download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', await store.exportAll(),
+      'application/json');
+  } catch (e) {
+    // The export reads the database of the browser only: the error is that of the browser, as it is.
+    toast(t('exportFailed', { reason: (e && e.message) || String(e) }), true);
+    return false;
+  }
+  await saveSettings({ exportedAt: at, exportLater: 0 });
+  renderBackupBanner();
+  return true;
+}
+
+async function postponeBackup() {
+  await saveSetting('exportLater', Date.now() + backupPostponed);
+  renderBackupBanner();
 }
 
 function download(name, content, type) {
@@ -469,6 +996,30 @@ function syncMemorySettings() {
   }, 200);
 }
 
+// A record saved or deleted while the copy offers lost records may be one of them: the offer counts again.
+function offerChanged() {
+  if (dbState.state === 'emptied') followCopy();
+}
+
+/*
+    Another tab saved again or restored the records the browser had deleted, deleted their copy or deleted everything:
+    the banner of this tab follows what the database and the copy hold now.
+*/
+function storageChanged() {
+  if (holdingAlone()) databaseClosed();
+  else if (dbState.state === 'emptied') followCopy();
+}
+
+/*
+    A project deleted in another tab leaves the lists of this tab at once, with its discussions outside of it: the
+    lists read again from a database the browser deleted would otherwise keep it (keepHeld).
+*/
+function projectDeleted(id) {
+  state.projects = state.projects.filter((x) => x.id !== id);
+  const held = state.conversations.concat(state.current || [], Array.from(generations.values(), (g) => g.c));
+  for (const c of held) if (c.projectId === id) c.projectId = null;
+}
+
 // A message of another tab.
 function receive(message) {
   if (!message || typeof message !== 'object') return;
@@ -489,6 +1040,10 @@ function receive(message) {
     everythingDeleted();
   } else if (message.type === 'lists') {
     syncLists();
+  } else if (message.type === 'storage') {
+    storageChanged();
+  } else if (message.type === 'projectDeleted' && typeof message.id === 'string') {
+    projectDeleted(message.id);
   } else if (message.type === 'projects') {
     syncProjects();
   } else if (message.type === 'busy' && typeof message.id === 'string' && typeof message.tab === 'string') {
@@ -501,6 +1056,7 @@ function settingChanged(key) {
   if (key === 'theme') applyTheme();
   else if (key === 'language') languageChanged().catch(() => {});
   else if (key === 'userName' || key === 'defaultRole') refreshViews();
+  else if (key === 'exportedAt' || key === 'exportLater') renderBackupBanner();
   if (/^memory/.test(key) && ui.memoryView) ui.memoryView();
 }
 
@@ -578,7 +1134,8 @@ async function applyStored(id) {
   if (deleted.has(id)) return;
   const stored = await store.getConversation(id);
   if (!stored) {
-    if (state.conversations.some((x) => x.id === id)) conversationDeleted(id);
+    // A discussion this tab holds alone (heldConversation) was not deleted elsewhere: the database lost it.
+    if (!heldConversation(id) && state.conversations.some((x) => x.id === id)) conversationDeleted(id);
     return;
   }
   let copy = stored;
@@ -615,6 +1172,7 @@ function conversationDeleted(id) {
   web.forgetPages(id);
   forgetDraft(id);
   state.conversations = state.conversations.filter((x) => x.id !== id);
+  offerChanged();
   afterDeletion(id);
 }
 
@@ -666,6 +1224,9 @@ function everythingDeleted() {
   images.removeAll(waitingImages());
   forgetStoredDrafts();
   for (const id of deleted) web.forgetPages(id);
+  // The projects leave with the discussions, also those a database deleted by the browser left to this tab alone.
+  state.projects = [];
+  storageChanged();
   syncLists().then(() => go('#/'));
 }
 
@@ -679,8 +1240,10 @@ function syncProjects() {
   if (!projectsSync) {
     projectsSync = new Promise((resolve) => setTimeout(resolve, 50)).then(async () => {
       projectsSync = null;
+      const held = { conversations: [], projects: state.projects };
       try {
         state.projects = await store.allProjects();
+        keepHeld(held);
       } catch (e) {
         storageFailed(e);
       }
@@ -688,6 +1251,28 @@ function syncProjects() {
     });
   }
   return projectsSync;
+}
+
+/*
+    Keeps in the lists just read from the database the records of held, the lists of this tab before that reading,
+    that this tab holds alone: the discussions whose last save was refused, as this tab holds them, and the
+    discussions and the projects that a database the browser deleted or closed (dbState) lacks.  They stay in this
+    tab until they are saved again or deleted here.
+*/
+function keepHeld(held) {
+  const alone = holdingAlone();
+  const stored = new Map(state.conversations.map((c, i) => [c.id, i]));
+  for (const c of held.conversations) {
+    if (deleted.has(c.id)) continue;
+    // A discussion whose save was refused stays as this tab holds it, in place of the stored one.
+    if (unsaved.has(c.id) && stored.has(c.id)) state.conversations[stored.get(c.id)] = c;
+    else if (!stored.has(c.id) && (alone || unsaved.has(c.id))) state.conversations.push(c);
+  }
+  state.conversations.sort((a, b) => b.updated - a.updated);
+  if (!alone) return;
+  const kept = new Set(state.projects.map((p) => p.id));
+  for (const p of held.projects) if (!kept.has(p.id)) state.projects.push(p);
+  state.projects.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /*
@@ -701,7 +1286,9 @@ function syncLists() {
   if (!listsSync) {
     listsSync = new Promise((resolve) => setTimeout(resolve, 50)).then(async () => {
       listsSync = null;
+      const held = { conversations: state.conversations, projects: state.projects };
       await reloadLists().catch(storageFailed);
+      keepHeld(held);
       keepOwnCopies();
       refreshViews();
     });
@@ -842,15 +1429,17 @@ function relayCapabilities() {
   const context = r.context || 0;
   return { reasoning: thinking !== 'none', reasoningAlways: thinking === 'always', tools: false, context,
     working: context, read: relayReadRate, write: relayWriteRate, relay: true, webSearch: !!r.web,
+    webPseudonymized: r.provider === 'claude' && !!r.pseudonymize,
     efforts: Array.isArray(r.efforts) ? r.efforts : [], defaultEffort: r.default_effort || '' };
 }
 
 /*
     Why the Web button of a discussion of the relay is off: '' when its external model searches the web itself
-    (Claude) and the service gives the web access, the reason otherwise.
+    (Claude), Pseudalis leaving the names of the texts as they are, and the service gives the web access, the
+    reason otherwise.
 */
 function relayWebUnavailable(caps) {
-  if (!caps.webSearch) return t('relayNoTools');
+  if (!caps.webSearch) return t(caps.webPseudonymized ? 'relayWebPseudonymized' : 'relayNoTools');
   const s = state.status;
   if (!s || !s.web || typeof s.web !== 'object') return t('webUnavailable');
   if (s.web.available) return '';
@@ -1578,6 +2167,9 @@ function searchDialog(kind) {
 
 // Sidebar.
 function renderSidebar() {
+  // The banners of the database and of the backup follow the records of the lists this panel shows.
+  renderDatabaseBanner();
+  renderBackupBanner();
   const scroll = ui.sideScroll;
   scroll.replaceChildren();
   if (state.search.trim()) {
@@ -1813,33 +2405,50 @@ const deleted = new Set();
 
 /*
     Saves a discussion and tells the other tabs.  Returns false when there is nothing to save, or
-    when the database refused it, the user being told; the copy in memory then stays the one of
-    this tab.
+    when the database refused it, which a toast or the banner of the database tells unless quiet
+    is true; the copy in memory then stays the one of this tab.
 */
-async function persist(c) {
+async function persist(c, quiet) {
   if (!c || c.incognito || deleted.has(c.id)) return false;
   // The answer being written is saved once it ends, whole.
-  const g = generations.get(c.id);
-  const live = g && g.turn;
-  const record = live && c.messages.includes(live)
-    ? Object.assign({}, c, { messages: c.messages.filter((x) => x !== live) }) : c;
+  const record = recordOf(c);
   try {
     await store.putConversation(record);
+    if (unsaved.delete(c.id)) guardLeaving();
     // A deletion that came while the discussion was being saved stays.
     if (deleted.has(c.id)) {
       await store.deleteConversation(c.id);
       return false;
     }
   } catch (e) {
-    storageFailed(e);
+    /*
+        The discussion stays in the lists of this tab, where the user finds it after another one is shown; it is
+        saved again once the database answers, and the browser asks before the page is left.
+    */
+    unsaved.add(c.id);
+    listConversation(c);
+    guardLeaving();
+    if (!quiet) {
+      storageFailed(e);
+    } else if (closedConnection(e)) {
+      store.forget();
+      databaseClosed();
+    }
+    retryUnsavedLater();
     return false;
   }
+  listConversation(c);
+  broadcast({ type: 'conversation', id: c.id });
+  offerChanged();
+  return true;
+}
+
+// Puts the discussion c in the list of this tab, in place of its earlier copy, the latest changed first.
+function listConversation(c) {
   const i = state.conversations.findIndex((x) => x.id === c.id);
   if (i >= 0) state.conversations[i] = c;
   else state.conversations.unshift(c);
   state.conversations.sort((a, b) => b.updated - a.updated);
-  broadcast({ type: 'conversation', id: c.id });
-  return true;
 }
 
 async function renameConversation(c) {
@@ -1885,6 +2494,7 @@ async function removeConversation(c) {
   await images.removeOwner(c.id).catch(() => {});
   broadcast({ type: 'deleted', id: c.id });
   state.conversations = state.conversations.filter((x) => x.id !== c.id);
+  offerChanged();
   afterDeletion(c.id);
 }
 
@@ -2444,6 +3054,8 @@ function renderProject(p) {
     } catch (e) {
       // The database is out of reach: the copy of this tab takes the edit.
     }
+    // So does it for a project the browser deleted with its database, which this tab still holds.
+    if (!stored && holdingAlone() && projectById(p.id)) stored = p;
     if (!stored) return;
     if (stored !== p) {
       for (const k of Object.keys(p)) if (!(k in stored)) delete p[k];
@@ -2640,9 +3252,15 @@ function renderProject(p) {
           await images.removeOwner(p.id).catch(() => {});
           if (state.current && state.current.projectId === p.id) state.current.projectId = null;
           for (const g of generations.values()) if (g.c.projectId === p.id) g.c.projectId = null;
+          // The records this tab holds alone stay (keepHeld), the project left out and its discussions outside of it.
+          const held = { conversations: state.conversations, projects: state.projects.filter((x) => x.id !== p.id) };
+          for (const c of held.conversations) if (c.projectId === p.id && holdingAlone()) c.projectId = null;
           await reloadLists().catch(storageFailed);
+          keepHeld(held);
           keepOwnCopies();
+          broadcast({ type: 'projectDeleted', id: p.id });
           broadcast({ type: 'lists' });
+          offerChanged();
           go('#/');
         }
       }))));
@@ -3232,7 +3850,9 @@ async function route() {
     if (!(state.current && state.current.id === m[1])) {
       // A discussion this tab is answering in the background is shown with its answer being written.
       const live = generations.get(m[1]);
-      const c = live ? live.c : deleted.has(m[1]) ? null : await store.getConversation(m[1]).catch(() => null);
+      // A discussion the database lacks while this tab holds it (heldConversation) is shown from the lists.
+      const c = live ? live.c : deleted.has(m[1]) ? null
+        : (await store.getConversation(m[1]).catch(() => null)) || heldConversation(m[1]);
       if (sequence !== routeSequence) return;
       if (!c) { go('#/'); return; }
       leaveCurrent();
@@ -3919,6 +4539,19 @@ function assistantElement(c, m, index, last) {
   return el;
 }
 
+// Writes again the model, the tokens and the speed of the answer m of c in its line, while c is shown.
+function refreshStats(c, m) {
+  const el = answerElement(c, m);
+  // The line of the buttons is a child of the answer; the text of the answer may hold elements of the same classes.
+  const meta = el && el.querySelector(':scope > .meta');
+  if (!meta) return;
+  const text = statsText(m);
+  const stats = meta.querySelector(':scope > .stats');
+  if (stats && text) stats.textContent = text;
+  else if (stats) stats.remove();
+  else if (text) meta.append(h('span', { class: 'stats' }, text));
+}
+
 function statsText(m) {
   const parts = [];
   if (m.model) parts.push(modelName(m.model));
@@ -4535,9 +5168,18 @@ function beginTurn(c) {
   return g.abort;
 }
 
-// A new answer of the discussion c, drawn live from now on.
+/*
+    The model an answer of c comes from now, as the answer keeps it: the external model of the relay by its name, which
+    the answer shows even once the relay changed, else the model of the function of c.
+*/
+function answeringModel(c) {
+  const role = chatRole(c);
+  return role === 'relay' ? 'relay:' + relayName(relayStatus()) : roleModel(role) || '';
+}
+
+// A new answer of the discussion c, drawn live from now on, under the name of the model that writes it.
 function newTurn(c) {
-  const turn = { id: store.uid(), role: 'assistant', steps: [], created: Date.now(), model: roleModel(c.role) || '' };
+  const turn = { id: store.uid(), role: 'assistant', steps: [], created: Date.now(), model: answeringModel(c) };
   c.messages.push(turn);
   const g = generations.get(c.id);
   if (g) g.turn = turn;
@@ -5568,7 +6210,10 @@ async function runTurn(c, abort, turn) {
   // The function, the reasoning and the agent of the answer stay those of its start, the relay included.
   const role = chatRole(c);
   const model = roleModel(role);
-  turn.model = role === 'relay' ? 'relay:' + relayName(relayStatus()) : model || '';
+  // The model may have changed while the question was prepared: the line of the answer then follows it.
+  const shown = turn.model;
+  turn.model = answeringModel(c);
+  if (turn.model !== shown) refreshStats(c, turn);
   const signal = abort.signal;
   const caps = roleCapabilities(role);
   const reasoning = !!(c.reasoning && caps.reasoning);
@@ -7077,6 +7722,25 @@ function dataTab(body, close) {
       for (const id of r.ids) deleted.delete(id);
       broadcast({ type: 'lists' });
       await syncLists();
+      /*
+          A file that holds every stored discussion and project, as recent as stored, is an external backup of the
+          database: the reminder of the backup counts from its time.  A file that holds some of them changes
+          nothing for the others.
+      */
+      const exported = Number(data.exported) || 0;
+      const times = new Map();
+      for (const x of data.conversations.concat(Array.isArray(data.projects) ? data.projects : [])) {
+        if (x && typeof x.id === 'string') times.set(x.id, Number(x.updated) || 0);
+      }
+      const whole = state.conversations.concat(state.projects).every(
+        (x) => times.has(x.id) && times.get(x.id) >= (Number(x.updated) || 0));
+      if (whole && exported > (Number(state.settings.exportedAt) || 0) && exported <= Date.now()) {
+        await saveSettings({ exportedAt: exported });
+      }
+      renderBackupBanner();
+      showStorage(storage);
+      // The records imported may be among those the copy offered.
+      offerChanged();
       toast(t('imported', {
         discussions: tn('discussionsCount', r.conversations), projects: tn('projectsCount', r.projects)
       }));
@@ -7111,13 +7775,16 @@ function dataTab(body, close) {
       h('button', {
         class: 'button', type: 'button', html: icon('download') + '<span>' + escapeHtml(t('exportAll')) + '</span>',
         onclick: async () => {
-          try {
-            download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', await store.exportAll(),
-              'application/json');
-          } catch (e) {
-            // The export reads the database of the browser only: the error is that of the browser, as it is.
-            toast(t('exportFailed', { reason: (e && e.message) || String(e) }), true);
+          // A database that lost its records or does not answer: the export holds what this tab or the copy keeps.
+          if (holdingAlone()) {
+            await exportHeld();
+            return;
           }
+          if (dbState.state === 'unopened') {
+            await exportCopy();
+            return;
+          }
+          if (await exportEverything()) showStorage(storage);
         }
       }),
       h('button', { class: 'button', type: 'button', html: icon('upload') + '<span>' + escapeHtml(t('importAll')) + '</span>', onclick: () => input.click() }),
@@ -7125,6 +7792,11 @@ function dataTab(body, close) {
       h('button', {
         class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('clearAll')) + '</span>',
         onclick: async () => {
+          // A database that does not answer keeps its records: nothing is deleted, and the user is told.
+          if (unanswering()) {
+            toast(t('errStorage'), true);
+            return;
+          }
           if (!await confirmDialog(t('clearAll'), t('clearAllText'))) return;
           // The answers in progress, shown or written in the background, and the work of the background
           // model stop, the stored discussions are not saved again, and the indexing in progress writes
@@ -7152,6 +7824,12 @@ function dataTab(body, close) {
             broadcast({ type: 'setting', key, value: reset[key] });
           }
           await reloadLists().catch(storageFailed);
+          /*
+              A banner on records the browser had deleted, or that their copy offered, follows: they left with the
+              rest.  The comparison also removes what a copy the browser refused to delete still holds.
+          */
+          if (holdingAlone()) databaseClosed();
+          else followCopy();
           close(true);
           go('#/');
         }
@@ -7199,8 +7877,19 @@ async function showStorage(el) {
   if (estimate && estimate.quota) {
     parts.push(t('storageEstimate', { used: formatSize(estimate.usage || 0), quota: formatSize(estimate.quota) }));
   }
+  // The copy of the records that the browser keeps outside of its database (store.js).
+  const copy = await store.copyCounts().catch(() => null);
+  const copied = copy ? t('copyHolds', {
+    discussions: tn('discussionsCount', copy.conversations), projects: tn('projectsCount', copy.projects),
+    images: tn('imagesCount', copy.images)
+  }) : t('copyUnavailable');
+  // The last export of everything, which the reminder of the backup counts from (backupDue).
+  const exported = Number(state.settings.exportedAt) || 0;
   el.dataset.persistent = String(kept);
-  fill(el, h('p', null, h('b', null, t('storageState')), ' ', parts.join(' · ')),
+  fill(el, h('p', null, h('b', null, t('storageState', { origin: location.origin })), ' ', parts.join(' · ')),
+    h('p', { class: 'storage-copy' }, h('b', null, t('copyState')), ' ', copied),
+    h('p', { class: 'storage-backup' }, h('b', null, t('backupState')), ' ',
+      exported ? new Date(exported).toLocaleString(language()) : t('backupNone')),
     kept === true ? null : h('p', { class: 'help storage-hint' }, h('span', { html: icon('info') }), t('storageHint')));
 }
 
@@ -7280,9 +7969,12 @@ async function aboutTab(body, close) {
   } catch (e) {
     // Usage figures are optional.
   }
-  body.append(h('p', { style: { marginTop: '14px' } }, t('createdBy', {
-    author: (s.author || 'Aldric Pierrain') + ' (' + (s.email || 'cydraltechnology@gmail.com') + ')'
-  }) + ' · ' + (s.copyright || 'Copyright (C) 2026 Cydral Technology')),
+  // The publisher: its copyright, its site and the address of its contact, as the service gives them.
+  const website = /^https:\/\/[^\s"'<>]+$/.test(s.website || '') ? s.website : 'https://www.cydral-technology.eu';
+  const contact = /^[^\s@"'<>]+@[^\s@"'<>]+$/.test(s.contact || '') ? s.contact : 'contact@cydral-technology.eu';
+  body.append(h('p', { style: { marginTop: '14px' } }, s.copyright || 'Copyright (C) 2026 Cydral Technology', ' · ',
+    h('a', { href: website, target: '_blank', rel: 'noopener' }, website.replace(/^https:\/\//, '')), ' · ',
+    h('a', { href: 'mailto:' + contact }, contact)),
   h('p', null, h('a', { href: s.project || 'https://github.com/Cydral/Dlib-Transformer-extensions', target: '_blank', rel: 'noopener' }, 'Dlib-Transformer-extensions'),
     ' · ', h('a', { href: '/docs/', target: '_blank' }, t('apiDocs')), ' · ',
     h('a', { href: '#/licenses', onclick: () => close(true) }, t('thirdParty'))));
@@ -7469,6 +8161,10 @@ function buildLayout() {
 
   ui.topbar = h('header', { class: 'topbar' });
   ui.banner = h('div', { class: 'banner hidden', html: icon('incognito') + '<span>' + escapeHtml(t('incognitoBanner')) + '</span>' });
+  // The state of the database of the browser, shown while it lost records or does not answer (renderDatabaseBanner).
+  ui.databaseBanner = h('div', { class: 'banner database hidden', role: 'alert' });
+  // The reminder of the external backup, shown while one is due (renderBackupBanner).
+  ui.backupBanner = h('div', { class: 'banner backup hidden', role: 'status' });
   ui.content = h('div', { class: 'scroller' });
   ui.input = markdownField({ label: t('placeholder') });
   ui.input.value = draft;
@@ -7588,7 +8284,10 @@ function buildLayout() {
   ui.stick = true;
   ui.ownTop = 0;
   ui.content.addEventListener('scroll', threadScrolled, { passive: true });
-  ui.main = h('main', { class: 'main' }, ui.topbar, ui.banner, ui.content, ui.jump, ui.composerWrap);
+  ui.main = h('main', { class: 'main' }, ui.topbar, ui.databaseBanner, ui.backupBanner, ui.banner, ui.content,
+    ui.jump, ui.composerWrap);
+  renderDatabaseBanner();
+  renderBackupBanner();
   app.append(ui.sidebar, ui.main, ui.toasts);
   ui.composerHeight = -1;
   watchComposer();
@@ -7608,6 +8307,9 @@ async function init() {
     }
   });
   let blocked = false;
+  // The error of a database that does not open or whose lists cannot be read, told by the banner once it is built.
+  let unopened = null;
+  store.watchClosed(databaseClosed);
   try {
     await store.open();
     state.settings = Object.assign({}, defaults, await store.getSettings());
@@ -7623,6 +8325,7 @@ async function init() {
     // keeps it open, the application keeps its data in memory, as in an incognito discussion.
     console.warn('Albireo: the database of the browser is unavailable', e);
     blocked = !!e && e.name === 'BlockedError';
+    if (!blocked) unopened = e || new Error('unavailable');
     state.incognito = true;
   }
   // The language of Albireo, when this interface follows it, before the first texts.
@@ -7636,14 +8339,28 @@ async function init() {
   // prunes them only once the lists are read whole.
   const indexed = state.incognito ? [] : await store.chunkDocuments().catch(() => []);
   const pictures = state.incognito ? [] : await store.imageKeys().catch(() => []);
-  if (await reloadLists().then(() => true, () => false)) {
+  let listed = false;
+  try {
+    await reloadLists();
+    listed = true;
+  } catch (e) {
+    // The lists stay empty, and nothing is pruned from what the database holds.
+    console.warn('Albireo: the discussions and the projects of the database cannot be read', e);
+    if (!state.incognito) unopened = e || new Error('unreadable');
+  }
+  if (listed) {
     pruneIndex(indexed).catch(() => {});
     pruneImages(pictures).catch(() => {});
-    if (!state.incognito) pruneDrafts();
   }
   buildLayout();
   guardFileDrops();
   if (blocked) toast(t('dbBlocked'), true, 30000);
+  /*
+      The copy of the records is compared with the database.  The drafts of the discussions the lists lack leave
+      once the database lacks no discussion of the copy: the drafts of those the copy offers wait for them.
+  */
+  if (unopened) setDatabaseState('unopened', unopened);
+  else if (listed && !state.incognito) followCopy(pruneDrafts);
   window.addEventListener('hashchange', route);
   // The text being typed stays when the page is left, reloaded or hidden.
   window.addEventListener('pagehide', () => saveDraft(true));
@@ -7659,6 +8376,8 @@ async function init() {
   */
   await refreshStatus();
   setInterval(refreshStatus, 4000);
+  // A tab that stays open for days reaches the time of the reminder of the external backup.
+  setInterval(renderBackupBanner, 3600000);
   // The documents of the projects without passages are indexed, by their words without an embedding
   // model; with one, the status has already started their indexing.
   if (!rag.embeddingModel()) indexProjects();

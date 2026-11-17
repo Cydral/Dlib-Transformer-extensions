@@ -9,7 +9,9 @@
     sequence, and the throughput of steps that advance several sequences together, with
     the keys and values in half precision (by default) or in 8 bits.  floats computes the
     products of the prompt on floats (qk_set_integer_prompt()) rather than on 8-bit
-    integers.
+    integers.  The sequences that advance together each start from the first tokens of the
+    prompt, 64 of them at most.  prompt_tokens and steps go from 1 to 1048576, and parallel
+    from 1 to 1024.
 */
 
 #include <algorithm>
@@ -41,26 +43,47 @@ int main(int argc, char** argv)
     const long prompt = argc > 3 ? std::atol(argv[3]) : 128;
     const long steps = argc > 4 ? std::atol(argv[4]) : 32;
     const long parallel = argc > 5 ? std::atol(argv[5]) : 4;
+    // The steps and the sequences divide the times, and the bounds keep the sizes below within a long of 32 bits.
+    if (prompt < 1 || prompt > (1L << 20) || steps < 1 || steps > (1L << 20) || parallel < 1 || parallel > 1024)
+    {
+        std::printf("bench_runtime: prompt_tokens and steps go from 1 to 1048576, parallel from 1 to 1024\n");
+        return 2;
+    }
     const kv_format format = argc > 6 && std::string(argv[6]) == "q8" ? kv_format::q8 : kv_format::f16;
     if (argc > 7 && std::string(argv[7]) == "floats") qk_set_integer_prompt(false);
 
     auto file = std::make_shared<model_file>(argv[1]);
     const model_config cfg = read_model_config(*file);
     thread_pool pool(threads);
-    // The keys and values of the prompt and of the steps, and of the parallel sequences.
+    /*
+        The keys and values, which the runtime holds by pages of 256 positions: the pages of the prompt with its
+        steps, and those of the sequences that advance together, each after the first tokens of the prompt, 64 at
+        most.
+    */
+    const long page = 256;
+    const long head = std::min<long>(64, prompt);
     const size_t per_token = 2 * static_cast<size_t>(cfg.n_layers) * static_cast<size_t>(cfg.n_kv_heads)
         * kv_row_bytes(format, cfg.head_dim);
-    const size_t budget = std::max<size_t>(size_t(1) << 30, per_token * static_cast<size_t>(prompt + 2 * steps + 64
-        + parallel * (64 + steps) + 1024));
-    cpu_runtime rt(file, cfg, pool, budget, 256, format);
+    const size_t pages = static_cast<size_t>((prompt + steps + page - 1) / page)
+        + static_cast<size_t>(parallel) * static_cast<size_t>((head + steps + page - 1) / page) + 4;
+    const size_t budget = std::max<size_t>(size_t(1) << 30, per_token * static_cast<size_t>(page) * pages);
+    cpu_runtime rt(file, cfg, pool, budget, page, format);
     std::printf("%s\n", rt.description().c_str());
     file->warm_up(false);
+    // A sequence that the runtime cannot hold ends the measure with its reason.
+    auto reserve = [&rt](int s, long positions) {
+        if (rt.reserve_sequence(s, positions)) return true;
+        std::printf("bench_runtime: the runtime cannot hold the keys and values of a sequence of %ld positions\n",
+            positions);
+        return false;
+    };
 
     // Prompt.
     std::vector<int> tokens(static_cast<size_t>(prompt));
-    for (long i = 0; i < prompt; ++i) tokens[static_cast<size_t>(i)] = static_cast<int>((i * 7919 + 13) % cfg.vocab);
+    for (long i = 0; i < prompt; ++i)
+        tokens[static_cast<size_t>(i)] = static_cast<int>((static_cast<long long>(i) * 7919 + 13) % cfg.vocab);
     const int seq = rt.create_sequence();
-    rt.reserve_sequence(seq, prompt + steps);
+    if (!reserve(seq, prompt + steps)) return 2;
     forward_batch b;
     b.tokens = tokens;
     b.segments.push_back({ seq, 0, prompt });
@@ -85,16 +108,16 @@ int main(int argc, char** argv)
     std::printf("generation: %.2f ms per token, %.1f tokens/s\n", sms, 1000.0 / sms);
     rt.release_sequence(seq);
 
-    // Several sequences advancing together.
+    // Several sequences advancing together, each after the first tokens of the prompt.
     std::vector<int> seqs;
     for (long p = 0; p < parallel; ++p)
     {
         const int s = rt.create_sequence();
-        rt.reserve_sequence(s, 64 + steps);
+        if (!reserve(s, head + steps)) return 2;
         b.clear();
-        b.tokens.assign(tokens.begin(), tokens.begin() + 64);
-        b.segments.push_back({ s, 0, 64 });
-        b.logit_rows.push_back(63);
+        b.tokens.assign(tokens.begin(), tokens.begin() + head);
+        b.segments.push_back({ s, 0, head });
+        b.logit_rows.push_back(head - 1);
         rt.forward(b, logits);
         seqs.push_back(s);
     }

@@ -516,9 +516,14 @@ namespace albireo
         if (first_run) settings_->set(st);
         port_ = st.port;
         apply_network_settings(st);
-        // The publication space, the only source of the downloads, is named without its link.
-        log_info(std::string("publication space: ") + (public_link_enabled() ? "set" : "not set")
-            + (public_link_has_password() ? ", with its password" : ", without password"));
+        // The publication space, first source of the models and only source of the updates, is named without its link.
+        std::string space = public_link_enabled() ? "set" : "not set";
+        space += public_link_has_password() ? ", with its password" : ", without password";
+        // A build without the password file of the publisher (public_link.h).
+        if (public_link_enabled() && !public_link_has_password())
+            space += " (while the link asks for one, the catalog and the models come from their official addresses "
+                "and the updates cannot be read)";
+        log_info("publication space: " + space);
         log_info("web search: " + web_search_provider(st));
 
         const std::string db_path = join_path(data_dir_, "albireo.db");
@@ -2294,8 +2299,12 @@ namespace albireo
         else if (r["enabled"].as_bool(false) && !image_model().empty()) mode = "described";
         r["image_mode"] = mode;
         r["images"] = mode != "none";
-        // Claude searches the web itself when a request asks for it (web_search), the web access allowing it.
-        r["web"] = st.relay.provider == "claude";
+        /*
+            Claude searches the web itself when a request asks for it (web_search), the web access
+            allowing it, unless Pseudalis replaces the names of the texts, which its searches would
+            then look for.
+        */
+        r["web"] = st.relay.provider == "claude" && !st.relay.pseudonymize;
         if (st.relay.enabled && st.relay.pseudonymize && relay_) r["pseudalis"] = relay_->pseudonymization_status();
         return r;
     }
@@ -2322,8 +2331,9 @@ namespace albireo
         s["product"] = ALBIREO_PRODUCT_NAME;
         s["edition"] = ALBIREO_EDITION;
         s["version"] = ALBIREO_VERSION;
-        s["author"] = ALBIREO_AUTHOR_NAME;
-        s["email"] = ALBIREO_AUTHOR_EMAIL;
+        s["publisher"] = ALBIREO_PUBLISHER_NAME;
+        s["website"] = ALBIREO_WEBSITE_URL;
+        s["contact"] = ALBIREO_CONTACT_EMAIL;
         s["copyright"] = ALBIREO_COPYRIGHT;
         s["project"] = ALBIREO_PROJECT_URL;
         s["started_at"] = static_cast<long long>(started_at_);

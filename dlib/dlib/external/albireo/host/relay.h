@@ -94,8 +94,8 @@ namespace albireo
               computer and its local network alone within reach: an "openai" engine whose
               address is "localhost" or a name under .localhost, reached at 127.0.0.1, an IP
               address of the local network (loopback, private or link-local), or a name of the
-              network, which each request resolves, refuses when one of its addresses lies
-              elsewhere, and reaches at an address it checked.  The providers "ollama" and
+              network, which each request resolves (http_resolve_local()), refuses when one of
+              its addresses lies elsewhere, and reaches at an address it checked.  The providers "ollama" and
               "claude" need the Internet.  Otherwise why tells it.
     !*/
     bool relay_offline_ready(const relay_settings& r, std::string& why);

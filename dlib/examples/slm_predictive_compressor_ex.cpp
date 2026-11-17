@@ -401,7 +401,6 @@ void compress_file(const std::string& input_path, const std::string& output_path
     out_bit_stream bit_writer(compressed_data);
 
     matrix<int, 0, 1> window(WINDOW_SIZE, 1);
-    long bits_saved = 0;
     long total_predictions = 0;
     long correct_predictions = 0;
 
@@ -419,13 +418,11 @@ void compress_file(const std::string& input_path, const std::string& output_path
 
         if (predicted_byte == data[i]) {
             bit_writer.write_bit(true);
-            bits_saved += 7;
             correct_predictions++;
         }
         else {
             bit_writer.write_bit(false);
             bit_writer.write_byte(data[i]);
-            bits_saved -= 1;
         }
 
         if ((i - WINDOW_SIZE) % 500 == 0 || i == data.size() - 1)

@@ -78,6 +78,15 @@
 #include <endian.h>
 #endif
 
+/* An undefined name reads as 0 in the test below, which would then choose the big endian order. */
+#if defined(__FreeBSD__)
+#if !defined(_BYTE_ORDER) || !defined(_BIG_ENDIAN)
+#error "picopltf.h: sys/endian.h defines no _BYTE_ORDER or no _BIG_ENDIAN"
+#endif
+#elif !defined(__BYTE_ORDER) || !defined(__BIG_ENDIAN)
+#error "picopltf.h: the byte order header of this platform defines no __BYTE_ORDER or no __BIG_ENDIAN"
+#endif
+
 #if __BYTE_ORDER == __BIG_ENDIAN
 #define PICO_ENDIANNESS ENDIANNESS_BIG
 #else

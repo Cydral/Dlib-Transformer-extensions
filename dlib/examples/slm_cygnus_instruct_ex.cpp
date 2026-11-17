@@ -194,7 +194,7 @@ void build_sft_samples(
 void display_sample_questions(size_t num_samples = 3)
 {
     try {
-        auto qa = get_dataset_as_pairs({ dataset_id::BLACK_HOLE_QA_PARTA });
+        auto qa = get_dataset_as_pairs(dataset_id::BLACK_HOLE_QA_PARTA);
         if (qa.empty()) return;
         dlib::rand rng(std::time(0));
         cout << "Sample questions the model was tuned on:\n";

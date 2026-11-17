@@ -478,6 +478,21 @@ a { color: var(--blue); }
 .toast.error { background: var(--danger); color: white; }
 .banner { display: flex; align-items: center; gap: 10px; justify-content: center; padding: 7px 12px; font-size: 13px; background: var(--incognito); color: white; }
 .banner svg { width: 16px; height: 16px; }
+/* The banners that carry actions: the state of the database of the browser, with the actions that keep or bring back
+   the records, and the reminder of the external backup. */
+.banner.database, .banner.backup { flex-wrap: wrap; row-gap: 6px; justify-content: flex-start; line-height: 1.4; }
+.banner.database { background: var(--danger); }
+.banner.backup { background: var(--mark); color: var(--text); border-bottom: 1px solid var(--border); }
+.banner .banner-icon { display: inline-flex; flex: none; }
+.banner .banner-text { flex: 1 1 320px; min-width: 0; }
+.banner .banner-actions { display: inline-flex; gap: 8px; flex-wrap: wrap; flex: none; }
+.banner.database .button.small, .banner.backup .button.small {
+  color: var(--text); background: var(--bg-elevated); border-color: transparent;
+}
+.banner.database .button.small.primary, .banner.backup .button.small.primary {
+  background: var(--text); color: var(--bg);
+}
+.banner.database .button.small:disabled { opacity: 0.6; cursor: default; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 14px; font-size: 13.5px; }
 .kv div:nth-child(odd) { color: var(--text-faint); }
 /* The tokens of each day, those read under those generated, with the dates of the first and last days under them. */

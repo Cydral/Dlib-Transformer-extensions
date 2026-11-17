@@ -12,8 +12,6 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <sys/socket.h>
 #endif
 
@@ -368,8 +366,12 @@ namespace albireo
             return host;
         }
 
-        // The addresses of the name host, as the resolver of the system gives them.
-        std::vector<std::string> resolve_name(const std::string& host)
+        /*
+            The addresses of the name host, which the resolver of the system gives within the bound
+            of http_resolve_local(), whatever the cancellation of the downloads; empty with error
+            when the name has none.
+        */
+        std::vector<std::string> resolve_name(const std::string& host, std::string& error)
         {
             {
                 std::lock_guard<std::mutex> lock(origins_m);
@@ -377,28 +379,7 @@ namespace albireo
                 if (it != test_names.end()) return it->second;
             }
             std::vector<std::string> addresses;
-            addrinfo hints = {};
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-            addrinfo* found = nullptr;
-            if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0 || !found) return addresses;
-            for (const addrinfo* a = found; a; a = a->ai_next)
-            {
-                char text[INET6_ADDRSTRLEN] = {};
-                const void* bytes = nullptr;
-                unsigned long zone = 0;
-                if (a->ai_family == AF_INET) bytes = &reinterpret_cast<const sockaddr_in*>(a->ai_addr)->sin_addr;
-                else if (a->ai_family == AF_INET6)
-                {
-                    const sockaddr_in6* v6 = reinterpret_cast<const sockaddr_in6*>(a->ai_addr);
-                    bytes = &v6->sin6_addr;
-                    zone = static_cast<unsigned long>(v6->sin6_scope_id);
-                }
-                // A link-local address keeps its zone, the interface the connection leaves by.
-                if (bytes && inet_ntop(a->ai_family, bytes, text, sizeof(text)))
-                    addresses.push_back(zone ? std::string(text) + "%" + std::to_string(zone) : std::string(text));
-            }
-            freeaddrinfo(found);
+            if (!http_resolve_local(host, addresses, error)) addresses.clear();
             return addresses;
         }
 
@@ -468,10 +449,13 @@ namespace albireo
                 return true;
             }
             const bool literal = address_literal(host);
-            const std::vector<std::string> addresses = literal ? std::vector<std::string>{ host } : resolve_name(host);
+            std::string error;
+            const std::vector<std::string> addresses = literal ? std::vector<std::string>{ host }
+                : resolve_name(host, error);
             if (addresses.empty())
             {
-                why = "offline mode: the name of the engine has no address on this network";
+                why = "offline mode: the name of the engine is not resolved on this network"
+                    + (error.empty() ? std::string() : ": " + error);
                 code = "relay_offline_unresolved";
                 return false;
             }
@@ -1228,6 +1212,10 @@ namespace albireo
                 return refuse(400, "web_search_not_supported", "the search of the web of the relay takes Claude, which "
                     "searches the web itself");
             if (!st.web_access) return refuse(403, "web_access_off", "the administrator turned the web access off");
+            // Pseudalis replaces the names before they leave: the searches would look for its substitutes.
+            if (st.relay.pseudonymize)
+                return refuse(400, "web_search_pseudonymized", "the relay pseudonymizes the texts with Pseudalis: a "
+                    "search of the web would look for its substitutes rather than for the names of the question");
         }
         if (request["n"].as_int(1) != 1)
             return refuse(400, "invalid_value", "only one choice per request (n = 1) is supported");
@@ -1437,7 +1425,8 @@ namespace albireo
             else reasoning_off = true;
         }
         const bool claude = r.provider == "claude";
-        const bool web = claude && request["web_search"].as_bool(false) && st.web_access;
+        // The settings of the answer itself: the web access and the pseudonymization may have changed since submit().
+        const bool web = claude && request["web_search"].as_bool(false) && st.web_access && !r.pseudonymize;
         const json body = claude ? claude_body(m, msgs, request, effort, web)
                                  : openai_body(r, m, msgs, request, effort, reasoning_off);
         msgs.clear();
@@ -1818,7 +1807,8 @@ namespace albireo
         // One line per answer, its provider, its model and its tokens, never its texts.
         log_info("relay: " + r.provider + " " + m.id + ", " + std::to_string(prompt_tokens) + " tokens read, "
             + std::to_string(completion_tokens) + " written"
-            + (web_searches > 0 ? ", " + std::to_string(web_searches) + " searches of the web" : std::string()));
+            + (web_searches > 0 ? ", " + std::to_string(web_searches) + (web_searches == 1 ? " search" : " searches")
+                + " of the web" : std::string()));
         j->sink(ALBIREO_EVENT_DONE, done.dump());
         j->done = true;
     }

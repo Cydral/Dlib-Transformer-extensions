@@ -182,7 +182,6 @@ namespace dlib
             if (length == 0) return false;
 
             size_t printable_count = 0;
-            size_t whitespace_count = 0;
             size_t control_count = 0;
 
             for (size_t i = 0; i < length; ++i)
@@ -192,7 +191,6 @@ namespace dlib
                 // Common whitespace characters
                 if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
                 {
-                    whitespace_count++;
                     printable_count++;
                 }
                 // Printable ASCII range

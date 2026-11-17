@@ -230,6 +230,12 @@ int main(int argc, char** argv)
     std::vector<int> tokens;
     for (; arg < argc; ++arg) tokens.push_back(std::atoi(argv[arg]));
     const long T = static_cast<long>(tokens.size());
+    // The checks cut the sequence into passes and steps, and share a block of 16 positions that a token follows.
+    if (T < 17)
+    {
+        std::printf("test_runtime: the checks need 17 token ids at least\n");
+        return 2;
+    }
 
     auto file = std::make_shared<model_file>(argv[1]);
     const model_config cfg = read_model_config(*file);

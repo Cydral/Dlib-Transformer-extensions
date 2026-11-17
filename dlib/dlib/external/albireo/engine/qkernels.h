@@ -136,7 +136,13 @@ namespace albireo
         the weights are expanded to floats and multiplied with the activations as they
         are.  Below this number, the activations are quantized and the integer kernels
         compute each dot product from the compact weights, which is what a generation step,
-        bound by the reading of the weights, needs.
+        bound by the reading of the weights, needs.  The answers of a pass hold one token
+        less than this number at most with their drafts (draft_pass_tokens, engine.cpp): a
+        pass of answers alone then stays on the integer kernels, which compute each token as
+        a step of its own does, and a lower number shortens the drafts by as much.  On two
+        cores of an x86 processor, the panels of Q4_K and Q6_K take less time than the
+        integer kernels from five tokens on, and the products of floats of Q8_0 in a build
+        for AVX2 from twelve (README.md).
     !*/
     const long qk_float_product_tokens = 8;
 

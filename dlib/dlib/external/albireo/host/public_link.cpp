@@ -29,6 +29,9 @@ namespace albireo
         const int api_read_seconds = 20;
         const int api_total_seconds = 60;
 
+        // The result of the interface for a protected link asked without password.
+        const long long password_asked = 2258;
+
         // The password, unmasked by the generator the configuration masked it with.
         std::string link_password()
         {
@@ -240,6 +243,9 @@ namespace albireo
             {
                 error = "the publication space of Albireo answers \"" + quoted(a["error"].as_string()) + "\" ("
                     + std::to_string(result) + ") for " + path;
+                // A service built without the password file: the message tells that the build is the cause.
+                if (result == password_asked && password.empty())
+                    error += ", and this build carries no password for it";
                 return false;
             }
             return true;
@@ -463,8 +469,8 @@ namespace albireo
             const size_t scheme = out.find("://", from);
             if (scheme == std::string::npos) break;
             size_t end = scheme + 3;
-            while (end < out.size() && out[end] != ' ' && out[end] != '\t' && out[end] != '\n' && out[end] != '"'
-                && out[end] != '\'')
+            while (end < out.size() && out[end] != ' ' && out[end] != '\t' && out[end] != '\n' && out[end] != '\r'
+                && out[end] != '"' && out[end] != '\'')
                 ++end;
             // The punctuation that follows an address in a message, "<address>: status 404", is not part of it.
             while (end > scheme + 3 && (out[end - 1] == ':' || out[end - 1] == ',' || out[end - 1] == ';'

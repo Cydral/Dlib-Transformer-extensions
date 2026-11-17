@@ -393,9 +393,9 @@ int main(int argc, char** argv)
         space_catalog adds dist/catalog.json, the signed catalog of the repository, with its
         signature (1) or with another one (2).  The official addresses of the catalogs lie under
         /official/ (official_files below).  protected_link makes the interface answer as a link
-        whose password is refused, and the faults make a method or the content server answer as a
-        proxy, a filter of the network or a damaged server would; reset_port is the server that
-        resets its connections.
+        whose password is refused, password_wanted as a protected link asked without password,
+        and the faults make a method or the content server answer as a proxy, a filter of the
+        network or a damaged server would; reset_port is the server that resets its connections.
     */
     const std::string feed_copy = "{\"feed\": 1}";
     const std::string linked = blob(250000, 'l');
@@ -414,7 +414,7 @@ int main(int argc, char** argv)
     };
     std::atomic<int> listings{0}, addresses{0}, password_mismatch{0}, official_requests{0}, listing_requests{0};
     std::atomic<int> space_catalog{0};
-    std::atomic<bool> protected_link{false};
+    std::atomic<bool> protected_link{false}, password_wanted{false};
     enum fault
     {
         no_fault, html_200, html_403, proxy_407, truncated_json, stall, trickle, metadata_array, result_string,
@@ -474,6 +474,11 @@ int main(int argc, char** argv)
         if (protected_link)
         {
             res.set_content("{\"result\": 1125, \"error\": \"Invalid 'linkpassword' provided.\"}", "application/json");
+            return true;
+        }
+        if (password_wanted && !req.has_param("linkpassword"))
+        {
+            res.set_content("{\"result\": 2258, \"error\": \"This link is password protected.\"}", "application/json");
             return true;
         }
         return false;
@@ -1026,6 +1031,11 @@ int main(int argc, char** argv)
             == "models/tiny/Tiny-Q4.gguf", "the copy of a file of a model lies in the folder of its identifier");
         check(albireo::without_queries("https://example.org/search?q=X&key=Y: status 500")
             == "https://example.org/search: status 500", "the queries of the addresses stay out of the messages");
+        check(albireo::without_queries("\"https://a.example/x?k=1\" then 'https://b.example/y?k=2'\t"
+            "https://c.example/z?k=3\r\nhttps://d.example/w?k=4, https://e.example/v")
+            == "\"https://a.example/x\" then 'https://b.example/y'\thttps://c.example/z\r\nhttps://d.example/w, "
+            "https://e.example/v",
+            "each address of a message loses its query, whatever ends it: a quotation mark, a tab or an end of line");
 
         /*
             The downloads: the copy of the space first, its official address for a part the space lacks, holds at
@@ -1152,6 +1162,21 @@ int main(int argc, char** argv)
         check(!ok && error == "the publication space of Albireo answers \"Invalid 'linkpassword' provided.\" (1125) "
             "for dist/feed.json", "a refused password is reported without the query (" + error + ")");
         protected_link = false;
+
+        // A protected link: it serves the build that carries its password, and tells the other that it carries none.
+        password_wanted = true;
+        albireo::public_link_for_tests(link);
+        body.clear();
+        error.clear();
+        ok = albireo::public_link_get("dist/feed.json", body, error, 1u << 20);
+        if (albireo::public_link_has_password())
+            check(ok && body == feed_copy,
+                "a protected link serves the build that carries its password (" + error + ")");
+        else
+            check(!ok && error == "the publication space of Albireo answers \"This link is password protected.\" "
+                "(2258) for dist/feed.json, and this build carries no password for it",
+                "a protected link tells a build without password that it carries none (" + error + ")");
+        password_wanted = false;
         albireo::public_link_for_tests("");
     }
 
@@ -1925,7 +1950,7 @@ int main(int argc, char** argv)
             std::lock_guard<std::mutex> lock(seen_m);
             check(seen_query == "Einstein relativit\xc3\xa9" && seen_count == "5"
                 && seen_agent == std::string("Albireo/") + ALBIREO_VERSION
-                + " (https://github.com/Cydral/Dlib-Transformer-extensions; cydraltechnology@gmail.com)",
+                + " (https://github.com/Cydral/Dlib-Transformer-extensions; contact@cydral-technology.eu)",
                 "Wikipedia receives the query, the count and the User-Agent with a contact (" + seen_agent + ")");
         }
         search_request["query"] = "too many";
@@ -2536,6 +2561,7 @@ int main(int argc, char** argv)
         }
         const json searched_done = json::parse_or_null(a->done);
         const json tool = static_cast<const json&>(body)["tools"][0];
+        const std::string searched_text = a->content + " | " + a->reasoning;
         const bool searched = answered && tool["type"].as_string() == "web_search_20250305"
             && tool["max_uses"].as_int() == 5
             && a->content
@@ -2551,9 +2577,18 @@ int main(int argc, char** argv)
             std::lock_guard<std::mutex> lock(settings_m);
             hs.web_access = true;
         }
-        check(searched && web_off, "Claude searches the web when the request asks for it, its query shown with the "
-            "reasoning and its source as a link after the text, and the web access turned off refuses it ("
-            + a->content + " | " + a->reasoning + ")");
+        // Pseudalis replaces the names before they leave: the searches would look for its substitutes.
+        set_relay([&](albireo::relay_settings& r) {
+            r.provider = "claude";
+            r.model = "claude-opus-5-5";
+            r.secret = key;
+            r.pseudonymize = true;
+        });
+        const bool pseudonymized = !ask(searching, a, status, code) && status == 400
+            && code == "web_search_pseudonymized";
+        check(searched && web_off && pseudonymized, "Claude searches the web when the request asks for it, its query "
+            "shown with the reasoning and its source as a link after the text, and the web access turned off or the "
+            "pseudonymization of the relay refuses it (" + searched_text + ")");
 
         // Ollama: the reasoning of a model that turns it on or off, the image as is.
         set_relay([&](albireo::relay_settings& r) {
@@ -2599,6 +2634,16 @@ int main(int argc, char** argv)
             Internet and a public address are refused before any connection.
         */
         albireo::http_cancel_all("offline mode");
+        {
+            // The names of the offline relay resolve whatever the cancellation of the downloads.
+            std::vector<std::string> local_addresses, download_addresses;
+            std::string local_error, download_error;
+            const bool local = albireo::http_resolve_local("localhost", local_addresses, local_error);
+            const bool download = albireo::http_resolve("localhost", download_addresses, download_error);
+            check(local && !local_addresses.empty() && !download,
+                "offline, the names of the relay resolve while the downloads are cancelled (" + local_error + " | "
+                + download_error + ")");
+        }
         set_relay([&](albireo::relay_settings& r) {
             r.provider = "openai";
             r.url = origin + "/v1";

@@ -2496,9 +2496,9 @@ namespace albireo
                 title = add(ui::label(hwnd, widen(ALBIREO_FULL_NAME), IDC_A_TITLE), ui::font_kind::title);
                 const std::wstring body = tr("about_version", { { "v", ALBIREO_VERSION }, { "e", ALBIREO_EDITION } })
                     + L"\n\n"
-                    + tr("about_built") + L"\n"
-                    + tr("about_created", { { "a", ALBIREO_AUTHOR_NAME " (" ALBIREO_AUTHOR_EMAIL ")" } }) + L"\n\n"
-                    + tr("about_license") + L"\n" + widen(ALBIREO_COPYRIGHT);
+                    + tr("about_built") + L"\n\n"
+                    + tr("about_license") + L"\n" + widen(ALBIREO_COPYRIGHT) + L"\n"
+                    + widen(ALBIREO_WEBSITE_URL) + L" \u00B7 " + widen(ALBIREO_CONTACT_EMAIL);
                 text = add(ui::label(hwnd, body, IDC_A_TEXT));
                 project = add(ui::button(hwnd, tr("btn_project"), IDC_A_PROJECT));
                 docs = add(ui::button(hwnd, tr("tray_docs"), IDC_A_DOCS));

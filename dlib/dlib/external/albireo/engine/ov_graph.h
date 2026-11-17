@@ -82,6 +82,20 @@ namespace albireo
         */
         bool single_precision = false;
         /*
+            The other devices keep the default of their plugin, which rounds the inputs in half
+            precision of its products to 8 bits (dynamic quantization), for the tests that measure
+            what it changes.  Otherwise the graph turns it off.  That default of the plugin of the
+            graphics processors (OpenVINO 2026.4.1) is one scale per token with systolic arrays
+            (XMX), in the passes of more than 64 tokens, and one scale per group of 32 values
+            without, in the kernel of the 4-bit products of an integrated graphics processor and in
+            the passes of more than 240 tokens.  The graph multiplies the unsigned 4-bit values of
+            Q4_K and adds the product of the negated minimums with the sums of the inputs, the first
+            about twice the whole product, and the rounding of its inputs is not cancelled by the
+            second: Qwen3-VL 4B departed from the processor runtime at the last token of a pass of
+            256 tokens (README.md).
+        */
+        bool dynamic_quantization = false;
+        /*
             A folder where the graph is written once built and read back with its weights mapped
             from their file, which the runtime deletes when it no longer needs it (at once on
             Linux, when the model leaves on Windows), or when the graph fails.  The plugins copy the

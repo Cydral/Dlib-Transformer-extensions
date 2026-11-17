@@ -1734,13 +1734,14 @@ namespace setup
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "albireo-setup.exe")) + L"\"";
         str(L"DisplayName", widen(ALBIREO_FULL_NAME));
         str(L"DisplayVersion", widen(ALBIREO_VERSION));
-        str(L"Publisher", widen(ALBIREO_AUTHOR_NAME));
+        str(L"Publisher", widen(ALBIREO_PUBLISHER_NAME));
         str(L"DisplayIcon", widen(join_path(program_dir, "albireo-tray.exe")) + L",0");
         str(L"InstallLocation", dir);
         str(L"UninstallString", setup + L" /uninstall");
         str(L"QuietUninstallString", setup + L" /uninstall /silent");
-        str(L"URLInfoAbout", widen(ALBIREO_PROJECT_URL));
+        str(L"URLInfoAbout", widen(ALBIREO_WEBSITE_URL));
         str(L"HelpLink", widen(ALBIREO_PROJECT_URL));
+        str(L"Contact", widen(ALBIREO_CONTACT_EMAIL));
         str(L"Comments", L"Local language models, based on the open source Dlib-Transformer-extensions library");
         time_t now = time(nullptr);
         tm t;
