@@ -27,12 +27,11 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The models of the machine and of the catalog: the catalog published in the
-                folder dist of the publication space (public_link.h), a signed JSON document
+                folder of the versions on the website (distribution.h), a signed JSON document
                 listing the models, their descriptions in each language, their files and
-                their hashes, the official source of each model among them, read from the
-                space, or from its official address in the repository of Albireo when the
-                space does not serve it; the installed models, the downloads in progress and
-                the imports from removable media.
+                their hashes, with the official address of each file on the hub of the models,
+                read from that folder alone; the installed models, the downloads in progress
+                and the imports from removable media.
 
             MODELS THAT READ IMAGES
                 Such a model comes as two GGUF files: its decoder, and a projector
@@ -57,27 +56,27 @@ namespace albireo
                 a hash that still fails or a model the database cannot record leaves
                 neither file under its final name.
 
-                Each segment comes first from the copy of its part in the publication space,
-                models/<identifier>/<file name of the official address of the part>: four
-                attempts, the first with the address of the cache, the next ones with a new
-                one, and a part the listing lacks is looked for once more in a new listing.
-                When the space does not serve the segment, it comes from the official address
-                of its part, the "url" of the catalog, with the same ranges, from where the
-                segment stopped, in three attempts separated by pauses that a cancellation
-                ends; an answer that announces the part at another size than the catalog ends
-                its attempt before any byte is written.  Once the space is not set, does not
-                answer or refuses the requests for a segment, the other segments of the
-                download go to their official addresses at once.  A part the space does not
-                hold, holds at another size, or whose bytes from the space fail its hash goes
-                there with all its segments.  The log tells each of these changes of source
-                once: the download continues from the official address it names, with the
-                failure of the space.  When the official address fails as well, the download
-                ends in error with the code download_failed, whose message ("e") names the
-                file in the space, the failure of the space, the official address and its
-                failure.  The messages and the log name the official addresses, which are
-                public, and never an address of the space.  The hashes of the catalog check
-                the bytes, whatever source served them.  An exception of a transfer fails the
-                download and never leaves its thread.
+                Each segment comes from the official address of its part, the "url" of the
+                catalog, and from nowhere else: its range from where the segment stopped, in
+                three attempts separated by pauses that a cancellation ends; an answer that
+                announces the part at another size than the catalog ends its attempt before
+                any byte is written.  When the address fails, the download ends in error with
+                the code download_failed, whose message ("e") names the address and its
+                failure, the query of the address left out; the progress stays, and the next
+                download resumes it.  The hashes of the catalog check the bytes.  An exception
+                of a transfer fails the download and never leaves its thread.
+
+                An official address that no longer publishes its file (http_withdrawn(): the
+                file, its repository or its revision was deleted, made private or withdrawn)
+                ends the download once a second answer confirms the first, with the code
+                download_unavailable, whose values name the model ("m"), the address ("url")
+                and the status of its answer ("status"); the other transfers of the download
+                stop there.  The progress and the partial files of such a download are
+                dropped, and the database keeps the address for seven days (withdrawn()), so
+                that the service does not ask for a default model again at each start: the
+                model cannot be downloaded, nor serve a function, until a catalog names
+                another address for it.  A download asked through the interface tries the
+                address again.  A model already installed stays as it is.
 
             OFFLINE INSTALLATION
                 import_path() installs the GGUF files of the import folder of the data
@@ -134,16 +133,12 @@ namespace albireo
 
         /*!
             ensures
-                - Reads the catalog and its signature from the folder dist of the publication
-                  space, or from their official address in the repository of Albireo when
-                  the space is not set, does not hold them, does not answer, or gives a
-                  catalog whose signature fails, and checks the signature of either.  The
-                  log tells which source served it.
+                - Reads the catalog and its signature from the folder of the versions on the
+                  website (distribution.h), and checks the signature.
                 - Keeps the last valid catalog, and the one in use when the fetched one was
                   published before it.
-                - Returns false with error when neither source gives a valid catalog: error
-                  names the failure of the space, the official address and its failure.  A
-                  service that stops or goes offline asks no other source.
+                - Returns false with error when the website gives no valid catalog: error
+                  names the address and its failure.  The catalog in use stays.
         !*/
         bool refresh_catalog(std::string& error);
         // The same on a thread of its own, one refresh at a time; the caller never waits.
@@ -189,6 +184,14 @@ namespace albireo
                   (builtin_installed, naming that model).
         !*/
         bool start_download(const std::string& id, user_error& error);
+        /*!
+            ensures
+                - Returns true when a download of the catalog entry ended because an official
+                  address no longer publishes its file (download_unavailable), within the last
+                  seven days, no download of it succeeded since, and the entry still names
+                  that address.  why, when given, then receives the error of that download.
+        !*/
+        bool withdrawn(const json& entry, user_error* why = nullptr) const;
         // Shows a download of id that could not start, with its error, until one starts.
         void note_failure(const std::string& id, const user_error& error);
         void cancel_download(const std::string& id);
@@ -456,16 +459,6 @@ namespace albireo
 
     // The inputs of a catalog entry: those it names, with "image" only when it names a projector.
     json entry_inputs(const json& entry);
-
-    /*!
-        Reserved for the tests (tests/test_host.cpp), which serve the catalog from a local
-        server.  No setting and no route reaches it.
-        ensures
-            - model_manager::refresh_catalog() reads the catalog at url and its signature at
-              url + ".sig" in place of their official address; an empty url gives the official
-              address back.
-    !*/
-    void official_catalog_for_tests(const std::string& url);
 
 }
 

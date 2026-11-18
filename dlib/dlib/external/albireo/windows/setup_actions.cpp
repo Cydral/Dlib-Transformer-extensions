@@ -1562,8 +1562,6 @@ namespace setup
         if (!secure_parents(dir, error) || !secure_folder(dir, error, !content_checked)) return false;
         for (const char* sub : { "logs", "import", "certificates" }) make_dirs(join_path(dir, sub));
         std::lock_guard<std::mutex> lock(log_m);
-        // The lines an installer before this one copied from the log of the service.
-        hide_publication_space_in_file(join_path(join_path(dir, "logs"), "setup.log"));
         log_ready = true;
         append_log(std::string());
         return true;
@@ -1734,7 +1732,8 @@ namespace setup
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "albireo-setup.exe")) + L"\"";
         str(L"DisplayName", widen(ALBIREO_FULL_NAME));
         str(L"DisplayVersion", widen(ALBIREO_VERSION));
-        str(L"Publisher", widen(ALBIREO_PUBLISHER_NAME));
+        // The entry names no publisher: the one the versions up to 1.0.24 wrote there leaves it.
+        RegDeleteValueW(k, L"Publisher");
         str(L"DisplayIcon", widen(join_path(program_dir, "albireo-tray.exe")) + L",0");
         str(L"InstallLocation", dir);
         str(L"UninstallString", setup + L" /uninstall");
@@ -2550,10 +2549,8 @@ namespace setup
 
     void log(const std::string& line)
     {
-        // The lines of the log of the service it copies included, which a version before this one wrote.
-        const std::string hidden = without_publication_space(line);
         std::lock_guard<std::mutex> lock(log_m);
-        append_log(iso_time(now_unix()) + " " + hidden + "\n");
+        append_log(iso_time(now_unix()) + " " + line + "\n");
     }
 
     void flush_log()

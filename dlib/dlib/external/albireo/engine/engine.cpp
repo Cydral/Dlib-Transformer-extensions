@@ -539,6 +539,9 @@ namespace albireo
                   the setting of the evaluations of their authors, top-p 0.95 and top-k 20;
                 - Granite 4.2: temperature 1 and top-p 0.95 for every task, with and without
                   reasoning, without top-k;
+                - the distilled DeepSeek-R1 models: temperature 0.6, in the range of 0.5 to 0.7
+                  their authors advise against repetitions and incoherent answers, and top-p
+                  0.95, without top-k;
                 - Ministral 3: temperature 0.1; Devstral and the other Mistral models without
                   reasoning: temperature 0.15; without top-p or top-k;
                 - the other models: temperature 0.6, top-p 0.95 and top-k 20 when they reason,
@@ -611,6 +614,12 @@ namespace albireo
             else if (format == "granite4")
             {
                 p.temperature = 1.0f;
+                p.top_p = 0.95f;
+                p.top_k = 0;
+            }
+            else if (format == "deepseek")
+            {
+                p.temperature = 0.6f;
                 p.top_p = 0.95f;
                 p.top_k = 0;
             }

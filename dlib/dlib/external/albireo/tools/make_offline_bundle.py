@@ -9,24 +9,28 @@ from a disk or a memory card.
                                    [--complete <albireo-setup.exe>] [--from <folder>]...
                                    [--dist <folder>] [--sign <albireo-sign> | --no-verify]
 
-The bundle holds the signed catalog and the signed update feed of dist/albireo, the installer
-the feed announces, and in its models folder the models chosen, each model that reads images
-with its projector: by default the default language model and the default embedding model of
-the catalog, which the search in the documents needs.  The installer is taken from --installer
-when given, else downloaded from the folder dist of the public link, under the name the feed gives
-it there (public_link.py), the only source of the installers.  --complete adds the complete
-installer of the version, which carries the models that come with Albireo: the default models
-are then left out, unless --models or --all name models; each model is taken from the folders
-of --from when one of their files has its size and its SHA-256, else downloaded from the
-addresses of the catalog.  Every file is checked against the hashes of the signed files before
-it enters the bundle, and the complete installer must carry the version of the feed.  The
-signatures are checked with albireo-sign (--sign, else build-albireo/bin of the repository,
-else the PATH); the program stops when it is not found, unless --no-verify leaves that check to
-the service.  A download stops when the server sends more than the feed or the catalog
-announces.
+The bundle holds the signed catalog and the signed update feed that the website serves in the
+folder of the versions (ALBIREO_DISTRIBUTION_URL of common/version.h), or those of the folder
+--dist names, the folder of the publication of the chain of the website for instance
+(~/work/cydral-website/releases/files/albireo/dist); the installer the feed announces; and in
+its models folder the models chosen, each model that reads images with its projector: by
+default the default language model and the default embedding model of the catalog, which the
+search in the documents needs.  The installer is taken from --installer when given, else from
+the folder of --dist when it holds it, else downloaded from the folder of the versions on the
+website, under the name the feed gives it there.  --complete adds the complete installer of the
+version, which carries the models that come with Albireo: the default models are then left out,
+unless --models or --all name models; each model is taken from the folders of --from when one
+of their files has its size and its SHA-256, else downloaded from the addresses of the catalog.
+The installer of the updates and the files of the models are checked against the hashes of the
+signed files before they enter the bundle, the complete installer must carry the version of the
+feed, and the signed files enter the bundle once its installer is there.  The signatures are
+checked with albireo-sign (--sign, else build-albireo/bin of the repository, else the PATH); the
+program stops when it is not found, unless --no-verify leaves that check to the service.  A
+download stops when the server sends more than the feed or the catalog announces.
 
 The bundle is used in one of three ways:
-- albireo-setup-<version>.exe started from the bundle installs Albireo, and the service
+- its installer, albireo-setup-complete-<version>.exe when --complete added it, else
+  albireo-setup-online-<version>.exe, started from the bundle installs Albireo, and the service
   installs the catalog and the models at its first start;
 - the Import button of the Models window, given the folder of the bundle, installs the
   catalog, the models and the update of an installed copy;
@@ -42,7 +46,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 import zlib
 
@@ -50,7 +56,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import make_feed  # noqa: E402
-import public_link  # noqa: E402
 import publish_release  # noqa: E402
 
 README = """Albireo {version}, offline bundle of {date}
@@ -85,15 +90,13 @@ la minute. La mise à jour s'installe au prochain démarrage du service.
 """
 
 
-def download(url, out, expected_size, gzip_part=False, label="", whole=None, compressed_size=None, shown=None):
+def download(url, out, expected_size, gzip_part=False, label="", whole=None, compressed_size=None):
     """Writes the content of url to the open file out, inflated when gzip_part, and returns
     the SHA-256 and the size of what was written; whole also receives the content.  The
     transfer stops with an error when the server sends more bytes than announced, the
     compressed_size of a compressed part or else expected_size, when a compressed part
     inflates beyond expected_size, and when the connection ends before the size the server
-    announced.  shown names the content in the messages in place of url: an address of the
-    public link, which no message gives."""
-    name = shown or url
+    announced."""
     h = hashlib.sha256()
     written = 0
     received = 0
@@ -110,12 +113,12 @@ def download(url, out, expected_size, gzip_part=False, label="", whole=None, com
                     break
                 received += len(block)
                 if received > announced:
-                    raise RuntimeError("%s sends more than the %d bytes announced" % (name, announced))
+                    raise RuntimeError("%s sends more than the %d bytes announced" % (url, announced))
                 if inflate:
                     # One byte beyond the rest of the part tells a part that inflates too far.
                     block = inflate.decompress(block, expected_size - written + 1)
                     if written + len(block) > expected_size:
-                        raise RuntimeError("%s inflates beyond the %d bytes announced" % (name, expected_size))
+                        raise RuntimeError("%s inflates beyond the %d bytes announced" % (url, expected_size))
                 out.write(block)
                 h.update(block)
                 if whole is not None:
@@ -128,20 +131,22 @@ def download(url, out, expected_size, gzip_part=False, label="", whole=None, com
             # The reading of a content of announced length stops without an error when the
             # connection closes before its end.
             if length.isdigit() and received < int(length):
-                raise RuntimeError("the transfer of %s was cut off after %d bytes" % (name, received))
+                raise RuntimeError("the transfer of %s was cut off after %d bytes" % (url, received))
             if inflate:
                 tail = inflate.flush()
                 if written + len(tail) > expected_size:
-                    raise RuntimeError("%s inflates beyond the %d bytes announced" % (name, expected_size))
+                    raise RuntimeError("%s inflates beyond the %d bytes announced" % (url, expected_size))
                 out.write(tail)
                 h.update(tail)
                 if whole is not None:
                     whole.update(tail)
                 written += len(tail)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("%s cannot be downloaded: the request is answered with the status %d" % (url, e.code))
     except http.client.IncompleteRead:
-        raise RuntimeError("the transfer of %s was cut off after %d bytes" % (name, received))
+        raise RuntimeError("the transfer of %s was cut off after %d bytes" % (url, received))
     except zlib.error as e:
-        raise RuntimeError("%s is not a valid gzip part (%s)" % (name, e))
+        raise RuntimeError("%s is not a valid gzip part (%s)" % (url, e))
     print("\r  %s: %d of %d MB" % (label, written >> 20, expected_size >> 20), file=sys.stderr)
     return h.hexdigest(), written
 
@@ -233,13 +238,16 @@ def main():
     p.add_argument("--installer")
     p.add_argument("--complete")
     p.add_argument("--from", dest="sources", action="append", default=[])
-    p.add_argument("--dist", default=os.path.join(publish_release.ROOT, "dist", "albireo"))
+    p.add_argument("--dist", help="folder of the signed feed and of the signed catalog, in place of those the "
+                   "website serves")
     check = p.add_mutually_exclusive_group()
     check.add_argument("--sign")
     check.add_argument("--no-verify", action="store_true",
                        help="copy the signed files without checking their signatures, left to the service")
     a = p.parse_args()
 
+    # The folder the signed files of the website are downloaded to, when no folder is given for them.
+    downloaded = None
     try:
         signer = None
         if a.no_verify:
@@ -249,41 +257,70 @@ def main():
                 signer = publish_release.find_signer(a.sign)
             except RuntimeError as e:
                 raise RuntimeError("%s; --no-verify leaves the check of the signatures to the service" % e)
-        os.makedirs(os.path.join(a.output, "models"), exist_ok=True)
+        dist = a.dist
+        # Where the signed files come from, for the messages.
+        origin = dist or publish_release.published_address()
+        if dist:
+            for name in publish_release.SIGNED:
+                if not os.path.isfile(os.path.join(dist, name)):
+                    raise RuntimeError("%s holds no %s: --dist names a folder that holds the signed feed and the "
+                                       "signed catalog, and without it the files the website serves are taken"
+                                       % (dist, name))
+        else:
+            dist = downloaded = tempfile.mkdtemp(prefix="albireo-bundle-")
+            for name in publish_release.SIGNED:
+                try:
+                    data = publish_release.fetch(origin + "/" + name, 16 << 20, "albireo-bundle")
+                except urllib.error.HTTPError as e:
+                    raise RuntimeError("%s/%s cannot be downloaded: the request is answered with the status %d; "
+                                       "--dist names a folder that holds the signed feed and the signed catalog"
+                                       % (origin, name, e.code))
+                except (OSError, http.client.HTTPException) as e:
+                    raise RuntimeError("%s/%s cannot be downloaded: %s" % (origin, name, e))
+                with open(os.path.join(dist, name), "wb") as f:
+                    f.write(data)
         for name in ("catalog.json", "feed.json"):
-            source = os.path.join(a.dist, name)
-            if signer:
-                subprocess.run([signer, "verify", source], check=True, stdout=subprocess.DEVNULL)
-            for suffix in ("", ".sig"):
-                shutil.copyfile(source + suffix, os.path.join(a.output, name + suffix))
+            if signer and subprocess.run(publish_release.verify_command(signer, os.path.join(dist, name)),
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                raise RuntimeError("the signature of %s of %s does not verify" % (name, origin))
 
-        with open(os.path.join(a.dist, "catalog.json"), encoding="utf-8") as f:
+        with open(os.path.join(dist, "catalog.json"), encoding="utf-8") as f:
             catalog = json.load(f)
-        with open(os.path.join(a.dist, "feed.json"), encoding="utf-8") as f:
+        with open(os.path.join(dist, "feed.json"), encoding="utf-8") as f:
             stable = json.load(f)["channels"]["stable"]
 
         installer = stable["installer"]
-        # The name of the installer in the folder dist of the public link.
+        # The name of the installer beside the feed, in the folder of the versions.
         installer_name = installer.get("file")
         if not installer.get("size") or not installer_name:
-            raise RuntimeError("the feed of %s announces no installer in the public link yet: publish the version "
-                               "first (publish_release.py)" % a.dist)
+            raise RuntimeError("the feed of %s announces no installer" % origin)
         if a.complete:
             make_feed.check_installer(a.complete, stable["version"])
+        os.makedirs(os.path.join(a.output, "models"), exist_ok=True)
         target = os.path.join(a.output, installer_name)
+        # The installer the folder of the signed files holds beside its feed.
+        beside_feed = os.path.join(dist, installer_name)
         if a.installer:
             if os.path.getsize(a.installer) != installer["size"] \
                     or make_feed.sha256_of(a.installer) != installer["sha256"]:
                 raise RuntimeError("%s is not the installer the feed announces" % a.installer)
             shutil.copyfile(a.installer, target)
-        elif not (os.path.isfile(target) and make_feed.sha256_of(target) == installer["sha256"]):
+        elif os.path.isfile(target) and make_feed.sha256_of(target) == installer["sha256"]:
+            pass
+        elif os.path.isfile(beside_feed) and os.path.getsize(beside_feed) == installer["size"] \
+                and make_feed.sha256_of(beside_feed) == installer["sha256"]:
+            shutil.copyfile(beside_feed, target)
+        else:
             partial = target + ".partial"
             try:
-                # The copy of the public link alone.
-                address = public_link.Link().address("dist/" + installer_name)
-                with open(partial, "wb") as out:
-                    sha, size = download(address, out, installer["size"], label=installer_name,
-                                         shown="the copy of dist/%s in the public link" % installer_name)
+                # The folder of the versions on the website, where the services read it.
+                address = publish_release.published_address() + "/" + installer_name
+                try:
+                    with open(partial, "wb") as out:
+                        sha, size = download(address, out, installer["size"], label=installer_name)
+                except RuntimeError as e:
+                    raise RuntimeError("%s; --installer names the installer of version %s when the website does "
+                                       "not serve it" % (e, stable["version"]))
                 if sha != installer["sha256"] or size != installer["size"]:
                     raise RuntimeError("the installer downloaded does not match the feed")
                 os.replace(partial, target)
@@ -303,6 +340,9 @@ def main():
                 print("%s: the models of the complete installer, beside it" % beside)
             elif os.path.isfile(os.path.join(a.output, beside)):
                 os.remove(os.path.join(a.output, beside))
+        # The signed files enter the bundle once its installer is there.
+        for name in publish_release.SIGNED:
+            shutil.copyfile(os.path.join(dist, name), os.path.join(a.output, name))
 
         entries = catalog["models"]
         if a.all:
@@ -338,9 +378,11 @@ def main():
                                   complete_fr=complete_fr))
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError,
             http.client.HTTPException) as e:
-        # The errors of the requests to the public link name none of its addresses.
-        print("error: %s" % public_link.hidden(e), file=sys.stderr)
+        print("error: %s" % e, file=sys.stderr)
         return 1
+    finally:
+        if downloaded:
+            shutil.rmtree(downloaded, ignore_errors=True)
     print("bundle %s: installer %s, %d models, %.2f GB of models"
           % (a.output, stable["version"], len(chosen), total / 1e9))
     return 0

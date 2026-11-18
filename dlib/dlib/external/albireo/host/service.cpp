@@ -28,7 +28,6 @@
 #include "certificates.h"
 #include "crypto.h"
 #include "http_fetch.h"
-#include "public_link.h"
 #include "relay.h"
 #include "web_access.h"
 
@@ -516,14 +515,9 @@ namespace albireo
         if (first_run) settings_->set(st);
         port_ = st.port;
         apply_network_settings(st);
-        // The publication space, first source of the models and only source of the updates, is named without its link.
-        std::string space = public_link_enabled() ? "set" : "not set";
-        space += public_link_has_password() ? ", with its password" : ", without password";
-        // A build without the password file of the publisher (public_link.h).
-        if (public_link_enabled() && !public_link_has_password())
-            space += " (while the link asks for one, the catalog and the models come from their official addresses "
-                "and the updates cannot be read)";
-        log_info("publication space: " + space);
+        // Where the downloads come from (distribution.h).
+        log_info(std::string("distribution: the versions and the catalog from ") + ALBIREO_DISTRIBUTION_URL
+            + ", the files of the models from the official addresses of the catalog");
         log_info("web search: " + web_search_provider(st));
 
         const std::string db_path = join_path(data_dir_, "albireo.db");
@@ -1450,7 +1444,9 @@ namespace albireo
         /*
             The download of a default model of the catalog: one in progress goes on, one cancelled in the Models
             window waits for the next start of the service, and one that failed starts again at the next check, at
-            the next refresh of the catalog.
+            the next refresh of the catalog.  A model whose official address withdrew its file waits for a catalog
+            that names another address, seven days at most: the Models window tells why and still starts its
+            download.
         */
         const json jobs = models_->downloads();
         auto fetch = [&](const json& e, const std::string& what) {
@@ -1459,6 +1455,15 @@ namespace albireo
             for (const auto& d : jobs.elements())
                 if (d["id"].as_string() == id) state = d["state"].as_string();
             if (state == "queued" || state == "downloading" || state == "verifying" || state == "cancelled") return;
+            user_error gone;
+            if (models_->withdrawn(e, &gone))
+            {
+                // The Models window keeps the reason, which no download in progress tells any more.
+                log_info("models: " + what + " " + id + " is no longer published at its official address and waits "
+                    "for a catalog that names another one");
+                models_->note_failure(id, gone);
+                return;
+            }
             user_error error;
             if (models_->start_download(id, error))
                 log_info("models: download of " + what + " " + id);
@@ -2331,7 +2336,6 @@ namespace albireo
         s["product"] = ALBIREO_PRODUCT_NAME;
         s["edition"] = ALBIREO_EDITION;
         s["version"] = ALBIREO_VERSION;
-        s["publisher"] = ALBIREO_PUBLISHER_NAME;
         s["website"] = ALBIREO_WEBSITE_URL;
         s["contact"] = ALBIREO_CONTACT_EMAIL;
         s["copyright"] = ALBIREO_COPYRIGHT;

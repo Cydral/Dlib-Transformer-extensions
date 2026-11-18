@@ -775,16 +775,27 @@ namespace albireo
             return false;
         }
 
+        // The files are asked as they are published, without an encoding of the transfer.
+        const char* const identity = "identity";
+
+        // Whether an answer carries the headers with which the hub of the models states a refusal of its own.
+        bool states_refusal(const httplib::Response& res)
+        {
+            return res.has_header("X-Error-Code") || res.has_header("X-Error-Message");
+        }
+
         // http_get(), which may throw.
         bool get_whole(const std::string& url, std::string& body, std::string& error, size_t max_bytes,
-            int read_seconds, int total_seconds)
+            int read_seconds, int total_seconds, http_answer& answer)
         {
             const auto deadline = clock_type::now() + std::chrono::seconds(total_seconds);
-            std::string current = url;
+            const httplib::Headers headers = { { "Accept-Encoding", identity } };
+            std::string current = url, asked;
             for (int hop = 0; hop <= max_redirections; ++hop)
             {
                 url_parts u;
                 if (!parse_hop(current, hop, u, error)) return false;
+                if (hop == 0) asked = u.origin;
                 if (cancelled)
                 {
                     error = cancelled_error();
@@ -814,14 +825,18 @@ namespace albireo
                 std::string location;
                 httplib::Result r;
                 auto last_data = clock_type::now();
+                answer = http_answer();
+                answer.redirected = u.origin != asked;
                 try
                 {
-                    r = c->Get(u.target,
+                    r = c->Get(u.target, headers,
                         [&](const httplib::Response& res) {
                             last_data = clock_type::now();
                             status = res.status;
                             if (res.status >= 300 && res.status < 400) location = res.get_header_value("Location");
-                            page = res.status == 200 && web_page(res.get_header_value("Content-Type"));
+                            answer.page = web_page(res.get_header_value("Content-Type"));
+                            answer.hub_error = states_refusal(res);
+                            page = res.status == 200 && answer.page;
                             return res.status == 200 && !page && !cancelled;
                         },
                         [&](const char* data, size_t n) {
@@ -851,6 +866,7 @@ namespace albireo
                 }
                 // The status of the answer, or of the proxy that refused to open the tunnel (407).
                 const int answered = status != 0 ? status : r ? r->status : 0;
+                answer.status = answered;
                 if (too_big) error = "the answer is larger than expected";
                 else if (page) error = web_page_text;
                 else if (answered != 0 && answered != 200) error = status_text(answered);
@@ -866,10 +882,11 @@ namespace albireo
 
         // http_get_range(), which may throw.
         bool get_range(const std::string& url, uint64_t from, int64_t to,
-            const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total)
+            const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total,
+            http_answer& answer)
         {
             const int read_seconds = bounded(30, test_read_seconds);
-            httplib::Headers headers;
+            httplib::Headers headers = { { "Accept-Encoding", identity } };
             const bool ranged = from > 0 || to >= 0;
             if (ranged)
             {
@@ -879,11 +896,12 @@ namespace albireo
             // The bytes asked for, when the range has an end: the receiver gets no more than them.
             const bool limited = to >= 0 && static_cast<uint64_t>(to) >= from;
             const uint64_t wanted = limited ? static_cast<uint64_t>(to) - from + 1 : 0;
-            std::string current = url;
+            std::string current = url, asked;
             for (int hop = 0; hop <= max_redirections; ++hop)
             {
                 url_parts u;
                 if (!parse_hop(current, hop, u, error)) return false;
+                if (hop == 0) asked = u.origin;
                 if (cancelled)
                 {
                     error = cancelled_error();
@@ -908,6 +926,8 @@ namespace albireo
                 std::string location;
                 httplib::Result r;
                 auto last_data = clock_type::now();
+                answer = http_answer();
+                answer.redirected = u.origin != asked;
                 try
                 {
                     r = c->Get(u.target, headers,
@@ -919,6 +939,8 @@ namespace albireo
                                 location = res.get_header_value("Location");
                                 return false;
                             }
+                            answer.page = web_page(res.get_header_value("Content-Type"));
+                            answer.hub_error = states_refusal(res);
                             const std::string cr = res.get_header_value("Content-Range");
                             if (total)
                             {
@@ -991,6 +1013,7 @@ namespace albireo
                 }
                 // The status of the answer, or of the proxy that refused to open the tunnel (407).
                 const int answered = status != 0 ? status : r ? r->status : 0;
+                answer.status = answered;
                 if (page) error = web_page_text;
                 else if (refused_range) error = "the server does not resume downloads";
                 else if (other_range) error = "the server answers with another range than the one asked";
@@ -1007,14 +1030,24 @@ namespace albireo
         }
     }
 
-    bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes, int timeout_seconds,
-        int total_seconds)
+    bool http_withdrawn(const http_answer& answer)
     {
+        if (answer.page || answer.redirected) return false;
+        if (answer.status == 404 || answer.status == 410 || answer.status == 451) return true;
+        return (answer.status == 401 || answer.status == 403) && answer.hub_error;
+    }
+
+    bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes, int timeout_seconds,
+        int total_seconds, http_answer* answer)
+    {
+        http_answer unused;
+        http_answer& told = answer ? *answer : unused;
+        told = http_answer();
         // An exception of httplib becomes the error of the request, which never leaves this function.
         try
         {
             return get_whole(url, body, error, max_bytes, bounded(timeout_seconds, test_read_seconds),
-                bounded(total_seconds, test_total_seconds));
+                bounded(total_seconds, test_total_seconds), told);
         }
         catch (const std::exception& e)
         {
@@ -1028,12 +1061,16 @@ namespace albireo
     }
 
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
-        const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total)
+        const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total,
+        http_answer* answer)
     {
+        http_answer unused;
+        http_answer& told = answer ? *answer : unused;
+        told = http_answer();
         // An exception of httplib or of the receiver becomes the error of the request, which never leaves here.
         try
         {
-            return get_range(url, from, to, receiver, error, total);
+            return get_range(url, from, to, receiver, error, total, told);
         }
         catch (const std::exception& e)
         {
@@ -1050,6 +1087,33 @@ namespace albireo
     {
         test_read_seconds = read_seconds;
         test_total_seconds = total_seconds;
+    }
+
+    std::string without_queries(const std::string& message)
+    {
+        std::string out = message;
+        size_t from = 0;
+        for (;;)
+        {
+            const size_t scheme = out.find("://", from);
+            if (scheme == std::string::npos) break;
+            size_t end = scheme + 3;
+            while (end < out.size() && out[end] != ' ' && out[end] != '\t' && out[end] != '\n' && out[end] != '\r'
+                && out[end] != '"' && out[end] != '\'')
+                ++end;
+            // The punctuation that follows an address in a message, "<address>: status 404", is not part of it.
+            while (end > scheme + 3 && (out[end - 1] == ':' || out[end - 1] == ',' || out[end - 1] == ';'
+                || out[end - 1] == ')'))
+                --end;
+            const size_t query = out.find('?', scheme + 3);
+            if (query != std::string::npos && query < end)
+            {
+                out.erase(query, end - query);
+                end = query;
+            }
+            from = end;
+        }
+        return out;
     }
 
 }

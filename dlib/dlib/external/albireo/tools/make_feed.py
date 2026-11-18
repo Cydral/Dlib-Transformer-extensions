@@ -3,13 +3,13 @@
 """
 Writes the update feed of Albireo for a new version.
 
-    python3 make_feed.py <output feed.json> <version> <installer> <file in the link> [<notes.json>]
+    python3 make_feed.py <output feed.json> <version> <installer> <file name> [<notes.json>]
 
 The installer is the albireo-setup-online.exe of the version, which must carry that version in
-its version resource, and the file in the link the name it takes in the folder dist of the
-public link of the published files, albireo-setup-online-<version>.exe, from which the services
-download it: the public link is the only source of their downloads (host/public_link.h), and the
-feed names no other address.
+its version resource, and the file name the one it takes beside the feed in the folder of the
+versions on the website, albireo-setup-online-<version>.exe, from which the services download
+it: that folder is the only source of their updates (host/distribution.h), and the feed names no
+other address.
 
 notes.json holds the release notes by language, {"en": "...", "fr": "...", ...}; the
 service shows the notes of the language of the user, else the English ones.  Without it,
@@ -17,10 +17,10 @@ the notes of the output feed are kept when that feed already describes the versi
 the notes otherwise read "Albireo <version>".
 
 The feed is then signed with albireo-sign (sign <private key> feed.json), and both files go
-to dist/albireo of the repository and to the folder dist of the link with the installer
-(fill_public_link.py dist).  The services that read it download the installer in the
-background, check its size and its SHA-256, and install it at their next start.
-publish_release.py runs these steps.
+with the installer to the folder of the chain of the website that holds the files of Albireo,
+releases/files/albireo/dist, from which that chain publishes them.  The services that read the
+feed download the installer in the background, check its size and its SHA-256, and install it
+at their next start.  publish_release.py runs these steps.
 """
 
 import hashlib
@@ -137,13 +137,12 @@ def read_notes(notes_path, output, version):
 
 
 def make_feed(version, installer, file, notes, size=None, sha256=None):
-    """The feed announcing version, whose installer is the file installer, published in the folder
-    dist of the public link under the name file (public_link.py).  size and sha256 spare reading
-    the file again when the caller has them."""
+    """The feed announcing version, whose installer is the file installer, published beside the feed
+    under the name file.  size and sha256 spare reading the file again when the caller has them."""
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("the version must have the form 1.2.3")
     if not file or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe", file):
-        raise ValueError("%s is not the name of an installer in the public link" % file)
+        raise ValueError("%s is not the name of an installer beside the feed" % file)
     check_installer(installer, version)
     described = {"file": file}
     described["size"] = size if size is not None else os.path.getsize(installer)

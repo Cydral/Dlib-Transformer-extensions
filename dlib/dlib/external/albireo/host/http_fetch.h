@@ -17,7 +17,9 @@
     service that stops, or that the settings put offline, calls http_cancel_all(), which
     ends the requests in progress at their next stage and makes the following ones fail at
     once, so that an unreachable network, as on a machine without Internet access, never
-    delays the service.
+    delays the service.  The files are asked as they are published ("Accept-Encoding:
+    identity"): their signatures and their hashes cover their exact bytes, and a range counts
+    the bytes of the file.
 
     The web access of the agent mode (web_access.h) makes its own requests with the same
     proxy (http_proxy_for()), the same bounded resolution (http_resolve()) and the same
@@ -70,6 +72,39 @@ namespace albireo
     // Seconds allowed to resolve the name of a server, and to connect to it.
     const int connect_seconds = 10;
 
+    struct http_answer
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                What answered a download that failed: the status of the answer, 0 when none
+                came; whether the answer was a web page, as a proxy or a filter of the network
+                sends one in place of the server; whether it came from another server than
+                the one of the address asked, a server of contents a redirection led to,
+                the redirections that stay on the server of the address not counting; and
+                whether the answer carries the error headers with which the hub of the models
+                states its own refusals (X-Error-Code, X-Error-Message).
+        !*/
+        int status = 0;
+        bool page = false;
+        bool redirected = false;
+        bool hub_error = false;
+    };
+
+    /*!
+        ensures
+            - Returns true when answer tells that the server of the address asked no longer
+              publishes the file: a status 404, 410 or 451, or a status 401 or 403 that
+              carries the error headers of the hub, given by that server itself and with no
+              web page.  The hub answers a request without credentials so for a file or a
+              revision that was deleted (404) and for a repository that was deleted, made
+              private or closed (401, 403).
+            - Returns false for the other failures, which another attempt may not meet: no
+              answer, a web page, a status 401 or 403 without these headers, as a proxy or a
+              filter of the network gives one, a status of a server of contents or of a
+              server that fails.
+    !*/
+    bool http_withdrawn(const http_answer& answer);
+
     /*!
         ensures
             - Downloads url into body, following up to five redirections, verifying the
@@ -79,11 +114,11 @@ namespace albireo
               of the file, as a proxy or a filter of the network sends one.
             - The errors tell the kind of failure ("the request is answered with the status
               403") and never name the address or its host, which the callers name as they
-              need: the downloads of the publication space name its files alone.
+              need.  answer, when given, receives what answered a request that failed.
             - Never throws: an exception of the transfer becomes its error.
     !*/
     bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes = 16u << 20,
-        int timeout_seconds = 20, int total_seconds = 120);
+        int timeout_seconds = 20, int total_seconds = 120, http_answer* answer = nullptr);
 
     /*!
         ensures
@@ -99,11 +134,18 @@ namespace albireo
             - With to >= 0, the receiver gets the bytes [from, to] at most: the reading ends
               once they have come, the answer of a server that ignores the range included,
               and an answer that ends before them fails.
-            - The errors are those of http_get(), and the function never throws either: an
-              exception of the transfer or of receiver becomes its error.
+            - The errors and answer are those of http_get(), and the function never throws
+              either: an exception of the transfer or of receiver becomes its error.
     !*/
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
-        const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total = nullptr);
+        const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total = nullptr,
+        http_answer* answer = nullptr);
+
+    /*
+        The message with the query of each address it quotes left out, where a signature or a key may
+        lie; a space, a tab, an end of line or a quotation mark ends an address.
+    */
+    std::string without_queries(const std::string& message);
 
     /*!
         Reserved for the tests (tests/test_host.cpp).  No setting and no route reaches it.

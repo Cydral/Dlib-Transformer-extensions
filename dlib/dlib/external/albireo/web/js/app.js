@@ -7969,10 +7969,11 @@ async function aboutTab(body, close) {
   } catch (e) {
     // Usage figures are optional.
   }
-  // The publisher: its copyright, its site and the address of its contact, as the service gives them.
+  // The copyright, the website and the address to write to, as the service gives them.
   const website = /^https:\/\/[^\s"'<>]+$/.test(s.website || '') ? s.website : 'https://www.cydral-technology.eu';
   const contact = /^[^\s@"'<>]+@[^\s@"'<>]+$/.test(s.contact || '') ? s.contact : 'contact@cydral-technology.eu';
-  body.append(h('p', { style: { marginTop: '14px' } }, s.copyright || 'Copyright (C) 2026 Cydral Technology', ' · ',
+  const copyright = s.copyright || 'Copyright (C) 2026 Cydral Technology, France';
+  body.append(h('p', { style: { marginTop: '14px' } }, copyright, ' · ',
     h('a', { href: website, target: '_blank', rel: 'noopener' }, website.replace(/^https:\/\//, '')), ' · ',
     h('a', { href: 'mailto:' + contact }, contact)),
   h('p', null, h('a', { href: s.project || 'https://github.com/Cydral/Dlib-Transformer-extensions', target: '_blank', rel: 'noopener' }, 'Dlib-Transformer-extensions'),

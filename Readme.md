@@ -258,7 +258,7 @@ A program built for a baseline processor can still run its hot code with the ext
 
 **One interface, an engine per kind of processor.** The engines are libraries with a C interface, built from the same sources for every x86-64 processor, for AVX2, for the NPU and the integrated GPU of Intel processors through OpenVINO, and for NVIDIA graphics processors through CUDA. The service describes them in child processes, measures them on the machine and runs the fastest. The engines of the devices keep quantized processor kernels for the products they lose to the processor and send the others to the device through the tensors of this library: the routing of the NPU module decides with OpenVINO, measurements of the engine decide with CUDA, where the weights stay on the card in their GGUF formats and the card computes the layers of a dense model whole, the processor keeping the attention.
 
-**What it serves.** The requests of every client are computed together in each forward pass, and the keys and values of a finished request stay cached for the next turn of its conversation. Three functions, general, code and security, each get a model from a signed catalog, downloaded in parallel parts and checked against its hashes, or imported from a disk for a machine without network. The web application keeps its discussions and projects in the browser, works without network, shows the reasoning of the models that reason, and lets a model call tools in agent mode. Updates come from a signed feed and install when the service restarts.
+**What it serves.** The requests of every client are computed together in each forward pass, and the keys and values of a finished request stay cached for the next turn of its conversation. Three functions, general, code and security, each get a model from a signed catalog, downloaded in parallel parts from the Hugging Face hub and checked against its hashes, or imported from a disk for a machine without network. The web application keeps its discussions and projects in the browser, works without network, shows the reasoning of the models that reason, and lets a model call tools in agent mode. Updates come from a signed feed published on the website of Cydral Technology, [cydral-technology.eu](https://cydral-technology.eu), and install when the service restarts.
 
 ![A discussion in the web application of Albireo](dlib/dlib/external/albireo/docs/images/chat.png)
 
@@ -305,7 +305,7 @@ This directory acts as the checkpoint and artifact layer.
 Longer-form articles, one subject at a time: what a design costs, where it breaks, and how to reproduce a result. The examples guide says what each program does; these say why. The directory also holds two research reports, on buffer-level residency and on the technical architecture of Pseudalis, which are papers rather than articles and are kept as PDF for that reason.
 
 ### 5. Distribution: [`dist/`](dist)
-The files the installed programs of Albireo read from the repository, its signed update feed and its model catalog, in [`dist/albireo`](dist/albireo). The installer of Pseudalis and its signed update feed are published on the website, [cydral-technology.eu](https://cydral-technology.eu), and the repository holds neither: [`dist/pseudalis`](dist/pseudalis) gives their addresses. Each folder has a README that gives the steps of a publication.
+The signed model catalog of Albireo, in [`dist/albireo`](dist/albireo). The website, [cydral-technology.eu](https://cydral-technology.eu), publishes it with the installers and the signed update feed of each version, written at its publication, and the copies installed from version 1.0.25 read them there. The installer of Pseudalis and its signed update feed are published on the same website, and the repository holds neither: [`dist/pseudalis`](dist/pseudalis) gives their addresses. Each folder has a README that gives the steps of a publication.
 
 The examples appear twice on purpose. [`examples/`](examples) is what a visitor reads: this project's files and the guide that explains them, with none of the upstream library's own examples in the way. `dlib/examples/` is what CMake builds: upstream's tree with this project's files added to it. Nothing connects the two, so `sync_examples.sh` at the repository root reports any drift between them and copies one over the other on request — the divergence being silent by construction, since both copies compile and both look complete.
 
@@ -372,6 +372,8 @@ If you wish to reference this project in a publication, report, article, technic
 ```
 
 If you are discussing the broader methodological foundations rather than the repository itself, it is also appropriate to cite the key academic references listed below.
+
+Cydral Technology presents the project and its products on its website, [cydral-technology.eu](https://cydral-technology.eu), and answers questions about them at contact@cydral-technology.eu.
 
 ---
 

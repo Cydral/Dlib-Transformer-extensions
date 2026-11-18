@@ -27,7 +27,6 @@
 #include "../common/version.h"
 #include "crypto.h"
 #include "http_fetch.h"
-#include "public_link.h"
 
 namespace albireo
 {

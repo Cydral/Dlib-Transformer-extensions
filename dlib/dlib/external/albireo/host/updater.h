@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -20,19 +21,19 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The updates of the programs.  The feed is a JSON document published in the
-                folder dist of the publication space (public_link.h), with a detached
-                signature (ECDSA P-256 over its exact bytes), both read from the space alone;
-                a feed whose signature does not verify against the key built into the
+                folder of the versions on the website (distribution.h), with a detached
+                signature (ECDSA P-256 over its exact bytes), both read from that folder
+                alone; a feed whose signature does not verify against the key built into the
                 programs is ignored.  When it announces a newer version, its installer is
-                downloaded in the background into the updates folder from the folder dist of
-                the space, by the name the feed gives it there ("file"), and checked against
-                the size and the hash the feed gives; the address a feed may also give
-                ("url") is never read.  A file the space does not hold yet fails the check
-                with the code update_not_published, which names it; the other failures name
-                the file and the kind of failure, never an address, and no exception leaves
-                the thread of a check.  The update is applied when the
-                service restarts: the service then starts the installer in its update mode,
-                which replaces the programs and starts the service again.
+                downloaded in the background into the updates folder from the same folder,
+                by the name the feed gives it there ("file"), and checked against the size
+                and the hash the feed gives; the address a feed may also give ("url") is
+                never read.  A file the website answers with 404 fails the check with the
+                code update_not_published, which names its address; the other failures name
+                the address and the kind of failure, and no exception leaves the thread of
+                a check.  The update is applied when the service restarts: the service then
+                starts the installer in its update mode, which replaces the programs and
+                starts the service again.
 
                 A check made from the menu of the tray downloads the update in the same
                 way and leaves it for the next restart; "apply" restarts at once.
@@ -136,6 +137,24 @@ namespace albireo
         std::atomic<bool> busy_{false};
         std::atomic<bool> cancelled_{false};
     };
+
+    /*!
+        requires
+            - file names the installer of version in the updates folder
+        ensures
+            - Downloads address into file + ".partial", a file created anew, and gives it the
+              name file once it has size bytes and the SHA-256 sha, those the signed feed names.
+              progress receives the bytes written so far, and cancelled, once true, ends the
+              transfer.
+            - Returns false with why otherwise, the partial file removed: update_record {version}
+              when a file cannot be written, update_not_published {file} when the website answers
+              404 itself, update_download {e} for the other failures of the transfer,
+              and update_installer_mismatch {version} when the bytes received are not those the
+              feed names.
+    !*/
+    bool download_installer(const std::string& address, const std::string& file, uint64_t size, const std::string& sha,
+        const std::string& version, const std::function<void(uint64_t)>& progress, const std::atomic<bool>& cancelled,
+        user_error& why);
 
 }
 

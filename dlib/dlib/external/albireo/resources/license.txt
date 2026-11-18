@@ -1,5 +1,5 @@
 Albireo
-Copyright (C) 2026 Cydral Technology
+Copyright (C) 2026 Cydral Technology, France
 https://www.cydral-technology.eu, contact@cydral-technology.eu
 Based on the open source Dlib-Transformer-extensions library.
 
@@ -59,7 +59,8 @@ components (web\vendor, web\docs) and in licenses\.
 Models
 ------
 
-Albireo downloads language models from the catalog its publisher maintains, or
-imports the files the user provides.  Each model is distributed under the license
-of its authors, which the Models window of Albireo shows; using a model means
-accepting its license.
+Albireo downloads language models from the addresses its catalog names, on the
+hub where their authors or their converters publish them, or imports the files
+the user provides.  Each model is distributed under the license of its authors,
+which the Models window of Albireo shows; using a model means accepting its
+license.

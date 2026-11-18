@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-11-11T15:46:16Z",
+  "updated": "2026-11-17T10:15:10Z",
   "models": [
     {
       "id": "qwen3-vl-4b-instruct",
@@ -625,6 +625,43 @@
           "url": "https://huggingface.co/ibm-granite/granite-4.2-8b-GGUF/resolve/93f3f6a8938ee922b784cf4e5b4203cd3428df8f/granite-4.2-8b-Q4_K_M.gguf",
           "size": 5347917952,
           "sha256": "16a9369d0805f80b7377d25d87f937a90c05dc04ad79173a52001e42c9aab311"
+        }
+      ]
+    },
+    {
+      "id": "deepseek-r1-distill-llama-8b",
+      "name": "DeepSeek-R1 Distill Llama 8B",
+      "publisher": "DeepSeek",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general",
+        "code"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": false,
+      "reasoning": true,
+      "reasoning_always": true,
+      "license": "Llama 3.1 Community License; MIT for the changes of DeepSeek",
+      "description": {
+        "en": "Reasoning model distilled from DeepSeek-R1 into Llama 3.1 8B, which reasons step by step before every answer: logic, mathematics, code and questions that call for a worked answer. It reads text alone and calls no tools, for computers with 16 GB of memory or a graphics processor.",
+        "fr": "Modèle de raisonnement distillé de DeepSeek-R1 dans Llama 3.1 8B, qui raisonne étape par étape avant chaque réponse : logique, mathématiques, code et questions qui demandent une réponse construite. Il lit le texte seul et n'appelle aucun outil, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
+        "de": "Aus DeepSeek-R1 in Llama 3.1 8B destilliertes Reasoning-Modell, das vor jeder Antwort Schritt für Schritt nachdenkt: Logik, Mathematik, Code und Fragen, die eine hergeleitete Antwort verlangen. Es liest nur Text und ruft keine Werkzeuge auf, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
+        "it": "Modello di ragionamento distillato da DeepSeek-R1 in Llama 3.1 8B, che ragiona passo dopo passo prima di ogni risposta: logica, matematica, codice e domande che richiedono una risposta argomentata. Legge solo testo e non chiama strumenti, per computer con 16 GB di memoria o un processore grafico.",
+        "es": "Modelo de razonamiento destilado de DeepSeek-R1 en Llama 3.1 8B, que razona paso a paso antes de cada respuesta: lógica, matemáticas, código y preguntas que piden una respuesta desarrollada. Lee solo texto y no llama herramientas, para ordenadores con 16 GB de memoria o un procesador gráfico."
+      },
+      "arch": "llama",
+      "parameters": 8030261312,
+      "context": 131072,
+      "source": "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF",
+      "size": 4920737216,
+      "sha256": "0addb1339a82385bcd973186cd80d18dcc71885d45eabd899781a118d03827d9",
+      "files": [
+        {
+          "url": "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF/resolve/615f8936e16dfde29dcc00be71145d4d5ce8ed53/DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf",
+          "size": 4920737216,
+          "sha256": "0addb1339a82385bcd973186cd80d18dcc71885d45eabd899781a118d03827d9"
         }
       ]
     },

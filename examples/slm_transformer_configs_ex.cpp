@@ -880,8 +880,8 @@ int run_pipeline(
                 if (ref_subset[i] != gen_subset[i]) {
                     if (diff_count < 10) {
                         cout << "  Position " << i << ": '"
-                            << tokenizer.decode({ ref_subset[i] }, false) << "' -> '"
-                            << tokenizer.decode({ gen_subset[i] }, false) << "'\n";
+                            << tokenizer.decode(ref_subset[i], false) << "' -> '"
+                            << tokenizer.decode(gen_subset[i], false) << "'\n";
                     }
                     diff_count++;
                 }

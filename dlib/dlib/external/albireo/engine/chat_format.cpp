@@ -2829,6 +2829,84 @@ namespace albireo
             std::string eos_;
         };
 
+        /*
+            The format of the DeepSeek-R1 models distilled into other decoders (DeepSeek-R1-Distill-Llama-8B),
+            as their template lays it out: the system prompt right after the beginning of sentence
+            token, without a marker of its own, each question after <｜User｜>, each answer after
+            <｜Assistant｜> and before the end of sentence token, with no line break between them.
+            The template takes the last system message of the conversation, wherever it lies, and
+            keeps of the earlier answers the text after their reasoning.  The prompt opens the
+            reasoning with <think> and a line break after <｜Assistant｜>, as the template of the
+            authors does since February 2025 and as they advise for every answer; the files
+            converted before carry a template that leaves that marker to the model.  The template
+            opens the reasoning of every answer: the model always reasons, the engine bounding the
+            length of the reasoning of a request that asks for none.  The template also writes the
+            calls and the results of tools between markers that the vocabulary of the model of the
+            catalog does not hold: the tools are not offered, and the other roles are left out.
+            The markers that open a turn end the one of the model, as the end of sentence does.
+        */
+        class deepseek_format : public chat_format
+        {
+        public:
+            explicit deepseek_format(const dlib::hf_tokenizer& tok)
+            {
+                for (const char* t : { "<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>",
+                        "<｜begin▁of▁sentence｜>" })
+                {
+                    const int id = tok.token_id(t);
+                    if (id >= 0) stop_tokens_.push_back(id);
+                }
+                bos_ = tok.bos_id() >= 0 ? tok.id_to_token(tok.bos_id()) : std::string();
+                eos_ = tok.eos_id() >= 0 ? tok.id_to_token(tok.eos_id()) : std::string("<｜end▁of▁sentence｜>");
+                add_markers(tok, { "<think>", "</think>" });
+            }
+
+            const char* name() const override { return "deepseek"; }
+            bool supports_tools() const override { return false; }
+            bool supports_reasoning() const override { return true; }
+            bool always_reasons() const override { return true; }
+            std::vector<prompt_piece> reasoning_close() const override { return closing("</think>", "\n\n"); }
+
+            void render(const std::vector<chat_message>& messages, const render_options& opt,
+                std::vector<prompt_piece>& out) const override
+            {
+                piece_writer w{ out };
+                w.markup(bos_);
+                const chat_message* system = nullptr;
+                for (const auto& m : messages)
+                    if (m.role == "system") system = &m;
+                if (system) w.text(system->content);
+                for (const auto& m : messages)
+                {
+                    if (m.role == "user")
+                    {
+                        w.markup("<｜User｜>");
+                        w.text(m.content);
+                    }
+                    else if (m.role == "assistant" && (!m.content.empty() || m.tool_calls.empty()))
+                    {
+                        const size_t close = m.content.rfind("</think>");
+                        w.markup("<｜Assistant｜>");
+                        w.text(close == std::string::npos ? m.content : m.content.substr(close + 8));
+                        w.markup(eos_);
+                    }
+                }
+                if (opt.add_generation_prompt) w.markup("<｜Assistant｜><think>\n");
+            }
+
+            std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
+            {
+                parser_config c;
+                c.think_open = "<think>";
+                c.think_close = "</think>";
+                c.starts_in_reasoning = opt.add_generation_prompt;
+                return std::unique_ptr<output_parser>(new tag_parser(c));
+            }
+
+        private:
+            std::string bos_, eos_;
+        };
+
         // Plain
 
         /*
@@ -2917,6 +2995,13 @@ namespace albireo
     std::unique_ptr<chat_format> chat_format::detect(const dlib::hf_tokenizer& tok, const std::string& tmpl)
     {
         auto has = [&](const char* s) { return tmpl.find(s) != std::string::npos; };
+        /*
+            The DeepSeek-R1 models distilled into other decoders, whose vocabulary keeps the control
+            tokens of their decoder beside their own: their template is read first.
+        */
+        const bool deepseek = tok.token_id("<｜User｜>") >= 0 && tok.token_id("<｜Assistant｜>") >= 0;
+        if (deepseek && has("<｜User｜>") && has("<｜Assistant｜>") && has("</think>"))
+            return std::unique_ptr<chat_format>(new deepseek_format(tok));
         if (has("[INST]") && (tok.token_id("[INST]") >= 0))
             return std::unique_ptr<chat_format>(new mistral_format(tok, tmpl));
         if (has("<|start_header_id|>") && tok.token_id("<|start_header_id|>") >= 0)
@@ -2942,6 +3027,8 @@ namespace albireo
         // the family of the model.
         if (tmpl.empty())
         {
+            if (deepseek && tok.token_id("</think>") >= 0)
+                return std::unique_ptr<chat_format>(new deepseek_format(tok));
             if (tok.token_id("<|start_header_id|>") >= 0 && tok.token_id("<|eot_id|>") >= 0)
                 return std::unique_ptr<chat_format>(new llama3_format(tok, tmpl));
             if (tok.token_id("<|start_of_role|>") >= 0 && tok.token_id("<|end_of_text|>") >= 0)

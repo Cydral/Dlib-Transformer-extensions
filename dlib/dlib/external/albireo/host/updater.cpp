@@ -22,8 +22,8 @@
 #include "../common/platform.h"
 #include "../common/version.h"
 #include "crypto.h"
+#include "distribution.h"
 #include "http_fetch.h"
-#include "public_link.h"
 
 namespace albireo
 {
@@ -65,6 +65,66 @@ namespace albireo
         {
             return user_error().set("the service stops", "stopping");
         }
+
+        /*
+            A file the website answers with 404 is not published yet.  The website gives that status with its
+            own page; the status of another server, which a redirection led to, tells nothing of the website.
+        */
+        bool unpublished(const http_answer& answer)
+        {
+            return answer.status == 404 && !answer.redirected;
+        }
+
+        user_error not_published(const std::string& address)
+        {
+            return user_error().set("the website does not serve " + address + " yet", "update_not_published")
+                .arg("file", address);
+        }
+    }
+
+    bool download_installer(const std::string& address, const std::string& file, uint64_t size, const std::string& sha,
+        const std::string& version, const std::function<void(uint64_t)>& progress, const std::atomic<bool>& cancelled,
+        user_error& why)
+    {
+        const user_error unrecorded = user_error().set("the update of version " + version + " cannot be recorded in "
+            + parent_path(file), "update_record").arg("version", version);
+        // The partial file of an earlier attempt goes: the new one must not exist yet (new_file).
+        const std::string tmp = file + ".partial";
+        remove_file(tmp);
+        progress(0);
+        new_file out;
+        const bool created = out.create(tmp);
+        uint64_t got = 0;
+        bool too_large = false, unwritten = false;
+        std::string e;
+        http_answer answer;
+        const bool ok = created && http_get_range(address, 0, -1, [&](const char* d, size_t n) {
+            if (got + n > size)
+            {
+                too_large = true;
+                return false;
+            }
+            if (!out.write(d, n))
+            {
+                unwritten = true;
+                return false;
+            }
+            got += n;
+            progress(got);
+            return !cancelled.load();
+        }, e, nullptr, &answer);
+        const bool closed = out.close();
+        e = address + " cannot be downloaded: " + e;
+        why = user_error();
+        if (!created || unwritten || (ok && !closed)) why = unrecorded;
+        else if (!ok && !too_large && unpublished(answer)) why = not_published(address);
+        else if (!ok && !too_large) why.set(e, "update_download").arg("e", e);
+        else if (too_large || got != size || sha256_file(tmp, nullptr, &cancelled) != sha)
+            why.set("the downloaded installer does not match the feed", "update_installer_mismatch")
+                .arg("version", version);
+        else if (!rename_file(tmp, file)) why = unrecorded;
+        if (!why.code.empty() && created) remove_file(tmp);
+        return why.code.empty();
     }
 
     updater::updater(const std::string& updates_dir)
@@ -299,28 +359,32 @@ namespace albireo
         if (ended()) return;
         set("state", "checking");
         set("checked_at", static_cast<long long>(now_unix()));
-        std::string body, sig, error;
+        std::string body, sig;
         // Where the installer comes from, for the log: empty when it was downloaded before.
         std::string origin;
-        // The feed and its signature come from the folder dist of the publication space alone.
-        auto read = [&](const std::string& path, std::string& into, size_t max_bytes) {
-            link_status status = link_status::ok;
-            if (public_link_get(path, into, error, max_bytes, &status)) return true;
-            // A file the space does not hold yet has its own code, which names it.
-            if (status == link_status::missing) fail(user_error().set(error, "update_not_published").arg("file", path));
-            else fail(user_error().set(error, "update_download").arg("e", error));
-            if (!ended()) log_warning("updates: " + error);
+        // The feed and its signature come from the folder of the versions on the website alone (distribution.h).
+        const std::string feed_address = distribution_address("feed.json");
+        auto read = [&](const std::string& address, std::string& into, size_t max_bytes) {
+            http_answer answer;
+            std::string e;
+            if (http_get(address, into, e, max_bytes, 20, 120, &answer)) return true;
+            // A file the website does not serve yet has its own code, which names it.
+            const user_error why = unpublished(answer) ? not_published(address)
+                : user_error().set(address + " cannot be downloaded: " + e, "update_download")
+                    .arg("e", address + " cannot be downloaded: " + e);
+            fail(why);
+            if (!ended()) log_warning("updates: " + why.text);
             return false;
         };
-        if (!read("dist/feed.json", body, 1u << 20) || !read("dist/feed.json.sig", sig, 4096)) return;
+        if (!read(feed_address, body, 1u << 20) || !read(feed_address + ".sig", sig, 4096)) return;
         if (!verify_signature(body, sig, feed_public_key_pem))
         {
             fail(user_error().set("the signature of the update feed is not valid", "update_signature")
-                .arg("file", "dist/feed.json"));
-            log_error("updates: the signature of the feed of the publication space is not valid, feed ignored");
+                .arg("file", feed_address));
+            log_error("updates: the signature of " + feed_address + " is not valid, feed ignored");
             return;
         }
-        log_info("updates: feed read from the publication space of Albireo");
+        log_info("updates: feed read from " + feed_address);
         const json feed = json::parse_or_null(body);
         const json& stable = feed["channels"]["stable"];
         const std::string latest = stable["version"].as_string();
@@ -352,16 +416,16 @@ namespace albireo
         set("latest", latest);
         set("notes", notes);
         const json& inst = stable["installer"];
-        // The installer lies in the folder dist of the publication space, under the name the feed gives it ("file").
-        const std::string in_link = inst["file"].as_string();
+        // The installer lies beside the feed, under the name the feed gives it ("file").
+        const std::string name = inst["file"].as_string();
         const std::string sha = inst["sha256"].as_string();
         // A size the feed gives as negative, or of another type, makes it incomplete.
         const long long given = inst["size"].as_int(0);
         const uint64_t size = given > 0 ? static_cast<uint64_t>(given) : 0;
-        if (in_link.empty() || !plain_name(in_link) || sha.size() != 64 || size == 0)
+        if (name.empty() || !plain_name(name) || sha.size() != 64 || size == 0)
         {
-            fail(user_error().set(in_link.empty() ? "the update feed names no installer in the publication space of "
-                "Albireo" : "the update feed is incomplete", "update_feed_invalid"));
+            fail(user_error().set(name.empty() ? "the update feed names no installer" : "the update feed is incomplete",
+                "update_feed_invalid"));
             return;
         }
         make_dirs(dir_);
@@ -371,88 +435,23 @@ namespace albireo
             set("state", "downloading");
             set("total", static_cast<unsigned long long>(size));
             set("received", 0ull);
-            const user_error unrecorded = user_error().set("the update of version " + latest
-                + " cannot be recorded in " + dir_, "update_record").arg("version", latest);
-            const std::string tmp = file + ".partial";
-            /*
-                One download of the installer from address into the partial file, checked against
-                the feed; label names the file in the messages, which never name its address.
-            */
-            auto download = [&](const std::string& address, const std::string& label, user_error& why) {
-                // The partial file of an earlier attempt goes: the new one must not exist yet (new_file).
-                remove_file(tmp);
-                set("received", 0ull);
-                new_file out;
-                const bool created = out.create(tmp);
-                uint64_t got = 0;
-                bool too_large = false, unwritten = false;
-                std::string e;
-                const bool ok = created && http_get_range(address, 0, -1, [&](const char* d, size_t n) {
-                    if (got + n > size)
-                    {
-                        too_large = true;
-                        return false;
-                    }
-                    if (!out.write(d, n))
-                    {
-                        unwritten = true;
-                        return false;
-                    }
-                    got += n;
-                    set("received", static_cast<unsigned long long>(got));
-                    return !cancelled_.load();
-                }, e);
-                const bool closed = out.close();
-                e = label + " cannot be downloaded: " + e;
-                why = user_error();
-                if (!created || unwritten || (ok && !closed)) why = unrecorded;
-                else if (!ok && !too_large) why.set(e, "update_download").arg("e", e);
-                else if (too_large || got != size || sha256_file(tmp, nullptr, &cancelled_) != sha)
-                    why.set("the downloaded installer does not match the feed", "update_installer_mismatch")
-                        .arg("version", latest);
-                else if (!rename_file(tmp, file)) why = unrecorded;
-                if (!why.code.empty() && created) remove_file(tmp);
-                return why.code.empty();
-            };
+            const std::string address = distribution_address(name);
             user_error why;
             bool done = false;
-            /*
-                The copy of the installer in the publication space: an address of the cache may
-                have expired, and a file the listing of the cache lacks may have been published
-                since, so that the second attempt asks the listing and the address again.
-            */
-            const std::string path = "dist/" + in_link;
-            const std::string label = "the copy of " + path + " in the publication space of Albireo";
+            // Two attempts, unless the file cannot be written or the website does not serve the installer yet.
             for (int attempt = 0; attempt < 2 && !done && !ended(); ++attempt)
             {
-                std::string address, e;
-                uint64_t listed = 0;
-                link_status status = link_status::ok;
-                if (!public_link_file(path, address, listed, e, attempt > 0, &status))
-                {
-                    if (status == link_status::missing) why.set(e, "update_not_published").arg("file", path);
-                    else why.set(e, "update_download").arg("e", e);
-                    if (status == link_status::missing && attempt == 0) continue;
-                    break;
-                }
-                if (listed != size)
-                {
-                    e = label + " does not have the size the feed gives";
-                    why.set(e, "update_download").arg("e", e);
-                    continue;
-                }
-                done = download(address, label, why);
-                // A file that cannot be written ends the attempts.
-                if (!done && why.code == "update_record") break;
+                done = download_installer(address, file, size, sha, latest,
+                    [&](uint64_t got) { set("received", static_cast<unsigned long long>(got)); }, cancelled_, why);
+                if (!done && (why.code == "update_record" || why.code == "update_not_published")) break;
             }
             if (!done)
             {
-                if (why.code.empty()) why.set("the update feed is incomplete", "update_feed_invalid");
                 fail(why);
                 if (!ended()) log_error("updates: download of " + latest + " failed: " + why.text);
                 return;
             }
-            origin = " from the publication space of Albireo";
+            origin = " from " + address;
         }
         user_error staging;
         switch (stage(latest, sha, notes, body, sig, staging))
@@ -520,7 +519,7 @@ namespace albireo
         const json& inst = stable["installer"];
         const std::string sha = inst["sha256"].as_string();
         const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        // The name of the installer in the folder dist of the publication space, else the one of its address.
+        // The name of the installer beside the feed, else the one of the address a feed of an earlier form gives.
         const std::string name = inst["file"].is_string() ? inst["file"].as_string()
             : file_name(inst["url"].as_string());
         const std::string source = join_path(folder, name);

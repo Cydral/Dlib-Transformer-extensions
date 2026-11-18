@@ -1,15 +1,29 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
 """
-Writes the model catalog of Albireo from the list below and from the Hugging Face hub.
+Writes the model catalog of Albireo from the list below and from the Hugging Face hub, and
+checks that the hub still publishes the files of a catalog.
 
     python3 make_catalog.py <output catalog.json>
+    python3 make_catalog.py --check [<catalog.json>]
 
 For each model, the hub gives the commit the files are pinned to, the size and the SHA-256
 of the file, the number of parameters and the trained context.  The download addresses
 name the commit, so that the file behind an address never changes after the catalog is
 signed.  A model published elsewhere, such as the parts made by publish_model.py on a
 GitHub release, is listed with its "files" given in full instead of "hub".
+
+The hub is the only place the services download the files of the models from: a model whose
+repository, revision or file leaves it can no longer be downloaded, until a catalog names
+another address.  The program stops, naming the model, when the hub no longer publishes a file
+of the list.  --check asks the address of each file of a signed catalog (dist/albireo/catalog.json
+of the repository by default), without downloading it, and lists the models to revise, whose
+address no longer publishes its file, or answers for a file of another size or SHA-256 than the
+catalog gives, so that a catalog is revised before its users meet the failure.  It follows an
+address that sends to another address of its own server, as the hub does for a repository that
+took another name, and tells apart the models it could not check, the hub not answering or
+answering without the size of the file.  Its exit code is 1 when a model is to revise, else 2
+when one could not be checked.
 
 A model that reads images names its projector, the image encoder published beside the
 decoder ("projector": repository, file and quantization of the mmproj GGUF file); its entry
@@ -29,11 +43,16 @@ search in the documents of the conversations and of the projects relies on it.  
 model holds the "embedding" role alone.
 
 The catalog is then signed with albireo-sign (sign <private key> catalog.json), and both
-files are published in dist/albireo of the repository.
+files are kept in dist/albireo of the repository, from which publish_release.py carries them
+to the folder of the chain of the website.
 """
 
+import http.client
 import json
+import os
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -485,6 +504,39 @@ MODELS = [
         },
     },
     {
+        "id": "deepseek-r1-distill-llama-8b",
+        "name": "DeepSeek-R1 Distill Llama 8B",
+        "publisher": "DeepSeek",
+        "hub": ("unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF", "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf"),
+        "quantization": "Q4_K_M",
+        "roles": ["general", "code"],
+        "inputs": ["text"],
+        "tools": False,
+        "reasoning": True,
+        "reasoning_always": True,
+        "license": "Llama 3.1 Community License; MIT for the changes of DeepSeek",
+        "description": {
+            "en": "Reasoning model distilled from DeepSeek-R1 into Llama 3.1 8B, which reasons step by step before "
+                  "every answer: logic, mathematics, code and questions that call for a worked answer. It reads text "
+                  "alone and calls no tools, for computers with 16 GB of memory or a graphics processor.",
+            "fr": "Modèle de raisonnement distillé de DeepSeek-R1 dans Llama 3.1 8B, qui raisonne étape par étape "
+                  "avant chaque réponse : logique, mathématiques, code et questions qui demandent une réponse "
+                  "construite. Il lit le texte seul et n'appelle aucun outil, pour les ordinateurs dotés de 16 Go de "
+                  "mémoire ou d'un processeur graphique.",
+            "de": "Aus DeepSeek-R1 in Llama 3.1 8B destilliertes Reasoning-Modell, das vor jeder Antwort Schritt für "
+                  "Schritt nachdenkt: Logik, Mathematik, Code und Fragen, die eine hergeleitete Antwort verlangen. Es "
+                  "liest nur Text und ruft keine Werkzeuge auf, für Computer mit 16 GB Arbeitsspeicher oder einem "
+                  "Grafikprozessor.",
+            "it": "Modello di ragionamento distillato da DeepSeek-R1 in Llama 3.1 8B, che ragiona passo dopo passo "
+                  "prima di ogni risposta: logica, matematica, codice e domande che richiedono una risposta "
+                  "argomentata. Legge solo testo e non chiama strumenti, per computer con 16 GB di memoria o un "
+                  "processore grafico.",
+            "es": "Modelo de razonamiento destilado de DeepSeek-R1 en Llama 3.1 8B, que razona paso a paso antes de "
+                  "cada respuesta: lógica, matemáticas, código y preguntas que piden una respuesta desarrollada. Lee "
+                  "solo texto y no llama herramientas, para ordenadores con 16 GB de memoria o un procesador gráfico.",
+        },
+    },
+    {
         "id": "qwen3-vl-30b-a3b-thinking",
         "name": "Qwen3-VL 30B A3B Thinking",
         "publisher": "Alibaba",
@@ -746,19 +798,35 @@ MODELS = [
 ]
 
 
+# The statuses with which the hub answers for a repository, a revision or a file it no longer publishes.
+WITHDRAWN = (401, 403, 404, 410, 451)
+
+
+class Unpublished(Exception):
+    """A file of the list that the hub no longer publishes."""
+
+
 def get_json(url):
     with urllib.request.urlopen(url, timeout=60) as r:
         return json.load(r)
 
 
 def hub_file(repo, name, cache):
-    """The commit of a repository and the size and SHA-256 of one of its files at that commit."""
+    """The commit of a repository and the size and SHA-256 of one of its files at that commit.
+    Raises Unpublished when the hub no longer publishes the repository or the file."""
     if repo not in cache:
-        info = get_json("https://huggingface.co/api/models/" + repo)
-        tree = get_json("https://huggingface.co/api/models/%s/tree/%s" % (repo, info["sha"]))
+        try:
+            info = get_json("https://huggingface.co/api/models/" + repo)
+            tree = get_json("https://huggingface.co/api/models/%s/tree/%s" % (repo, info["sha"]))
+        except urllib.error.HTTPError as e:
+            if e.code not in WITHDRAWN:
+                raise
+            raise Unpublished("the hub no longer publishes the repository %s (HTTP %d)" % (repo, e.code))
         cache[repo] = (info, tree)
     info, tree = cache[repo]
-    entry = next(t for t in tree if t.get("path") == name)
+    entry = next((t for t in tree if t.get("path") == name), None)
+    if entry is None or "lfs" not in entry:
+        raise Unpublished("the repository %s of the hub no longer holds %s" % (repo, name))
     return info, entry["lfs"]["size"], entry["lfs"]["oid"]
 
 
@@ -824,7 +892,97 @@ def check_models(models):
               % ("embedding" if embedding else "language", len(defaults), ", ".join(defaults) or "none"))
 
 
+class no_redirection(urllib.request.HTTPRedirectHandler):
+    """The address of a file answers for itself: the server of contents it sends to is not asked."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def published(part):
+    """What the address of a published part answers: None when it serves the file of the catalog, else
+    (definite, reason).  definite tells that the address no longer publishes the file, or gives it at
+    another size or with another SHA-256, the model being to revise; the reason of an answer that tells
+    nothing of the file, a server that fails or cannot be reached, comes with definite false.  A status
+    401 or 403 counts as the answer of the hub when it carries its error headers, as for the service."""
+    url = part["url"]
+    host = urllib.parse.urlsplit(url).netloc
+    headers = None
+    for _ in range(6):
+        request = urllib.request.Request(url, headers={"User-Agent": "albireo-tools"}, method="HEAD")
+        try:
+            with urllib.request.build_opener(no_redirection).open(request, timeout=60) as r:
+                headers = r.headers
+            break
+        except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                target = urllib.parse.urljoin(url, e.headers.get("Location") or "")
+                # An address of the same server, which the file took: the one that answers for it.
+                if urllib.parse.urlsplit(target).netloc == host and e.headers.get("X-Linked-Size") is None \
+                        and target != url:
+                    url = target
+                    continue
+                headers = e.headers
+                break
+            stated = e.headers.get("X-Error-Code") or e.headers.get("X-Error-Message")
+            if e.code in (404, 410, 451) or (e.code in (401, 403) and stated):
+                return True, "no longer published (HTTP %d)" % e.code
+            return False, "HTTP %d" % e.code
+        except (OSError, http.client.HTTPException) as e:
+            return False, "not reached: %s" % e
+    if headers is None:
+        return False, "its redirections go on"
+    size = headers.get("X-Linked-Size")
+    etag = (headers.get("X-Linked-ETag") or "").strip('"')
+    expected = part.get("compressed_size") if part.get("compression") == "gzip" else part["size"]
+    if size is not None and size != str(expected):
+        return True, "another size: %s bytes, %d in the catalog" % (size, expected)
+    if len(etag) == 64 and part.get("compression") != "gzip" and etag != part["sha256"]:
+        return True, "another SHA-256 than the catalog gives"
+    if size is None and host == "huggingface.co":
+        return False, "the hub gives no size for the file"
+    return None
+
+
+def check_catalog(path):
+    """Asks the address of each file of the catalog at path; returns the number of models to revise,
+    whose address no longer serves the file of the catalog, and the number of models that could not be
+    checked."""
+    with open(path, encoding="utf-8") as f:
+        catalog = json.load(f)
+    revise = unchecked = 0
+    for entry in catalog["models"]:
+        reasons = []
+        definite = False
+        for label, parts in (("", entry["files"]), ("projector: ", entry.get("projector", {}).get("files", []))):
+            for part in parts:
+                answer = published(part)
+                if answer:
+                    definite = definite or answer[0]
+                    reasons.append("%s%s: %s" % (label, part["url"], answer[1]))
+        print("%-32s %s" % (entry["id"], "published" if not reasons else "TO REVISE" if definite else "NOT CHECKED"))
+        for reason in reasons:
+            print("    %s" % reason)
+        revise += 1 if definite else 0
+        unchecked += 1 if reasons and not definite else 0
+    print("%d models, %d to revise%s" % (len(catalog["models"]), revise,
+                                        ", %d not checked" % unchecked if unchecked else ""))
+    return revise, unchecked
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--check":
+        if len(sys.argv) > 3:
+            print(__doc__)
+            return 2
+        here = os.path.dirname(os.path.abspath(__file__))
+        default = os.path.join(here, "..", "..", "..", "..", "..", "dist", "albireo", "catalog.json")
+        try:
+            revise, unchecked = check_catalog(sys.argv[2] if len(sys.argv) == 3 else default)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            print("error: %s" % e, file=sys.stderr)
+            return 1
+        return 1 if revise else 2 if unchecked else 0
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
@@ -836,7 +994,12 @@ def main():
     models = []
     cache = {}
     for m in MODELS:
-        models.append(from_hub(m, cache) if "hub" in m else m)
+        try:
+            models.append(from_hub(m, cache) if "hub" in m else m)
+        except Unpublished as e:
+            print("error: %s: %s; take the model out of the list, or name another repository for it" % (m["id"], e),
+                  file=sys.stderr)
+            return 1
         e = models[-1]
         total = e["size"] + e.get("projector", {}).get("size", 0)
         print("%-28s %-18s %6.2f GB  %s" % (e["id"], e["publisher"], total / 1e9, e["sha256"]))

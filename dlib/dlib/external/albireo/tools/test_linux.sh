@@ -9,7 +9,7 @@
 # Defaults: build-albireo at the root of the repository, ~/models/Qwen3-0.6B-Q4_K_M.gguf and
 # ~/models/Qwen3-Embedding-0.6B-Q8_0.gguf.  The steps whose model is missing are skipped.
 # The service runs offline in a data folder of its own, on port 18443 (ALBIREO_TEST_PORT, and
-# the next port for the local server of test_host), receives the model as the tray sends it,
+# the eight ports after it for the local servers of test_host), receives the model as the tray sends it,
 # refuses it by its path, answers a question through the OpenAI interface and stops.  The
 # first step checks the tools of the build with tools/prerequisites_linux.sh, which installs those
 # that are missing.  The exit code is the number of failed steps.
@@ -116,6 +116,12 @@ fi
 if [ -x "$BUILD/tests/test_host" ]; then
   step "models folder and imports" "all checks passed" "$BUILD/tests/test_host" "$WORK" $((PORT + 1))
 else skip "models folder and imports" "no $BUILD/tests/test_host"
+fi
+# The publication of a version: the feed signed, the installers handed to a chain of the website that a
+# script plays, and the check of what a local hosting serves.
+if [ -x "$BUILD/bin/albireo-sign" ]; then
+  step "publication" "all tests passed" python3 "$HERE/../tests/test_publish_release.py" "$BUILD/bin/albireo-sign"
+else skip "publication" "no $BUILD/bin/albireo-sign"
 fi
 
 for variant in cpu-avxvnni cpu-avx2 cpu; do

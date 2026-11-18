@@ -621,10 +621,9 @@ paths = {
             "product": {"type": "string", "example": "Albireo"},
             "edition": {"type": "string", "description": "The edition, Community Edition."},
             "version": {"type": "string"},
-            "publisher": {"type": "string", "example": "Cydral Technology"},
-            "website": {"type": "string", "description": "The site of the publisher."},
-            "contact": {"type": "string", "description": "The address of the contact of the publisher."},
-            "copyright": {"type": "string"},
+            "copyright": {"type": "string", "example": "Copyright (C) 2026 Cydral Technology, France"},
+            "website": {"type": "string", "description": "The website of Cydral Technology."},
+            "contact": {"type": "string", "description": "The address to write to."},
             "project": {"type": "string", "description": "The address of the source code of Albireo."},
             "settings": {"type": "object", "description": "The settings of the service that the web application "
                          "follows, such as the language of the interface.", "properties": {
@@ -729,7 +728,23 @@ paths = {
                 "size": {"type": "integer"}, "publisher": {"type": "string"},
                 "license": {"type": "string", "description": "As for the language models."}}},
                 "description": "The installed embedding models."},
-            "downloads": {"type": "array", "items": {"type": "object"}},
+            "downloads": {"type": "array", "description": "The downloads, each with its state (queued, downloading, "
+                          "verifying, done, cancelled or error), the bytes received and their total. An error comes "
+                          "with its text in English, its code and its values: download_failed {e} when the official "
+                          "address of a file fails, the progress kept for the next download; download_unavailable "
+                          "{m, url, status} when that address no longer publishes the file, the model waiting for a "
+                          "catalog that names another address; download_hash, download_file {file} and "
+                          "download_install {e}.", "items": {"type": "object"}},
+            "catalog": {"type": "object", "description": "The catalog in place and its last reading on the website.",
+                        "properties": {
+                            "state": {"type": "string", "enum": ["idle", "checking", "ok", "error"]},
+                            "error": {"type": "string", "description": "Why the last reading failed."},
+                            "updated": {"type": "string", "description": "The time of publication of the catalog "
+                                        "in place, empty without one.", "example": "2026-11-17T10:15:10Z"},
+                            "models": {"type": "integer", "description": "The number of its models."},
+                            "time": {"type": "integer", "description": "When the service installed it, in seconds "
+                                     "since 1970."}}},
+            "catalog_time": {"type": "integer", "description": "The time of catalog."},
             "pending_projectors": {"type": "array", "description": "The projectors imported without their decoder, "
                                    "which wait for it.", "items": {"type": "object", "properties": {
                                        "name": {"type": "string"}, "size": {"type": "integer"},
@@ -884,10 +899,16 @@ paths = {
             "504": reply("The site did not answer in time (code timeout)", ref("Error"))}}},
     "/albireo/v1/models/refresh": {"post": {"tags": ["Administration"], "security": admin,
                                             "summary": "Fetches the catalog again, in the background",
+                                            "description": "The catalog and its signature come from the folder of "
+                                                           "the versions on the website of Cydral Technology, and "
+                                                           "from nowhere else.",
                                             "responses": dict({"202": reply("Started", {"type": "object"})},
                                                               **offline_reply)}},
     "/albireo/v1/models/{id}/download": {
         "post": {"tags": ["Administration"], "security": admin, "summary": "Starts or resumes the download of a model",
+                 "description": "Each file of the model comes from its official address, the one its entry of the "
+                                "catalog names on the hub of the models, and from nowhere else. The downloads of "
+                                "/albireo/v1/models tell how it goes.",
                  "parameters": [model_id],
                  "responses": dict({"202": reply("Started", ok), "400": reply("Refused", ok)}, **offline_reply)},
         "delete": {"tags": ["Administration"], "security": admin, "summary": "Cancels a download",
@@ -983,6 +1004,9 @@ paths = {
                                            ref("Error"))}}},
     "/albireo/v1/updates/check": {"post": {"tags": ["Administration"], "security": admin,
                                            "summary": "Checks for an update and downloads it, in the background",
+                                           "description": "The feed, its signature and the installer it names come "
+                                                          "from the folder of the versions on the website of Cydral "
+                                                          "Technology, and from nowhere else.",
                                            "responses": dict({"202": reply("State", ref("UpdateState"))},
                                                              **offline_reply)}},
     "/albireo/v1/updates/apply": {"post": {"tags": ["Administration"], "security": admin,

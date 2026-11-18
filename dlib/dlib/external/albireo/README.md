@@ -9,12 +9,12 @@ machine, and nothing asks for an account.
 
 ![A question about a chart in the web application of Albireo, answered by the model that comes with it](docs/images/chat.png)
 
-Albireo is published by Cydral Technology (https://www.cydral-technology.eu,
-contact@cydral-technology.eu). Its name is that of a double star of the constellation Cygnus, one
-gold and one blue, which its icon draws. This version is the Community Edition: the installer, the
-About windows of the icon and of the web application, the description of the interface and the
-list of the programs of Windows name it "Albireo Community Edition", with Cydral Technology as its
-publisher.
+Its name is that of a double star of the constellation Cygnus, one gold and one blue, which its
+icon draws. This version is the Community Edition: the installer, the About windows of the icon
+and of the web application, the description of the interface and the list of the programs of
+Windows name it "Albireo Community Edition". They carry the copyright of Cydral Technology,
+France, with its website, https://www.cydral-technology.eu, where the versions are published, and
+the address to write to, contact@cydral-technology.eu; they name no author and no publisher.
 
 ## Contents
 
@@ -123,11 +123,11 @@ publisher.
   runs the accelerator of the computer, the processor computing what its device does not take, and
   the Accelerator menu of the icon chooses it, the processor alone, or a device by its name, and
   measures the engines on the machine.
-- **Models from a signed catalog**, downloaded in parallel parts from the publication space of
-  Albireo, else from their official sources, checked against their hashes, or imported from a disk
-  or a memory card.
-- **Updates** announced by a signed feed of the publication space, their installers published
-  there, downloaded in the background and installed when the service restarts.
+- **Models from a signed catalog**, downloaded in parallel parts from their official addresses
+  on the Hugging Face hub, and from nowhere else, checked against their hashes, or imported from a
+  disk or a memory card.
+- **Updates** announced by a signed feed on the website of Cydral Technology, their installers
+  published beside it, downloaded in the background and installed when the service restarts.
 - **An offline mode** for the computers without network: the service opens no connection, and
   the catalog, the models and the updates come from an offline bundle brought on a disk.
 - **Five languages** in every window: English, French, German, Italian and Spanish, the language
@@ -640,39 +640,42 @@ The conversation formats are written natively ([`engine/chat_format.cpp`](engine
 the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
 reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2, Mistral Small
 3.2), Llama 3, Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`),
-Phi-4-mini, the format of Foundation-Sec-8B-Reasoning and that of Foundation-Sec 1.1 8B Instruct,
-whose role markers `<|system|>`, `<|user|>` and `<|assistant|>` are plain text of its vocabulary:
-its GGUF files carry no template, the engine takes the one of the repository of the model, and these
-markers end its answer as its end of text token does. The instructions of the tools of Qwen2.5 keep
-the doubled braces of the example of its template, and CyberSecQwen 4B receives a system message in
-the turn of the user, as the template of its training writes it. The tests compare the prompts with
-those of the reference templates rendered by Jinja, byte for byte, as the libraries that apply chat
-templates render them, the line break after each tag and the spaces before it removed: the template
-of Foundation-Sec-8B-Reasoning, written over several lines, gives its turns one after the other, the
-answer right after `<|assistant|>`. The tokenizer of dlib reads the byte-level BPE vocabularies,
-with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and GPT-4o (Phi-4-mini) among others, and
-the SentencePiece ones (EuroLLM), whose leading space it puts after each control token as the
-reference tokenizers do; the token identifiers of the tests are those of llama.cpp.
+Phi-4-mini, the format of DeepSeek-R1 Distill Llama 8B, whose control tokens `<｜User｜>` and
+`<｜Assistant｜>` open the turns in the vocabulary of Llama 3.1, the system message at the head of the
+prompt and the earlier answers without their reasoning, the format of Foundation-Sec-8B-Reasoning
+and that of Foundation-Sec 1.1 8B Instruct, whose role markers `<|system|>`, `<|user|>` and
+`<|assistant|>` are plain text of its vocabulary: its GGUF files carry no template, the engine takes
+the one of the repository of the model, and these markers end its answer as its end of text token
+does. The instructions of the tools of Qwen2.5 keep the doubled braces of the example of its
+template, and CyberSecQwen 4B receives a system message in the turn of the user, as the template of
+its training writes it. The tests compare the prompts with those of the reference templates rendered
+by Jinja, byte for byte, as the libraries that apply chat templates render them, the line break
+after each tag and the spaces before it removed: the template of Foundation-Sec-8B-Reasoning,
+written over several lines, gives its turns one after the other, the answer right after
+`<|assistant|>`. The tokenizer of dlib reads the byte-level BPE vocabularies, with the
+pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and GPT-4o (Phi-4-mini) among others, and the
+SentencePiece ones (EuroLLM), whose leading space it puts after each control token as the reference
+tokenizers do; the token identifiers of the tests are those of llama.cpp.
 
 A model whose template opens the reasoning of every answer, the Thinking variants of Qwen3 and
-Qwen3-VL and Foundation-Sec-8B-Reasoning, was trained to reason before each answer, and its prompt
-opens that reasoning whatever the request asks. When the request asks for no reasoning, the engine
-ends it at once by writing in place of the model the sentence its authors give for the budget of a
-reasoning ("Considering the limited time by the user, I have to give the solution based on the
-thinking directly now.") and the marker `</think>`; the model then answers directly, the prompt
-staying within what it learned, where a reasoning closed empty before it starts led its answer to
-take up the corrections and returns of a reasoning, which could loop. With the effort `low`, the
-engine ends the reasoning after 512 tokens, 256 for the work in the background, and
-`reasoning_budget` sets that limit for any request, -1 or null lifting it. Without it, the reasoning
-takes half of the tokens of the answer at most (`max_tokens`, or the room the context leaves after
-the prompt), 32,768 at most, the length of answer the authors of Qwen3 advise for most questions,
-unless the effort is `high`: a reasoning that goes on, as the small Thinking models do at times,
-ends then and the model answers in the room left. The end the engine writes counts
-among the tokens of the answer and stays out of the `reasoning_content` the client receives; the
-answer of a request that asked for no reasoning receives its `max_tokens` once the reasoning ends,
-and its stop sequences apply to that answer alone. The prompt of
-Foundation-Sec-8B-Reasoning opens its reasoning with `<think>`, as the current template of the model
-does; the template of its GGUF file, an earlier one, leaves that marker to the model.
+Qwen3-VL, Foundation-Sec-8B-Reasoning and DeepSeek-R1 Distill Llama 8B, was trained to reason before
+each answer, and its prompt opens that reasoning whatever the request asks. When the request asks
+for no reasoning, the engine ends it at once by writing in place of the model the sentence the
+authors of Qwen3 give for the budget of a reasoning ("Considering the limited time by the user, I
+have to give the solution based on the thinking directly now.") and the marker `</think>`; the model
+then answers directly, the prompt staying within what it learned, where a reasoning closed empty
+before it starts led its answer to take up the corrections and returns of a reasoning, which could
+loop. With the effort `low`, the engine ends the reasoning after 512 tokens, 256 for the work in the
+background, and `reasoning_budget` sets that limit for any request, -1 or null lifting it. Without
+it, the reasoning takes half of the tokens of the answer at most (`max_tokens`, or the room the
+context leaves after the prompt), 32,768 at most, the length of answer the authors of Qwen3 advise
+for most questions, unless the effort is `high`: a reasoning that goes on, as the small Thinking
+models do at times, ends then and the model answers in the room left. The end the engine writes
+counts among the tokens of the answer and stays out of the `reasoning_content` the client receives;
+the answer of a request that asked for no reasoning receives its `max_tokens` once the reasoning
+ends, and its stop sequences apply to that answer alone. The prompt of Foundation-Sec-8B-Reasoning
+opens its reasoning with `<think>`, as the current template of the model does; the template of its
+GGUF file, an earlier one, leaves that marker to the model.
 
 The engine watches the repetitions of the reasoning and of the answer apart: a part loops when nine
 tenths of its last 384 tokens end a passage of 16 tokens that it wrote twice before. A reasoning
@@ -1319,7 +1322,6 @@ reported as unusable, with its compute capability, and the other engines serve t
 | `ALBIREO_MODEL_CACHE`     | user cache | downloaded and converted models that come with Albireo         |
 | `ALBIREO_BUILTIN_MANIFEST`| `resources/builtin_models.json` | the models that come with Albireo           |
 | `ALBIREO_BUILTIN_TOOL`    |         | `albireo-builtin` of the build machine, for a cross build         |
-| `ALBIREO_PUBLIC_LINK_PASSWORD_FILE` | `keys/albireo-public-link.txt` of the user's folder | password of the public link, built into the service (see [Publishing a version](#publishing-a-version)) |
 | `ALBIREO_RUNTIME_LICENSES`|         | more license files for the `licenses` folder                      |
 
 The programs link their C and C++ runtime statically and depend on system libraries only; the
@@ -1364,10 +1366,11 @@ cmake --build build-albireo-win -j
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, the 8192 tokens of an answer of the relay of a document before version 3 read 16384, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, an account without credit, the substitutes left in the answer for a check, an address without `/v1` or with the path of an operation reaching the interface at `/v1`, the codes, statuses and messages of the failures of the test, the refusals of the tools, of the offline mode and of a missing key, offline an engine of this computer answering with Pseudalis while the downloads are cancelled and the providers of the Internet and the public addresses refused before any connection, and a log that names no key and no value) |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads of the models from a local server of official addresses, and from nowhere else (the address of a message without its query; a file of another size or of other bytes, a web page in place of a file and a server that fails, each failing the download with the address and its failure, the progress kept; a model of eight parts, one compressed, resumed with the part it lacked; a download cancelled at once; an address that answers twice 404, 410 or 451, or 401 or 403 with the error headers of the hub, by itself or through another address of its own server and without a web page, ending the download with the code `download_unavailable`, its progress and its partial files dropped and its address kept seven days, the same statuses from a web page or from another server a redirection led to, and 401 or 403 without these headers, staying failures of the transfer), the catalog and the feed of the updates from a local folder of the versions alone (the signed catalog of the repository and the signed feed of `tests/data` read from it; a file it lacks, answered with a line of text or with the page of a website, another signature, with no request to an official address), the installer of an update written through a new partial file and named once it has the size and the hash the feed names, each failure of the folder of the versions with the bounds of the tests shortened (web pages with 200 and 403, a proxy that asks for its authentication, connections reset or refused, a server that stalls or answers byte by byte) failing with the address and the failure, without exception, the local server still answering, the settings of an earlier version written again without the link of that version and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, the 8192 tokens of an answer of the relay of a document before version 3 read 16384, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, an account without credit, the substitutes left in the answer for a check, an address without `/v1` or with the path of an operation reaching the interface at `/v1`, the codes, statuses and messages of the failures of the test, the refusals of the tools, of the offline mode and of a missing key, offline an engine of this computer answering with Pseudalis while the downloads are cancelled and the providers of the Internet and the public addresses refused before any connection, and a log that names no key and no value) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`, written to the environment block of the process, which dlib reads on Windows whatever the runtime of C of the program), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni`; the sequences that advance together start from the first tokens of the prompt, 64 at most, and their number is the size of the passes their steps measure |
 | `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input, `-f32` has the other devices compute in single precision rather than in half precision, and `-dq` leaves their plugin its default, which rounds the inputs of the products of the long passes of a prompt to 8 bits; a comparison whose largest divergence exceeds 0.1 names its pass or step and the most probable tokens of both runtimes with their probabilities. `test_ov_graph model.gguf [device] [threads] [f16\|u8][-mask][-f32][-dq] [prompt] [chunk] [steps]` |
+| `test_publish_release.py` | the publication of a version by `tools/publish_release.py`, with a chain of the website played by a script, which publishes the feed, the catalog and the installers of its folder of the publication, and a local hosting: the refusals before anything is written, each told in one line (a folder without the chain, an installer of another version or of another folder, a key of another pair, notes that are no texts by language, a catalog whose signature fails or that tells no time, the feed of a later version or a later catalog in the folder of the publication or on the website, a website that cannot be read or answers with a page), the release notes of the sources taken by default, the seven files written under hidden names, each copy compared with its source, a link at one of these names never written through and the names a run cut short left removed, a signature of the feed that fails or is the one of another key, a failure at the first name, which leaves the folder as it was, and one after it, told with what the folder holds and completed by the same command, the order of the names, another build of one version and of one size, the two commands of the chain on the terminal of the publisher, the check of what the hosting serves (another signed file, a signature that fails, another size, another installer by the list of the files, a later version, a redirection, a feed served after a moment), `--deposit`, `--dry-run`, the catalog alone with `--catalog` (a feed that is not the one served, an installer the folder lacks), the note on a catalog that Git does not hold yet, the offline bundle of `tools/make_offline_bundle.py` from the hosting and from a folder, and no name of a session, of a password file or of a setting of the website in the program; `test_linux.sh` runs it |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which
@@ -1408,7 +1411,9 @@ Windows runs no program of 4 GiB or more: when the program and its models would 
 the complete installer does with the libraries of CUDA and of OpenVINO, its models lie beside it in
 `albireo-setup.models`, which the installer reads when it carries none; the two files travel
 together and are renamed together (`albireo-setup-complete-<version>.exe` and
-`albireo-setup-complete-<version>.models`).
+`albireo-setup-complete-<version>.models`). The website publishes the installers of each version
+under these names, `albireo-setup-online-<version>.exe` for the one without models, and offers
+them on its downloads page, https://cydral-technology.eu/en/downloads/.
 
 The wizard asks for the language, the license, the folders of the programs, of the data and of the
 models, the options (start with Windows, desktop shortcut, trust of the local certificate, the
@@ -1514,11 +1519,13 @@ Two ways to update an installed computer:
 - by hand: start the new `albireo-setup.exe`, or `albireo-setup-online.exe`, and follow the
   update wizard;
 - automatically: once a version is published (see [Publishing a version](#publishing-a-version)),
-  the service reads the signed feed at its start and every six hours in the public link,
-  downloads the installer without models in the background from the link as well, checks
-  its size, its SHA-256 and the signature of the feed,
-  and the menu of the icon offers "Install version <version> and restart"; otherwise the update is
-  installed at the next start of the service. "Check for updates" asks the feed at once.
+  the service reads the signed feed at its start and every six hours on the website of Cydral
+  Technology, downloads the installer without models in the background from the same folder,
+  checks its size, its SHA-256 and the signature of the feed, and the menu of the icon offers
+  "Install version <version> and restart"; otherwise the update is installed at the next start of
+  the service. "Check for updates" asks the feed at once. The versions up to 1.0.24 read their
+  updates elsewhere, in a storage space that no longer receives them: they are updated by hand,
+  once, with an installer of the website.
 
 ## Settings
 
@@ -1583,15 +1590,15 @@ the catalog that stands for it, or `auto`; the `model` of `/v1/embeddings` takes
 | `GET /albireo/v1/licenses/<file>`        | one of these texts, 1 MB at most, a file of that folder only |
 | `/docs/`                                 | Swagger page of the interface                             |
 
-The sampling of every model goes through the sampler of Albireo, whatever the architecture of
-the model and the engine: `temperature`, `top_p`, `top_k`, `min_p` and the penalties apply the
-same way to all of them. The settings a request leaves out take the values the authors of the
-family of the model advise on its card, for a request of text alone or with images as the cards of
-Qwen3-VL distinguish them, or the temperature of the use and of the evaluations their cards describe
-for CyberSecQwen 4B and the Foundation-Sec models, `min_p` being 0 for all of them. A Thinking model
-of Qwen3-VL whose reasoning the engine ends at once answers as a model without reasoning, with the
-values the authors of Qwen3 advise for that mode. The "Generation" tab of the web application leaves
-them out while its settings stay on automatic:
+The sampling of every model goes through the sampler of Albireo, whatever the architecture of the
+model and the engine: `temperature`, `top_p`, `top_k`, `min_p` and the penalties apply the same way
+to all of them. The settings a request leaves out take the values the authors of the family of the
+model advise on its card, for a request of text alone or with images as the cards of Qwen3-VL
+distinguish them, or the temperature of the use and of the evaluations their cards describe for
+CyberSecQwen 4B, the Foundation-Sec models and DeepSeek-R1 Distill Llama 8B, `min_p` being 0 for all
+of them. A Thinking model of Qwen3-VL whose reasoning the engine ends at once answers as a model
+without reasoning, with the values the authors of Qwen3 advise for that mode. The "Generation" tab
+of the web application leaves them out while its settings stay on automatic:
 
 | Models                                   | `temperature` | `top_p` | `top_k` | Penalty                                   |
 |------------------------------------------|---------------|---------|---------|-------------------------------------------|
@@ -1604,6 +1611,7 @@ them out while its settings stay on automatic:
 | Qwen3 without reasoning                  | 0.7           | 0.8     | 20      | none                                      |
 | Qwen2.5                                  | 0.7           | 0.8     | 20      | `repeat_penalty` 1.05 over 64 tokens      |
 | Foundation-Sec 1.1 8B and 8B Reasoning   | 0.3           | 0.95    | 20      | none                                      |
+| DeepSeek-R1 Distill Llama 8B             | 0.6           | 0.95    | none    | none                                      |
 | Granite 4.2, with and without reasoning  | 1             | 0.95    | none    | none                                      |
 | Ministral 3                              | 0.1           | 1       | none    | none                                      |
 | Devstral, other Mistral without reasoning | 0.15         | 1       | none    | none                                      |
@@ -2021,26 +2029,38 @@ turns send these answers as they came, substitutes included.
 
 The catalog ([`dist/albireo/catalog.json`](../../../../dist/albireo/catalog.json)) lists models of
 the architectures the engine supports (llama, mistral, mistral3, granite, granitemoe, phi3, qwen2,
-qwen3, qwen3moe, qwen3vl, qwen3vlmoe, mixtral), with their functions, the company or the
-consortium that made them, what they read, their descriptions in the five languages, their
-license, and the address, size and SHA-256 of each file, the projector of a model that reads
-images included. [`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face
-hub, the addresses pinned to a commit so that a file never changes under its hash. The service
-downloads each file first from its copy in the public link of the published files,
-`models/<identifier>/<file name of its address>`, then from the address of the catalog, the
-official source of the model, when the link is not set, does not answer, refuses the requests, does
-not hold the file, holds it at another size than the catalog, or gives bytes that fail its hash:
-the parts of the download continue there from where they stopped, the next segments go there at
-once when the link fails for the whole download, and the log tells each change of source once,
-with the official address and the failure of the link. A
-computer whose network blocks the storage service of the link, behind a proxy of a company for
-instance, downloads its models this way. A download that both sources fail ends with the code
-`download_failed`, whose message names the file in the link, the failure of the link, the official
-address and its failure. The catalog comes the same way from the link, else from its official
-address in the repository of Albireo, `dist/albireo/catalog.json` and its signature, and the log
-tells which source served it; the updates come from the link alone (see [Updates](#updates)). The
-signature and the hashes check the bytes, whatever their source. The sizes below count the decoder
-and its projector.
+qwen3, qwen3moe, qwen3vl, qwen3vlmoe, mixtral), with their functions, the company or the consortium
+that made them, what they read, their descriptions in the five languages, their license, and the
+address, size and SHA-256 of each file, the projector of a model that reads images included.
+[`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face hub, the addresses
+pinned to a commit so that a file never changes under its hash. The hub is the only source of the
+files of the models. The service downloads each file from its address in the catalog, each segment
+in three attempts at most. A download that the address fails ends with the code `download_failed`,
+whose message names the address and its failure, and keeps the bytes received, which the next
+download resumes. An address that tells twice in a row that it no longer publishes its file ends the
+download with the code `download_unavailable`, which gives the model, the address and the status of
+its answer: 404 for a file or a revision that left the hub, 410 and 451 read the same way, and 401
+or 403 with the error headers of the hub (`X-Error-Code`, `X-Error-Message`) for a repository
+deleted, made private or closed; an address that sends to another address of its own server, as the
+hub does for a repository that took another name, answers through it. The other transfers of the
+download stop there. The service then drops the progress and the partial files and keeps the address
+for seven days: it no longer asks for a default model by itself while the catalog names that
+address, and the Models window tells why and still starts the download. Such a model cannot be
+downloaded, nor serve a function, until a catalog names another address for it; a copy already
+installed stays in use. The web page that a proxy or a filter answers in place of the file, a status
+401 or 403 without the headers of the hub, and the refusal of the content server the hub redirects
+to, are failures of the network (`download_failed`), whatever their status.
+
+The catalog and its signature come from the folder of the versions on the website of Cydral
+Technology, `https://cydral-technology.eu/files/albireo/dist/catalog.json` and `catalog.json.sig`,
+where the update feed lies too (see [Updates](#updates)). A service that cannot reach the website
+keeps the catalog it stored, which an offline bundle brings as well, and the log names the address
+and its failure. The signature and the hashes check the bytes, whatever the server that gave them.
+`python tools/make_catalog.py --check` asks the hub for each address of the catalog of the
+repository, with its size and its SHA-256, and names the models to revise, those whose file the hub
+no longer publishes there or gives at another size or with another hash, apart from those it could
+not check, the hub not answering; it ends with 1 when a model is to revise, else with 2 when one
+could not be checked. The sizes below count the decoder and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Agent and web  | Deep reasoning | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------------|----------------|----------|---------|
@@ -2058,6 +2078,7 @@ and its projector.
 | EuroLLM 9B Instruct            | EuroLLM consortium | general                 | text          | no             | no             | 5.58 GB  | Apache-2.0 |
 | Granite 4.2 3B                 | IBM                | general, code           | text          | with reasoning | yes            | 2.24 GB  | Apache-2.0 |
 | Granite 4.2 8B                 | IBM                | general, code           | text          | with reasoning | yes            | 5.35 GB  | Apache-2.0 |
+| DeepSeek-R1 Distill Llama 8B   | DeepSeek           | general, code           | text          | no             | yes            | 4.92 GB  | Llama 3.1 Community License |
 | Qwen3-VL 30B A3B Thinking      | Alibaba            | general, code, security | text, image   | with reasoning | yes            | 19.27 GB | Apache-2.0 |
 | Mistral Small 3.2 24B          | Mistral AI         | general                 | text, image   | yes            | no             | 15.21 GB | Apache-2.0 |
 | Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | no             | no             | 1.12 GB  | Apache-2.0 |
@@ -2070,13 +2091,14 @@ and its projector.
 The columns Agent and web and Deep reasoning give the buttons of the web application that each model
 enables, from the capabilities of its entry (`tools`, `reasoning`, `reasoning_always`): with "with
 reasoning", Agent and Web come with the deep reasoning, and the models trained to reason before each
-answer, the Thinking models and Foundation-Sec 8B Reasoning, answer directly while it is off, the
-engine ending their reasoning at once. These capabilities were verified model by model. The template
-of each file gives those of its format in the engine. Then the models of 8B at most whose format
-gives tools or reasoning, served by the service built for Linux with the system message and the
-tools of the web application, answered two requests that ask for a web search, a question that calls
-for one and a calculation, with the deep reasoning when they reason, and a question with the deep
-reasoning on and off, the only one Foundation-Sec 8B Reasoning answered since it calls no tools.
+answer, the Thinking models, Foundation-Sec 8B Reasoning and DeepSeek-R1 Distill Llama 8B, answer
+directly while it is off, the engine ending their reasoning at once. These capabilities were
+verified model by model. The template of each file gives those of its format in the engine. Then the
+models of 8B at most whose format gives tools or reasoning, served by the service built for Linux
+with the system message and the tools of the web application, answered two requests that ask for a
+web search, a question that calls for one and a calculation, with the deep reasoning when they
+reason, and a question with the deep reasoning on and off, the only one Foundation-Sec 8B Reasoning
+and DeepSeek-R1 Distill Llama 8B answered since they call no tools.
 Qwen2.5 Coder 1.5B and 7B made no call that the engine reads in their 8 answers each, 13 of the 16
 writing their call as a JSON block, between code fences or the double braces of the example of their
 template, or as an empty tag, so that their entries give no tools. Mistral Small 3.2 24B, Devstral
@@ -2089,8 +2111,8 @@ those of 32 GB, a general assistant and a programming agent:
 
 | Function | Text and images | Text |
 |----------|-----------------|------|
-| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, Mistral Small 3.2 24B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B |
-| Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking, Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B |
+| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, Mistral Small 3.2 24B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B, DeepSeek-R1 Distill Llama 8B |
+| Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking, Devstral Small 2 | Granite 4.2 3B and 8B, DeepSeek-R1 Distill Llama 8B, Qwen2.5 Coder 1.5B and 7B |
 | Security | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Instruct and Thinking), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking | CyberSecQwen 4B, Foundation-Sec 1.1 8B and 8B Reasoning |
 
 The choices follow the published measures: Qwen3-VL gives the best scores of the models that read
@@ -2109,12 +2131,17 @@ assistant of the same size, which follows instructions more closely than Mistral
 of the instruction tests of its authors against 82.75 %), answers better in conversation (Wildbench
 v2 65.33 against 55.6, Arena Hard v2 43.1 against 19.56), falls into endless repetitions less often
 (1.29 % of the long and repetitive prompts of its authors against 2.11 %) and calls tools more
-reliably; its GGUF files by Unsloth keep the format of version 11 of its tokenizer, whose
-template writes the tools before the last question and an identifier with each call and each result.
-Phi-4-mini is the latest small model of Microsoft with a standard decoder. EuroLLM 9B Instruct
-translates and writes the 24 official languages of the European Union best of the list (FLORES
-88.9), and EuroVLM 9B Preview, built on it, reads images in these languages; its publishers give it
-as a preview version.
+reliably; its GGUF files by Unsloth keep the format of version 11 of its tokenizer, whose template
+writes the tools before the last question and an identifier with each call and each result.
+Phi-4-mini is the latest small model of Microsoft with a standard decoder. DeepSeek-R1 Distill Llama
+8B, which DeepSeek distilled from DeepSeek-R1 into Llama 3.1 8B, reasons before every answer on
+mathematics, logic and code (AIME 2024 50.4, MATH-500 89.1, GPQA Diamond 49.0 and LiveCodeBench 39.6
+at the first attempt, measured by its authors); its GGUF file by Unsloth keeps the template of
+DeepSeek, which writes the system message of the web application at the head of the prompt, where
+its authors advise to give the instructions in the question. EuroLLM 9B Instruct translates and
+writes the 24 official languages of the European Union best of the list (FLORES 88.9), and EuroVLM
+9B Preview, built on it, reads images in these languages; its publishers give it as a preview
+version.
 
 Without the models that come with the complete installer, the service downloads at its first start
 the default language model and the default embedding model of the catalog, whatever the options of
@@ -2250,20 +2277,26 @@ icon greys "Check for updates". What the service needs then comes from an offlin
 prepared on a computer with network:
 
 ```
-python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--models qwen3-4b,qwen3-embedding-0.6b] [--from ~/models]
+python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--models qwen3-vl-4b-instruct,qwen3-embedding-0.6b] [--from ~/models]
 ```
 
-The bundle holds the signed catalog and the signed update feed of `dist/albireo`, the installer the
-feed announces, taken from `--installer` or else from the folder `dist` of the public link alone, a
-`models` folder with the models chosen, each model that reads images with its
-projector (the two default models when `--models` is absent) and a `README.txt`. `--complete build-albireo/bin/albireo-setup.exe` adds the complete
-installer, which carries the models that come with Albireo: the bundle then needs no models. Each
-file is checked against the hashes of the signed files when it enters the bundle, and again by the
-service when it installs it; the signatures are checked with `albireo-sign` (`--sign`, else
-`build-albireo/bin`, else the `PATH`), and `--no-verify` leaves that check to the service. The bundle is used in one of
-three ways:
+The bundle holds the signed catalog and the signed update feed that the website serves, or those of
+the folder `--dist` names, the folder of the publication for instance (see
+[Publishing a version](#publishing-a-version)); the installer the feed announces, taken from
+`--installer`, else from the folder of `--dist`, else downloaded from the folder of the versions on
+the website; a `models` folder with the models chosen, taken from the folders of `--from` or else
+downloaded from the addresses of the catalog, each model that reads images with its projector (the
+two default models when `--models` is absent); and a `README.txt`. `--complete <albireo-setup.exe>`
+adds the complete installer of a build, which carries the models that come with Albireo: the bundle
+then needs no models. The installer of the updates and the files of the models are checked against
+the hashes of the signed files when they enter the bundle, the complete installer against the
+version of the feed, and each file again by the service when it installs it; the signatures are
+checked with `albireo-sign` (`--sign`, else `build-albireo/bin`, else the `PATH`), and `--no-verify`
+leaves that check to the service. The bundle is used in one of three ways:
 
-- `albireo-setup-<version>.exe` started from the bundle installs Albireo with its models;
+- its installer, `albireo-setup-complete-<version>.exe` when `--complete` added it, else
+  `albireo-setup-online-<version>.exe`, started from the bundle installs Albireo, and the service
+  installs the catalog and the models at its first start;
 - the Import button of the Models window, given the folder of the bundle, installs the catalog,
   the models and the update of an installed computer;
 - the content of the bundle copied into `C:\ProgramData\Albireo\import` is installed by the service
@@ -2282,76 +2315,97 @@ while the service tells the Windows service manager that its stop goes on.
 
 ## Publishing a version
 
-The feed and the catalog live in [`dist/albireo`](../../../../dist/albireo) of the repository, each
-with a detached signature (ECDSA P-256 over its exact bytes) that the programs check with the public
-key built into [`host/crypto.cpp`](host/crypto.cpp). The private key stays with the publisher;
-`albireo-sign keygen` refuses a path that exists, so that the key of the feed is never replaced, and
-gives the private key to the account that runs it alone. The programs travel in the installer, which
-carries the service, the tray, every engine with the runtime libraries of its device, and the web
-application.
+The feed and the catalog each bear a detached signature (ECDSA P-256 over their exact bytes) that
+the programs check with the public key built into [`host/crypto.cpp`](host/crypto.cpp). The private
+key stays with the publisher; `albireo-sign keygen` refuses a path that exists, so that the key of
+the feed is never replaced, and gives the private key to the account that runs it alone. The
+programs travel in the installer, which carries the service, the tray, every engine with the
+runtime libraries of its device, and the web application.
 
-The published files lie in the publication space of Albireo, the public link of a public folder of
-pCloud read only, a constant of the build that no setting, route or document gives
-([`host/public_link.h`](host/public_link.h)), protected by a password that the service carries. Its
-folder `dist` holds `feed.json`, `catalog.json`, their signatures, the installer of the updates,
-`albireo-setup-online-<version>.exe`, and the complete installer,
-`albireo-setup-complete-<version>.exe`; its folder `models` holds each file of the catalog at
-`<identifier>/<file name of its official address>`. The service reads the feed and the installer
-there alone, through the API of pCloud: a space that does not answer or that does not hold a file
-makes the update fail with a message that names the file in the space and the kind of failure ("the
-publication space of Albireo cannot be reached for dist/feed.json: the request is answered with the
-status 403"). The catalog and the model files come from there first, and from their official
-addresses when the space does not serve them (see [Models](#models)), the message of a failure of
-both naming the file in the space, its failure, the official address and its failure. The
-signatures and the hashes check every file. No message, window or log of the service, the tray
-or the installer names the link, its code, an address of the API or of a content server, or a host
-of pCloud: the messages name the files of the space, and the log, the errors of the routes, the
-windows of the tray and the log of the installer pass their texts through a last guard that
-replaces any such word with "the publication space of Albireo" ([`common/log.h`](common/log.h)),
-the log files of an earlier version included. [`dist/albireo`](../../../../dist/albireo) of the
-repository keeps the signed feed and catalog that the publisher places in the link.
+The website of Cydral Technology publishes the versions in one folder,
+`https://cydral-technology.eu/files/albireo/dist/` (`ALBIREO_DISTRIBUTION_URL` of
+[`common/version.h`](common/version.h)): `feed.json`, `catalog.json`, their signatures, the
+installer of the updates, `albireo-setup-online-<version>.exe`, the complete installer,
+`albireo-setup-complete-<version>.exe`, and the models of the latter,
+`albireo-setup-complete-<version>.models`, when the build puts them beside it. The service asks that
+folder alone for the feed, the catalog and the installer of an update
+([`host/distribution.h`](host/distribution.h)), without account and without password. The files of
+the models come from the Hugging Face hub alone (see [Models](#models)), and the website holds no
+copy of them. A file the website does not serve yet makes the update fail with the code
+`update_not_published`, which names its address; the other failures name the address and their
+cause. The signatures and the hashes check every file.
 
-The password is read at the configuration from `ALBIREO_PUBLIC_LINK_PASSWORD_FILE`, by default
-`keys\albireo-public-link.txt` in the folder of the user (`~/keys` on Linux), outside the
-repository, and built into the service masked; a service built without that file reaches the link
-without password, which the link refuses while it is protected. Such a build, that of a copy of the
-repository without the file of its publisher, says so at its start ("publication space: set, without
-password") and in each refusal ("and this build carries no password for it"): its catalog and its
-models come from their official addresses, with a warning in the log at each read, and its updates,
-which the space alone serves, fail, so that `check_updates` is best turned off there. The tools of
-the publisher read the same file, or the variable `ALBIREO_PUBLIC_LINK_PASSWORD`.
+The chain of the website, a folder of its own outside the repository (`~/work/cydral-website` under
+WSL), is the only one that carries files to the hosting. It publishes the files of its folder
+`releases/files` under `files/` of the website, with one layout for every product: the folder of
+the publication of Albireo is `releases/files/albireo/dist`, served as the folder above. The
+repository holds the sources, the release notes of each version in [`notes`](notes)
+(`notes/<version>.json`, the texts by language) and, in [`dist/albireo`](../../../../dist/albireo),
+the signed catalog: nothing of a publication is written in it.
+[`tools/publish_release.py`](tools/publish_release.py) joins the two chains, under WSL, in this
+order:
 
-[`tools/publish_release.py`](tools/publish_release.py) writes the feed of a version from its
-installer without models: it checks that the installer carries the version of
-[`common/version.h`](common/version.h), writes the feed with the name of the installer in the link,
-its size and its SHA-256, signs it, checks the signature, puts the feed and its signature in place
-and prints the commands that push them. [`tools/fill_public_link.py`](tools/fill_public_link.py)
-then fills the local copy of the link, the folder the storage service synchronizes: `dist` copies the
-signed feed and catalog with their signatures, checked with `albireo-sign`, and both installers
-under their names, checked against the feed, with the file of models of the complete installer
-when it has one, the feed last; `models` places the files of the
-catalog, kept when they are in place, copied from the folders of `--from` when a file has their size
-and SHA-256, else downloaded from their official addresses, resumed after a cut and checked; `check`
-reads the listing of the link and reports the files it lacks or holds at another size:
+- it checks that both installers carry the version of [`common/version.h`](common/version.h), that
+  the private key signs what the key built into the programs verifies, that the catalog of the
+  repository bears its signature, that neither the folder of the publication nor the website holds
+  the feed of a later version or a catalog published after the one of the repository, and that the
+  disk of the folder has room for the files; a failure leaves every folder as it is, and so does a
+  website that cannot be read from the computer, or that answers with something else than a feed
+  and a catalog, as a portal or a filter of a network does: its version stays unknown;
+- it fills the folder of the publication, where a file already there as it is stays: the installers
+  under their published names, the catalog and its signature, each first copied under a name that
+  starts with a dot, which no feed names and the chain leaves aside, and compared with its source,
+  and the feed, with the name of the installer of the updates, its size, its SHA-256 and the release
+  notes, signed and its signature checked;
+- it gives these files their names, the installers first and the feed last, and the installers of
+  the other versions leave the folder; a failure before the first name is taken leaves the folder
+  as it was, and a failure after it is told with what the folder then holds, the same command
+  completing the version;
+- it runs `tools/site.sh status`, then `tools/site.sh publish`, from the folder of the website and
+  on the terminal of the publisher, where the chain asks for the password of the hosting when it
+  needs it, and stops when one of the two ends with an error;
+- it reads the website until it serves the four signed files as they are in the folder of the
+  publication, byte for byte, and the installers at their sizes, with the SHA-256 the list of the
+  files of the website gives for each of them.
 
-```
-python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
-python dlib\dlib\external\albireo\tools\fill_public_link.py dist <copy of the link>\dist --online build-albireo\bin\albireo-setup-online.exe --complete build-albireo\bin\albireo-setup.exe
-python dlib\dlib\external\albireo\tools\fill_public_link.py models <copy of the link>\models --from C:\ProgramData\Albireo\models
-python dlib\dlib\external\albireo\tools\fill_public_link.py check
-```
-
-The feed names the installer by its file in the link alone, with no address of another site. A
-model published outside the hub, a model converted for the engine for instance, is cut into parts
-of less than 2 GiB and attached to the release `albireo-models` of GitHub by
-[`tools/publish_model.py`](tools/publish_model.py), whose output is the entry of the catalog, with
-the architecture, the parameters and the context read from the file; these release files are the
-official addresses of its parts, from which `fill_public_link.py models` copies them to the link,
-and the token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`:
+The program opens no session with the hosting, neither reads, keeps nor passes on its password, and
+reads no setting of the website. The same command publishes from each computer of the publisher,
+whose folders of the user differ: the installers are by default those of
+`%USERPROFILE%\work\Dlib-Transformer-extensions\build-albireo\bin`, the copy of the repository
+that [`tools/build_windows.ps1`](tools/build_windows.ps1) builds, found from WSL through `cmd.exe`
+and `wslpath`; the folder of the website and the private key are by default `~/work/cydral-website`
+and `~/keys/albireo-feed-signing.key`. `tools/site.sh take online`, run from the folder of the
+website, brings to a computer the files that another one published.
 
 ```
-python3 dlib/dlib/external/albireo/tools/publish_model.py model.gguf my-model parts --release albireo-models --gzip
+python3 dlib/dlib/external/albireo/tools/publish_release.py --dry-run
+python3 dlib/dlib/external/albireo/tools/publish_release.py
+python3 dlib/dlib/external/albireo/tools/publish_release.py --deposit
+python3 dlib/dlib/external/albireo/tools/publish_release.py --catalog
+python3 dlib/dlib/external/albireo/tools/publish_release.py --check
 ```
+
+`--dry-run` makes the checks, prints the files of the publication, its notes and the installers that
+would leave the folder, and writes nothing. `--deposit` writes the files of the folder of the
+publication and leaves the two commands of the website to the publisher, who runs them from its
+folder, with the files of another product for instance; it goes on, with a note, on a computer that
+cannot read the website. `--check` reads what the website serves, for the folder as it is, and
+checks the signatures of its feed and of its catalog when `albireo-sign` is found. `--notes` names
+another file of release notes than the one of the sources; without either, the notes the feed of
+the folder already gives the version are kept, and a version without notes reads
+"Albireo <version>". `--catalog` publishes the catalog of the repository between two versions, for
+a model that left the hub or a model added to the list, once
+[`tools/make_catalog.py`](tools/make_catalog.py) wrote it and `albireo-sign` signed it: the feed
+stays the one of the folder of the publication, which must be the feed the website serves, byte for
+byte, beside the installer it names, and the program reads no installer and no key.
+`tools/site.sh deploy --prune`, of the website, removes the installers of the earlier versions from
+the hosting.
+
+The catalog lists models of the Hugging Face hub alone.
+[`tools/publish_model.py`](tools/publish_model.py) stays for a model converted for the engine, which
+it cuts into parts of less than 2 GiB attached to a release of GitHub, printing the entry of the
+catalog with the architecture, the parameters and the context read from the file; no model of the
+catalog is published this way.
 
 [`dist/albireo/README.md`](../../../../dist/albireo/README.md) gives every step, the catalog
 included. A feed announcing a higher version makes the services download the installer, check its
@@ -2413,17 +2467,14 @@ size and its SHA-256, and run it in update mode at their next start.
   the signed offline bundles (see [Models](#models)). Every error of the updates carries a code
   with its values (`update_signature`, `update_installer_mismatch`, `update_package_manager`...),
   which the tray explains in the language of the user.
-- The publication space, the only source of the updates and the first one of the catalog and of the
-  models, brings nothing the signed feed and catalog do not name, at the size and with the SHA-256
-  they give: a file of the space that differs is refused, and only the official address of the
-  catalog or of the model, checked the same way, takes its place. A web page that a proxy or a
-  filter of the network sends in place of an answer, a body cut short, a JSON of other types, a
-  stalled server and a connection reset end the attempt with its message, bounded in time, and no
-  exception leaves the threads of the downloads and of the checks. The password of its link never
-  lies in the repository: the configuration reads it from a file of the publisher and builds it into
-  the service masked, and the messages and the logs never name the link, its code or the addresses
-  of pCloud. It keeps the link from being read outside Albireo, not from someone who studies the
-  program.
+- The website, the only source of the feed, of the catalog and of the installer of an update, and
+  the Hugging Face hub, the only source of the files of the models, bring nothing the signed feed
+  and catalog do not name, at the size and with the SHA-256 they give: a file that differs is
+  refused. A web page that a proxy or a filter of the network sends in place of an answer, a body
+  cut short, a JSON of other types, a stalled server and a connection reset end the attempt with
+  its message, bounded in time, and no exception leaves the threads of the downloads and of the
+  checks. Both sources are public: the service carries no password and no key for them, and the
+  messages and the logs name their addresses.
 - The JavaScript the agent mode runs executes in a sandboxed frame of opaque origin, in a worker
   stopped after 15 s; the page builds its own copy of each answer of the frame, with checked and
   shortened fields, and gives up on a frame silent for 20 s.

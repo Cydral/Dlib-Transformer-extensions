@@ -133,10 +133,17 @@ namespace albireo
                 - role-tags: Foundation-Sec 1.1 8B Instruct, each message after <|system|>,
                   <|user|> or <|assistant|> and a line break, these markers being plain text
                   of its vocabulary, an answer ended by the end of text token.
+                - deepseek: the DeepSeek-R1 models distilled into other decoders
+                  (DeepSeek-R1-Distill-Llama-8B), the system prompt right after the beginning
+                  of sentence token, the questions after <｜User｜>, the answers after
+                  <｜Assistant｜> and before the end of sentence token, and a reasoning that the
+                  prompt opens with <think> and the model closes with </think> before its
+                  answer.
 
             REASONING
                 A format whose template opens the reasoning of every answer (the thinking
-                variants of Qwen3 and Qwen3-VL, Foundation-Sec-8B-Reasoning) always reasons:
+                variants of Qwen3 and Qwen3-VL, Foundation-Sec-8B-Reasoning, the distilled
+                DeepSeek-R1 models) always reasons:
                 the model was trained to, and an answer whose reasoning the prompt closes at
                 once is outside what it learned.  The engine bounds the length of such a
                 reasoning instead (reasoning_close()).

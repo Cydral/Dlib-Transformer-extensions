@@ -587,6 +587,16 @@ namespace albireo
             { "err_download_failed", { "The download failed: {e}", "Le téléchargement a échoué : {e}",
                 "Der Download ist fehlgeschlagen: {e}", "Il download non è riuscito: {e}",
                 "La descarga ha fallado: {e}" } },
+            { "err_download_unavailable", { "{m} is no longer published at its official address ({url}, status "
+                "{status}). It can be downloaded again once the catalog names another address.",
+                "{m} n'est plus publié à son adresse officielle ({url}, statut {status}). Son téléchargement "
+                "redeviendra possible lorsque le catalogue lui donnera une autre adresse.",
+                "{m} wird unter seiner offiziellen Adresse nicht mehr veröffentlicht ({url}, Status {status}). Der "
+                "Download ist wieder möglich, sobald der Katalog eine andere Adresse nennt.",
+                "{m} non è più pubblicato al suo indirizzo ufficiale ({url}, stato {status}). Il download tornerà "
+                "possibile quando il catalogo indicherà un altro indirizzo.",
+                "{m} ya no está publicado en su dirección oficial ({url}, estado {status}). La descarga volverá a ser "
+                "posible cuando el catálogo indique otra dirección." } },
             { "err_download_file", { "The file of the download cannot be created: {file}",
                 "Le fichier du téléchargement ne peut pas être créé : {file}",
                 "Die Datei des Downloads kann nicht angelegt werden: {file}",
@@ -708,13 +718,12 @@ namespace albireo
                 "Le téléchargement de la mise à jour a échoué : {e}",
                 "Der Download der Aktualisierung ist fehlgeschlagen: {e}",
                 "Il download dell'aggiornamento non è riuscito: {e}", "La descarga de la actualización falló: {e}" } },
-            { "err_update_not_published", { "The publication space of Albireo does not hold {file} yet: the "
-                "update comes once it is published there.", "L'espace de publication d'Albireo ne contient pas "
-                "encore {file} : la mise à jour viendra une fois ce fichier publié.", "Der "
-                "Veröffentlichungsbereich von Albireo enthält {file} noch nicht: Die Aktualisierung folgt, sobald die "
-                "Datei dort veröffentlicht ist.", "Lo spazio di pubblicazione di Albireo non contiene ancora {file}: "
-                "l'aggiornamento arriverà una volta pubblicato il file.", "El espacio de publicación de Albireo aún "
-                "no contiene {file}: la actualización llegará una vez publicado el archivo." } },
+            { "err_update_not_published", { "{file} is not published yet: the update comes once this file is on "
+                "the website.", "{file} n'est pas encore publié : la mise à jour viendra une fois ce fichier sur le "
+                "site.", "{file} ist noch nicht veröffentlicht: Die Aktualisierung folgt, sobald die Datei auf der "
+                "Website liegt.", "{file} non è ancora pubblicato: l'aggiornamento arriverà quando il file sarà sul "
+                "sito.", "{file} aún no está publicado: la actualización llegará cuando el archivo esté en el sitio "
+                "web." } },
             { "err_update_not_ready", { "No update is ready.", "Aucune mise à jour n'est prête.",
                 "Keine Aktualisierung ist bereit.", "Nessun aggiornamento è pronto.",
                 "No hay ninguna actualización lista." } },
