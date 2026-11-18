@@ -16,6 +16,12 @@ Windows name it "Albireo Community Edition". They carry the copyright of Cydral 
 France, with its website, https://www.cydral-technology.eu, where the versions are published, and
 the address to write to, contact@cydral-technology.eu; they name no author and no publisher.
 
+The website presents the program on
+[its product page](https://cydral-technology.eu/en/products/albireo/), with a
+[product sheet](https://cydral-technology.eu/files/docs/albireo-product-sheet-en.pdf) in PDF and
+the models of the catalog with their official sources, and offers the installers of the current
+version on its [downloads page](https://cydral-technology.eu/en/downloads/).
+
 ## Contents
 
 - [What it does](#what-it-does)
@@ -135,8 +141,8 @@ the address to write to, contact@cydral-technology.eu; they name no author and n
 
 ## Screenshots
 
-The web application served by the service, the windows of the icon and the installer, with the
-model Qwen3-VL-4B-Thinking-albireo on a processor of two cores.
+The web application served by the service, the windows of the icon and the installer, in version
+1.0.25, with the model Qwen3-VL-4B-Instruct-albireo on a processor of two cores.
 
 | | |
 |---|---|
@@ -147,7 +153,7 @@ model Qwen3-VL-4B-Thinking-albireo on a processor of two cores.
 | ![The Models window](docs/images/models.png) | ![The About tab](docs/images/about.png) |
 | The Models window of the icon | Version, engine, processor and use of the service |
 | ![The installer](docs/images/setup.png) | ![The documentation of the interface](docs/images/api.png) |
-| The installer, which carries the models | The documentation of the interface, at `/docs/` |
+| The installer | The documentation of the interface, at `/docs/` |
 
 ## How it is built
 
@@ -612,6 +618,44 @@ models, and the model is unloaded after the last one (the requests still running
 end with the unloading). The window shows it as unloading meanwhile; activated again before it
 leaves, the model stays loaded. A model deleted while it answers is deleted the same way, once its
 requests are served, and is shown as being deleted until then.
+
+### Sequence mixers in preparation
+
+The engines serve decoders whose layers are an attention and a feed-forward block, dense or a
+mixture of experts. Three mechanisms that recent decoders put beside this attention, or in its
+place, are written and checked on their own, in sources that no engine library holds yet: the
+runtime of a model that uses them starts from kernels already compared with their definitions.
+
+| Source | Mechanism | Definition |
+|--------|-----------|------------|
+| [`engine/mamba3.h`](engine/mamba3.h) | the recurrence of a Mamba-3 layer between its two matrices, with one input and one output per channel or several (rank, weights of the inputs, of the gates and of the outputs), the groups of B and C, both pairings of the rotation and the normalization of the outputs before the gate | Lahoti et al., *Mamba-3: Improved Sequence Modeling using State Space Principles* (2026), and the module `mamba_ssm/modules/mamba3.py` of its authors |
+| [`engine/differential_tpa.h`](engine/differential_tpa.h) | the queries, keys and values of Tensor Product Attention, built from their two factors | Zhang et al., *Tensor Product Attention Is All You Need* (2025), and the module `CPLinear` of its authors |
+| [`engine/differential_tpa.h`](engine/differential_tpa.h) | the two maps of a head of differential attention combined: `lambda`, the subtraction, the normalization of each head and its scale | Ye et al., *Differential Transformer* (2025), and `multihead_diffattn.py` of its authors |
+
+A Mamba-3 layer keeps of a sequence a state of fixed size (`mamba3_state`): the angles of its
+rotation, the state of the recurrence (`d_inner * d_state` floats), and the rotated B and the inputs
+of the last token, which the trapezoidal discretization reads at the next one. A layer of 4096
+channels with a state of 128 keeps 2.1 MB per sequence, at any length of the sequence. This state
+has no positions to cut, as the keys and values of an attention have: a copy of it is a snapshot of
+the sequence at its last token, and a sequence goes back to an earlier token by taking the copy made
+there, then reading again the tokens that follow. `forward()` takes the rows the first matrix of the
+layer gives for consecutive tokens and writes the rows its second matrix takes; the heads being
+independent, the threads of a runtime share them by ranges. The recurrence has the instructions of
+AVX2 and FMA and a portable form, as the quantized kernels have: on a processor of two cores, one
+token of that layer takes about 0.2 ms on one thread with AVX2 and 0.4 ms without.
+
+[`tools/make_mixer_golden.py`](tools/make_mixer_golden.py) computes the cases of
+`tests/data/mixers.golden` in double precision with numpy, after the functions the authors of each
+mechanism give as references, and `test_mixers` compares the engine with them. Where these sources
+differ among themselves, the script tells which one a case follows: with fewer key heads than heads,
+the sources of differential attention give the keys to the maps in two ways, and the cases hold
+both.
+
+Two other needs of a model built on these mechanisms are met by the engines as they are. The
+mixtures of experts take up to 4096 experts per layer: on a model of 256 experts per layer of which
+16 answer a token, written by [`tests/make_moe_model.py`](tests/make_moe_model.py), the processor
+runtime gives the logits of `tests/reference_forward.py` and every engine library answers with the
+same tokens. The kernels read weights stored in BF16.
 
 ### Measures of the engines
 
@@ -1162,8 +1206,8 @@ installed models, each with its version, its role and its license, whose text op
 | [`web/`](web)            | the web application, the Swagger page and the OpenAPI description            |
 | [`resources/`](resources)| icons, images, license, version resources, models that come with Albireo      |
 | [`cmake/`](cmake)        | MinGW-w64 toolchain, payload of the installer, runtime libraries of devices, downloads of the models |
-| [`tests/`](tests)        | kernel, runtime, tokenizer and device tests, engine driver, benchmark          |
-| [`tools/`](tools)        | build and test scripts, preparation of the models that come with Albireo, catalog, feed, publication, offline bundle, images |
+| [`tests/`](tests)        | kernel, mixer, runtime, tokenizer and device tests, engine driver, benchmark   |
+| [`tools/`](tools)        | build and test scripts, preparation of the models that come with Albireo, catalog, feed, publication, offline bundle, images, generator of the reference results of the sequence mixers |
 
 ## Building on Windows
 
@@ -1365,12 +1409,18 @@ cmake --build build-albireo-win -j
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
+| `test_mixers`    | the sequence mixers in preparation against the cases of `tests/data/mixers.golden`: the outputs and the final states of nine Mamba-3 layers (one or several inputs and outputs per channel, groups of B and C, both pairings of the rotation, outputs normalized before the gate, and rows scaled until the floor of the decay, the linear part of the softplus and the eps of the normalizations decide the results), the same numbers however the tokens are cut among the calls and the heads among the ranges, a sequence that takes back a copy of its state, the geometry of the reference module and the sizes refused; the rows of Tensor Product Attention from their factors, in arrays whose rows lie apart; differential attention with as many key heads as heads and with fewer, in both mappings of the keys of its reference sources, its outputs written over its maps; also as `test_mixers_portable`, without the instructions of AVX2, which the first program requires of the processor, as `test_qkernels` does |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads of the models from a local server of official addresses, and from nowhere else (the address of a message without its query; a file of another size or of other bytes, a web page in place of a file and a server that fails, each failing the download with the address and its failure, the progress kept; a model of eight parts, one compressed, resumed with the part it lacked; a download cancelled at once; an address that answers twice 404, 410 or 451, or 401 or 403 with the error headers of the hub, by itself or through another address of its own server and without a web page, ending the download with the code `download_unavailable`, its progress and its partial files dropped and its address kept seven days, the same statuses from a web page or from another server a redirection led to, and 401 or 403 without these headers, staying failures of the transfer), the catalog and the feed of the updates from a local folder of the versions alone (the signed catalog of the repository and the signed feed of `tests/data` read from it; a file it lacks, answered with a line of text or with the page of a website, another signature, with no request to an official address), the installer of an update written through a new partial file and named once it has the size and the hash the feed names, each failure of the folder of the versions with the bounds of the tests shortened (web pages with 200 and 403, a proxy that asks for its authentication, connections reset or refused, a server that stalls or answers byte by byte) failing with the address and the failure, without exception, the local server still answering, the settings of an earlier version written again without the link of that version and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, the 8192 tokens of an answer of the relay of a document before version 3 read 16384, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, an account without credit, the substitutes left in the answer for a check, an address without `/v1` or with the path of an operation reaching the interface at `/v1`, the codes, statuses and messages of the failures of the test, the refusals of the tools, of the offline mode and of a missing key, offline an engine of this computer answering with Pseudalis while the downloads are cancelled and the providers of the Internet and the public addresses refused before any connection, and a log that names no key and no value) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`, written to the environment block of the process, which dlib reads on Windows whatever the runtime of C of the program), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni`; the sequences that advance together start from the first tokens of the prompt, 64 at most, and their number is the size of the passes their steps measure |
 | `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input, `-f32` has the other devices compute in single precision rather than in half precision, and `-dq` leaves their plugin its default, which rounds the inputs of the products of the long passes of a prompt to 8 bits; a comparison whose largest divergence exceeds 0.1 names its pass or step and the most probable tokens of both runtimes with their probabilities. `test_ov_graph model.gguf [device] [threads] [f16\|u8][-mask][-f32][-dq] [prompt] [chunk] [steps]` |
 | `test_publish_release.py` | the publication of a version by `tools/publish_release.py`, with a chain of the website played by a script, which publishes the feed, the catalog and the installers of its folder of the publication, and a local hosting: the refusals before anything is written, each told in one line (a folder without the chain, an installer of another version or of another folder, a key of another pair, notes that are no texts by language, a catalog whose signature fails or that tells no time, the feed of a later version or a later catalog in the folder of the publication or on the website, a website that cannot be read or answers with a page), the release notes of the sources taken by default, the seven files written under hidden names, each copy compared with its source, a link at one of these names never written through and the names a run cut short left removed, a signature of the feed that fails or is the one of another key, a failure at the first name, which leaves the folder as it was, and one after it, told with what the folder holds and completed by the same command, the order of the names, another build of one version and of one size, the two commands of the chain on the terminal of the publisher, the check of what the hosting serves (another signed file, a signature that fails, another size, another installer by the list of the files, a later version, a redirection, a feed served after a moment), `--deposit`, `--dry-run`, the catalog alone with `--catalog` (a feed that is not the one served, an installer the folder lacks), the note on a catalog that Git does not hold yet, the offline bundle of `tools/make_offline_bundle.py` from the hosting and from a folder, and no name of a session, of a password file or of a setting of the website in the program; `test_linux.sh` runs it |
+
+[`tests/make_moe_model.py`](tests/make_moe_model.py) writes a small mixture-of-experts model with a
+chosen number of experts, whose logits by `tests/reference_forward.py` are a reference of
+`test_runtime`: `python3 tests/make_moe_model.py moe.gguf 256 16` gives 256 experts per layer of
+which 16 answer a token.
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same tests on the host code of dlib, which

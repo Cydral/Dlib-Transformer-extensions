@@ -108,6 +108,23 @@ fi
 if [ -x "$BUILD/tests/test_sampler" ]; then step "sampler" "all checks passed" "$BUILD/tests/test_sampler"
 else skip "sampler" "no $BUILD/tests/test_sampler"
 fi
+# The sequence mixers in preparation (Mamba-3, tensor product and differential attention) against
+# their reference results, with the instructions of AVX2, skipped by the processors without them,
+# and in their portable form.
+for family in "" _portable; do
+  test=$BUILD/tests/test_mixers$family
+  name="sequence mixers${family:+ ${family#_}}"
+  if [ ! -x "$test" ]; then
+    skip "$name" "no $test"
+    continue
+  fi
+  out=$("$test" "$HERE/../tests/data/mixers.golden" 2>&1)
+  if printf '%s\n' "$out" | grep -q "skipped, the processor lacks"; then
+    skip "$name" "$(printf '%s\n' "$out" | grep -o 'lacks [^(]*' | head -1)"
+  else
+    step "$name" "all checks passed" "$test" "$HERE/../tests/data/mixers.golden"
+  fi
+done
 if [ -x "$BUILD/tests/test_engine_api" ] && [ -f "$ENGINES/libalbireo-engine-cpu.so" ]; then
   step "engine interface" "all checks passed" "$BUILD/tests/test_engine_api" "$ENGINES/libalbireo-engine-cpu.so" "$WORK"
 else skip "engine interface" "no $BUILD/tests/test_engine_api or no portable engine"

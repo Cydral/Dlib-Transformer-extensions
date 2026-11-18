@@ -262,7 +262,7 @@ A program built for a baseline processor can still run its hot code with the ext
 
 ![A discussion in the web application of Albireo](dlib/dlib/external/albireo/docs/images/chat.png)
 
-The [README of Albireo](dlib/dlib/external/albireo/README.md) describes its architecture, its build, its tests and its publication, with screenshots of the web application, of the windows of the icon and of the installer.
+The [README of Albireo](dlib/dlib/external/albireo/README.md) describes its architecture, its build, its tests and its publication, with screenshots of the web application, of the windows of the icon and of the installer. The website of Cydral Technology presents the program on [its product page](https://cydral-technology.eu/en/products/albireo/), with a [product sheet](https://cydral-technology.eu/files/docs/albireo-product-sheet-en.pdf) in PDF, and offers the installers of the current version on its [downloads page](https://cydral-technology.eu/en/downloads/).
 
 ---
 

@@ -12,21 +12,21 @@
     missing are skipped.
 
     Steps: the quantized kernels; the loading of damaged model files and of a file of more than
-    2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on the
-    device of -Device (CPU by default, which every machine has), test_ov_graph on the processor,
-    with the graph of the graphics processor on the processor too, and on the graphics processor
-    when -Device names it, and a question to each OpenVINO engine, on its devices and through
-    the graph of the processor, and of the graphics processor when -Device names it, its weights
-    read back from a cache folder as in the service; with the CUDA tree, when the machine has a
-    card it supports, a question to the CUDA engine, then test_device_ops, test_offload on the
-    card and its check of the attention of the card on a tiny model; the embedding model;
-    the models that come with Albireo, prepared by the build, and a question to their language
-    model, these engine steps with the PATH of the service, System32 and the Windows folder
-    only; a sentence read aloud by the program of the speech synthesis; then the installed
-    service, unless -NoService, once it has started: its state, its models, its engines, each
-    described within its time limit, with the devices they found, the models that came with
-    it, a question and the vectors of two texts through the OpenAI interface, and a sentence
-    read aloud through its speech route.
+    2 GiB; the sequence mixers in preparation; a question to each processor engine; with the
+    OpenVINO tree, test_offload on the device of -Device (CPU by default, which every machine
+    has), test_ov_graph on the processor, with the graph of the graphics processor on the
+    processor too, and on the graphics processor when -Device names it, and a question to each
+    OpenVINO engine, on its devices and through the graph of the processor, and of the graphics
+    processor when -Device names it, its weights read back from a cache folder as in the
+    service; with the CUDA tree, when the machine has a card it supports, a question to the CUDA
+    engine, then test_device_ops, test_offload on the card and its check of the attention of the
+    card on a tiny model; the embedding model; the models that come with Albireo, prepared by
+    the build, and a question to their language model, these engine steps with the PATH of the
+    service, System32 and the Windows folder only; a sentence read aloud by the program of the
+    speech synthesis; then the installed service, unless -NoService, once it has started: its
+    state, its models, its engines, each described within its time limit, with the devices they
+    found, the models that came with it, a question and the vectors of two texts through the
+    OpenAI interface, and a sentence read aloud through its speech route.
     The exit code is the number of failed steps.
 #>
 param(
@@ -101,6 +101,22 @@ Invoke-Check "model files" "all checks passed" (Join-Path $main "tests\test_mode
 $samplerTest = Join-Path $main "tests\test_sampler.exe"
 if (Test-Path $samplerTest) { Invoke-Check "sampler" "all checks passed" $samplerTest @() | Out-Null }
 else { Add-Result "sampler" "SKIP" "no $samplerTest (build_windows.ps1 -Tests)" 0 }
+
+# The sequence mixers in preparation (Mamba-3, tensor product and differential attention) against their
+# reference results, with the instructions of AVX2, skipped by the processors without them, and in their
+# portable form.
+$mixerResults = Join-Path $PSScriptRoot "..\tests\data\mixers.golden"
+foreach ($family in @("", "_portable")) {
+    $mixerTest = Join-Path $main "tests\test_mixers$family.exe"
+    $name = "sequence mixers" + $family.Replace("_", " ")
+    if (-not (Test-Path $mixerTest)) {
+        Add-Result $name "SKIP" "no $mixerTest (build_windows.ps1 -Tests)" 0
+        continue
+    }
+    $out = (& $mixerTest $mixerResults 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($out -match "skipped, the processor lacks ([^(]*)") { Add-Result $name "SKIP" "lacks $($Matches[1])" 0 }
+    else { Invoke-Check $name "all checks passed" $mixerTest @($mixerResults) | Out-Null }
+}
 
 # The attention of the steps split among the threads, against one task per key/value head, with keys and values
 # in half precision and in 8 bits, on a tiny model written in the folder of the logs.

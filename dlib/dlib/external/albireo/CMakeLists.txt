@@ -820,6 +820,28 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
    add_executable(test_sampler tests/test_sampler.cpp engine/sampler.cpp)
    target_compile_options(test_sampler PRIVATE ${ALBIREO_WARNINGS})
    albireo_output_dir(test_sampler ${CMAKE_BINARY_DIR}/tests)
+   # The sequence mixers in preparation beside the attention of the engines (engine/mamba3.cpp,
+   # engine/differential_tpa.cpp), which no engine library holds yet: their results against
+   # tests/data/mixers.golden, with the instructions of AVX2 and without them.
+   foreach (family avx2 portable)
+      albireo_kernels(${family})
+      if (family STREQUAL "avx2")
+         set(t test_mixers)
+      else()
+         set(t test_mixers_${family})
+      endif()
+      add_executable(${t} tests/test_mixers.cpp engine/mamba3.cpp engine/differential_tpa.cpp
+         $<TARGET_OBJECTS:albireo-kernels-${family}> common/system_info.cpp)
+      target_include_directories(${t} PRIVATE ${ALBIREO_INCLUDE_DIR})
+      target_compile_options(${t} PRIVATE ${ALBIREO_WARNINGS})
+      if (NOT family STREQUAL "portable")
+         target_compile_options(${t} PRIVATE ${ALBIREO_ISA_${family}})
+      endif()
+      if (NOT WIN32)
+         target_link_libraries(${t} PRIVATE Threads::Threads)
+      endif()
+      albireo_output_dir(${t} ${CMAKE_BINARY_DIR}/tests)
+   endforeach()
    # The kernels of AVX-VNNI: their checks and their speed, on the processors that have its
    # instructions (the others skip them).
    if (ALBIREO_HAS_avxvnni)
