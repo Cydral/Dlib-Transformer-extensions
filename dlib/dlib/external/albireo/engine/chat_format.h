@@ -53,6 +53,8 @@ namespace albireo
     {
         bool add_generation_prompt = true;
         bool reasoning = false;     // ask a model that can reason to do so
+        std::string effort;         // "low", "medium" or "high" for the formats whose prompt names the
+                                    // effort of that reasoning, which take "medium" without one
         json tools;                 // OpenAI tool definitions, an array, or null
         std::string today;          // dates, for the formats whose default prompt names them:
         std::string yesterday;      // "2026-10-29", "2026-10-28"
@@ -86,6 +88,10 @@ namespace albireo
 
         // Whether the text fed so far leaves the model inside its reasoning.
         virtual bool in_reasoning() const { return false; }
+
+        // Whether the text fed so far ends the answer, whatever the model writes after it: the
+        // engine then ends the turn without waiting for its end token.
+        virtual bool complete() const { return false; }
     };
 
     class chat_format
@@ -133,6 +139,13 @@ namespace albireo
                 - role-tags: Foundation-Sec 1.1 8B Instruct, each message after <|system|>,
                   <|user|> or <|assistant|> and a line break, these markers being plain text
                   of its vocabulary, an answer ended by the end of text token.
+                - channels: Olala (OVHai LLM), ChatML turns whose content lies in named
+                  channels between <|channel_start|>name<|content|> and <|channel_end|>: a
+                  system turn with the instructions of the template, which name the reasoning
+                  effort (render_options::effort, "disabled" for a request without reasoning),
+                  a developer turn for the system message and the tools, an analysis
+                  channel for the reasoning of an answer, a final channel for its text and a
+                  tools channel for its calls (<call> elements in <toolcalls>).
                 - deepseek: the DeepSeek-R1 models distilled into other decoders
                   (DeepSeek-R1-Distill-Llama-8B), the system prompt right after the beginning
                   of sentence token, the questions after <｜User｜>, the answers after

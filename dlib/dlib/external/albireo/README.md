@@ -619,43 +619,115 @@ end with the unloading). The window shows it as unloading meanwhile; activated a
 leaves, the model stays loaded. A model deleted while it answers is deleted the same way, once its
 requests are served, and is shown as being deleted until then.
 
-### Sequence mixers in preparation
+### Hybrid decoders
 
-The engines serve decoders whose layers are an attention and a feed-forward block, dense or a
-mixture of experts. Three mechanisms that recent decoders put beside this attention, or in its
-place, are written and checked on their own, in sources that no engine library holds yet: the
-runtime of a model that uses them starts from kernels already compared with their definitions.
+Beside the decoders whose layers are an attention and a feed-forward block, dense or a mixture of
+experts, the engines serve the hybrid decoders of the architecture `olala`, that of Olala 1.0 mini
+7A1B of OVHai LLM. The GGUF file of such a model names the mixer of each layer
+(`olala.layer_types`, `M` for a Mamba-3 layer and `V` for an attention, 29 and 7 of the 36 layers
+of Olala mini), and the processor runtime computes these layers on a path of its own
+([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp), `run_hybrid()`), written after the module
+`modeling_olala.py` its authors publish with the weights:
 
-| Source | Mechanism | Definition |
-|--------|-----------|------------|
-| [`engine/mamba3.h`](engine/mamba3.h) | the recurrence of a Mamba-3 layer between its two matrices, with one input and one output per channel or several (rank, weights of the inputs, of the gates and of the outputs), the groups of B and C, both pairings of the rotation and the normalization of the outputs before the gate | Lahoti et al., *Mamba-3: Improved Sequence Modeling using State Space Principles* (2026), and the module `mamba_ssm/modules/mamba3.py` of its authors |
-| [`engine/differential_tpa.h`](engine/differential_tpa.h) | the queries, keys and values of Tensor Product Attention, built from their two factors | Zhang et al., *Tensor Product Attention Is All You Need* (2025), and the module `CPLinear` of its authors |
-| [`engine/differential_tpa.h`](engine/differential_tpa.h) | the two maps of a head of differential attention combined: `lambda`, the subtraction, the normalization of each head and its scale | Ye et al., *Differential Transformer* (2025), and `multihead_diffattn.py` of its authors |
+| Part of a layer | Computation |
+|-----------------|-------------|
+| Hidden states | no position encoding and no normalization of the hidden states: the embedding of a token is brought to the unit sphere, and each layer turns the state on its sphere towards the output of its mixer, then towards the output of its experts, by an angle bounded at pi/4 that the layer scales, shifts and divides by its rank among the layers (`geodesic_update()`) |
+| Mamba-3 layer (`M`) | one matrix gives each head its gate, its inputs, its step, its decay and its trapezoid weight, another the rows of B and C, which the layer normalizes, shifts by a bias of each head and turns by angles it adds up from token to token; the state of each channel then takes the inputs of the token and those of the token before it (trapezoid rule), through several inputs and outputs per channel, 4 for Olala mini (`mamba3_mixer()`, kernel `qk_state_step()`) |
+| Attention (`V`) | queries from one matrix, each key and each value as the mean of products of two factors (Tensor Product Attention, 4 products for Olala mini), then leaned on the key and the value of the token before; queries and keys normalized, the queries scaled by the logarithm of the positions they see; scores bounded by `150 tanh(s / 150)` (`qk_softcap()`); each key head serves a group of query heads, the last of which reads the noise that the others give up in a proportion the token chooses (differential attention), and a gate of the token opens the result (`differential_attention()`) |
+| Experts | a sigmoid router takes 6 of 256 experts for a token; the experts work in a latent space of 384 values that one matrix enters and one leaves, beside a shared expert that reads the hidden state (`latent_experts()`) |
 
-A Mamba-3 layer keeps of a sequence a state of fixed size (`mamba3_state`): the angles of its
-rotation, the state of the recurrence (`d_inner * d_state` floats), and the rotated B and the inputs
-of the last token, which the trapezoidal discretization reads at the next one. A layer of 4096
-channels with a state of 128 keeps 2.1 MB per sequence, at any length of the sequence. This state
-has no positions to cut, as the keys and values of an attention have: a copy of it is a snapshot of
-the sequence at its last token, and a sequence goes back to an earlier token by taking the copy made
-there, then reading again the tokens that follow. `forward()` takes the rows the first matrix of the
-layer gives for consecutive tokens and writes the rows its second matrix takes; the heads being
-independent, the threads of a runtime share them by ranges. The recurrence has the instructions of
-AVX2 and FMA and a portable form, as the quantized kernels have: on a processor of two cores, one
-token of that layer takes about 0.2 ms on one thread with AVX2 and 0.4 ms without.
+The logits read the hidden state of the last layer as it stands, without a final normalization.
+[`tests/reference_forward.py`](tests/reference_forward.py) computes the same model with numpy on
+the weights the gguf package dequantizes. On the Q5_K_M file of the authors and 20 tokens, the
+logits of the runtime, the largest of which is 22.7, stay within 0.0076 of that reference with the
+products on floats (mean divergence 2.5e-7, the same most probable token at the 20 positions), and
+within a mean divergence of 0.004 with the products of the prompts on 8-bit integers.
 
-[`tools/make_mixer_golden.py`](tools/make_mixer_golden.py) computes the cases of
-`tests/data/mixers.golden` in double precision with numpy, after the functions the authors of each
-mechanism give as references, and `test_mixers` compares the engine with them. Where these sources
-differ among themselves, the script tells which one a case follows: with fewer key heads than heads,
-the sources of differential attention give the keys to the maps in two ways, and the cases hold
-both.
+A Mamba-3 layer keeps of a sequence a state of fixed size: the angles of its rotations, the state
+of its channels, and the rows of B and the inputs of the last token, which the trapezoid rule reads
+at the next one. A layer of Olala mini (48 heads of 64 channels, 128 values per channel) keeps 1.69
+MB, a sequence 49 MB for its 29 layers, at any length. The attention layers keep their keys and
+values in the pool of the engine, which counts these 7 layers only: 43 KB per token in half
+precision, 1.41 GB for the 32,768 positions of their window. The file declares a context of
+100,000 tokens beside that window, and the engine serves the model with the window as its context.
 
-Two other needs of a model built on these mechanisms are met by the engines as they are. The
-mixtures of experts take up to 4096 experts per layer: on a model of 256 experts per layer of which
-16 answer a token, written by [`tests/make_moe_model.py`](tests/make_moe_model.py), the processor
-runtime gives the logits of `tests/reference_forward.py` and every engine library answers with the
-same tokens. The kernels read weights stored in BF16.
+Such a state has no positions to cut, as keys and values have. The runtime saves it at the end of
+the passes that read several tokens of a prompt, the state of a chunk replacing that of the chunk
+before it, and keeps the states of the last two prompts (`saved_states`, 147 MB per sequence with
+the current state for Olala mini). The engine reads the last token of a prompt in a pass of its own:
+the state saved for a prompt is then the one before its last token, which a request with the same
+prompt goes back to, since one token of a prompt is always left to compute.
+`restorable_length()` gives the scheduler the longest length a sequence goes back to within the
+tokens two prompts share, and the engine reads the tokens after it again. With the file above, a
+request that repeated its prompt of 302 tokens took 301 of them from the saved state. A
+conversation whose next prompt repeats every token of its sequence, its last answer included, goes
+on from its current state: a prompt of 395 tokens took 370 of them from it. So does each step of a
+loop of tool calls, whose prompt keeps the reasoning of the steps before it (the chat format of the
+model, below): the step that gave the result of a call took 1,099 of its 1,139 tokens from the
+current state. A prompt that departs from these tokens, as the question that follows a reasoned
+answer does, since that reasoning leaves the prompt, sends the sequence back to the state saved for
+the prompt before, and the answer is read again with the new question: a prompt of 943 tokens took
+688 of them from that state. The engine reads that answer ahead, as the next question will render
+it, while the user reads it: a question that comes after this reading takes the answer from the
+current state as well (1,891 of the 1,906 tokens of the question that followed a prompt of 1,762
+tokens and its answer). A new conversation reads its whole prompt, the instructions it shares with
+the others included. For the same reason, the engine writes the answers of a hybrid decoder
+without drafts, whose refused tokens a sequence could not give back, and keeps 4 idle sequences of
+such a model at most.
+Its keys and values stay in half precision unless `kv_type` asks for 8 bits: an attention of this
+kind subtracts the output of a head from those of the others, and the rounding of the keys weighs
+more on the result (mean divergence 0.007 with 8-bit keys on the 20 tokens above, where the other
+models of the catalog stay below 0.005).
+
+The three quantized files of the authors were measured on the two cores of a virtual machine (Xeon
+at 2.1 GHz, 8 GB of memory) with a prompt of 845 tokens and an answer of 128 tokens, by the engines
+`cpu-avx2` then `cpu-avxvnni`:
+
+| File of the authors   | Size    | Prompt, tokens per second | Answer, tokens per second |
+|-----------------------|---------|---------------------------|---------------------------|
+| Q5_K_M                | 5.99 GB | 55, then 58               | 9.0, then 8.9             |
+| Q6_K                  | 6.31 GB | 47 to 50, then 58 to 60   | 8.2 to 8.6, then 8.8      |
+| Q8_0 (`q8_0-safe2`)   | 6.88 GB | 28 to 35                  | 5.7 to 5.9, then 6.0      |
+
+The 8-bit file keeps in BF16 the output projection of each mixer and the down projection of each
+shared expert, 276 million weights that a token reads through products of floats: the AVX2 kernel
+of the BF16 weights, eight of them per instruction, brought its answers from 4.6 to 5.9 tokens per
+second. Its prompts are slowed here by the memory of the machine, which the file exceeds with the
+rest of the system. The engines of the devices serve a hybrid decoder through the same path, whose
+products go to the device as those of a mixture of experts do; the layers of a device and the graph
+of OpenVINO, built for decoders made of attentions, are not offered to it (`graph` set to `on` is
+refused for such a model).
+
+The same computation exists in dlib for the programs that load a GGUF file without Albireo:
+`tt::geodesic_update()` and `tt::mamba3_step()`
+([`dlib/cuda/tensor_tools.h`](../../cuda/tensor_tools.h)), with their kernels for the processor and
+for CUDA, and the hybrid path of `dlib::runtime_transformer`
+([`dlib/dnn/runtime_transformer.h`](../../dnn/runtime_transformer.h)), which `test_gguf` of the
+tests of dlib checks on a small model against the logits of the numpy reference.
+
+[`slm_safetensors_to_gguf.py`](../../../examples/slm_tools/slm_safetensors_to_gguf.py) of the
+examples of dlib writes the GGUF files of such a model from the weights its authors publish in
+safetensors, in F32, F16, BF16, Q8_0, Q6_K, Q5_K_M and Q4_K_M; a file it wrote is imported through
+the Models window as any GGUF file. It converts the same way the models that the authors
+fine-tuned from Olala 1.0 mini and publish as weights alone, Olala-v1.0-summarise and
+Olala-v1.0-translate, whose checkpoints store in BF16 the tensors a file keeps in single
+precision.
+
+The scales of a quantized format are numbers in half precision, which round to zero for values
+under about 1e-4. The latent down projections of five layers of these models (7, 8, 9, 10 and 14)
+hold values near 2e-5, as the other tensors of the routed experts of these layers do: the part of
+these experts in the output of their block stays under 2e-18 of that of the shared expert, where it
+is about 1.7 times that part in layer 6. The 6-bit file of the authors reads the five projections
+as zeros, which changes no answer. The converter measures each tensor it writes and keeps in BF16
+a tensor its format leaves beyond the distance `verify` accepts, these five in a 6-bit file.
+
+The Q6_K file it wrote from the weights of Olala-v1.0-summarise (989 tensors, 6.31 GB) follows them
+tensor by tensor (`verify`: largest relative distance 0.0492 in 6 bits, 0.0085 in 8 bits). The
+service imports it with the capabilities of its format and the window of 65,536 tokens its
+configuration declares, where the card of its authors gives 32K tokens for the input and the
+output. Asked to summarize a text in five points, a prompt of 1,762 tokens, it reasoned, then
+wrote them at 8.5 tokens per second on the two cores above; the engines give the same tokens with
+a file that reads the five projections as zeros.
 
 ### Measures of the engines
 
@@ -684,9 +756,10 @@ The conversation formats are written natively ([`engine/chat_format.cpp`](engine
 the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
 reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2, Mistral Small
 3.2), Llama 3, Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`),
-Phi-4-mini, the format of DeepSeek-R1 Distill Llama 8B, whose control tokens `<｜User｜>` and
-`<｜Assistant｜>` open the turns in the vocabulary of Llama 3.1, the system message at the head of the
-prompt and the earlier answers without their reasoning, the format of Foundation-Sec-8B-Reasoning
+the channels of Olala (see below), Phi-4-mini, the format of DeepSeek-R1 Distill Llama 8B, whose
+control tokens `<｜User｜>` and `<｜Assistant｜>` open the turns in the vocabulary of Llama 3.1, the
+system message at the head of the prompt and the earlier answers without their reasoning, the
+format of Foundation-Sec-8B-Reasoning
 and that of Foundation-Sec 1.1 8B Instruct, whose role markers `<|system|>`, `<|user|>` and
 `<|assistant|>` are plain text of its vocabulary: its GGUF files carry no template, the engine takes
 the one of the repository of the model, and these markers end its answer as its end of text token
@@ -700,6 +773,38 @@ written over several lines, gives its turns one after the other, the answer righ
 pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and GPT-4o (Phi-4-mini) among others, and the
 SentencePiece ones (EuroLLM), whose leading space it puts after each control token as the reference
 tokenizers do; the token identifiers of the tests are those of llama.cpp.
+
+Olala 1.0 mini writes the turns of ChatML with their content in named channels, each between
+`<|channel_start|>name<|content|>` and `<|channel_end|>`: an answer holds its reasoning in the
+`analysis` channel, its text in the `final` channel and its calls in the `tools` channel, as
+`<call>` elements with a name and arguments in JSON. The system turn of every prompt holds
+instructions that the template of the model writes itself, with a reasoning effort and a
+description of the tools channel that depends on the tools of the request; the engine reads them
+from the template of the file (`dlib::channel_instructions()` of
+[`dlib/tokenizer/chat_template.h`](../../tokenizer/chat_template.h)) and gives them the effort of
+the request (`reasoning_effort`, also read among `chat_template_kwargs`, where the card of the
+model gives it): `low`, `medium` or `high`, `medium` for a reasoning asked without an effort, and
+`disabled` for a request without reasoning, whose prompt closes the analysis channel at once. The
+system message of the request and its tools, one JSON object per line, go to
+a developer turn, the result of a call to a tool turn with the name and the identifier of the
+call.
+
+The authors publish this template twice: inside their files (`chat_template.jinja` of the model),
+and beside their GGUF files (`Olala-v1.0-mini-7A1B-chat-template.jinja`), for the engines that keep
+the state of a conversation. The two differ on two points, and the engine follows the second one
+on both, whichever of them a file holds. The analysis of an answer stays in the prompt as long as
+no user turn follows it, where the first template keeps that of the last message alone: along a
+loop of tool calls the model reads its own reasoning, and the prompt of each step extends the one
+before it, which lets a sequence go on from the state of its recurrent layers; a new user turn
+drops the analyses before it. The instructions of the tools channel leave out the rule that asks
+to batch independent calls. The argument `preserve_thinking` of the template, which keeps every
+analysis, is not offered. An answer is complete once its final channel is closed, or its tools
+channel when the request offers tools; with tools, a channel other than the calls that opens after
+the final one completes the answer as well. The tools channel of an answer to a request without
+tools is dropped, as are the channels of other names. The prompts of eight conversations (with and
+without reasoning, a system message, the efforts, a loop of two tool calls, the question that
+follows such a loop, two calls in one answer) equal those Jinja renders from the template published
+beside the GGUF files, byte for byte, for a file that holds either template.
 
 A model whose template opens the reasoning of every answer, the Thinking variants of Qwen3 and
 Qwen3-VL, Foundation-Sec-8B-Reasoning and DeepSeek-R1 Distill Llama 8B, was trained to reason before
@@ -1206,8 +1311,8 @@ installed models, each with its version, its role and its license, whose text op
 | [`web/`](web)            | the web application, the Swagger page and the OpenAPI description            |
 | [`resources/`](resources)| icons, images, license, version resources, models that come with Albireo      |
 | [`cmake/`](cmake)        | MinGW-w64 toolchain, payload of the installer, runtime libraries of devices, downloads of the models |
-| [`tests/`](tests)        | kernel, mixer, runtime, tokenizer and device tests, engine driver, benchmark   |
-| [`tools/`](tools)        | build and test scripts, preparation of the models that come with Albireo, catalog, feed, publication, offline bundle, images, generator of the reference results of the sequence mixers |
+| [`tests/`](tests)        | kernel, runtime, tokenizer and device tests, engine driver, benchmark          |
+| [`tools/`](tools)        | build and test scripts, preparation of the models that come with Albireo, catalog, feed, publication, offline bundle, images |
 
 ## Building on Windows
 
@@ -1401,16 +1506,15 @@ cmake --build build-albireo-win -j
 
 | Program          | Checks                                                                               |
 |------------------|--------------------------------------------------------------------------------------|
-| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
-| `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
+| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, the bound of the scores of an attention (`qk_softcap()`) and the step of the state of a Mamba-3 layer (`qk_state_step()`) against their definitions in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
+| `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches; `synthetic` checks the attention on a tiny model, then a tiny hybrid decoder (Mamba-3 layers, differential attentions, experts in a latent space) against the logits of the reference for 24 tokens, which `tests/data/hybrid.golden` holds, on two threads and on twelve, with 8-bit keys, by passes and by steps, its sequences cut and copied at the lengths of their saved states, and the states saved along the prompts (a lone token of a prompt, the prompt after generated tokens); also as `test_runtime_portable`, without the instructions of AVX2 in the kernels. `test_runtime hybrid-model file.gguf` writes that tiny decoder, from which `python3 tests/reference_forward.py file.gguf hybrid.golden 1 2 ... 24` computes the logits again |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise), come back, then leave it again within the period of that rise, which bounds the next rises and doubles their period |
 | `test_device_ops` | on the processor, the lanes of the kernel of the card for Q4_K and Q6_K (`gguf_blocks::lane_products()`) against the processor kernels; then the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); then the time of the products of one and of eight tokens on the matrices of a 2B model, and of the attention of a generated token over 4,096 positions |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
-| `test_mixers`    | the sequence mixers in preparation against the cases of `tests/data/mixers.golden`: the outputs and the final states of nine Mamba-3 layers (one or several inputs and outputs per channel, groups of B and C, both pairings of the rotation, outputs normalized before the gate, and rows scaled until the floor of the decay, the linear part of the softplus and the eps of the normalizations decide the results), the same numbers however the tokens are cut among the calls and the heads among the ranges, a sequence that takes back a copy of its state, the geometry of the reference module and the sizes refused; the rows of Tensor Product Attention from their factors, in arrays whose rows lie apart; differential attention with as many key heads as heads and with fewer, in both mappings of the keys of its reference sources, its outputs written over its maps; also as `test_mixers_portable`, without the instructions of AVX2, which the first program requires of the processor, as `test_qkernels` does |
-| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
+| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>`; the prompts of the format of Olala (the instructions of its template for each reasoning effort, with and without tools, the effort of a request among those the model learned, the tools of a developer turn, the analyses kept along a loop of tool calls and dropped by a new question, a call and its result) and its answers read channel by channel, whole or cut in pieces, with the tools channel of a request without tools dropped, a marker inside a channel, a channel without content, a name longer than those of the channels and what a model writes after a complete answer dropped |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads of the models from a local server of official addresses, and from nowhere else (the address of a message without its query; a file of another size or of other bytes, a web page in place of a file and a server that fails, each failing the download with the address and its failure, the progress kept; a model of eight parts, one compressed, resumed with the part it lacked; a download cancelled at once; an address that answers twice 404, 410 or 451, or 401 or 403 with the error headers of the hub, by itself or through another address of its own server and without a web page, ending the download with the code `download_unavailable`, its progress and its partial files dropped and its address kept seven days, the same statuses from a web page or from another server a redirection led to, and 401 or 403 without these headers, staying failures of the transfer), the catalog and the feed of the updates from a local folder of the versions alone (the signed catalog of the repository and the signed feed of `tests/data` read from it; a file it lacks, answered with a line of text or with the page of a website, another signature, with no request to an official address), the installer of an update written through a new partial file and named once it has the size and the hash the feed names, each failure of the folder of the versions with the bounds of the tests shortened (web pages with 200 and 403, a proxy that asks for its authentication, connections reset or refused, a server that stalls or answers byte by byte) failing with the address and the failure, without exception, the local server still answering, the settings of an earlier version written again without the link of that version and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, the 8192 tokens of an answer of the relay of a document before version 3 read 16384, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, an account without credit, the substitutes left in the answer for a check, an address without `/v1` or with the path of an operation reaching the interface at `/v1`, the codes, statuses and messages of the failures of the test, the refusals of the tools, of the offline mode and of a missing key, offline an engine of this computer answering with Pseudalis while the downloads are cancelled and the providers of the Internet and the public addresses refused before any connection, and a log that names no key and no value) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`, written to the environment block of the process, which dlib reads on Windows whatever the runtime of C of the program), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni`; the sequences that advance together start from the first tokens of the prompt, 64 at most, and their number is the size of the passes their steps measure |
@@ -1663,6 +1767,7 @@ of the web application leaves them out while its settings stay on automatic:
 | Foundation-Sec 1.1 8B and 8B Reasoning   | 0.3           | 0.95    | 20      | none                                      |
 | DeepSeek-R1 Distill Llama 8B             | 0.6           | 0.95    | none    | none                                      |
 | Granite 4.2, with and without reasoning  | 1             | 0.95    | none    | none                                      |
+| Olala 1.0 mini, with and without reasoning | 0.8         | 0.9     | 40      | none                                      |
 | Ministral 3                              | 0.1           | 1       | none    | none                                      |
 | Devstral, other Mistral without reasoning | 0.15         | 1       | none    | none                                      |
 | Other models, while they reason          | 0.6           | 0.95    | 20      | none                                      |
@@ -2079,8 +2184,9 @@ turns send these answers as they came, substitutes included.
 
 The catalog ([`dist/albireo/catalog.json`](../../../../dist/albireo/catalog.json)) lists models of
 the architectures the engine supports (llama, mistral, mistral3, granite, granitemoe, phi3, qwen2,
-qwen3, qwen3moe, qwen3vl, qwen3vlmoe, mixtral), with their functions, the company or the consortium
-that made them, what they read, their descriptions in the five languages, their license, and the
+qwen3, qwen3moe, qwen3vl, qwen3vlmoe, mixtral, olala), with their functions, the company or the
+consortium that made them, what they read, their descriptions in the five languages, their license,
+and the
 address, size and SHA-256 of each file, the projector of a model that reads images included.
 [`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face hub, the addresses
 pinned to a commit so that a file never changes under its hash. The hub is the only source of the
@@ -2129,6 +2235,7 @@ could not be checked. The sizes below count the decoder and its projector.
 | Granite 4.2 3B                 | IBM                | general, code           | text          | with reasoning | yes            | 2.24 GB  | Apache-2.0 |
 | Granite 4.2 8B                 | IBM                | general, code           | text          | with reasoning | yes            | 5.35 GB  | Apache-2.0 |
 | DeepSeek-R1 Distill Llama 8B   | DeepSeek           | general, code           | text          | no             | yes            | 4.92 GB  | Llama 3.1 Community License |
+| Olala 1.0 mini 7A1B            | OVHai LLM          | general                 | text          | with reasoning | yes            | 6.31 GB  | Apache-2.0 |
 | Qwen3-VL 30B A3B Thinking      | Alibaba            | general, code, security | text, image   | with reasoning | yes            | 19.27 GB | Apache-2.0 |
 | Mistral Small 3.2 24B          | Mistral AI         | general                 | text, image   | yes            | no             | 15.21 GB | Apache-2.0 |
 | Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | no             | no             | 1.12 GB  | Apache-2.0 |
@@ -2161,7 +2268,7 @@ those of 32 GB, a general assistant and a programming agent:
 
 | Function | Text and images | Text |
 |----------|-----------------|------|
-| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, Mistral Small 3.2 24B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B, DeepSeek-R1 Distill Llama 8B |
+| General  | Qwen3-VL 2B, 4B and 8B, Qwen3-VL 30B A3B Thinking, Ministral 3 3B and 8B, Mistral Small 3.2 24B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B, DeepSeek-R1 Distill Llama 8B, Olala 1.0 mini 7A1B |
 | Code     | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking, Devstral Small 2 | Granite 4.2 3B and 8B, DeepSeek-R1 Distill Llama 8B, Qwen2.5 Coder 1.5B and 7B |
 | Security | Qwen3-VL 2B Thinking, Qwen3-VL 4B (Instruct and Thinking), Qwen3-VL 8B (Instruct and Thinking), Qwen3-VL 30B A3B Thinking | CyberSecQwen 4B, Foundation-Sec 1.1 8B and 8B Reasoning |
 
@@ -2191,7 +2298,17 @@ DeepSeek, which writes the system message of the web application at the head of 
 its authors advise to give the instructions in the question. EuroLLM 9B Instruct translates and
 writes the 24 official languages of the European Union best of the list (FLORES 88.9), and EuroVLM
 9B Preview, built on it, reads images in these languages; its publishers give it as a preview
-version.
+version. Olala 1.0 mini 7A1B, designed in France by OVHai LLM (OVHcloud group) and trained on three
+European supercomputers, computes each token with about 1B of its 6.8B parameters and keeps keys
+and values in 7 of its 36 layers only (see [Hybrid decoders](#hybrid-decoders)); it reasons on
+request and calls tools, and its authors measure it strongest on instruction following (IFBench
+57.7, 68.0 on average over their twelve benchmarks) and weakest on competition mathematics. Its
+entry names the Q6_K file among the three quantized files its authors publish for their fork of
+llama.cpp, which the engine reads as they are: the authors measure it closer to the weights in BF16
+than their Q5_K_M file (divergence 0.0106 against 0.0194, the same next token 94.6 % of the time
+against 92.8 %) for 0.32 GB more, and the engine writes with it at the pace of the Q5_K_M file
+(see [Hybrid decoders](#hybrid-decoders)). Their Q8_0 file, the closest of the three (0.0040,
+96.9 %), keeps three kinds of matrices in BF16, whose products of floats make it the slowest here.
 
 Without the models that come with the complete installer, the service downloads at its first start
 the default language model and the default embedding model of the catalog, whatever the options of

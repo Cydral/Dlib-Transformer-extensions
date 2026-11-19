@@ -14,6 +14,9 @@
 //   - guanaco : "### Human: ...\n### Assistant:" (OpenAssistant-Guanaco fine-tunes);
 //   - granite : "<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n"
 //               (IBM Granite instruct models, dense and MoE);
+//   - channels: "<|im_start|>role<|channel_start|>name<|content|>...<|channel_end|><|im_end|>"
+//               (Olala hybrid decoders: ChatML turns whose content lies in named channels,
+//               after a system turn whose instructions the template of the model holds);
 //   - raw     : no markup, plain text completion.
 //
 // The template kind is detected from the declared template when the model carries
@@ -29,13 +32,123 @@
 #include "chat_template_abstract.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "hf_tokenizer.h"
 
 namespace dlib
 {
-    enum class chat_template_kind { raw, zephyr, chatml, guanaco, granite, idefics3 };
+    enum class chat_template_kind { raw, zephyr, chatml, guanaco, granite, idefics3, channels };
+
+    /* The instructions of the system turn of a template with channels (the olala family),
+       for a reasoning effort ("disabled", "low", "medium" or "high") and with or without
+       tools: the text the template writes between
+       "<|im_start|>system<|channel_start|>instructions<|content|>" and
+       "<|channel_end|><|im_end|>".  The template writes it with a few statements, read
+       here as Jinja reads them with the options of the chat templates (the line break after
+       a statement and the spaces before it on its line are not text, and every line ends
+       with a line feed): comments, the value of reasoning_effort, and the tests of
+       reasoning_effort and of tools with their branches.  Returns false, out being then
+       unspecified, when the template holds no such turn, when its instructions hold
+       anything else, or when they exceed 256 KB or 64 nested tests: the template comes
+       from a model file, and its reading takes a time proportional to its length. */
+    inline bool channel_instructions(const std::string& chat_template, const std::string& effort, bool tools,
+        std::string& out)
+    {
+        const std::string open = "<|im_start|>system<|channel_start|>instructions<|content|>";
+        const size_t first = chat_template.find(open);
+        const size_t last = first == std::string::npos ? first
+            : chat_template.find("<|channel_end|><|im_end|>", first);
+        if (last == std::string::npos) return false;
+        const size_t max_length = size_t(256) << 10, max_depth = 64;
+        if (last - first - open.size() > max_length) return false;
+        // The instructions with the line ends Jinja gives its templates.
+        std::string s;
+        s.reserve(last - first - open.size());
+        for (size_t i = first + open.size(); i < last; ++i)
+        {
+            const char c = chat_template[i];
+            if (c != '\r') s += c;
+            else if (i + 1 >= last || chat_template[i + 1] != '\n') s += '\n';
+        }
+        auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
+        out.clear();
+        // For each test in progress: whether its text is written, and whether its test held.
+        std::vector<std::pair<bool, bool>> tests;
+        // The tests in progress whose text is not written: the text is written when there is none.
+        size_t hidden = 0;
+        size_t at = 0;
+        while (at < s.size())
+        {
+            const size_t next = s.find('{', at);
+            const bool tag = next != std::string::npos && next + 1 < s.size()
+                && (s[next + 1] == '%' || s[next + 1] == '#' || s[next + 1] == '{');
+            if (!tag)
+            {
+                const size_t end = next == std::string::npos ? s.size() : next + 1;
+                if (hidden == 0) out.append(s, at, end - at);
+                at = end;
+                continue;
+            }
+            const char kind = s[next + 1];
+            const size_t close = s.find(kind == '%' ? "%}" : kind == '#' ? "#}" : "}}", next + 2);
+            if (close == std::string::npos) return false;
+            // The statement without its trimming marks and the blanks around it.
+            size_t from = next + 2, to = close;
+            const bool trim_before = from < to && s[from] == '-';
+            if (trim_before) ++from;
+            const bool trim_after = from < to && s[to - 1] == '-';
+            if (trim_after) --to;
+            while (from < to && blank(s[from])) ++from;
+            while (to > from && blank(s[to - 1])) --to;
+            const std::string body = s.substr(from, to - from);
+            // The text before the statement, without the spaces that precede a statement on its line.
+            size_t end = next;
+            if (kind != '{')
+            {
+                size_t b = end;
+                while (b > at && (s[b - 1] == ' ' || s[b - 1] == '\t')) --b;
+                if (b > 0 && s[b - 1] == '\n') end = b;
+            }
+            if (trim_before)
+                while (end > at && blank(s[end - 1])) --end;
+            if (hidden == 0) out.append(s, at, end - at);
+            at = close + 2;
+            if (trim_after)
+                while (at < s.size() && blank(s[at])) ++at;
+            else if (kind != '{' && at < s.size() && s[at] == '\n') ++at;
+
+            if (kind == '#') continue;
+            if (kind == '{')
+            {
+                if (body != "reasoning_effort") return false;
+                if (hidden == 0) out += effort;
+            }
+            else if (body == "if tools" || body == "if reasoning_effort is not defined")
+            {
+                if (tests.size() >= max_depth) return false;
+                const bool holds = body == "if tools" && tools;
+                tests.push_back(std::make_pair(holds, holds));
+                if (!holds) ++hidden;
+            }
+            else if (body == "else")
+            {
+                if (tests.empty()) return false;
+                if (!tests.back().first) --hidden;
+                tests.back().first = !tests.back().second;
+                if (!tests.back().first) ++hidden;
+            }
+            else if (body == "endif")
+            {
+                if (tests.empty()) return false;
+                if (!tests.back().first) --hidden;
+                tests.pop_back();
+            }
+            else if (body.compare(0, 4, "set ") != 0 || hidden == 0) return false;
+        }
+        return tests.empty();
+    }
 
     /* Markers of the idefics3 family, exposed because a caller assembling a multimodal
        prompt has to reserve the positions its vision tower will fill and therefore needs
@@ -77,9 +190,10 @@ namespace dlib
                 trained with. The turn strings are designed so that the running token
                 stream matches a single continuous tokenization of the whole
                 conversation: the first turn carries the system block, later turns
-                begin with the newline that follows the assistant's closing token, and
-                every assistant turn is closed by the tokenizer's eos token (</s> for
-                zephyr, <|im_end|> for chatml, <|end_of_text|> for granite).
+                begin with the newline that follows the assistant's closing token (the
+                channels kind writes none between its turns), and every assistant turn
+                is closed by the tokenizer's eos token (</s> for zephyr, <|im_end|> for
+                chatml and channels, <|end_of_text|> for granite).
 
                 For chatml, the assistant header depends on the model: thinking-capable
                 models (Qwen3, detected by "<think>" encoding to a single special token)
@@ -122,6 +236,8 @@ namespace dlib
                 if (tpl.find("<end_of_utterance>") != std::string::npos)
                     return chat_template_kind::idefics3;
                 if (tpl.find("<|start_of_role|>") != std::string::npos) return chat_template_kind::granite;
+                // The channels come in the turns of ChatML: their marker is tested first.
+                if (tpl.find("<|channel_start|>") != std::string::npos) return chat_template_kind::channels;
                 if (tpl.find("<|im_start|>") != std::string::npos) return chat_template_kind::chatml;
                 if (tpl.find("<|user|>") != std::string::npos)     return chat_template_kind::zephyr;
                 if (tpl.find("### Human") != std::string::npos)    return chat_template_kind::guanaco;
@@ -163,6 +279,14 @@ namespace dlib
                     /*add_eos=*/false, /*parse_special=*/true, /*allow_space_prefix=*/false);
                 fmt.thinking_ = (t.size() == 1);
             }
+            if (fmt.kind_ == chat_template_kind::channels)
+            {
+                /* The instructions of the system turn come from the template of the
+                   model, for an answer without reasoning (the prompt closes the analysis
+                   channel at once) and without tools. */
+                if (!channel_instructions(tok.chat_template(), "disabled", false, fmt.instructions_))
+                    fmt.instructions_ = "Reasoning effort: disabled";
+            }
             return fmt;
         }
 
@@ -175,6 +299,7 @@ namespace dlib
             if (n == "guanaco") return chat_template_kind::guanaco;
             if (n == "granite") return chat_template_kind::granite;
             if (n == "idefics3" || n == "smolvlm") return chat_template_kind::idefics3;
+            if (n == "channels" || n == "olala") return chat_template_kind::channels;
             return chat_template_kind::raw;
         }
 
@@ -187,6 +312,7 @@ namespace dlib
             case chat_template_kind::guanaco: return "guanaco";
             case chat_template_kind::granite: return "granite";
             case chat_template_kind::idefics3: return "idefics3";
+            case chat_template_kind::channels: return "channels";
             default:                         return "raw";
             }
         }
@@ -250,6 +376,19 @@ namespace dlib
                     + (system_prompt.empty() ? std::string()
                        : "System: " + system_prompt
                          + idefics3_markers::end_of_utterance() + "\n");
+            case chat_template_kind::channels:
+                /* The system turn belongs to the model; the system prompt of the
+                   conversation is the instructions channel of a developer turn. */
+                {
+                    // The template writes the system prompt without the white space around it.
+                    const size_t a = system_prompt.find_first_not_of(" \t\r\n");
+                    const size_t b = system_prompt.find_last_not_of(" \t\r\n");
+                    return "<|endoftext|><|im_start|>system<|channel_start|>instructions<|content|>" + instructions_
+                        + "<|channel_end|><|im_end|>"
+                        + (a == std::string::npos ? std::string()
+                           : "<|im_start|>developer<|channel_start|>instructions<|content|>"
+                             + system_prompt.substr(a, b - a + 1) + "<|channel_end|><|im_end|>\n");
+                }
             default:
                 return std::string();
             }
@@ -280,6 +419,8 @@ namespace dlib
                 return system_prefix(system_prompt)
                     + "User:" + (opens_on_image(user_text) ? "" : " ") + user_text
                     + idefics3_markers::end_of_utterance() + "\nAssistant:";
+            case chat_template_kind::channels:
+                return system_prefix(system_prompt) + channel_turn(user_text);
             default:
                 return user_text;
             }
@@ -287,7 +428,8 @@ namespace dlib
 
         // Text of every later turn. Starts with the newline that follows the eos the
         // generation loop fed to close the previous assistant turn, so the token
-        // stream stays identical to a one-shot tokenization of the conversation.
+        // stream stays identical to a one-shot tokenization of the conversation; the
+        // channels kind writes no newline between its turns.
         std::string next_turn(const std::string& user_text) const
         {
             switch (kind_)
@@ -305,6 +447,9 @@ namespace dlib
             case chat_template_kind::granite:
                 return "\n<|start_of_role|>user<|end_of_role|>" + user_text
                     + "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>";
+            case chat_template_kind::channels:
+                // No line break between the turns of this template.
+                return channel_turn(user_text);
             default:
                 return user_text;
             }
@@ -332,6 +477,17 @@ namespace dlib
                 const size_t b = text.find("###");
                 if (b != std::string::npos) text.erase(b);
             }
+            else if (kind_ == chat_template_kind::channels)
+            {
+                /* The markers of the channels are control tokens, which the decoding
+                   leaves out: what remains of them is the name of each channel, before
+                   its text.  The answer is the text of the final channel, which the
+                   model opens first, the prompt having closed its analysis; a tools
+                   channel the model would open after it holds no answer. */
+                if (text.compare(0, 5, "final") == 0) text.erase(0, 5);
+                const size_t b = text.find("tools<toolcalls>");
+                if (b != std::string::npos) text.erase(b);
+            }
             else
             {
                 return text;
@@ -357,6 +513,7 @@ namespace dlib
 
         // Sampling presets matching the model family's published recommendations.
         // Generation programs apply them when the user did not override the values.
+        // The channels family takes the values of the card of its model: 0.8, 40 and 0.9.
         double default_temperature() const
         {
             return kind_ == chat_template_kind::chatml ? 0.6 : 0.8;
@@ -394,9 +551,19 @@ namespace dlib
             return text.compare(0, mark.size(), mark) == 0;
         }
 
+        // A question in the text channel of a user turn, then the turn of the answer, its
+        // analysis channel closed at once: the model answers in its final channel.
+        static std::string channel_turn(const std::string& user_text)
+        {
+            return "<|im_start|>user<|channel_start|>text<|content|>" + user_text + "<|channel_end|><|im_end|>"
+                "<|im_start|>assistant<|channel_start|>analysis<|content|><|channel_end|>";
+        }
+
         chat_template_kind kind_ = chat_template_kind::raw;
         bool thinking_ = false;
         bool reasoning_ = false;
+        // The instructions of the system turn of a template with channels.
+        std::string instructions_;
     };
 }
 

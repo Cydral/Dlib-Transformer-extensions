@@ -3,6 +3,8 @@
 
 #include "chat_format.h"
 
+#include <dlib/tokenizer/chat_template.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -13,6 +15,7 @@
 #include <ctime>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
@@ -2907,6 +2910,390 @@ namespace albireo
             std::string bos_, eos_;
         };
 
+        // Channels
+
+        /*
+            The answers of the format of Olala: the text of the analysis channel is the
+            reasoning, the text of the final channel the answer, and the tools channel holds
+            the calls, <call id="..."><name>...</name><arguments>{...}</arguments></call>
+            elements in <toolcalls>.  A channel ends at its closing marker or where another one
+            opens; the channels of other names are dropped, as the text between two channels,
+            which is white space.  The tools channel of a request without tools is dropped too,
+            and the answer is then complete once its final channel is closed, as it is with
+            tools once the tools channel is.  An answer holds one final channel: with tools, a
+            channel other than the calls that opens after it completes the answer and is dropped.
+        */
+        class channel_parser : public output_parser
+        {
+        public:
+            channel_parser(bool starts_in_reasoning, bool tools)
+                : state_(starts_in_reasoning ? state::analysis : state::outside), strip_(starts_in_reasoning),
+                  tools_(tools) {}
+
+            void feed(const std::string& text, std::vector<output_event>& events) override
+            {
+                buffer_ += text;
+                process(events, false);
+            }
+
+            void finish(std::vector<output_event>& events) override
+            {
+                process(events, true);
+                if (state_ == state::tools) calls(events);
+                state_ = state::outside;
+            }
+
+            bool in_reasoning() const override { return state_ == state::analysis; }
+            bool complete() const override { return complete_; }
+
+        private:
+            enum class state { outside, name, analysis, answer, tools, other };
+
+            // The length of the end of the buffer that may begin a marker.
+            size_t held() const
+            {
+                size_t most = 0;
+                for (const char* m : { "<|channel_start|>", "<|channel_end|>", "<|content|>" })
+                {
+                    const std::string marker = m;
+                    for (size_t n = std::min(marker.size() - 1, buffer_.size()); n > most; --n)
+                        if (buffer_.compare(buffer_.size() - n, n, marker, 0, n) == 0)
+                        {
+                            most = n;
+                            break;
+                        }
+                }
+                return most;
+            }
+
+            void emit(const std::string& text, std::vector<output_event>& events)
+            {
+                std::string t = text;
+                if (strip_)
+                {
+                    // The white space that opens a channel is not part of it.
+                    size_t a = 0;
+                    while (a < t.size() && std::isspace(static_cast<unsigned char>(t[a]))) ++a;
+                    t.erase(0, a);
+                    if (t.empty()) return;
+                    strip_ = false;
+                }
+                if (t.empty()) return;
+                if (state_ == state::tools)
+                {
+                    calls_ += t;
+                    return;
+                }
+                if (state_ != state::analysis && state_ != state::answer) return;
+                output_event e;
+                e.kind = state_ == state::analysis ? output_kind::reasoning : output_kind::content;
+                e.text = t;
+                events.push_back(e);
+            }
+
+            void process(std::vector<output_event>& events, bool last)
+            {
+                const std::string open = "<|channel_start|>", close = "<|channel_end|>", content = "<|content|>";
+                // The names of the channels are short: a longer text before <|content|> names none.
+                const size_t longest_name = 64;
+                for (;;)
+                {
+                    // The turn is over: what a model writes after it is dropped.
+                    if (complete_)
+                    {
+                        buffer_.clear();
+                        return;
+                    }
+                    // The first marker of the buffer, whatever the state: none of them is ever text.
+                    const size_t opened = buffer_.find(open);
+                    const size_t closed = buffer_.find(close);
+                    const size_t named = buffer_.find(content);
+                    const size_t at = std::min(opened, std::min(closed, named));
+                    if (state_ == state::name)
+                    {
+                        if (at == std::string::npos)
+                        {
+                            // A name that goes on beyond the names of the channels opens a channel to drop.
+                            if (last) buffer_.clear();
+                            else if (buffer_.size() - held() > longest_name)
+                            {
+                                buffer_.erase(0, buffer_.size() - held());
+                                state_ = state::other;
+                            }
+                            return;
+                        }
+                        if (at == named)
+                        {
+                            const std::string name = at <= longest_name ? strip_spaces(buffer_.substr(0, at))
+                                : std::string();
+                            state_ = name == "analysis" ? state::analysis : name == "final" ? state::answer
+                                : name == "tools" && tools_ ? state::tools : state::other;
+                            if (answered_ && state_ != state::tools)
+                            {
+                                complete_ = true;
+                                state_ = state::other;
+                            }
+                            strip_ = true;
+                        }
+                        else
+                        {
+                            // A channel closed, or another one opened, before its content began.
+                            state_ = at == opened ? state::name : state::outside;
+                        }
+                        const size_t marker = at == named ? content.size() : at == opened ? open.size() : close.size();
+                        buffer_.erase(0, at + marker);
+                        continue;
+                    }
+                    if (at == std::string::npos)
+                    {
+                        const size_t safe = buffer_.size() - (last ? 0 : held());
+                        emit(buffer_.substr(0, safe), events);
+                        buffer_.erase(0, safe);
+                        return;
+                    }
+                    emit(buffer_.substr(0, at), events);
+                    if (at == named)
+                    {
+                        // The marker of a content inside a channel: the channel goes on without it.
+                        buffer_.erase(0, at + content.size());
+                        continue;
+                    }
+                    if (state_ == state::tools) calls(events);
+                    if (state_ == state::tools || (state_ == state::answer && !tools_)) complete_ = true;
+                    if (state_ == state::answer) answered_ = true;
+                    buffer_.erase(0, at + (at == opened ? open.size() : close.size()));
+                    state_ = at == opened ? state::name : state::outside;
+                }
+            }
+
+            // The text of an element of the tools channel from position at on, between open and close.
+            static bool element(const std::string& text, size_t& at, const std::string& open, const std::string& close,
+                std::string& value)
+            {
+                const size_t a = text.find(open, at);
+                if (a == std::string::npos) return false;
+                const size_t b = text.find(close, a + open.size());
+                if (b == std::string::npos) return false;
+                value = text.substr(a + open.size(), b - a - open.size());
+                at = b + close.size();
+                return true;
+            }
+
+            // The calls the tools channel holds; a channel that holds none is given as text of the answer.
+            void calls(std::vector<output_event>& events)
+            {
+                size_t at = 0, found = 0;
+                for (;;)
+                {
+                    std::string id, name, arguments;
+                    if (!element(calls_, at, "<call id=\"", "\">", id)
+                        || !element(calls_, at, "<name>", "</name>", name)
+                        || !element(calls_, at, "<arguments>", "</arguments>", arguments))
+                        break;
+                    json parsed;
+                    std::string repaired;
+                    arguments = strip_spaces(arguments);
+                    name = strip_spaces(name);
+                    if (name.empty() || !parse_call_json(arguments, parsed, repaired) || !parsed.is_object()) continue;
+                    output_event e;
+                    e.kind = output_kind::tool_call;
+                    e.call.id = id.empty() ? new_call_id() : id;
+                    e.call.name = name;
+                    e.call.arguments = repaired.empty() ? arguments : repaired;
+                    events.push_back(e);
+                    ++found;
+                }
+                if (found == 0 && !strip_spaces(calls_).empty())
+                {
+                    output_event e;
+                    e.kind = output_kind::content;
+                    e.text = calls_;
+                    events.push_back(e);
+                }
+                calls_.clear();
+            }
+
+            state state_;
+            bool strip_;
+            bool tools_;
+            bool complete_ = false;
+            bool answered_ = false;    // a final channel was closed
+            std::string buffer_, calls_;
+        };
+
+        /*
+            The format of Olala (OVHai LLM): the turns of ChatML, their content in named channels,
+            each between <|channel_start|>name<|content|> and <|channel_end|>.  Every prompt
+            opens with a system turn whose instructions the template of the model holds: they
+            name the reasoning effort, "medium" for a request that asks for a reasoning and
+            "disabled" otherwise, and describe the tools channel when the request offers tools.
+            A system message of the conversation and the tools go to a developer turn; a
+            question is the text channel of a user turn, the result of a call the metadata and
+            tool_output channels of a tool turn.  An answer holds an analysis channel, its
+            reasoning, then a final channel and, for calls, a tools channel; the prompt opens
+            the analysis of the answer to come, and closes it at once without reasoning.
+
+            The authors publish their template twice, inside their files and beside their GGUF
+            files, and the prompts follow the second one, whichever of them a file holds.  The
+            analysis of an answer is written again as long as no user turn follows it: the
+            prompt of each step of a loop of tool calls then extends the one before it, and a
+            sequence goes on from the state of its recurrent layers.  The instructions of the
+            tools channel leave out the rule that asks to batch independent calls.
+        */
+        class channels_format : public chat_format
+        {
+        public:
+            channels_format(const dlib::hf_tokenizer& tok, const std::string& tmpl)
+            {
+                for (const char* t : { "<|im_end|>", "<|endoftext|>", "<|im_start|>" })
+                {
+                    const int id = tok.token_id(t);
+                    if (id >= 0) stop_tokens_.push_back(id);
+                }
+                add_markers(tok, { "<|channel_start|>", "<|channel_end|>", "<|content|>" });
+                // The template opens the prompt with the end of text token.
+                if (tmpl.find("<|endoftext|><|im_start|>system") != std::string::npos) bos_ = "<|endoftext|>";
+                /*
+                    The instructions of the system turn, read from the template once for each effort
+                    the model learned, with and without the tools channel; a template they cannot be
+                    read from leaves the line of the effort.  The template the authors publish beside
+                    their GGUF files leaves out one rule of the tools channel that the template inside
+                    these files still holds: it is left out here as well.
+                */
+                const std::string batch = "- Batch independent calls when possible.\n";
+                for (const char* effort : { "disabled", "low", "medium", "high" })
+                    for (const bool tools : { false, true })
+                    {
+                        std::string& text = instructions_[std::string(effort) + (tools ? "+tools" : "")];
+                        if (!dlib::channel_instructions(tmpl, effort, tools, text))
+                            text = std::string("Reasoning effort: ") + effort;
+                        const size_t rule = tools ? text.find(batch) : std::string::npos;
+                        if (rule != std::string::npos) text.erase(rule, batch.size());
+                    }
+            }
+
+            const char* name() const override { return "channels"; }
+            bool supports_tools() const override { return true; }
+            bool supports_reasoning() const override { return true; }
+
+            std::vector<prompt_piece> reasoning_close() const override
+            {
+                return closing("<|channel_end|>", "<|channel_start|>final<|content|>");
+            }
+
+            void render(const std::vector<chat_message>& messages, const render_options& opt,
+                std::vector<prompt_piece>& out) const override
+            {
+                piece_writer w{ out };
+                const bool tools = opt.tools.is_array() && !opt.tools.empty();
+                // The efforts the model learned: the one of the request, medium for a reasoning without one.
+                const std::string effort = !opt.reasoning ? "disabled"
+                    : opt.effort == "low" ? "low"
+                    : opt.effort == "high" || opt.effort == "xhigh" || opt.effort == "max" ? "high" : "medium";
+                // The instructions of the template for this effort, with or without the tools channel.
+                w.markup(bos_ + "<|im_start|>system<|channel_start|>instructions<|content|>");
+                w.text(instructions_.at(effort + (tools ? "+tools" : "")));
+                w.markup("<|channel_end|><|im_end|>");
+
+                const bool led = !messages.empty() && (messages[0].role == "system" || messages[0].role == "developer");
+                const std::string developer = led ? strip_spaces(messages[0].content) : std::string();
+                if (!developer.empty() || tools)
+                {
+                    w.markup("<|im_start|>developer");
+                    if (!developer.empty())
+                    {
+                        w.markup("<|channel_start|>instructions<|content|>");
+                        w.text(developer);
+                        w.markup("<|channel_end|>");
+                    }
+                    if (tools)
+                    {
+                        w.markup("<|channel_start|>tools<|content|>");
+                        for (size_t i = 0; i < opt.tools.size(); ++i)
+                        {
+                            const json& tool = opt.tools[i];
+                            w.text((tool["function"].is_object() ? tool["function"] : tool).dump_formatted() + "\n");
+                        }
+                        w.markup("<|channel_end|>");
+                    }
+                    w.markup("<|im_end|>\n");
+                }
+                /*
+                    The reasoning of the answers that follow the last user turn is kept, as the template
+                    published beside the GGUF files does (the template inside the files keeps that of the
+                    last message alone): along a loop of tool calls the model reads its own reasoning, and
+                    the prompt of each step extends the one before it, which lets a sequence go on from
+                    the state of its recurrent layers.  A new user turn drops the reasoning before it.
+                */
+                size_t last_user = messages.size();
+                for (size_t i = led ? 1 : 0; i < messages.size(); ++i)
+                    if (messages[i].role == "user") last_user = i;
+                for (size_t i = led ? 1 : 0; i < messages.size(); ++i)
+                {
+                    const chat_message& m = messages[i];
+                    if (m.role == "user")
+                    {
+                        w.markup("<|im_start|>user<|channel_start|>text<|content|>");
+                        w.text(m.content);
+                        w.markup("<|channel_end|><|im_end|>");
+                    }
+                    else if (m.role == "assistant")
+                    {
+                        w.markup("<|im_start|>assistant<|channel_start|>analysis<|content|>");
+                        if (last_user == messages.size() || i > last_user) w.text(m.reasoning);
+                        w.markup("<|channel_end|><|channel_start|>final<|content|>");
+                        w.text(m.content);
+                        w.markup("<|channel_end|>");
+                        if (!m.tool_calls.empty())
+                        {
+                            w.markup("<|channel_start|>tools<|content|>");
+                            std::string calls = "<toolcalls>";
+                            for (size_t c = 0; c < m.tool_calls.size(); ++c)
+                            {
+                                const tool_call_data& call = m.tool_calls[c];
+                                json arguments;
+                                const bool read = json::parse(call.arguments, arguments);
+                                calls += "<call id=\"" + (call.id.empty() ? "call_" + std::to_string(c) : call.id)
+                                    + "\"><name>" + call.name + "</name><arguments>"
+                                    + (read ? arguments_text(arguments) : call.arguments) + "</arguments></call>";
+                            }
+                            w.text(calls + "</toolcalls>");
+                            w.markup("<|channel_end|>");
+                        }
+                        w.markup("<|im_end|>");
+                    }
+                    else if (m.role == "tool")
+                    {
+                        // The name of the tool and the identifier of its call, those the message gives.
+                        std::string metadata;
+                        if (!m.name.empty()) metadata += "\"name\": " + json(m.name).dump();
+                        if (!m.tool_call_id.empty())
+                            metadata += std::string(metadata.empty() ? "" : ", ") + "\"id\": "
+                                + json(m.tool_call_id).dump();
+                        w.markup("<|im_start|>tool<|channel_start|>metadata<|content|>");
+                        w.text("{" + metadata + "}");
+                        w.markup("<|channel_end|><|channel_start|>tool_output<|content|>");
+                        w.text(m.content);
+                        w.markup("<|channel_end|><|im_end|>");
+                    }
+                }
+                if (opt.add_generation_prompt)
+                    w.markup(std::string("<|im_start|>assistant<|channel_start|>analysis<|content|>")
+                        + (opt.reasoning ? "" : "<|channel_end|>"));
+            }
+
+            std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
+            {
+                return std::unique_ptr<output_parser>(new channel_parser(opt.add_generation_prompt && opt.reasoning,
+                    opt.tools.is_array() && !opt.tools.empty()));
+            }
+
+        private:
+            std::string bos_;
+            // The instructions of the system turn by effort, the key ending with +tools for those with tools.
+            std::map<std::string, std::string> instructions_;
+        };
+
         // Plain
 
         /*
@@ -3009,6 +3396,10 @@ namespace albireo
         if (has("<|start_of_role|>") && tok.token_id("<|start_of_role|>") >= 0)
             return std::unique_ptr<chat_format>(new granite_format(tok, tmpl));
         const bool chatml = tok.token_id("<|im_start|>") >= 0 && tok.token_id("<|im_end|>") >= 0;
+        // The turns of ChatML with their content in channels (Olala).
+        if (chatml && has("<|channel_start|>") && tok.token_id("<|channel_start|>") >= 0
+            && tok.token_id("<|channel_end|>") >= 0 && tok.token_id("<|content|>") >= 0)
+            return std::unique_ptr<chat_format>(new channels_format(tok, tmpl));
         if (chatml && has("<function=") && has("<think></think>"))
             return std::unique_ptr<chat_format>(new granite4_format(tok));
         if (chatml)

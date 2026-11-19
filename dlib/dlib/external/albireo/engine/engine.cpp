@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -143,30 +144,6 @@ namespace albireo
             size_t i = 0;
             while (i < n && a[i] == b[i]) ++i;
             return static_cast<long>(i);
-        }
-
-        std::string type_name(dlib::ggml_type t)
-        {
-            switch (t)
-            {
-            case dlib::ggml_type::F32: return "F32";
-            case dlib::ggml_type::F16: return "F16";
-            case dlib::ggml_type::BF16: return "BF16";
-            case dlib::ggml_type::Q4_0: return "Q4_0";
-            case dlib::ggml_type::Q4_1: return "Q4_1";
-            case dlib::ggml_type::Q5_0: return "Q5_0";
-            case dlib::ggml_type::Q5_1: return "Q5_1";
-            case dlib::ggml_type::Q8_0: return "Q8_0";
-            case dlib::ggml_type::Q8_1: return "Q8_1";
-            case dlib::ggml_type::Q2_K: return "Q2_K";
-            case dlib::ggml_type::Q3_K: return "Q3_K";
-            case dlib::ggml_type::Q4_K: return "Q4_K";
-            case dlib::ggml_type::Q5_K: return "Q5_K";
-            case dlib::ggml_type::Q6_K: return "Q6_K";
-            case dlib::ggml_type::Q8_K: return "Q8_K";
-            case dlib::ggml_type::IQ4_NL: return "IQ4_NL";
-            }
-            return "unknown";
         }
 
         /*
@@ -505,6 +482,18 @@ namespace albireo
         }
 
         /*
+            Whether the request of a client takes over a warm-up: it starts with most of the
+            history the warm-up reads, or, once the warm-up holds a sequence, with all the tokens
+            the warm-up found cached, as a request that writes the same answer again does.
+        */
+        bool takes_over(const request_state& client, const request_state& warm)
+        {
+            const long shared = common_prefix(client.keys, warm.keys);
+            return shared > 0 && (2 * shared >= static_cast<long>(warm.keys.size())
+                || (warm.seq >= 0 && shared >= warm.cached));
+        }
+
+        /*
             The tokens of the short reasoning of a request that asks for a low effort: an answer of
             a user, and a work in the background (titles, summaries, memory), which waits for less.
         */
@@ -544,6 +533,8 @@ namespace albireo
                   0.95, without top-k;
                 - Ministral 3: temperature 0.1; Devstral and the other Mistral models without
                   reasoning: temperature 0.15; without top-p or top-k;
+                - Olala: temperature 0.8, top-p 0.9 and top-k 40, the sampling of the card of the model,
+                  with which its authors measured its scores;
                 - the other models: temperature 0.6, top-p 0.95 and top-k 20 when they reason,
                   0.7, 0.9 and 40 otherwise.
             None of them selects by min-p.
@@ -628,6 +619,12 @@ namespace albireo
                 p.temperature = name.find("ministral") != std::string::npos ? 0.1f : 0.15f;
                 p.top_p = 1.0f;
                 p.top_k = 0;
+            }
+            else if (format == "channels")
+            {
+                p.temperature = 0.8f;
+                p.top_p = 0.9f;
+                p.top_k = 40;
             }
             else if (reasoning)
             {
@@ -1375,13 +1372,21 @@ namespace albireo
             : std::max<long>(1, static_cast<long>(setting("max_sequences", 8, 0, 256)));
         m->batch_tokens = embedding && !options.contains("batch_tokens") ? 256
             : std::max<long>(16, static_cast<long>(setting("batch_tokens", 512, 0, 65536)));
-        // The drafts of the answers (propose_draft()): 4 tokens by default, 0 for none, 6 at most.
-        m->draft_tokens = embedding ? 0 : static_cast<long>(setting("draft_tokens", 4, 0, draft_pass_tokens - 1));
+        /*
+            The drafts of the answers (propose_draft()): 4 tokens by default, 0 for none, 6 at most.
+            None for a hybrid decoder, whose recurrent states cannot give back the tokens of a draft
+            the model refuses.
+        */
+        const bool hybrid = m->cfg.hybrid();
+        m->draft_tokens = embedding || hybrid ? 0
+            : static_cast<long>(setting("draft_tokens", 4, 0, draft_pass_tokens - 1));
 
         /*
             The storage of the keys and values (kv_format): auto takes the 8-bit integers for a
             language model whose heads hold whole groups of them, and half precision for an
-            embedding model, whose vectors then keep the values of its reference implementation.
+            embedding model, whose vectors then keep the values of its reference implementation,
+            and for a hybrid decoder, whose few attention layers subtract the outputs of their
+            heads from one another, which doubles what the rounding to 8 bits costs.
         */
         const json none;
         const json& kv_type_value = options.contains("kv_type") ? options["kv_type"]
@@ -1391,13 +1396,13 @@ namespace albireo
             || (kv_type != "auto" && kv_type != "q8" && kv_type != "f16"))
             throw std::invalid_argument("the setting kv_type must be auto, q8 or f16");
         const bool whole_groups = m->cfg.head_dim % kv_q8_group == 0;
-        m->kv_type = whole_groups && (kv_type == "q8" || (kv_type == "auto" && !embedding)) ? kv_format::q8
-            : kv_format::f16;
+        m->kv_type = whole_groups && (kv_type == "q8" || (kv_type == "auto" && !embedding && !hybrid))
+            ? kv_format::q8 : kv_format::f16;
         if (kv_type == "q8" && !whole_groups)
             log(ALBIREO_LOG_WARNING, "model '" + id + "': heads of " + std::to_string(m->cfg.head_dim) + " values "
                 "hold no whole groups of 8-bit keys and values, which stay in half precision");
 
-        size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * static_cast<size_t>(m->cfg.n_kv_heads)
+        size_t per_token = 2 * static_cast<size_t>(m->cfg.attention_layers()) * static_cast<size_t>(m->cfg.n_kv_heads)
             * kv_row_bytes(m->kv_type, m->cfg.head_dim);
 #ifdef ALBIREO_OV_GRAPH
         /*
@@ -1610,17 +1615,10 @@ namespace albireo
         std::sort(m->stops.begin(), m->stops.end());
         m->stops.erase(std::unique(m->stops.begin(), m->stops.end()), m->stops.end());
 
-        // Size and dominant storage type of the weights.
-        std::map<std::string, uint64_t> by_type;
-        for (const auto& t : m->file->reader().tensors())
-        {
-            m->parameters += t.n_elements();
-            by_type[type_name(t.type)] += t.nbytes;
-        }
+        // Size of the weights and the format the file is known by.
+        for (const auto& t : m->file->reader().tensors()) m->parameters += t.n_elements();
         m->bytes = m->file->size();
-        uint64_t most = 0;
-        for (const auto& kvp : by_type)
-            if (kvp.second > most) { most = kvp.second; m->quantization = kvp.first; }
+        m->quantization = dlib::gguf_quantization_name(m->file->reader());
 
         // The graph of OpenVINO read the weights it holds while it was built.
         if (processor && settings_["warm_up"].as_bool(true)) m->file->warm_up(true);
@@ -1741,13 +1739,19 @@ namespace albireo
 
         render_options opt;
         current_dates(opt);
-        const std::string effort = req["reasoning_effort"].as_string();
+        // The effort of the reasoning, which the cards of some models give among the arguments of their template.
+        std::string effort = req["reasoning_effort"].as_string();
+        if (effort.empty()) effort = req["chat_template_kwargs"]["reasoning_effort"].as_string();
+        // The names of the efforts are read whatever their case.
+        for (char& c : effort) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         bool reasoning = m->format->supports_reasoning();
         if (req.contains("reasoning")) reasoning = req["reasoning"].as_bool(reasoning);
-        if (!effort.empty()) reasoning = effort != "none" && effort != "minimal";
+        if (!effort.empty())
+            reasoning = effort != "none" && effort != "minimal" && effort != "disabled" && effort != "off";
         if (req["chat_template_kwargs"].contains("enable_thinking"))
             reasoning = req["chat_template_kwargs"]["enable_thinking"].as_bool(reasoning);
         opt.reasoning = reasoning && m->format->supports_reasoning();
+        opt.effort = effort;
         /*
             The budget of the reasoning: the tokens it may take before the engine ends it.  The
             template of a model that always reasons opens its reasoning whatever the request asks:
@@ -2406,6 +2410,13 @@ namespace albireo
                 continue;
             }
             r->started = clock_type::now();
+            /*
+                A request that joined the queue after yield_warm_ups() read it may leave it, in this
+                call, right after the warm-up of its own conversation, which then holds the sequence
+                the two share: the warm-up ends here as it does there, and the request finds its keys
+                and values among the cached sequences instead of reading its whole prompt again.
+            */
+            if (!r->warm) end_warm_ups(m, *r);
             if (!assign_sequence(m, *r))
             {
                 fail(*r, "out_of_memory", "no memory left for the keys and values of this request");
@@ -2451,6 +2462,8 @@ namespace albireo
         {
             cache_entry& e = m.idle[best];
             const bool take = best_len * 2 >= static_cast<long>(e.tokens.size());
+            // A runtime with recurrent states goes back to the lengths it saved: the tokens after them are read again.
+            best_len = m.runtime->restorable_length(e.seq, best_len);
             /*
                 The request owns its sequence before a truncation or a copy, which may throw with the graph of
                 OpenVINO: the error then releases it with the request, and no entry of the cache names it.
@@ -2687,6 +2700,12 @@ namespace albireo
         auto slice = [&](request_state& r, long most) -> long {
             const long done = static_cast<long>(r.kv_tokens.size());
             long n = std::min<long>(static_cast<long>(r.prompt.size()) - done, most);
+            /*
+                A hybrid decoder reads the last token of a prompt in a pass of its own: the state its
+                runtime saves at the end of the pass before is then the one a request with the same
+                prompt goes back to, since one token of a prompt is always left to compute.
+            */
+            if (m.cfg.hybrid() && n > 1 && done + n == static_cast<long>(r.prompt.size())) --n;
             // The slice stops before the first image it reads that is not encoded yet.
             for (size_t i = 0; i < r.images.size(); ++i)
             {
@@ -2727,7 +2746,7 @@ namespace albireo
             // A warm-up needs no logits: it ends with its prompt.
             const bool last = done + n == static_cast<long>(r.prompt.size()) && !r.warm;
             const long row0 = static_cast<long>(b.tokens.size());
-            b.segments.push_back({ r.seq, row0, n });
+            b.segments.push_back({ r.seq, row0, n, true });
             if (last) b.logit_rows.push_back(row0 + n - 1);
             b.tokens.insert(b.tokens.end(), r.prompt.begin() + done, r.prompt.begin() + done + n);
             if (multimodal)
@@ -3021,6 +3040,12 @@ namespace albireo
             emit_text(m, r, text);
             if (r.ph == request_state::phase::done) return;
         }
+        // An answer its format reads as complete ends here, as at the end token of its turn.
+        if (r.parser && r.parser->complete())
+        {
+            finish(m, r, "stop");
+            return;
+        }
         const bool reasoning = r.parser && r.parser->in_reasoning();
         /*
             The end of a short reasoning: the answer receives the tokens the request gave it, after
@@ -3232,8 +3257,9 @@ namespace albireo
                 e.stamp = ++m.stamp;
                 m.idle.push_back(std::move(e));
                 cached = true;
-                // A bounded number of cached sequences, the least recently used dropped.
-                const size_t limit = static_cast<size_t>(std::max<long>(4, 2 * m.max_sequences));
+                // A bounded number of cached sequences, the least recently used dropped: fewer for a
+                // hybrid decoder, whose sequences keep the states of their layers, saved ones included.
+                const size_t limit = m.cfg.hybrid() ? 4 : static_cast<size_t>(std::max<long>(4, 2 * m.max_sequences));
                 while (m.idle.size() > limit)
                 {
                     size_t lru = 0;
@@ -3373,25 +3399,15 @@ namespace albireo
             for (const auto& a : m.active) warming = warming || a->warm;
             if (!warming || clients == 0) return;
             long places = m.max_sequences - static_cast<long>(m.active.size());
-            /*
-                A request takes over a warm-up when it starts with most of its history, or, once
-                the warm-up holds a sequence, with all the tokens the warm-up found cached, as a
-                request that writes the same answer again does.
-            */
-            auto takes_over = [&](const request_state& warm) {
+            // Whether a waiting request of a client takes over the warm-up (takes_over()).
+            auto taken_over = [&](const request_state& warm) {
                 for (const auto& c : m.waiting)
-                {
-                    if (c->warm) continue;
-                    const long shared = common_prefix(c->keys, warm.keys);
-                    if (shared > 0 && (2 * shared >= static_cast<long>(warm.keys.size())
-                        || (warm.seq >= 0 && shared >= warm.cached)))
-                        return true;
-                }
+                    if (!c->warm && takes_over(*c, warm)) return true;
                 return false;
             };
             for (auto it = m.waiting.begin(); it != m.waiting.end();)
             {
-                if ((*it)->warm && takes_over(**it))
+                if ((*it)->warm && taken_over(**it))
                 {
                     dropped.push_back(*it);
                     it = m.waiting.erase(it);
@@ -3404,7 +3420,7 @@ namespace albireo
             for (const auto& a : m.active)
             {
                 if (!a->warm || a->ph != request_state::phase::prefill) continue;
-                if (takes_over(*a) || places < clients)
+                if (taken_over(*a) || places < clients)
                 {
                     dropped.push_back(a);
                     ++places;
@@ -3413,6 +3429,19 @@ namespace albireo
         }
         for (const auto& w : dropped) finish(m, *w, "replaced");
         m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
+    }
+
+    void engine::end_warm_ups(loaded_model& m, const request_state& client)
+    {
+        // The requests keep their order: the one being admitted stays the last of the active ones.
+        bool ended = false;
+        for (const auto& a : m.active)
+        {
+            if (!a->warm || a->ph != request_state::phase::prefill || !takes_over(client, *a)) continue;
+            finish(m, *a, "replaced");
+            ended = true;
+        }
+        if (ended) m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
     }
 
     void engine::fail(request_state& r, const std::string& code, const std::string& message)

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-11-17T10:15:10Z",
+  "updated": "2026-11-19T16:04:09Z",
   "models": [
     {
       "id": "qwen3-vl-4b-instruct",
@@ -662,6 +662,42 @@
           "url": "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF/resolve/615f8936e16dfde29dcc00be71145d4d5ce8ed53/DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf",
           "size": 4920737216,
           "sha256": "0addb1339a82385bcd973186cd80d18dcc71885d45eabd899781a118d03827d9"
+        }
+      ]
+    },
+    {
+      "id": "olala-1.0-mini-7a1b",
+      "name": "Olala 1.0 mini 7A1B",
+      "publisher": "OVHai LLM",
+      "quantization": "Q6_K",
+      "context": 32768,
+      "roles": [
+        "general"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": true,
+      "reasoning": true,
+      "reasoning_always": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Hybrid model from OVHai LLM (France) with 6.8 billion parameters, about 1 billion of which compute each token: Mamba-3 layers, a few attention layers and a mixture of 256 experts, for answers at the pace of a small model on a processor. It reasons on request and calls tools, reads text alone, and suits computers with 16 GB of memory.",
+        "fr": "Modèle hybride d'OVHai LLM (France) de 6,8 milliards de paramètres, dont environ 1 milliard calcule chaque jeton : couches Mamba-3, quelques couches d'attention et mélange de 256 experts, pour des réponses au rythme d'un petit modèle sur un processeur. Il raisonne sur demande et appelle des outils, lit le texte seul et convient aux ordinateurs dotés de 16 Go de mémoire.",
+        "de": "Hybrides Modell von OVHai LLM (Frankreich) mit 6,8 Milliarden Parametern, von denen rund 1 Milliarde jedes Token berechnet: Mamba-3-Schichten, einige Attention-Schichten und eine Mischung aus 256 Experten, für Antworten im Tempo eines kleinen Modells auf einem Prozessor. Es denkt auf Wunsch nach und ruft Werkzeuge auf, liest nur Text und eignet sich für Computer mit 16 GB Arbeitsspeicher.",
+        "it": "Modello ibrido di OVHai LLM (Francia) con 6,8 miliardi di parametri, di cui circa 1 miliardo calcola ogni token: strati Mamba-3, alcuni strati di attenzione e una miscela di 256 esperti, per risposte al ritmo di un piccolo modello su un processore. Ragiona su richiesta e chiama strumenti, legge solo testo ed è adatto ai computer con 16 GB di memoria.",
+        "es": "Modelo híbrido de OVHai LLM (Francia) con 6800 millones de parámetros, de los que unos 1000 millones calculan cada token: capas Mamba-3, algunas capas de atención y una mezcla de 256 expertos, para respuestas al ritmo de un modelo pequeño en un procesador. Razona a petición y llama herramientas, lee solo texto y conviene a los ordenadores con 16 GB de memoria."
+      },
+      "arch": "olala",
+      "parameters": 6775272608,
+      "source": "https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF",
+      "size": 6306979040,
+      "sha256": "58a2b658158290687a431705c3c256c1331580ad4e8e99db55d03a8131d223c8",
+      "files": [
+        {
+          "url": "https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF/resolve/b9f5d20adf2ac0aec05e9fa00b057cf26df263fc/Olala-v1.0-mini-7A1B-q6_k.gguf",
+          "size": 6306979040,
+          "sha256": "58a2b658158290687a431705c3c256c1331580ad4e8e99db55d03a8131d223c8"
         }
       ]
     },

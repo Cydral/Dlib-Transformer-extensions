@@ -82,11 +82,18 @@ for family in "" _avxvnni; do
 done
 
 # The attention of the steps split among the threads, against one task per key/value head, with
-# keys and values in half precision and in 8 bits, on a tiny model written in the work folder.
-if [ -x "$BUILD/tests/test_runtime" ]; then
-  step "attention" "all checks passed" "$BUILD/tests/test_runtime" synthetic "$WORK"
-else skip "attention" "no $BUILD/tests/test_runtime"
-fi
+# keys and values in half precision and in 8 bits, on a tiny model written in the work folder;
+# then a tiny hybrid decoder (Mamba-3 layers, differential attentions, experts in a latent space)
+# against the logits of its reference and however its sequences are cut.  With the kernels of
+# AVX2, then with the portable ones.
+for family in "" _portable; do
+  test=$BUILD/tests/test_runtime$family
+  name="attention and hybrid decoder${family:+ ${family#_}}"
+  if [ -x "$test" ]; then
+    step "$name" "all checks passed" "$test" synthetic "$WORK" "$HERE/../tests/data/hybrid.golden"
+  else skip "$name" "no $test"
+  fi
+done
 
 # The attention of a device on the same tiny model, through the host code of dlib, when the tree
 # was configured with ALBIREO_ENGINE_DLIB=ON.
@@ -108,23 +115,6 @@ fi
 if [ -x "$BUILD/tests/test_sampler" ]; then step "sampler" "all checks passed" "$BUILD/tests/test_sampler"
 else skip "sampler" "no $BUILD/tests/test_sampler"
 fi
-# The sequence mixers in preparation (Mamba-3, tensor product and differential attention) against
-# their reference results, with the instructions of AVX2, skipped by the processors without them,
-# and in their portable form.
-for family in "" _portable; do
-  test=$BUILD/tests/test_mixers$family
-  name="sequence mixers${family:+ ${family#_}}"
-  if [ ! -x "$test" ]; then
-    skip "$name" "no $test"
-    continue
-  fi
-  out=$("$test" "$HERE/../tests/data/mixers.golden" 2>&1)
-  if printf '%s\n' "$out" | grep -q "skipped, the processor lacks"; then
-    skip "$name" "$(printf '%s\n' "$out" | grep -o 'lacks [^(]*' | head -1)"
-  else
-    step "$name" "all checks passed" "$test" "$HERE/../tests/data/mixers.golden"
-  fi
-done
 if [ -x "$BUILD/tests/test_engine_api" ] && [ -f "$ENGINES/libalbireo-engine-cpu.so" ]; then
   step "engine interface" "all checks passed" "$BUILD/tests/test_engine_api" "$ENGINES/libalbireo-engine-cpu.so" "$WORK"
 else skip "engine interface" "no $BUILD/tests/test_engine_api or no portable engine"

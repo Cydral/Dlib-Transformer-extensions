@@ -132,6 +132,8 @@ namespace albireo
         void warm_history(loaded_model& m, const request_state& r, const std::vector<int>& cached);
         // Ends the warm-ups whose history a waiting request of a client starts with.
         void yield_warm_ups(loaded_model& m);
+        // Ends the warm-ups being read whose history the request of a client, being admitted, starts with.
+        void end_warm_ups(loaded_model& m, const request_state& client);
         void fail(request_state& r, const std::string& code, const std::string& message);
         void log(int level, const std::string& message);
         json model_info(const loaded_model& m) const;

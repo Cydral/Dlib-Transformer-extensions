@@ -22,7 +22,7 @@
 
 namespace dlib
 {
-    enum class arch_family { llama, mistral, gemma, gemma2, qwen2, qwen3, mixtral, granite_moe, unknown };
+    enum class arch_family { llama, mistral, gemma, gemma2, qwen2, qwen3, mixtral, granite_moe, olala, unknown };
 
     inline arch_family arch_family_from_name(const std::string& a)
     {
@@ -34,6 +34,7 @@ namespace dlib
         if (a == "qwen3")   return arch_family::qwen3;
         if (a == "mixtral") return arch_family::mixtral;
         if (a == "granitemoe") return arch_family::granite_moe;
+        if (a == "olala")   return arch_family::olala;
         return arch_family::unknown;
     }
 
@@ -76,6 +77,35 @@ namespace dlib
         bool embedding_model = false;
         bool quantized = false;                 // at least one tensor is neither F32 nor F16
         bool qk_norm = false;                   // per-head RMSNorm on Q and K (Qwen3)
+
+        /* Hybrid decoders (olala). layer_types names the mixer of each layer, 'M' for a
+           Mamba-3 layer with several inputs and outputs and 'V' for a differential
+           attention whose keys and values are tensor products; it is empty for the
+           decoders whose layers are all attentions with rotary positions. Such a decoder
+           normalizes no hidden state: each block turns the residual stream on its sphere
+           (geodesic_update); its feed-forward blocks are mixtures of experts of
+           d_ffn_expert hidden values in a latent space of d_latent values, beside a
+           shared expert of d_ffn_shared hidden values, routed by sigmoids.
+
+           A Mamba-3 layer holds ssm_heads heads of ssm_head_dim channels, each channel a
+           state of ssm_state values with ssm_rank inputs and outputs, ssm_angles pairs of
+           which are rotated. An attention gives each of its n_kv_heads key and value heads
+           to n_heads / n_kv_heads query heads, the last of them the noise head of the
+           group; keys and values are means of tpa_rank tensor products, a query sees
+           attention_window positions at most (0 for all), the scores are capped at
+           attn_softcap through a hyperbolic tangent (0 for none) and gate_bias is added
+           to the gate of the output. hybrid_supported is false when the file declares a
+           variant of these layers that the runtime engine does not compute, or a geometry
+           beyond the one tt::mamba3_step() takes. */
+        std::string layer_types;
+        long ssm_heads = 0, ssm_head_dim = 0, ssm_state = 0, ssm_rank = 0, ssm_angles = 0;
+        long tpa_rank = 0, attention_window = 0;
+        double attn_softcap = 0.0, gate_bias = 0.0;
+        long d_ffn_expert = 0, d_ffn_shared = 0, d_latent = 0;
+        double expert_weights_scale = 1.0;
+        bool hybrid_supported = true;
+
+        bool hybrid() const { return !layer_types.empty(); }
     };
 
     inline long gcd_long(long a, long b)
@@ -204,6 +234,54 @@ namespace dlib
         s.embedding_model = s.tied_embeddings && s.pooling_type >= 0;
         s.qk_norm = (g.find_tensor("blk.0.attn_q_norm.weight") != nullptr);
         for (const auto& t : g.tensors()) if (t.is_quantized()) { s.quantized = true; break; }
+
+        if (s.family == arch_family::olala)
+        {
+            auto flag = [&](const char* key, bool def) {
+                return g.has(p + "." + key) ? g.get_int(p + "." + key, def ? 1 : 0) != 0 : def;
+            };
+            s.layer_types = g.get_str(p + ".layer_types", "");
+            s.ssm_head_dim = static_cast<long>(gguf_bounded_int(g, p + ".mamba_headdim", 0, 0, 4096));
+            s.ssm_state = static_cast<long>(gguf_bounded_int(g, p + ".ssm.state_size", 0, 0, 4096));
+            s.ssm_rank = static_cast<long>(gguf_bounded_int(g, p + ".mamba_mimo_dim", 0, 0, 64));
+            s.ssm_angles = static_cast<long>(gguf_bounded_int(g, p + ".num_rope_angles", 0, 0, 4096));
+            const long inner = static_cast<long>(gguf_bounded_int(g, p + ".ssm.inner_size", 0, 0, int64_t(1) << 20));
+            s.ssm_heads = s.ssm_head_dim > 0 ? inner / s.ssm_head_dim : 0;
+            s.tpa_rank = static_cast<long>(gguf_bounded_int(g, p + ".tpa_rank", 0, 0, 64));
+            s.attention_window = static_cast<long>(gguf_bounded_int(g, p + ".attention.sliding_window", 0, 0,
+                int64_t(1) << 26));
+            s.attn_softcap = gguf_bounded_double(g, p + ".attn_logit_softcapping", 0.0, 0.0, 1e6);
+            s.gate_bias = gguf_bounded_double(g, p + ".gate_bias", 0.0, -1e6, 1e6);
+            s.d_ffn_expert = static_cast<long>(gguf_bounded_int(g, p + ".expert_feed_forward_length", 0, 0,
+                int64_t(1) << 20));
+            s.d_ffn_shared = static_cast<long>(gguf_bounded_int(g, p + ".expert_shared_feed_forward_length", 0, 0,
+                int64_t(1) << 20));
+            s.d_latent = static_cast<long>(gguf_bounded_int(g, p + ".moe_latent_size", 0, 0, int64_t(1) << 17));
+            s.expert_weights_scale = gguf_bounded_double(g, p + ".expert_weights_scale", 1.0, -1e6, 1e6);
+            // The scores of a head are divided by its width, and its queries and keys are normalized.
+            if (s.head_dim > 0) s.attention_scale = 1.0 / static_cast<double>(s.head_dim);
+            s.qk_norm = true;
+            const long noise = static_cast<long>(gguf_bounded_int(g, p + ".num_noise_heads", 0, 0, 1024));
+            const long signal = static_cast<long>(gguf_bounded_int(g, p + ".num_signal_heads", 0, 0, 1024));
+            bool known = static_cast<long>(s.layer_types.size()) == s.n_layers && s.n_layers > 0;
+            for (char t : s.layer_types) known = known && (t == 'M' || t == 'V');
+            s.hybrid_supported = known
+                && flag("geodesic_update", false) && !flag("final_norm", false) && flag("gate_attn", false)
+                && !g.has(p + ".rope.dimension_count")
+                && gguf_bounded_int(g, p + ".ssm.group_count", 1, 0, 1024) == 1
+                && gguf_bounded_int(g, p + ".expert_gating_func", 0, 0, 16) == 2
+                && gguf_bounded_int(g, p + ".expert_shared_count", 0, 0, 4096) == 1
+                && s.ssm_heads > 0 && s.ssm_heads * s.ssm_head_dim == inner && s.ssm_state > 0
+                && s.ssm_state % 2 == 0 && s.ssm_rank > 0 && s.ssm_angles <= s.ssm_state / 2
+                && s.tpa_rank > 0 && noise == s.n_kv_heads && signal + noise == s.n_heads && noise > 0
+                && s.n_heads / noise >= 2 && s.n_heads % noise == 0
+                && s.n_experts > 0 && s.n_experts_used > 0 && s.d_ffn_expert > 0 && s.d_ffn_shared > 0
+                && s.d_latent > 0
+                // The inputs and the angles tt::mamba3_step() takes, and states that a long indexes.
+                && s.ssm_rank <= 8 && s.ssm_angles <= 256 && inner <= 65536
+                && static_cast<int64_t>(inner) * s.ssm_state <= (int64_t(1) << 26)
+                && static_cast<int64_t>(s.ssm_heads) * s.ssm_rank * s.ssm_state <= (int64_t(1) << 26);
+        }
         return s;
     }
 
@@ -273,6 +351,14 @@ namespace dlib
                        + ", " + std::to_string(s.d_model) + " dimensions)\n"
                  : std::string())
           << "Quantized weights  : " << (s.quantized ? "yes" : "no") << "\n";
+        if (s.hybrid())
+            o << "Layer types        : " << s.layer_types << " (M Mamba-3, V differential attention)\n"
+              << "Mamba-3 heads      : " << s.ssm_heads << " of " << s.ssm_head_dim << " channels, states of "
+              << s.ssm_state << ", rank " << s.ssm_rank << ", " << s.ssm_angles << " rotated pairs\n"
+              << "Tensor products    : rank " << s.tpa_rank << ", window " << s.attention_window
+              << ", scores capped at " << s.attn_softcap << "\n"
+              << "Latent experts     : hidden " << s.d_ffn_expert << " in a space of " << s.d_latent
+              << ", shared expert of " << s.d_ffn_shared << ", weights scaled by " << s.expert_weights_scale << "\n";
         return o.str();
     }
 
@@ -296,6 +382,22 @@ namespace dlib
            them in the inference forwards and freezes them during training (their
            gradients are zeroed). */
         (void)fused_attention_path;
+        if (s.hybrid() || s.family == arch_family::olala)
+        {
+            /* Hybrid decoders run through the runtime engine, which reads their tokens one
+               after the other with the states of their layers; the template network has
+               no such layers. */
+            if (fused_attention_path)
+                r.blockers.push_back("hybrid decoders import only through the runtime engine (no Mamba-3 layer nor "
+                    "geodesic update in the template network)");
+            else if (!s.hybrid_supported)
+                r.blockers.push_back("this variant of the hybrid layers of architecture '" + s.arch_name
+                    + "' is not supported");
+            if (s.d_model <= 0 || s.n_layers <= 0 || s.vocab_size <= 0)
+                r.blockers.push_back("incomplete metadata (missing dimensions)");
+            r.ok = r.blockers.empty();
+            return r;
+        }
         if (s.n_experts > 0)
         {
             /* MoE support scope: the runtime engine implements the canonical routing

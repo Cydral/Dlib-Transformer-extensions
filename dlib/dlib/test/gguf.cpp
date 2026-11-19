@@ -2,13 +2,22 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 
 #include <dlib/data_io/gguf_dequantize.h>
+#include <dlib/data_io/gguf_model_spec.h>
 #include <dlib/data_io/gguf_reader.h>
+#include <dlib/dnn.h>
+#include <dlib/dnn/runtime_transformer.h>
+#include <dlib/rand.h>
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "tester.h"
@@ -30,8 +39,8 @@ namespace
     */
     struct gguf_image
     {
-        vector<unsigned char> bytes;
-        vector<pair<string, size_t>> fields;
+        std::vector<unsigned char> bytes;
+        std::vector<pair<string, size_t>> fields;
         size_t data_start = 0;
 
         size_t at(const string& name) const
@@ -42,16 +51,16 @@ namespace
             return 0;
         }
 
-        vector<unsigned char> with_u64(const string& name, uint64_t v) const
+        std::vector<unsigned char> with_u64(const string& name, uint64_t v) const
         {
-            vector<unsigned char> b = bytes;
+            std::vector<unsigned char> b = bytes;
             for (int i = 0; i < 8; ++i) b[at(name) + i] = static_cast<unsigned char>(v >> (8 * i));
             return b;
         }
 
-        vector<unsigned char> with_u32(const string& name, uint32_t v) const
+        std::vector<unsigned char> with_u32(const string& name, uint32_t v) const
         {
-            vector<unsigned char> b = bytes;
+            std::vector<unsigned char> b = bytes;
             for (int i = 0; i < 4; ++i) b[at(name) + i] = static_cast<unsigned char>(v >> (8 * i));
             return b;
         }
@@ -61,7 +70,8 @@ namespace
     class gguf_builder
     {
     public:
-        gguf_image build()
+        // The file, with the file type given in its header when it is not negative.
+        gguf_image build(long file_type = -1)
         {
             out = gguf_image();
             u32(0x46554747u);
@@ -69,9 +79,14 @@ namespace
             u32(3);
             mark("tensor count");
             u64(3);
-            u64(5);     // metadata entries
+            u64(file_type < 0 ? 5 : 6);     // metadata entries
             key("general.architecture", 8);
             str("llama");
+            if (file_type >= 0)
+            {
+                key("general.file_type", 4);
+                u32(static_cast<uint32_t>(file_type));
+            }
             key("general.alignment", 4);
             u32(32);
             key("llama.block_count", 4);
@@ -126,7 +141,7 @@ namespace
             u32(type);
         }
 
-        void tensor(const string& name, const vector<uint64_t>& dims, uint32_t type, uint64_t offset)
+        void tensor(const string& name, const std::vector<uint64_t>& dims, uint32_t type, uint64_t offset)
         {
             mark("name " + name);
             str(name);
@@ -144,7 +159,7 @@ namespace
     };
 
     // The message of the exception the reader throws for the bytes, empty when it reads them.
-    string refusal(const vector<unsigned char>& bytes)
+    string refusal(const std::vector<unsigned char>& bytes)
     {
         try
         {
@@ -183,7 +198,7 @@ namespace
         DLIB_TEST(w->nbytes == 32 && h->nbytes == 16 && q->nbytes == 68);
         DLIB_TEST(q->is_quantized() && !w->is_quantized());
 
-        vector<float> values;
+        std::vector<float> values;
         gguf_read_dequantized(r, *w, values);
         DLIB_TEST(values.size() == 8);
         for (int i = 0; i < 8; ++i) DLIB_TEST(values[i] == 0.5f * i - 1.0f);
@@ -198,6 +213,22 @@ namespace
             DLIB_TEST(values[32 + k] == 0.5f * static_cast<float>(k - 16));
         }
 
+        // The format the file is known by: the one of most of its bytes without a file type,
+        // the file type declared when the file holds tensors of its base format.
+        DLIB_TEST(string(ggml_type_name(ggml_type::Q5_K)) == "Q5_K");
+        DLIB_TEST(string(ggml_type_name(static_cast<ggml_type>(999))) == "unknown");
+        DLIB_TEST(gguf_quantization_name(r) == "Q8_0");
+        const std::pair<long, const char*> named[] = { { 7, "Q8_0" }, { 1, "F16" }, { 0, "F32" }, { 17, "Q8_0" },
+            { 15, "Q8_0" }, { 999, "Q8_0" } };
+        for (const auto& n : named)
+        {
+            const gguf_image typed = gguf_builder().build(n.first);
+            gguf_reader t(typed.bytes.data(), typed.bytes.size());
+            DLIB_TEST_MSG(gguf_quantization_name(t) == n.second, "file type " << n.first << ": "
+                << gguf_quantization_name(t));
+            DLIB_TEST(t.tensors().size() == 3);
+        }
+
         // The same container read from a file.
         const string path = "gguf_test_file.gguf";
         {
@@ -208,7 +239,7 @@ namespace
         {
             gguf_reader file(path);
             DLIB_TEST(file.tensors().size() == 3);
-            vector<uint8_t> raw;
+            std::vector<uint8_t> raw;
             file.read_tensor_raw(*file.find_tensor("blocks"), raw);
             DLIB_TEST(raw.size() == 68);
             DLIB_TEST(std::equal(raw.begin(), raw.end(), image.bytes.begin() + image.data_start + 64));
@@ -224,10 +255,11 @@ namespace
         // Truncations, at every byte of the header and through the data.
         for (size_t cut = 0; cut < image.bytes.size(); cut += (cut < image.data_start ? 1 : 17))
         {
-            const vector<unsigned char> b(image.bytes.begin(), image.bytes.begin() + static_cast<std::ptrdiff_t>(cut));
+            const std::vector<unsigned char> b(image.bytes.begin(),
+                image.bytes.begin() + static_cast<std::ptrdiff_t>(cut));
             DLIB_TEST_MSG(!refusal(b).empty(), "truncated at " << cut);
         }
-        vector<unsigned char> magic = image.bytes;
+        std::vector<unsigned char> magic = image.bytes;
         magic[0] = 'X';
         DLIB_TEST(refusal(magic).find("bad magic") != string::npos);
         DLIB_TEST(refusal(image.with_u32("version", 4)).find("version") != string::npos);
@@ -236,7 +268,7 @@ namespace
         // A key and a tensor name given twice: llama.rope.freq_base renamed general.architecture,
         // of the same length, and the tensor blocks renamed halves.
         {
-            vector<unsigned char> b = image.bytes;
+            std::vector<unsigned char> b = image.bytes;
             const string name = "general.architecture";
             for (size_t i = 0; i < name.size(); ++i)
                 b[image.at("key llama.rope.freq_base") + 8 + i] = static_cast<unsigned char>(name[i]);
@@ -244,7 +276,7 @@ namespace
             DLIB_TEST_MSG(m.find("duplicate metadata key 'general.architecture'") != string::npos, m);
         }
         {
-            vector<unsigned char> b = image.bytes;
+            std::vector<unsigned char> b = image.bytes;
             const string name = "halves";
             for (size_t i = 0; i < name.size(); ++i)
                 b[image.at("name blocks") + 8 + i] = static_cast<unsigned char>(name[i]);
@@ -256,7 +288,7 @@ namespace
         string m = refusal(image.with_u64("offset halves", 40));
         DLIB_TEST_MSG(m.find("alignment") != string::npos, m);
         {
-            vector<unsigned char> b = image.with_u64("dim0 blocks", 16);
+            std::vector<unsigned char> b = image.with_u64("dim0 blocks", 16);
             for (int i = 0; i < 8; ++i)
                 b[image.at("dim1 blocks") + i] = static_cast<unsigned char>(uint64_t(4) >> (8 * i));
             m = refusal(b);
@@ -293,13 +325,369 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    /*
+        A tiny hybrid decoder of the olala family written in memory, in single precision: four
+        layers of width 64, two Mamba-3 layers with several inputs and outputs and two
+        differential attentions, each followed by a mixture of experts in a latent space
+        beside a shared expert.  Its values come from a fixed sequence, around those of a
+        trained model: scales and factors around one.
+    */
+    class hybrid_builder
+    {
+    public:
+        std::vector<unsigned char> build()
+        {
+            const long d = 64, layers = 4, vocab = 288;
+            const long ssm_heads = 8, ssm_hd = 16, state = 16, rank = 2, angles = 4;
+            const long heads = 8, kv_heads = 2, hd = 32, tpa = 2, signal = heads - kv_heads;
+            const long experts = 8, used = 2, hidden = 32, latent = 16, shared = 48;
+            const string types = "MVMV";
+            list.clear();
+            out.clear();
+            add("output.weight", { d, vocab }, 0.0f, 8.0f);
+            add("token_embd.weight", { d, vocab }, 0.0f, 0.4f);
+            for (long l = 0; l < layers; ++l)
+            {
+                const string p = "blk." + to_string(l) + ".";
+                add(p + "geo_mixer_scale", { 1 }, 1.0f, 0.2f);
+                add(p + "geo_mixer_bias", { 1 }, 0.02f, 0.02f);
+                add(p + "geo_mlp_scale", { 1 }, 1.0f, 0.2f);
+                add(p + "geo_mlp_bias", { 1 }, 0.02f, 0.02f);
+                if (types[static_cast<size_t>(l)] == 'M')
+                {
+                    add(p + "ssm_in.weight", { d, ssm_heads * (2 * ssm_hd + 3) }, 0.0f, 0.8f);
+                    add(p + "ssm_in_dyn.weight", { d, 2 * rank * state + angles }, 0.0f, 0.8f);
+                    add(p + "attn_output.weight", { ssm_heads * ssm_hd, d }, 0.0f, 0.4f);
+                    add(p + "ssm_b_norm.weight", { state }, 1.0f, 0.2f);
+                    add(p + "ssm_c_norm.weight", { state }, 1.0f, 0.2f);
+                    add(p + "ssm_b_bias", { state, rank, ssm_heads }, 1.0f, 0.6f);
+                    add(p + "ssm_c_bias", { state, rank, ssm_heads }, 1.0f, 0.6f);
+                    add(p + "ssm_dt_bias", { ssm_heads }, -1.0f, 1.0f);
+                    add(p + "ssm_d", { ssm_heads }, 1.0f, 0.6f);
+                    add(p + "ssm_mimo_x", { ssm_hd, rank, ssm_heads }, 0.5f, 0.4f);
+                    add(p + "ssm_mimo_z", { ssm_hd, rank, ssm_heads }, 1.0f, 0.6f);
+                    add(p + "ssm_mimo_o", { ssm_hd, rank, ssm_heads }, 0.5f, 0.4f);
+                }
+                else
+                {
+                    add(p + "attn_q.weight", { d, heads * hd }, 0.0f, 0.8f);
+                    add(p + "attn_wa_k.weight", { d, kv_heads * tpa }, 0.0f, 1.6f);
+                    add(p + "attn_wb_k.weight", { d, tpa * hd }, 0.0f, 1.6f);
+                    add(p + "attn_wa_v.weight", { d, kv_heads * tpa }, 0.0f, 1.6f);
+                    add(p + "attn_wb_v.weight", { d, tpa * hd }, 0.0f, 1.6f);
+                    add(p + "attn_shift_k.weight", { d, kv_heads }, 0.0f, 1.6f);
+                    add(p + "attn_shift_v.weight", { d, kv_heads }, 0.0f, 1.6f);
+                    add(p + "attn_lambda.weight", { d, kv_heads }, 0.0f, 1.6f);
+                    add(p + "attn_gate.weight", { d, signal * hd }, 0.0f, 0.8f);
+                    add(p + "attn_output.weight", { signal * hd, d }, 0.0f, 0.4f);
+                    add(p + "attn_q_norm.weight", { hd }, 1.0f, 0.2f);
+                    add(p + "attn_k_norm.weight", { hd }, 1.0f, 0.2f);
+                    add(p + "attn_softmax_scaler", { heads }, 2.0f, 2.0f);
+                }
+                add(p + "ffn_gate_inp.weight", { d, experts }, 0.0f, 4.0f);
+                add(p + "exp_probs_b", { experts }, 0.0f, 0.1f);
+                add(p + "ffn_latent_down.weight", { d, latent }, 0.0f, 0.8f);
+                add(p + "ffn_latent_up.weight", { latent, d }, 0.0f, 0.4f);
+                add(p + "ffn_up_exps.weight", { latent, hidden, experts }, 0.0f, 0.8f);
+                add(p + "ffn_down_exps.weight", { hidden, latent, experts }, 0.0f, 0.4f);
+                add(p + "ffn_up_shexp.weight", { d, shared }, 0.0f, 0.8f);
+                add(p + "ffn_down_shexp.weight", { shared, d }, 0.0f, 0.4f);
+            }
+
+            u32(0x46554747u);
+            u32(3);
+            u64(list.size());
+            const size_t count_at = out.size();
+            u64(0);
+            n_keys = 0;
+            text("general.architecture", "olala");
+            text("general.name", "tiny hybrid");
+            number("olala.block_count", layers);
+            number("olala.context_length", 4096);
+            number("olala.embedding_length", d);
+            number("olala.vocab_size", vocab);
+            number("olala.attention.head_count", heads);
+            number("olala.attention.head_count_kv", kv_heads);
+            number("olala.attention.key_length", hd);
+            real("olala.attention.layer_norm_rms_epsilon", 1e-6f);
+            number("olala.attention.sliding_window", 2048);
+            real("olala.attn_logit_softcapping", 2.0f);
+            number("olala.expert_count", experts);
+            number("olala.expert_used_count", used);
+            number("olala.expert_feed_forward_length", hidden);
+            number("olala.expert_shared_feed_forward_length", shared);
+            number("olala.expert_shared_count", 1);
+            real("olala.expert_weights_scale", 2.45f);
+            number("olala.expert_gating_func", 2);
+            number("olala.moe_latent_size", latent);
+            number("olala.ssm.inner_size", ssm_heads * ssm_hd);
+            number("olala.ssm.state_size", state);
+            number("olala.ssm.group_count", 1);
+            number("olala.mamba_mimo_dim", rank);
+            number("olala.mamba_headdim", ssm_hd);
+            number("olala.num_signal_heads", signal);
+            number("olala.num_noise_heads", kv_heads);
+            number("olala.tpa_rank", tpa);
+            number("olala.num_rope_angles", angles);
+            text("olala.layer_types", types);
+            real("olala.gate_bias", 1.15f);
+            number("olala.gate_attn", 1);
+            number("olala.geodesic_update", 1);
+            number("olala.final_norm", 0);
+            for (int i = 0; i < 8; ++i) out[count_at + i] = static_cast<unsigned char>(n_keys >> (8 * i));
+
+            uint64_t offset = 0;
+            std::vector<uint64_t> offsets;
+            for (const auto& t : list)
+            {
+                str(t.name);
+                u32(static_cast<uint32_t>(t.dims.size()));
+                uint64_t n = 1;
+                for (long x : t.dims)
+                {
+                    u64(static_cast<uint64_t>(x));
+                    n *= static_cast<uint64_t>(x);
+                }
+                u32(0);     // F32
+                u64(offset);
+                offsets.push_back(offset);
+                offset += (n * 4 + 31) / 32 * 32;
+            }
+            while (out.size() % 32 != 0) out.push_back(0);
+            const size_t data = out.size();
+            uint32_t state_of_sequence = 12345;
+            for (size_t i = 0; i < list.size(); ++i)
+            {
+                while (out.size() < data + offsets[i]) out.push_back(0);
+                uint64_t n = 1;
+                for (long x : list[i].dims) n *= static_cast<uint64_t>(x);
+                for (uint64_t k = 0; k < n; ++k)
+                {
+                    state_of_sequence = state_of_sequence * 1664525u + 1013904223u;
+                    const float v = list[i].center
+                        + (static_cast<float>(state_of_sequence >> 8) / 16777216.0f - 0.5f) * list[i].spread;
+                    uint32_t bits;
+                    std::memcpy(&bits, &v, 4);
+                    u32(bits);
+                }
+            }
+            return out;
+        }
+
+    private:
+        struct entry { string name; std::vector<long> dims; float center; float spread; };
+        std::vector<entry> list;
+        std::vector<unsigned char> out;
+        uint64_t n_keys = 0;
+
+        void add(const string& name, const std::vector<long>& dims, float center, float spread)
+        {
+            list.push_back(entry{ name, dims, center, spread });
+        }
+        void put(uint64_t v, int n)
+        {
+            for (int i = 0; i < n; ++i) out.push_back(static_cast<unsigned char>(v >> (8 * i)));
+        }
+        void u32(uint32_t v) { put(v, 4); }
+        void u64(uint64_t v) { put(v, 8); }
+        void str(const string& s) { u64(s.size()); out.insert(out.end(), s.begin(), s.end()); }
+        void text(const string& k, const string& v) { str(k); u32(8); str(v); ++n_keys; }
+        void number(const string& k, uint64_t v) { str(k); u32(10); u64(v); ++n_keys; }
+        void real(const string& k, float f)
+        {
+            str(k);
+            u32(6);
+            uint32_t v;
+            std::memcpy(&v, &f, 4);
+            u32(v);
+            ++n_keys;
+        }
+    };
+
+    // tt::geodesic_update() against its formula in double precision.
+    void test_geodesic_update()
+    {
+        dlib::rand rnd;
+        for (int trial = 0; trial < 3; ++trial)
+        {
+            const long rows = 5, nc = 48;
+            resizable_tensor x(1, 1, rows, nc), g(1, 1, rows, nc);
+            for (float& v : x) v = rnd.get_random_gaussian();
+            // Outputs as large as those of the mixers of the hybrid decoders, then a null row.
+            for (float& v : g) v = static_cast<float>(rnd.get_random_gaussian() * (trial == 2 ? 1e12 : 1.0));
+            if (trial == 1) std::fill(g.host(), g.host() + nc, 0.0f);
+            const float scale = 1.3f, bias = 0.02f;
+            const long depth = 3;
+            resizable_tensor want(x), start(x);
+            const double quarter = 0.78539816339744830962;
+            for (long r = 0; r < rows; ++r)
+            {
+                float* xr = want.host() + r * nc;
+                const float* gr = g.host() + r * nc;
+                double xx = 0, xg = 0, tt2 = 0;
+                for (long i = 0; i < nc; ++i)
+                {
+                    xx += static_cast<double>(xr[i]) * xr[i];
+                    xg += static_cast<double>(xr[i]) * gr[i];
+                }
+                std::vector<double> t(nc);
+                for (long i = 0; i < nc; ++i)
+                {
+                    t[i] = gr[i] - xg / std::max(xx, 1e-12) * xr[i];
+                    tt2 += t[i] * t[i];
+                }
+                const double norm = std::max(std::sqrt(tt2), 1e-8), radius = std::max(std::sqrt(xx), 1e-6);
+                double theta = std::min(norm / radius, quarter);
+                theta = std::min((theta * scale + bias) / depth, quarter);
+                for (long i = 0; i < nc; ++i)
+                    xr[i] = static_cast<float>(xr[i] * std::cos(theta) + t[i] / norm * radius * std::sin(theta));
+            }
+            tt::geodesic_update(x, g, scale, bias, depth);
+            DLIB_TEST_MSG(max(abs(mat(x) - mat(want))) < 1e-5, max(abs(mat(x) - mat(want))));
+            // A row that turns keeps its length.
+            double before = 0, after = 0;
+            for (long i = 0; i < nc; ++i)
+            {
+                before += static_cast<double>(start.host()[2 * nc + i]) * start.host()[2 * nc + i];
+                after += static_cast<double>(x.host()[2 * nc + i]) * x.host()[2 * nc + i];
+            }
+            DLIB_TEST(std::abs(std::sqrt(before) - std::sqrt(after)) < 1e-4);
+        }
+    }
+
+    /*
+        The hybrid decoders in the runtime engine: the detection of the family, the logits of
+        a token sequence against those tests/reference_forward.py of Albireo computes for
+        this model with numpy, and the steps of one token against the pass of the whole
+        sequence.  With CUDA, the pass runs the device kernels of tt::mamba3_step() and of
+        tt::geodesic_update().
+    */
+    void test_hybrid_decoder()
+    {
+        const std::vector<unsigned char> bytes = hybrid_builder().build();
+        gguf_reader g(bytes.data(), bytes.size());
+        const model_spec spec = detect_model(g);
+        DLIB_TEST(spec.family == arch_family::olala && spec.hybrid() && spec.hybrid_supported);
+        DLIB_TEST(spec.layer_types == "MVMV" && spec.ssm_heads == 8 && spec.ssm_head_dim == 16);
+        DLIB_TEST(spec.ssm_state == 16 && spec.ssm_rank == 2 && spec.ssm_angles == 4 && spec.tpa_rank == 2);
+        DLIB_TEST(spec.d_latent == 16 && spec.d_ffn_expert == 32 && spec.d_ffn_shared == 48);
+        DLIB_TEST(std::abs(spec.attention_scale - 1.0 / 32) < 1e-12 && spec.vocab_size == 288);
+        // The runtime engine takes the model; the template network has no such layers.
+        DLIB_TEST(check_compatibility(spec, false).ok);
+        DLIB_TEST(!check_compatibility(spec, true).ok);
+
+        runtime_transformer rt;
+        for (int at_rest = 0; at_rest < 2; ++at_rest)
+        {
+            rt.set_quantized_at_rest(at_rest != 0);
+            rt.load(g, spec, gguf_load_options());
+            std::vector<int> tokens(24);
+            for (int i = 0; i < 24; ++i) tokens[static_cast<size_t>(i)] = i + 1;
+            const tensor& all = rt.forward_prefill(tokens);
+            DLIB_TEST(all.nr() == 24 && all.nc() == 288);
+            std::vector<float> whole(all.host(), all.host() + all.size());
+            // Logits of the reference, at the first, at a middle and at the last position.
+            const long ids[5] = { 0, 1, 97, 200, 287 };
+            const long rows[3] = { 0, 11, 23 };
+            const long best[3] = { 101, 17, 4 };
+            const double want[3][5] = {
+                { 2.064247, -3.492518, -0.050489, 1.429517, -0.063549 },
+                { 0.097271, -3.198817, 0.103718, -2.553112, 2.278232 },
+                { -1.557517, 0.276659, -0.921414, 0.911741, 1.237635 } };
+            for (int r = 0; r < 3; ++r)
+            {
+                const float* row = whole.data() + rows[r] * 288;
+                for (int i = 0; i < 5; ++i)
+                    DLIB_TEST_MSG(std::abs(row[ids[i]] - want[r][i]) < 2e-3, "row " << rows[r] << " id " << ids[i]
+                        << ": " << row[ids[i]] << " for " << want[r][i]);
+                DLIB_TEST(std::max_element(row, row + 288) - row == best[r]);
+            }
+
+            // A context, the first half read in one pass, then one token at a time.
+            rt.set_context(26);
+            const std::vector<int> head(tokens.begin(), tokens.begin() + 12);
+            rt.forward_prefill(head);
+            for (int t = 12; t < 24; ++t)
+            {
+                const tensor& one = rt.step(tokens[static_cast<size_t>(t)]);
+                const float* o = one.host();
+                double worst = 0;
+                for (long v = 0; v < 288; ++v)
+                {
+                    const double want_v = whole[static_cast<size_t>(t * 288 + v)];
+                    worst = std::max(worst, std::abs(o[v] - want_v));
+                }
+                DLIB_TEST_MSG(worst < 1e-4, "step " << t << ": " << worst);
+            }
+            DLIB_TEST(rt.cache_length() == 24);
+            // The layers cannot give up the tokens they read: a full context refuses the next one.
+            rt.step(1);
+            rt.step(2);
+            bool thrown = false;
+            try { rt.step(3); }
+            catch (const std::runtime_error&) { thrown = true; }
+            DLIB_TEST(thrown);
+            // Nor does a runtime archive hold such a decoder.
+            thrown = false;
+            std::ostringstream sout;
+            try { rt.save(sout); }
+            catch (const std::runtime_error&) { thrown = true; }
+            DLIB_TEST(thrown);
+        }
+    }
+
+#ifdef DLIB_USE_CUDA
+    // The device kernels of tt::mamba3_step() against the processor, over several tokens of several geometries.
+    void test_mamba3_step_devices()
+    {
+        dlib::rand rnd;
+        const long geometries[4][5] = { { 3, 5, 8, 2, 2 }, { 4, 16, 16, 1, 4 }, { 2, 7, 12, 4, 0 },
+            { 6, 8, 32, 3, 16 } };
+        for (const auto& c : geometries)
+        {
+            const long H = c[0], P = c[1], N = c[2], R = c[3], S = c[4];
+            resizable_tensor norms(2, N), bias(H, 2 * R, N), misc(2, H), mxz(H, 2 * R, P), mo(H, R, P);
+            for (float& v : norms) v = 1 + 0.2f * rnd.get_random_gaussian();
+            for (float& v : bias) v = 1 + 0.3f * rnd.get_random_gaussian();
+            for (float& v : misc) v = 0.5f * rnd.get_random_gaussian();
+            for (float& v : mxz) v = 0.7f + 0.3f * rnd.get_random_gaussian();
+            for (float& v : mo) v = 0.5f + 0.2f * rnd.get_random_gaussian();
+            resizable_tensor s1(1, 1, 1, H * S + H * P * N + H * R * N + H * P), s2;
+            s1 = 0;
+            s2 = s1;
+            resizable_tensor o1(1, 1, 1, H * P), o2(1, 1, 1, H * P), in(1, 1, 1, H * (2 * P + 3));
+            resizable_tensor dyn(1, 1, 1, 2 * R * N + S);
+            for (int t = 0; t < 8; ++t)
+            {
+                for (float& v : in) v = rnd.get_random_gaussian();
+                for (float& v : dyn) v = 1.5f * rnd.get_random_gaussian();
+                cpu::mamba3_step(o1, s1, in, dyn, norms, bias, misc, mxz, mo, 1e-6f);
+                cuda::mamba3_step(o2, s2, in, dyn, norms, bias, misc, mxz, mo, 1e-6f);
+                const float outputs = max(abs(mat(o1) - mat(o2))), states = max(abs(mat(s1) - mat(s2)));
+                DLIB_TEST_MSG(outputs < 1e-3 * (1 + max(abs(mat(o1)))), outputs);
+                DLIB_TEST_MSG(states < 1e-3 * (1 + max(abs(mat(s1)))), states);
+            }
+        }
+        resizable_tensor x(2, 1, 3, 40), g(2, 1, 3, 40);
+        for (float& v : x) v = rnd.get_random_gaussian();
+        for (float& v : g) v = 3 * rnd.get_random_gaussian();
+        resizable_tensor y(x);
+        cpu::geodesic_update(x, g, 1.2f, 0.01f, 2);
+        cuda::geodesic_update(y, g, 1.2f, 0.01f, 2);
+        DLIB_TEST_MSG(max(abs(mat(x) - mat(y))) < 1e-5, max(abs(mat(x) - mat(y))));
+    }
+#endif
+
+// ----------------------------------------------------------------------------------------
+
     class gguf_tester : public tester
     {
     public:
         gguf_tester (
         ) :
             tester ("test_gguf",
-                    "Runs tests on the GGUF reader: metadata, tensors, dequantization and damaged files.")
+                    "Runs tests on the GGUF reader (metadata, tensors, dequantization, damaged files) and on "
+                    "the hybrid decoders of the runtime engine.")
         {}
 
         void perform_test (
@@ -311,6 +699,14 @@ namespace
             test_damaged();
             print_spinner();
             test_bounded();
+            print_spinner();
+            test_geodesic_update();
+            print_spinner();
+            test_hybrid_decoder();
+#ifdef DLIB_USE_CUDA
+            print_spinner();
+            test_mamba3_step_devices();
+#endif
         }
     } a;
 

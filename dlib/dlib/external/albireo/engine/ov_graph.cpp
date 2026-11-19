@@ -1571,6 +1571,7 @@ namespace albireo
 
     std::string ov_graph_unsupported(const model_config& c, const model_file& f)
     {
+        if (c.hybrid()) return "the graph holds decoders made of attention layers only";
         if (c.is_moe()) return "the graph holds dense models only";
         if (c.rope_dims <= 0 || c.rope_dims % 2 != 0) return "the rotary dimensions are not even";
         if (c.head_dim != c.head_dim_v) return "the keys and values of the model differ in width";

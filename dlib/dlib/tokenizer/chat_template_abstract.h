@@ -18,7 +18,8 @@ namespace dlib
         chatml,  // "<|im_start|>role\n...<|im_end|>\n"
         guanaco, // "### Human: ...\n### Assistant: ..."
         granite, // "<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n"
-        idefics3 // "<|im_start|>User: ...<end_of_utterance>\nAssistant: ..."
+        idefics3, // "<|im_start|>User: ...<end_of_utterance>\nAssistant: ..."
+        channels // "<|im_start|>role<|channel_start|>name<|content|>...<|channel_end|><|im_end|>"
     };
     /*!
         WHAT THIS OBJECT REPRESENTS
@@ -29,12 +30,42 @@ namespace dlib
             and derivatives such as SmolLM2-Instruct, guanaco covers models fine-tuned
             on the OpenAssistant-Guanaco turn format, granite covers the IBM Granite
             instruct models (dense and mixture-of-experts), idefics3 covers the
-            multimodal SmolVLM and Idefics families, and raw disables any markup for
-            plain completion.
+            multimodal SmolVLM and Idefics families, channels covers the hybrid decoders
+            of the olala family (Olala 1.0 mini), whose turns are those of ChatML with
+            their content in named channels, and raw disables any markup for plain
+            completion.
 
             idefics3 differs from the others in one respect: a message may open on an
             image, and the role name is then followed by no space. The distinction is
             not cosmetic, it is what the model was trained on.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    bool channel_instructions(
+        const std::string& chat_template,
+        const std::string& effort,
+        bool tools,
+        std::string& out
+    );
+    /*!
+        ensures
+            - Reads, in the chat template of a model of the channels kind, the
+              instructions of its system turn: the text the template writes between
+              "<|im_start|>system<|channel_start|>instructions<|content|>" and
+              "<|channel_end|><|im_end|>", for the reasoning effort given ("disabled",
+              "low", "medium" or "high") and with or without tools.
+            - The statements of that text are read as Jinja reads them with the options
+              of the chat templates: comments, the value of reasoning_effort, the tests
+              "if tools" and "if reasoning_effort is not defined" with their branches;
+              the line break after a statement and the spaces before it on its line are
+              not text, and every line ends with a line feed.
+            - Returns true and writes the instructions to #out; returns false, #out
+              being then unspecified, when the template holds no such turn, when its
+              instructions hold any other statement, or when they exceed 256 KB or 64
+              nested tests.
+            - The template comes from a model file: the reading takes a time
+              proportional to its length and never reads outside it.
     !*/
 
 // ----------------------------------------------------------------------------------------
@@ -74,9 +105,11 @@ namespace dlib
                 The turn strings are designed so that the running token stream of a
                 conversation matches a single continuous tokenization of the whole
                 dialogue: the first turn carries the system block, every later turn
-                begins with the newline that follows the assistant's closing token,
-                and each assistant turn is closed by the tokenizer's eos token (</s>
-                for zephyr, <|im_end|> for chatml, <|end_of_text|> for granite). A generation loop therefore only
+                begins with the newline that follows the assistant's closing token
+                (the channels kind writes none between its turns), and each assistant
+                turn is closed by the tokenizer's eos token (</s> for zephyr,
+                <|im_end|> for chatml and channels, <|end_of_text|> for granite). A
+                generation loop therefore only
                 has to feed first_turn() once, then next_turn() per exchange, and to
                 append the eos token after each generated answer.
 
@@ -85,6 +118,13 @@ namespace dlib
                 special token) receive an empty "<think>\n\n</think>\n\n" block, the
                 documented soft switch that disables the reasoning trace, while plain
                 ChatML instruct models (e.g. SmolLM2, Qwen2) receive the bare header.
+
+                For channels, the system turn holds the instructions of the template of
+                the model, read by channel_instructions() for the effort "disabled" and
+                without tools; the system prompt of the conversation is the instructions
+                channel of a developer turn, each question the text channel of a user
+                turn, and the assistant header closes the analysis channel at once, so
+                that the model writes its answer in the final channel.
 
             THREAD SAFETY
                 Instances are immutable after construction, so concurrent calls to the
@@ -125,8 +165,9 @@ namespace dlib
                   </s> eos) while any declared template is typically inherited from
                   the base model by the conversion. The declared template is
                   fingerprinted next: "<|start_of_role|>" yields granite,
-                  "<|im_start|>" yields chatml, "<|user|>" yields zephyr and
-                  "### Human" yields guanaco. When the
+                  "<|im_start|>" yields channels when the template also holds
+                  "<|channel_start|>" and chatml otherwise, "<|user|>" yields zephyr
+                  and "### Human" yields guanaco. When the
                   model declares no template, the text of the tokenizer's eos special
                   token is used as a fallback heuristic: "<|im_end|>" yields chatml,
                   "</s>" yields zephyr, "<|end_of_text|>" yields granite, anything
@@ -169,6 +210,10 @@ namespace dlib
                   thinking-capable and the assistant header emitted by first_turn()
                   and next_turn() carries the empty think block that disables the
                   reasoning trace.
+                - If F.kind() == chat_template_kind::channels, the instructions of the
+                  system turn are those channel_instructions() reads in the template
+                  the tokenizer holds, for the effort "disabled" and without tools, and
+                  the line "Reasoning effort: disabled" when it reads none.
         !*/
 
         static chat_template_kind from_name(
@@ -177,7 +222,8 @@ namespace dlib
         /*!
             ensures
                 - Returns the kind named by n ("zephyr", "chatml", "guanaco",
-                  "granite"); any other string yields chat_template_kind::raw.
+                  "granite", "idefics3", and "channels" or "olala"); any other string
+                  yields chat_template_kind::raw.
         !*/
 
         static const char* name(
@@ -186,7 +232,7 @@ namespace dlib
         /*!
             ensures
                 - Returns a human-readable identifier of k: "raw", "zephyr",
-                  "chatml", "guanaco" or "granite".
+                  "chatml", "guanaco", "granite", "idefics3" or "channels".
         !*/
 
         chat_template_kind kind(
@@ -250,7 +296,8 @@ namespace dlib
                 - The text begins with the newline that follows the eos token the
                   generation loop fed to close the previous assistant turn, so the
                   running token stream stays identical to a one-shot tokenization of
-                  the whole conversation.
+                  the whole conversation. The channels kind writes no newline between
+                  its turns: its text begins with the user turn.
         !*/
 
         std::string clean_answer(
@@ -263,7 +310,11 @@ namespace dlib
                   of the text).
                 - For the guanaco kind, returns text truncated at the first "###",
                   removing a leaked next-turn marker.
-                - In both cases the surrounding whitespace left behind is trimmed.
+                - For the channels kind, whose markers are control tokens the decoding
+                  leaves out, returns the text of the final channel: the name "final"
+                  that begins text is removed, and text is truncated where a tools
+                  channel begins ("tools<toolcalls>").
+                - In these cases the surrounding whitespace left behind is trimmed.
                 - For the other kinds, returns text unchanged.
         !*/
 

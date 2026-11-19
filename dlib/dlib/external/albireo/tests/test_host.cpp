@@ -756,6 +756,19 @@ int main(int argc, char** argv)
         check(u2["imported"].size() == 1 && u2["imported"][0].as_string() == "tiny-import-2",
             "a second unknown file of that name takes the next free name (" + u2.dump() + ")");
         albireo::remove_file(unknown);
+        /*
+            A hybrid decoder described from its header: its context is the window of its
+            attentions, and its template, which writes the answers in channels with a reasoning
+            effort, gives it the reasoning on request and the tools.
+        */
+        const albireo_test::tiny_gguf hybrid_model = albireo_test::tiny_gguf_writer().build_hybrid();
+        const std::string hybrid_path = albireo::join_path(work, "hybrid-described.gguf");
+        hybrid_model.save(hybrid_path, hybrid_model.bytes);
+        const json h = albireo::describe_gguf(hybrid_path);
+        check(h["arch"].as_string() == "olala" && h["context"].as_int() == 2048 && h["experts"].as_int() == 8
+            && h["reasoning"].as_bool(false) && !h["reasoning_always"].as_bool(true) && h["tools"].as_bool(false)
+            && h["quantization"].as_string() == "F32", "a hybrid decoder described from its header (" + h.dump() + ")");
+        albireo::remove_file(hybrid_path);
         m.stop();
     }
 

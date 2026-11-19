@@ -37,7 +37,8 @@ namespace albireo
                 n_deepstack), phi3 (Phi-3 and Phi-4-mini: one matrix for the queries, keys
                 and values, one for the gate and up projections, rotary positions on the
                 leading dimensions of the heads, LongRoPE; the sliding window the files
-                declare is not applied, as in llama.cpp).
+                declare is not applied, as in llama.cpp), olala (the hybrid decoders of
+                OVHai LLM, see layer_types).
 
             EMBEDDING MODELS
                 A decoder that declares <arch>.pooling_type computes vectors instead of
@@ -131,6 +132,53 @@ namespace albireo
         // hidden state after layer k.
         long n_deepstack = 0;
 
+        /*
+            Hybrid decoders (olala).  layer_types names the mixer of each layer, 'M' for a
+            Mamba-3 layer with several inputs and outputs and 'V' for a differential attention
+            whose keys and values are tensor products; it is empty for the decoders whose
+            layers are all attentions with rotary positions.  A hybrid decoder has no position
+            encoding and no normalization of its residual stream, which each block turns on
+            its sphere (geodesic update); its feed-forward blocks are mixtures of experts in a
+            latent space of d_latent values beside a shared expert of d_ffn_shared hidden
+            values, routed by sigmoids, the weights of the experts a token takes being
+            multiplied by expert_weights_scale.
+
+            A Mamba-3 layer holds ssm_heads heads of ssm_head_dim channels, each channel a
+            state of ssm_state values that ssm_rank inputs write and as many outputs read,
+            ssm_angles pairs of each input and output being rotated.  An attention gives each
+            of its n_kv_heads key and value heads to n_heads / n_kv_heads query heads, the
+            last of which is subtracted from the others (the noise head of the group); keys
+            and values are sums of tpa_rank tensor products, a query sees attention_window
+            positions at most (0 for all), the scores go through attn_softcap * tanh(score /
+            attn_softcap) when attn_softcap is positive, and gate_bias is added to the gate of
+            the output.
+        */
+        std::string layer_types;
+        long ssm_heads = 0;
+        long ssm_head_dim = 0;
+        long ssm_state = 0;
+        long ssm_rank = 0;
+        long ssm_angles = 0;
+        long tpa_rank = 0;
+        long attention_window = 0;
+        double attn_softcap = 0.0;
+        double gate_bias = 0.0;
+        long d_latent = 0;
+        long d_ffn_shared = 0;
+        double expert_weights_scale = 1.0;
+
+        bool hybrid() const { return !layer_types.empty(); }
+        // The layers that keep keys and values.
+        long attention_layers() const
+        {
+            if (!hybrid()) return n_layers;
+            long n = 0;
+            for (char t : layer_types) n += t == 'V' ? 1 : 0;
+            return n;
+        }
+        long ssm_inner() const { return ssm_heads * ssm_head_dim; }
+        // The heads of a differential attention that are not the noise head of their group.
+        long signal_heads() const { return n_heads - n_kv_heads; }
         bool is_moe() const { return n_experts > 0; }
         bool multimodal_rope() const { return !rope_sections.empty(); }
         long input_width() const { return d_model * (1 + n_deepstack); }

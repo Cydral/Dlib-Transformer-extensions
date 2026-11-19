@@ -82,6 +82,31 @@ namespace dlib
         }
     }
 
+    // The name of a ggml type, as the tools of the GGUF ecosystem write it.
+    inline const char* ggml_type_name(ggml_type t)
+    {
+        switch (t)
+        {
+        case ggml_type::F32:  return "F32";
+        case ggml_type::F16:  return "F16";
+        case ggml_type::Q4_0: return "Q4_0";
+        case ggml_type::Q4_1: return "Q4_1";
+        case ggml_type::Q5_0: return "Q5_0";
+        case ggml_type::Q5_1: return "Q5_1";
+        case ggml_type::Q8_0: return "Q8_0";
+        case ggml_type::Q8_1: return "Q8_1";
+        case ggml_type::Q2_K: return "Q2_K";
+        case ggml_type::Q3_K: return "Q3_K";
+        case ggml_type::Q4_K: return "Q4_K";
+        case ggml_type::Q5_K: return "Q5_K";
+        case ggml_type::Q6_K: return "Q6_K";
+        case ggml_type::Q8_K: return "Q8_K";
+        case ggml_type::IQ4_NL: return "IQ4_NL";
+        case ggml_type::BF16: return "BF16";
+        default: return "unknown";
+        }
+    }
+
     // A parsed metadata value. Only the field matching `type` (or `array_type` for
     // arrays) is populated. Integers are widened to int64, floats to double.
     struct gguf_value
@@ -548,6 +573,42 @@ namespace dlib
             throw std::runtime_error("gguf: metadata '" + key + "' is not a finite number from "
                 + std::to_string(lo) + " to " + std::to_string(hi));
         return x;
+    }
+
+    /* The format a file is known by: the name of the file type its header declares
+       (general.file_type, numbered as the tools that quantize number it) when the file holds
+       tensors in the base format of that type, else the format that holds most of its bytes.
+       A file of a mixed recipe is thereby named after its base format, Q5_K_M for instance,
+       where its tensors in a wider format weigh more. */
+    inline std::string gguf_quantization_name(const gguf_reader& g)
+    {
+        struct file_type { int64_t id; const char* name; ggml_type base; };
+        static const file_type types[] = {
+            { 0, "F32", ggml_type::F32 }, { 1, "F16", ggml_type::F16 }, { 2, "Q4_0", ggml_type::Q4_0 },
+            { 3, "Q4_1", ggml_type::Q4_1 }, { 7, "Q8_0", ggml_type::Q8_0 }, { 8, "Q5_0", ggml_type::Q5_0 },
+            { 9, "Q5_1", ggml_type::Q5_1 }, { 10, "Q2_K", ggml_type::Q2_K }, { 11, "Q3_K_S", ggml_type::Q3_K },
+            { 12, "Q3_K_M", ggml_type::Q3_K }, { 13, "Q3_K_L", ggml_type::Q3_K }, { 14, "Q4_K_S", ggml_type::Q4_K },
+            { 15, "Q4_K_M", ggml_type::Q4_K }, { 16, "Q5_K_S", ggml_type::Q5_K }, { 17, "Q5_K_M", ggml_type::Q5_K },
+            { 18, "Q6_K", ggml_type::Q6_K }, { 25, "IQ4_NL", ggml_type::IQ4_NL }, { 32, "BF16", ggml_type::BF16 } };
+        std::map<uint32_t, uint64_t> bytes;
+        for (const gguf_tensor_info& t : g.tensors()) bytes[static_cast<uint32_t>(t.type)] += t.nbytes;
+        if (g.has("general.file_type"))
+        {
+            const gguf_value& v = g.at("general.file_type");
+            const bool integer = !v.is_array() && v.type != gguf_type::STRING && v.type != gguf_type::BOOL
+                && v.type != gguf_type::FLOAT32 && v.type != gguf_type::FLOAT64;
+            for (const file_type& f : types)
+                if (integer && v.i == f.id && bytes.count(static_cast<uint32_t>(f.base))) return f.name;
+        }
+        uint64_t most = 0;
+        ggml_type dominant = ggml_type::F32;
+        for (const auto& kv : bytes)
+            if (kv.second > most)
+            {
+                most = kv.second;
+                dominant = static_cast<ggml_type>(kv.first);
+            }
+        return bytes.empty() ? std::string() : std::string(ggml_type_name(dominant));
     }
 }
 

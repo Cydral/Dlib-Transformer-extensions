@@ -136,11 +136,15 @@ The project has grown from a set of Transformer building blocks into a **model l
 
 ### Interoperability with the open-weight ecosystem
 
-**GGUF containers are read directly.** The reader parses the metadata, detects the architecture family, and reports what it found before touching a single weight. Detection currently spans the **llama, mistral, mixtral, gemma, gemma2, qwen2, qwen3 and granitemoe** families, which together account for the large majority of open-weight decoder models published today.
+**GGUF containers are read directly.** The reader parses the metadata, detects the architecture family, and reports what it found before touching a single weight. Detection currently spans the **llama, mistral, mixtral, gemma, gemma2, qwen2, qwen3, granitemoe and olala** families, which together account for the large majority of open-weight decoder models published today.
 
 **Quantized weights are dequantized on the fly.** The legacy block formats (**Q4_0, Q4_1, Q5_0, Q5_1, Q8_0**), the whole **k-quant** range (**Q2_K** through **Q6_K**) and **IQ4_NL** are supported. The grid-based i-quants (**IQ1, IQ2, IQ3**) are not, and the loader says so rather than producing plausible noise.
 
 **Compatibility is reported, not assumed.** Before any import, a compatibility pass lists what is supported, what is merely noted, and what blocks. Mixture-of-experts containers, for instance, are served by the runtime engine but explicitly refused by the static path, because the compiled network has no expert packing. An honest refusal is worth more than a silent approximation.
+
+**Hybrid decoders are served by the runtime engine.** The `olala` family, that of Olala 1.0 mini 7A1B of OVHai LLM, replaces most attention layers with Mamba-3 layers of several inputs and outputs per channel, keeps a differential attention whose keys and values are tensor products in one layer out of five, routes each token through a mixture of experts in a latent space, and turns the hidden state on its sphere in place of normalizing it. `dlib::runtime_transformer` reads such a container token by token, each layer keeping its state, on two primitives added to the tensor tools, `tt::mamba3_step()` and `tt::geodesic_update()`, with their kernels for the processor and for CUDA. The static path refuses these containers, as it refuses the mixtures of experts.
+
+**Open weights become GGUF containers.** [`slm_safetensors_to_gguf.py`](dlib/examples/slm_tools/slm_safetensors_to_gguf.py) is a standalone program that reads a checkpoint published in safetensors and writes the GGUF containers of its inference: full precision (F32, F16, BF16) or quantized (Q8_0, Q6_K, Q5_K_M, Q4_K_M), with numpy as its only dependency. It covers the `olala` family, whose containers it writes with the names, the shapes and the metadata of the files of its authors, for Olala 1.0 mini 7A1B and for the models fine-tuned from it that are published as weights alone (Olala-v1.0-summarise, Olala-v1.0-translate); it keeps in BF16 a tensor whose values a quantized format cannot hold, sets each tensor of a container against the weights of its checkpoint (`verify`) and checks its own quantizers and its container format on a small model (`selftest`). The [guide of the examples](examples/Readme.md#slm_tools-python-witnesses) describes its commands.
 
 ### Two execution paths, one behaviour
 

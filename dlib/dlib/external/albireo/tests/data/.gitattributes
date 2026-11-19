@@ -2,5 +2,5 @@
 # the checkout (core.autocrlf on Windows) would change the bytes their signatures cover.
 *.json -text
 *.sig -text
-# The reference results of the sequence mixers (tools/make_mixer_golden.py), arrays of floats.
+# The logits of the reference of the tiny hybrid decoder (tests/test_runtime.cpp), an array of floats.
 *.golden binary

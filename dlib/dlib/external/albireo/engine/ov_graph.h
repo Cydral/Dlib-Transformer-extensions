@@ -55,7 +55,7 @@ namespace albireo
         SUPPORTED MODELS
             The dense decoders of model_config (llama, mistral, mistral3, qwen2, qwen3,
             qwen3vl, granite, phi3), language and embedding models.  The mixtures of experts
-            stay with the processor runtime.
+            and the hybrid decoders (model_config::layer_types) stay with the processor runtime.
     !*/
 
     struct ov_graph_settings

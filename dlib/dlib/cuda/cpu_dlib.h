@@ -721,6 +721,29 @@ namespace dlib
 
     // -----------------------------------------------------------------------------------
 
+        void geodesic_update(
+            tensor& x,
+            const tensor& g,
+            float scale,
+            float bias,
+            long depth
+        );
+
+        void mamba3_step(
+            tensor& out,
+            tensor& state,
+            const tensor& in,
+            const tensor& dyn,
+            const tensor& norms,
+            const tensor& bias,
+            const tensor& misc,
+            const tensor& mxz,
+            const tensor& mo,
+            float eps
+        );
+
+    // -----------------------------------------------------------------------------------
+
         class pooling
         {
         public:

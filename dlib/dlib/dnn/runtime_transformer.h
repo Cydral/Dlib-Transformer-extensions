@@ -58,6 +58,18 @@ namespace dlib
                 Q and K with positions 0..N-1, GQA repeat by channel copy, causal
                 masking by additive per-head bias, plane-wise softmax, and a SwiGLU
                 feed-forward.
+
+                A hybrid decoder (model_spec::layer_types, the olala family) takes a path
+                of its own: its tokens are read one after the other, each layer keeping
+                its state.  The hidden states are normalized by no layer: each block
+                turns them on their sphere towards the output of its mixer, then towards
+                the output of its mixture of experts (tt::geodesic_update).  A Mamba-3
+                layer keeps the states of its channels (tt::mamba3_step); an attention
+                layer keeps keys and values that are means of tensor products, shifted
+                towards those of the previous token, and subtracts from the heads of each
+                group the head that reads the noise; the experts work in a latent space
+                beside a shared expert.  Such a decoder holds no position to evict: its
+                context does not slide, and step() throws once the capacity is reached.
         !*/
 
         /* Storage of one weight matrix. In resident mode the dequantized, transposed
@@ -91,6 +103,24 @@ namespace dlib
                these empty and use w_gate/w_up/w_down above. */
             stored_matrix router;
             std::vector<stored_matrix> e_gate, e_up, e_down;
+
+            /* Hybrid decoders, which use wq, wo, qnorm_g, knorm_g, router, e_up, e_down
+               and the caches above with their own tensors. A Mamba-3 layer: its two
+               projections, the constants of its heads packed as tt::mamba3_step() takes
+               them, and its state. An attention layer: the factors of the tensor
+               products of its keys and values, the projections of their shifts, of the
+               weights of the noise heads and of the gate, the factor of each query head,
+               and the key and value of the last token before their shift. The experts:
+               the projections to and from their latent space, the bias of their choice
+               and the shared expert. Then the scale and bias of the two geodesic
+               updates of the block. */
+            stored_matrix ssm_in, ssm_dyn;
+            resizable_tensor ssm_norms, ssm_bias, ssm_misc, ssm_mxz, ssm_mo, ssm_state;
+            stored_matrix wa_k, wb_k, wa_v, wb_v, shift_k, shift_v, noise, attn_gate;
+            std::vector<float> softmax_scaler, expert_bias;
+            resizable_tensor last_k, last_v;
+            stored_matrix latent_down, latent_up, shared_up, shared_down;
+            float mixer_scale = 1.0f, mixer_bias = 0.0f, ffn_scale = 1.0f, ffn_bias = 0.0f;
         };
 
         static void serialize_matrix(const stored_matrix& m, std::ostream& out)
@@ -147,6 +177,16 @@ namespace dlib
         void load(gguf_reader& g, const model_spec& spec, const gguf_load_options& opt)
         {
             spec_ = spec;
+            // The layers start anew: no context, no position read.
+            cap_ = keep_ = cur_len_ = 0;
+            own_context_ = false;
+            if (spec.hybrid())
+            {
+                rope_permute_ = false;
+                load_hybrid(g, opt);
+                load_embeddings(g);
+                return;
+            }
             /* Rotary convention: llama-family GGUFs carry Q/K weights pre-permuted for
                the interleaved kernel, while the qwen families keep the split-half
                (NeoX) layout; the load-time permutation maps the latter onto the
@@ -192,10 +232,16 @@ namespace dlib
             load_gamma(g, "output_norm.weight", d, final_norm_g_);
             load_matrix(g, spec.tied_embeddings ? "token_embd.weight" : "output.weight",
                 d, spec.vocab_size, lm_head_, opt);
+            load_embeddings(g);
+        }
 
-            /* The embedding table stays on the host. Resident mode keeps it as a flat
-               float array; at rest, the raw quantized rows are kept and gathered rows
-               are dequantized on demand (a token row spans only a few blocks). */
+        /* The embedding table stays on the host. Resident mode keeps it as a flat
+           float array; at rest, the raw quantized rows are kept and gathered rows
+           are dequantized on demand (a token row spans only a few blocks). */
+        void load_embeddings(gguf_reader& g)
+        {
+            const model_spec& spec = spec_;
+            const long d = spec.d_model;
             const gguf_tensor_info* e = g.find_tensor("token_embd.weight");
             if (!e) throw std::runtime_error("runtime_transformer: token_embd.weight not found");
             if (at_rest_)
@@ -245,16 +291,27 @@ namespace dlib
         // pinned across evictions. Call before forward_prefill(); resets the cache.
         void set_context(long capacity, long keep_length = 0)
         {
+            if (spec_.hybrid() && spec_.attention_window > 0 && capacity > spec_.attention_window)
+                throw std::runtime_error("runtime_transformer: the context of this hybrid decoder holds "
+                    + std::to_string(spec_.attention_window) + " positions at most, the window of its attention");
             cap_ = capacity;
             keep_ = keep_length;
+            own_context_ = false;
             reset_cache();
         }
 
         void reset_cache()
         {
             cur_len_ = 0;
-            for (layer& L : layers_)
+            for (size_t i = 0; i < layers_.size(); ++i)
             {
+                layer& L = layers_[i];
+                if (spec_.hybrid())
+                {
+                    // The states of the layers start from zero; the attention layers alone keep keys and values.
+                    if (L.ssm_state.size() != 0) L.ssm_state = 0;
+                    if (spec_.layer_types[i] != 'V') continue;
+                }
                 if (cap_ > 0)
                 {
                     L.k_cache.set_size(1, spec_.n_kv_heads, cap_, head_dim());
@@ -286,6 +343,7 @@ namespace dlib
                 : 1.0f / std::sqrt(static_cast<float>(hd));
             const float eps = static_cast<float>(spec_.rms_eps);
             DLIB_CASSERT(N > 0);
+            if (spec_.hybrid()) return hybrid_prefill(tokens);
             if (cap_ > 0 && cur_len_ + N > cap_)
                 throw std::runtime_error("runtime_transformer: prompt exceeds the context capacity");
             /* The prefill computes attention within the chunk only, which is exact on
@@ -477,6 +535,14 @@ namespace dlib
         {
             DLIB_CASSERT(cap_ > 0, "set_context() must be called before step()");
             DLIB_CASSERT(cur_len_ > 0, "forward_prefill() must run before step()");
+            if (spec_.hybrid())
+            {
+                if (own_context_ || cur_len_ + 1 > cap_)
+                    throw std::runtime_error("runtime_transformer: the context of a hybrid decoder is full, and its "
+                        "layers cannot give up the tokens they read; set_context() takes a larger one");
+                hybrid_token(token);
+                return logits_;
+            }
             if (cur_len_ + 1 > cap_)
                 evict_middle_block();
 
@@ -640,6 +706,9 @@ namespace dlib
            through the template path reach it via an export visitor on that side. */
         void save(std::ostream& out) const
         {
+            if (spec_.hybrid())
+                throw std::runtime_error("runtime_transformer: the runtime archive does not hold the hybrid decoders; "
+                    "they load from their GGUF file");
             const bool moe = spec_.n_experts > 0;
             dlib::serialize(moe ? "rtm_2" : "rtm_1", out);
             dlib::serialize(spec_.arch_name, out);
@@ -716,7 +785,10 @@ namespace dlib
             dlib::deserialize(spec_.model_name, in);
             int fam = 0;
             dlib::deserialize(fam, in);
-            spec_.family = static_cast<arch_family>(fam);
+            /* The family follows the name of the architecture, which the archive holds: the
+               number stored beside it is the rank the family had in the list of the library
+               that wrote the archive, and the list grows. */
+            spec_.family = arch_family_from_name(spec_.arch_name);
             dlib::deserialize(spec_.n_layers, in);
             dlib::deserialize(spec_.n_heads, in);
             dlib::deserialize(spec_.n_kv_heads, in);
@@ -1153,6 +1225,397 @@ namespace dlib
             }
         }
 
+        // Hybrid decoders
+
+        // out [1, 1, 1, w.out_dim] = in [1, 1, 1, w.in_dim] through a weight matrix.
+        void project(resizable_tensor& out, resizable_tensor& in, stored_matrix& w)
+        {
+            DLIB_CASSERT(static_cast<long>(in.size()) == w.in_dim);
+            out.set_size(1, 1, 1, w.out_dim);
+            alias_tensor i_2d(1, w.in_dim), o_2d(1, w.out_dim);
+            auto iv = i_2d(in, 0);
+            auto ov = o_2d(out, 0);
+            tt::gemm(0.0f, ov, 1.0f, iv, false, weight(w), false);
+        }
+
+        // The values of a tensor of the file, count of them, or throws.
+        std::vector<float> read_floats(gguf_reader& g, const std::string& name, size_t count)
+        {
+            const gguf_tensor_info* t = g.find_tensor(name);
+            if (!t) throw std::runtime_error("runtime_transformer: missing tensor " + name);
+            std::vector<float> v;
+            gguf_read_dequantized(g, *t, v);
+            if (v.size() != count) throw std::runtime_error("runtime_transformer: shape mismatch for " + name);
+            return v;
+        }
+
+        /* The constants of a Mamba-3 layer as tt::mamba3_step() takes them: the tensor the
+           file packs them in, or, for a file without it, its two parts side by side, each
+           values of first then each values of second for each of the outer blocks. */
+        void load_packed(gguf_reader& g, const std::string& packed, const std::string& first,
+            const std::string& second, long outer, long each, resizable_tensor& dst)
+        {
+            const size_t n = static_cast<size_t>(2 * outer * each);
+            dst.set_size(1, 1, 1, static_cast<long>(n));
+            float* out = dst.host_write_only();
+            if (g.find_tensor(packed))
+            {
+                const std::vector<float> v = read_floats(g, packed, n);
+                std::memcpy(out, v.data(), n * sizeof(float));
+                return;
+            }
+            const std::vector<float> a = read_floats(g, first, n / 2), b = read_floats(g, second, n / 2);
+            for (long o = 0; o < outer; ++o)
+            {
+                std::memcpy(out + 2 * o * each, a.data() + o * each, static_cast<size_t>(each) * sizeof(float));
+                std::memcpy(out + (2 * o + 1) * each, b.data() + o * each, static_cast<size_t>(each) * sizeof(float));
+            }
+        }
+
+        void load_hybrid(gguf_reader& g, const gguf_load_options& opt)
+        {
+            const model_spec& s = spec_;
+            if (!s.hybrid_supported)
+                throw std::runtime_error("runtime_transformer: this variant of the hybrid layers is not supported");
+            const long d = s.d_model, hd = head_dim();
+            const long H = s.ssm_heads, P = s.ssm_head_dim, N = s.ssm_state, R = s.ssm_rank, S = s.ssm_angles;
+            const long KV = s.n_kv_heads, rank = s.tpa_rank;
+            const long signal = (s.n_heads - KV) * hd;
+            layers_.clear();
+            layers_.resize(static_cast<size_t>(s.n_layers));
+            for (long i = 0; i < s.n_layers; ++i)
+            {
+                const std::string p = "blk." + std::to_string(i) + ".";
+                layer& L = layers_[static_cast<size_t>(i)];
+                L.mixer_scale = read_floats(g, p + "geo_mixer_scale", 1)[0];
+                L.mixer_bias = read_floats(g, p + "geo_mixer_bias", 1)[0];
+                L.ffn_scale = read_floats(g, p + "geo_mlp_scale", 1)[0];
+                L.ffn_bias = read_floats(g, p + "geo_mlp_bias", 1)[0];
+                if (s.layer_types[static_cast<size_t>(i)] == 'M')
+                {
+                    load_matrix(g, p + "ssm_in.weight", d, H * (2 * P + 3), L.ssm_in, opt);
+                    load_matrix(g, p + "ssm_in_dyn.weight", d, 2 * R * N + S, L.ssm_dyn, opt);
+                    load_matrix(g, p + "attn_output.weight", H * P, d, L.wo, opt);
+                    load_packed(g, p + "ssm_m3_norms", p + "ssm_b_norm.weight", p + "ssm_c_norm.weight", 1, N,
+                        L.ssm_norms);
+                    load_packed(g, p + "ssm_m3_bias", p + "ssm_b_bias", p + "ssm_c_bias", H, R * N, L.ssm_bias);
+                    load_packed(g, p + "ssm_m3_misc", p + "ssm_dt_bias", p + "ssm_d", 1, H, L.ssm_misc);
+                    load_packed(g, p + "ssm_m3_mxz", p + "ssm_mimo_x", p + "ssm_mimo_z", H, R * P, L.ssm_mxz);
+                    load_gamma(g, p + "ssm_mimo_o", H * R * P, L.ssm_mo);
+                    L.ssm_state.set_size(1, 1, 1, H * S + H * P * N + H * R * N + H * P);
+                    L.ssm_state = 0;
+                }
+                else
+                {
+                    load_matrix(g, p + "attn_q.weight", d, s.n_heads * hd, L.wq, opt);
+                    load_matrix(g, p + "attn_wa_k.weight", d, KV * rank, L.wa_k, opt);
+                    load_matrix(g, p + "attn_wb_k.weight", d, rank * hd, L.wb_k, opt);
+                    load_matrix(g, p + "attn_wa_v.weight", d, KV * rank, L.wa_v, opt);
+                    load_matrix(g, p + "attn_wb_v.weight", d, rank * hd, L.wb_v, opt);
+                    load_matrix(g, p + "attn_shift_k.weight", d, KV, L.shift_k, opt);
+                    load_matrix(g, p + "attn_shift_v.weight", d, KV, L.shift_v, opt);
+                    load_matrix(g, p + "attn_lambda.weight", d, KV, L.noise, opt);
+                    load_matrix(g, p + "attn_gate.weight", d, signal, L.attn_gate, opt);
+                    load_matrix(g, p + "attn_output.weight", signal, d, L.wo, opt);
+                    load_optional_head_gamma(g, p + "attn_q_norm.weight", L.qnorm_g);
+                    load_optional_head_gamma(g, p + "attn_k_norm.weight", L.knorm_g);
+                    if (L.qnorm_g.size() == 0 || L.knorm_g.size() == 0)
+                        throw std::runtime_error("runtime_transformer: missing tensor " + p
+                            + "attn_q_norm.weight");
+                    L.softmax_scaler = read_floats(g, p + "attn_softmax_scaler", static_cast<size_t>(s.n_heads));
+                    L.last_k.set_size(1, 1, 1, KV * hd);
+                    L.last_v.set_size(1, 1, 1, KV * hd);
+                }
+                load_matrix(g, p + "ffn_gate_inp.weight", d, s.n_experts, L.router, opt);
+                L.expert_bias = read_floats(g, p + "exp_probs_b", static_cast<size_t>(s.n_experts));
+                load_matrix(g, p + "ffn_latent_down.weight", d, s.d_latent, L.latent_down, opt);
+                load_matrix(g, p + "ffn_latent_up.weight", s.d_latent, d, L.latent_up, opt);
+                load_expert_matrices(g, p + "ffn_up_exps.weight", s.d_latent, s.d_ffn_expert, L.e_up);
+                load_expert_matrices(g, p + "ffn_down_exps.weight", s.d_ffn_expert, s.d_latent, L.e_down);
+                load_matrix(g, p + "ffn_up_shexp.weight", d, s.d_ffn_shared, L.shared_up, opt);
+                load_matrix(g, p + "ffn_down_shexp.weight", s.d_ffn_shared, d, L.shared_down, opt);
+            }
+            load_matrix(g, "output.weight", d, s.vocab_size, lm_head_, opt);
+        }
+
+        // The logits of every token of a prompt, read one token after the other.
+        const tensor& hybrid_prefill(const std::vector<int>& tokens)
+        {
+            const long N = static_cast<long>(tokens.size());
+            if (cap_ == 0 || own_context_)
+            {
+                // Without a context, the pass keeps its keys, values and states for its own tokens.
+                cap_ = N;
+                own_context_ = true;
+                reset_cache();
+            }
+            DLIB_CASSERT(cur_len_ == 0, "forward_prefill() requires an empty cache; use step() to extend");
+            if (N > cap_) throw std::runtime_error("runtime_transformer: prompt exceeds the context capacity");
+            injected_.clear();
+            const long V = spec_.vocab_size, d = spec_.d_model;
+            all_logits_.set_size(1, 1, N, V);
+            all_hidden_.set_size(1, 1, N, d);
+            alias_tensor row(1, 1, 1, V), state(1, 1, 1, d);
+            for (long t = 0; t < N; ++t)
+            {
+                hybrid_token(tokens[static_cast<size_t>(t)]);
+                auto dst = row(all_logits_, static_cast<size_t>(t) * V);
+                memcpy(dst, logits_);
+                auto hs = state(all_hidden_, static_cast<size_t>(t) * d);
+                memcpy(hs, x_);
+            }
+            // The hidden states of the pass, which hidden_states() returns.
+            xn_ = all_hidden_;
+            return all_logits_;
+        }
+
+        // Reads one token: its logits in logits_, its hidden state in xn_.
+        void hybrid_token(int token)
+        {
+            DLIB_CASSERT(token >= 0 && token < spec_.vocab_size, "token id out of range");
+            const long d = spec_.d_model;
+            x_.set_size(1, 1, 1, d);
+            {
+                // The embedding enters the sphere the blocks keep the hidden state on.
+                float* x = x_.host_write_only();
+                gather_embedding_row(token, x);
+                double ss = 0.0;
+                for (long i = 0; i < d; ++i) ss += static_cast<double>(x[i]) * x[i];
+                const float inv = static_cast<float>(1.0 / std::max(std::sqrt(ss), 1e-12));
+                for (long i = 0; i < d; ++i) x[i] *= inv;
+            }
+            for (size_t i = 0; i < layers_.size(); ++i)
+            {
+                layer& L = layers_[i];
+                const long depth = static_cast<long>(i) + 1;
+                if (spec_.layer_types[i] == 'M') mamba3_mixer(L);
+                else differential_attention(L);
+                tt::geodesic_update(x_, attn_out_, L.mixer_scale, L.mixer_bias, depth);
+                latent_experts(L);
+                tt::geodesic_update(x_, ffn_out_, L.ffn_scale, L.ffn_bias, depth);
+            }
+            ++cur_len_;
+            xn_ = x_;
+            project(logits_, x_, lm_head_);
+        }
+
+        void mamba3_mixer(layer& L)
+        {
+            project(m_in_, x_, L.ssm_in);
+            project(m_dyn_, x_, L.ssm_dyn);
+            m_out_.set_size(1, 1, 1, spec_.ssm_heads * spec_.ssm_head_dim);
+            tt::mamba3_step(m_out_, L.ssm_state, m_in_, m_dyn_, L.ssm_norms, L.ssm_bias, L.ssm_misc, L.ssm_mxz,
+                L.ssm_mo, static_cast<float>(spec_.rms_eps));
+            project(attn_out_, m_out_, L.wo);
+        }
+
+        // A key, or a value, of each head: the mean of the products of a factor of the head and a row of its width.
+        void tensor_products(stored_matrix& wa, stored_matrix& wb, resizable_tensor& out)
+        {
+            const long KV = spec_.n_kv_heads, rank = spec_.tpa_rank, hd = head_dim();
+            project(factor_a_, x_, wa);
+            project(factor_b_, x_, wb);
+            out.set_size(1, 1, 1, KV * hd);
+            alias_tensor a_2d(KV, rank), b_2d(rank, hd), o_2d(KV, hd);
+            auto av = a_2d(factor_a_, 0);
+            auto bv = b_2d(factor_b_, 0);
+            auto ov = o_2d(out, 0);
+            tt::gemm(0.0f, ov, 1.0f / static_cast<float>(rank), av, false, bv, false);
+        }
+
+        void differential_attention(layer& L)
+        {
+            const long H = spec_.n_heads, KV = spec_.n_kv_heads, hd = head_dim();
+            const long group = H / KV;
+            const long pos = cur_len_, len = cur_len_ + 1;
+            const float eps = static_cast<float>(spec_.rms_eps);
+            auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+
+            project(q_flat_, x_, L.wq);
+            tensor_products(L.wa_k, L.wb_k, k_flat_);
+            tensor_products(L.wa_v, L.wb_v, v_flat_);
+
+            /* The shift: each key and each value leans on the one of the previous token,
+               as it stood before its own shift. */
+            project(shift_, x_, L.shift_k);
+            project(noise_, x_, L.shift_v);
+            {
+                float* k = k_flat_.host();
+                float* v = v_flat_.host();
+                float* lk = L.last_k.host();
+                float* lv = L.last_v.host();
+                const float* sk = shift_.host();
+                const float* sv = noise_.host();
+                for (long h = 0; h < KV; ++h)
+                {
+                    const float ak = sigmoid(sk[h]), av = sigmoid(sv[h]);
+                    for (long e = 0; e < hd; ++e)
+                    {
+                        const float raw_k = k[h * hd + e], raw_v = v[h * hd + e];
+                        if (pos > 0)
+                        {
+                            k[h * hd + e] = ak * lk[h * hd + e] + (1.0f - ak) * raw_k;
+                            v[h * hd + e] = av * lv[h * hd + e] + (1.0f - av) * raw_v;
+                        }
+                        lk[h * hd + e] = raw_k;
+                        lv[h * hd + e] = raw_v;
+                    }
+                }
+            }
+
+            q4_.set_size(1, H, 1, hd);
+            k4_.set_size(1, KV, 1, hd);
+            v4_.set_size(1, KV, 1, hd);
+            tt::split_heads(false, q4_, q_flat_);
+            tt::split_heads(false, k4_, k_flat_);
+            tt::split_heads(false, v4_, v_flat_);
+            apply_qk_norm(L, eps);
+            {
+                // The queries grow with the logarithm of the positions they see, each head by its own factor.
+                long seen = len;
+                if (spec_.attention_window > 0) seen = std::min(seen, spec_.attention_window);
+                const float reach = static_cast<float>(std::log(static_cast<double>(seen)));
+                float* q = q4_.host();
+                for (long h = 0; h < H; ++h)
+                {
+                    const float f = L.softmax_scaler[static_cast<size_t>(h)] * reach;
+                    for (long e = 0; e < hd; ++e) q[h * hd + e] *= f;
+                }
+            }
+            append_to_cache(L, k4_, v4_, 1);
+
+            // The keys and values of the sequence, each key and value head given to its group of query heads.
+            k_win_.set_size(1, KV, len, hd);
+            v_win_.set_size(1, KV, len, hd);
+            {
+                alias_tensor w_2d(1, 1, len, hd);
+                for (long c = 0; c < KV; ++c)
+                {
+                    auto kw = w_2d(k_win_, static_cast<size_t>(c) * len * hd);
+                    auto vw = w_2d(v_win_, static_cast<size_t>(c) * len * hd);
+                    auto ks = w_2d(L.k_cache, static_cast<size_t>(c) * cap_ * hd);
+                    auto vs = w_2d(L.v_cache, static_cast<size_t>(c) * cap_ * hd);
+                    memcpy(kw, ks);
+                    memcpy(vw, vs);
+                }
+            }
+            k_rep_.set_size(1, H, len, hd);
+            v_rep_.set_size(1, H, len, hd);
+            for (long h = 0; h < H; ++h)
+            {
+                tt::copy_tensor(false, k_rep_, h, k_win_, h / group, 1);
+                tt::copy_tensor(false, v_rep_, h, v_win_, h / group, 1);
+            }
+            scores_.set_size(1, H, 1, len);
+            tt::gemm(0.0f, scores_, static_cast<float>(spec_.attention_scale), q4_, false, k_rep_, true,
+                operation_mode::PLANE_WISE);
+            attn_.copy_size(scores_);
+            if (spec_.attn_softcap > 0.0)
+            {
+                // The scores are capped: cap * tanh(score / cap).
+                const float cap = static_cast<float>(spec_.attn_softcap);
+                tt::affine_transform(attn_, scores_, 1.0f / cap, 0.0f);
+                tt::tanh(scores_, attn_);
+                tt::affine_transform(scores_, scores_, cap, 0.0f);
+            }
+            tt::softmax(attn_, scores_, operation_mode::PLANE_WISE);
+            ctx4_.set_size(1, H, 1, hd);
+            tt::gemm(0.0f, ctx4_, 1.0f, attn_, false, v_rep_, false, operation_mode::PLANE_WISE);
+
+            /* Each group of heads gives up the noise its last head reads, in the proportion
+               the token chooses; the gate of the layer then opens each value of the result. */
+            const long signal = group - 1;
+            project(noise_, x_, L.noise);
+            diff_.set_size(1, 1, 1, KV * signal * hd);
+            {
+                const float* c = ctx4_.host();
+                const float* share = noise_.host();
+                float* o = diff_.host_write_only();
+                for (long g = 0; g < KV; ++g)
+                {
+                    const float lambda = sigmoid(share[g]);
+                    const float* heads = c + g * group * hd;
+                    const float* noise = heads + signal * hd;
+                    for (long i = 0; i < signal; ++i)
+                        for (long e = 0; e < hd; ++e)
+                            o[(g * signal + i) * hd + e] = heads[i * hd + e] - lambda * noise[e];
+                }
+            }
+            project(gate_, x_, L.attn_gate);
+            if (spec_.gate_bias != 0.0)
+                tt::affine_transform(gate_, gate_, 1.0f, static_cast<float>(spec_.gate_bias));
+            sig_.copy_size(gate_);
+            tt::sigmoid(sig_, gate_);
+            tt::multiply(false, gate_, gate_, sig_);
+            tt::multiply(false, gate_, gate_, diff_);
+            project(attn_out_, gate_, L.wo);
+        }
+
+        /* The mixture of experts of a hybrid block, written in ffn_out_: the router gives
+           each expert a sigmoid, the token takes the experts of the largest sigmoids once
+           their biases are added, with the sigmoids themselves, brought to a sum of one and
+           scaled, as their weights; the experts work in a latent space, with the square of
+           a rectified linear unit between their two matrices, as does the shared expert,
+           which reads the hidden state itself. */
+        void latent_experts(layer& L)
+        {
+            const long n_exp = spec_.n_experts;
+            const long top_k = spec_.n_experts_used;
+            project(router_logits_, x_, L.router);
+            const float* rl = router_logits_.host();
+            probs_.resize(static_cast<size_t>(2 * n_exp));
+            for (long e = 0; e < n_exp; ++e)
+            {
+                probs_[static_cast<size_t>(e)] = 1.0f / (1.0f + std::exp(-rl[e]));
+                probs_[static_cast<size_t>(n_exp + e)] = probs_[static_cast<size_t>(e)]
+                    + L.expert_bias[static_cast<size_t>(e)];
+            }
+            route_e_.assign(static_cast<size_t>(top_k), 0);
+            route_w_.assign(static_cast<size_t>(top_k), 0.0f);
+            float chosen = 0.0f;
+            for (long k = 0; k < top_k; ++k)
+            {
+                long best = -1;
+                for (long e = 0; e < n_exp; ++e)
+                {
+                    bool taken = false;
+                    for (long j = 0; j < k; ++j) taken = taken || route_e_[static_cast<size_t>(j)] == e;
+                    const float* ranked = probs_.data() + n_exp;
+                    if (!taken && (best < 0 || ranked[e] > ranked[best])) best = e;
+                }
+                route_e_[static_cast<size_t>(k)] = best;
+                route_w_[static_cast<size_t>(k)] = probs_[static_cast<size_t>(best)];
+                chosen += probs_[static_cast<size_t>(best)];
+            }
+            for (long k = 0; k < top_k; ++k)
+            {
+                if (top_k > 1) route_w_[static_cast<size_t>(k)] /= chosen + 1e-20f;
+                route_w_[static_cast<size_t>(k)] *= static_cast<float>(spec_.expert_weights_scale);
+            }
+
+            project(latent_, x_, L.latent_down);
+            routed_.set_size(1, 1, 1, spec_.d_latent);
+            routed_ = 0;
+            for (long k = 0; k < top_k; ++k)
+            {
+                const size_t e = static_cast<size_t>(route_e_[static_cast<size_t>(k)]);
+                project(eu_, latent_, L.e_up[e]);
+                esig_.copy_size(eu_);
+                tt::relu(esig_, eu_);
+                tt::multiply(false, eu_, esig_, esig_);
+                project(ey_, eu_, L.e_down[e]);
+                tt::affine_transform(routed_, routed_, ey_, 1.0f, route_w_[static_cast<size_t>(k)]);
+            }
+            project(ffn_out_, routed_, L.latent_up);
+
+            project(gate_, x_, L.shared_up);
+            sig_.copy_size(gate_);
+            tt::relu(sig_, gate_);
+            tt::multiply(false, gate_, sig_, sig_);
+            project(up_, gate_, L.shared_down);
+            tt::add(ffn_out_, ffn_out_, up_);
+        }
+
         void load_gamma(gguf_reader& g, const std::string& name, long d, resizable_tensor& dst)
         {
             const gguf_tensor_info* t = g.find_tensor(name);
@@ -1251,6 +1714,12 @@ namespace dlib
         std::vector<long> injected_;
         resizable_tensor gate_, up_, sig_, ffn_out_;
         resizable_tensor cos_cache_, sin_cache_, mask_, logits_;
+
+        /* Hybrid decoders: the work buffers of their layers, and whether the context is
+           the one a prefill sized for its own tokens (no set_context()). */
+        resizable_tensor m_in_, m_dyn_, m_out_, factor_a_, factor_b_, shift_, noise_, diff_, latent_, routed_;
+        resizable_tensor all_logits_, all_hidden_;
+        bool own_context_ = false;
     };
 }
 

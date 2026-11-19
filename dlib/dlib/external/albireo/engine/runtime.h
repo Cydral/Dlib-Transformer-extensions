@@ -52,6 +52,12 @@ namespace albireo
             int sequence = -1;
             long start = 0;
             long count = 0;
+            /*
+                Whether a lone token is one of a prompt being read, the others being generated:
+                a runtime that keeps states of its sequences saves them along the prompts, and
+                a pass that reads one token of a prompt goes on with it (cpu_runtime).
+            */
+            bool prompt = false;
         };
 
         static const long position_components = 3;
@@ -106,6 +112,13 @@ namespace albireo
         // false when memory is exhausted.  This is how several requests start from the
         // same cached prefix, such as a long system prompt, without computing it again.
         virtual bool copy_sequence(int src, int dst, long length) = 0;
+        /*
+            The longest length, at most length, that truncate_sequence() and copy_sequence() take
+            for seq.  A runtime whose layers keep a recurrent state cannot give back the tokens a
+            sequence read: it returns the last length at or before length at which it saved the
+            state, 0 when it saved none, and the scheduler reads again the tokens that follow.
+        */
+        virtual long restorable_length(int seq, long length) const { (void)seq; return length; }
 
         // Runs the batch, appends its keys and values to the sequences and writes, for each
         // entry of logit_rows, a row of config().vocab logits into logits, unless the batch

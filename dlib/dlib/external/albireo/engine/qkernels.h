@@ -34,8 +34,8 @@ namespace albireo
         Formats with a dedicated kernel: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
         IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K and Q6_K.  The AVX2 build carries vector versions
         of the formats that the published models use most (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K,
-        F16 and F32); the others run their portable version, which the compiler still
-        vectorizes in part.
+        F16, BF16 and F32); the others run their portable version, which the compiler
+        still vectorizes in part.
 
         Products are distributed over the threads of a thread_pool by groups of output
         rows, so that each thread reads a disjoint part of the matrix.
@@ -270,6 +270,28 @@ namespace albireo
     float qk_exp_shift_sum(float* x, float m, long n);
     // g[i] = silu(g[i]) * u[i], the gate of a SwiGLU block, silu(x) = x / (1 + exp(-x)).
     void qk_silu_mul(float* g, const float* u, long n);
+    // x[i] = cap * tanh(x[i] / cap), the cap of the scores of an attention; cap > 0.
+    void qk_softcap(float* x, float cap, long n);
+
+    // The inputs and outputs of the state of a channel that qk_state_step() takes at most.
+    const long qk_state_rank = 8;
+
+    /*!
+        requires
+            - 0 < rank <= qk_state_rank, n > 0
+            - s holds n floats; kb, k and q hold rank rows of n floats; before, now and y hold
+              rank floats.
+        ensures
+            - One step of the state s of a channel of a Mamba-3 layer with rank inputs and
+              outputs:
+                s[i] = alpha * s[i] + sum over r of (before[r] * kb[r][i] + now[r] * k[r][i])
+                y[r] = sum over i of s[i] * q[r][i], with the new s
+              The state is read and written once for all its inputs and outputs: kb holds the
+              inputs of the previous token (the second point of the trapezoid rule), k those
+              of this one.
+    !*/
+    void qk_state_step(float* s, float alpha, const float* before, const float* kb, const float* now, const float* k,
+        const float* q, long rank, long n, float* y);
 
     /*!
         The attention by tiles of the processor runtime.  A tile holds rows of queries, the

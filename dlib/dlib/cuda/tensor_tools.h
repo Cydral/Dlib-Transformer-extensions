@@ -3126,6 +3126,91 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void geodesic_update(
+        tensor& x,
+        const tensor& g,
+        float scale,
+        float bias,
+        long depth
+    );
+    /*!
+        requires
+            - have_same_dimensions(x, g) == true
+            - depth > 0
+            - x and g are distinct objects
+        ensures
+            - The residual update of the decoders that keep their hidden states on a sphere
+              instead of normalizing them (the hybrid decoders of the olala family).  x holds
+              rows of x.nc() values, x.size()/x.nc() of them, and g the output of a block for
+              each row.  Each row x turns towards the part of its row g that is tangent to
+              it, by an angle that grows with the size of that part:
+                t = g - (dot(x,g)/max(dot(x,x), 1e-12))*x
+                theta = min(|t|/max(|x|, 1e-6), pi/4)
+                theta = min((theta*scale + bias)/depth, pi/4)
+                x = x*cos(theta) + (t/max(|t|, 1e-8))*max(|x|, 1e-6)*sin(theta)
+              A row keeps its length when t is not null.  depth is the rank of the block in
+              the network, from 1: the deeper blocks turn their rows less.
+            - The sums run in double precision, the rows of g being allowed values far
+              beyond those of x.
+    !*/
+
+    void mamba3_step(
+        tensor& out,
+        tensor& state,
+        const tensor& in,
+        const tensor& dyn,
+        const tensor& norms,
+        const tensor& bias,
+        const tensor& misc,
+        const tensor& mxz,
+        const tensor& mo,
+        float eps
+    );
+    /*!
+        requires
+            - The sizes of the tensors give the geometry of the layer: N == norms.size()/2
+              values in the state of a channel, N even; H == misc.size()/2 heads;
+              R == bias.size()/(2*N*H) inputs and outputs of a state; P == mo.size()/(H*R)
+              channels in a head; S == dyn.size() - 2*R*N rotated pairs, 0 <= S <= N/2.
+            - bias.size() == 2*H*R*N, mxz.size() == 2*H*R*P, mo.size() == H*R*P
+            - in.size() == H*(2*P + 3) and out.size() == H*P
+            - state.size() == H*S + H*P*N + H*R*N + H*P
+            - With CUDA, R <= 8 and S <= 256.
+        ensures
+            - One token of a Mamba-3 layer with several inputs and outputs (Gu and Dao's
+              state space layers in their third version, as the olala family computes
+              them), between the two projections of the layer.  in holds, for each head, a
+              gate and an input for each of its P channels, then a step, a decay and a
+              trapezoid weight; dyn holds R input rows and R output rows of N values, shared
+              by the heads, then S turns.  The constants of the layer come packed as the
+              files of that family store them: norms holds the weights of the normalization
+              of the input rows then of the output rows (2 x N); bias the biases of the
+              input rows then of the output rows of each head (H x 2R x N); misc the bias
+              of the steps then the direct weights of the heads (2 x H); mxz the factors of
+              the inputs then of the gates (H x 2R x P); mo the factors of the outputs
+              (H x R x P).
+            - For head h, with dt = softplus(step + misc[0][h]), A = min(-softplus(decay),
+              -1e-4), w = sigmoid(trapezoid weight), alpha = exp(A*dt), beta = (1-w)*dt*alpha
+              and gamma = w*dt:
+                - the angles of the head advance by tanh(turn)*pi*dt and stay within one turn;
+                - each input row k[r] and output row q[r] is its row of dyn divided by its
+                  root mean square (eps added to the mean of the squares), multiplied by
+                  the weights of norms, plus its bias, its pairs (i, i + N/2), i < S, turned
+                  by the angles of the head;
+                - the state s of channel p, whose input is x, becomes
+                    s = alpha*s + sum over r of (gamma*x*mx[r][p]*k[r]
+                                                + beta*x'*mx[r][p]*k'[r])
+                  x' and k' being the input and the input rows of the previous token (the
+                  trapezoid rule), null for the first one;
+                - out[h][p] = sum over r of silu(gate*mz[r][p]) * (dot(s, q[r])
+                              + misc[1][h]*x*mx[r][p]) * mo[h][r][p]
+            - state holds what a sequence keeps of the layer, in this order: the angles
+              (H x S), the states of the channels (H x P x N), then the input rows (H x R x N)
+              and the inputs (H x P) of the last token.  A state of zeros starts a sequence.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
     void gguf_matvec (
         tensor& dest,
         const tensor& src,

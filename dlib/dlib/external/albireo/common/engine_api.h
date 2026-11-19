@@ -159,9 +159,10 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
    A language model takes the members of an OpenAI chat completion request:
      "model", "messages" (or "prompt", a text read as it is), "tools", "tool_choice",
      "reasoning" (true or false) or "reasoning_effort" or
-     "chat_template_kwargs":{"enable_thinking"}, "reasoning_budget", "max_tokens" or
-     "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
-     "frequency_penalty", "repeat_penalty", "repeat_last_n", "seed", "stop", "logit_bias".
+     "chat_template_kwargs":{"enable_thinking","reasoning_effort"}, "reasoning_budget",
+     "max_tokens" or "max_completion_tokens", "temperature", "top_p", "top_k", "min_p",
+     "presence_penalty", "frequency_penalty", "repeat_penalty", "repeat_last_n", "seed", "stop",
+     "logit_bias".
    "top_k" is limited to 1024, and the keys of "logit_bias" must be token identifiers of the
    vocabulary.  The sampling settings a request leaves out take the values the authors of the
    family of the model advise.  The engine ends a reasoning after "reasoning_budget" tokens

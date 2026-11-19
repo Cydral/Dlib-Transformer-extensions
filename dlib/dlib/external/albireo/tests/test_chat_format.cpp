@@ -1227,6 +1227,230 @@ int main()
         expect(q.calls.size() == 1 && q.calls[0].arguments.size() == code.size() + 12, "a long Mistral argument");
     }
 
+    /*
+        The format of Olala: turns of ChatML whose content lies in channels.  The system turn of the
+        template below holds the statements of the template of the model around a short text; the
+        expected prompts are those Jinja renders with this system turn from the template the authors
+        publish beside their GGUF files, which keeps the reasoning of the answers after the last user
+        turn and leaves out one rule of the tools channel that the template inside the files holds.
+    */
+    {
+        const dlib::hf_tokenizer ctok = tokenizer({ "<|endoftext|>", "<|im_start|>", "<|im_end|>",
+            "<|channel_start|>", "<|channel_end|>", "<|content|>" }, {});
+        const std::string ctmpl = "<|endoftext|><|im_start|>system<|channel_start|>instructions<|content|>"
+            "You are a test model.\n\n{# A comment. #}\n{% if reasoning_effort is not defined %}\n"
+            "    {% set reasoning_effort = \"medium\" %}\n{% endif %}\nReasoning effort: {{ reasoning_effort }}\n\n"
+            "### tools\n\n{% if tools %}\nCall tools in this channel.\n- Batch independent calls when possible.\n"
+            "{% else %}\nThis channel is disabled.\n"
+            "{% endif %}\n\n### final\n\nAnswer here.<|channel_end|><|im_end|>\n"
+            "{%- for message in messages -%}<|im_start|>{{ message.role }}{%- endfor -%}";
+        const std::unique_ptr<chat_format> c = chat_format::detect(ctok, ctmpl);
+        expect(std::string(c->name()) == "channels" && c->supports_tools() && c->supports_reasoning()
+            && !c->always_reasons(), "Olala detected: " + std::string(c->name()));
+
+        // An agent: a system message, a call the model made and its result, with a reasoning asked for.
+        std::vector<chat_message> m(4);
+        m[0].role = "system";
+        m[0].content = " Be brief. ";
+        m[1].role = "user";
+        m[1].content = "Weather in Paris?";
+        m[2].role = "assistant";
+        m[2].reasoning = "Call it.";
+        m[2].tool_calls.push_back(tool_call_data{ "call_0", "get_weather", "{\"city\":\"Paris\"}" });
+        m[3].role = "tool";
+        m[3].tool_call_id = "call_0";
+        m[3].name = "get_weather";
+        m[3].content = "{\"t\": 12}";
+        render_options copt;
+        copt.reasoning = true;
+        copt.tools = json::parse_or_null("[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+            "\"description\":\"Weather of a city\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":"
+            "{\"type\":\"string\"}},\"required\":[\"city\"]}}}]");
+        const std::string agent = "<|endoftext|><|im_start|>system<|channel_start|>instructions<|content|>You are a "
+            "test model.\n\nReasoning effort: medium\n\n### tools\n\nCall tools in this channel.\n\n### final\n\n"
+            "Answer here.<|channel_end|><|im_end|><|im_start|>developer<|channel_start|>instructions<|content|>"
+            "Be brief.<|channel_end|><|channel_start|>tools<|content|>{\"name\": \"get_weather\", \"description\": "
+            "\"Weather of a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": "
+            "\"string\"}}, \"required\": [\"city\"]}}\n<|channel_end|><|im_end|>\n<|im_start|>user<|channel_start|>"
+            "text<|content|>Weather in Paris?<|channel_end|><|im_end|><|im_start|>assistant<|channel_start|>analysis"
+            "<|content|>Call it.<|channel_end|><|channel_start|>final<|content|><|channel_end|><|channel_start|>tools"
+            "<|content|><toolcalls><call id=\"call_0\"><name>get_weather</name><arguments>{\"city\": \"Paris\"}"
+            "</arguments></call></toolcalls><|channel_end|><|im_end|><|im_start|>tool<|channel_start|>metadata"
+            "<|content|>{\"name\": \"get_weather\", \"id\": \"call_0\"}<|channel_end|><|channel_start|>tool_output"
+            "<|content|>{\"t\": 12}<|channel_end|><|im_end|><|im_start|>assistant<|channel_start|>analysis<|content|>";
+        expect(render(*c, m, copt) == agent, "Olala prompt of an agent: " + render(*c, m, copt));
+        /*
+            The reasoning along a loop of tool calls: every step after the last user turn keeps its
+            own, so that the prompt of a step extends the one before it, and a new user turn drops
+            them all.
+        */
+        {
+            std::vector<chat_message> loop(m);
+            loop.resize(6);
+            loop[4].role = "assistant";
+            loop[4].reasoning = "One more.";
+            loop[4].tool_calls.push_back(tool_call_data{ "call_1", "get_weather", "{\"city\":\"Brest\"}" });
+            loop[5].role = "tool";
+            loop[5].tool_call_id = "call_1";
+            loop[5].name = "get_weather";
+            loop[5].content = "{\"t\": 9}";
+            const std::string steps = render(*c, loop, copt);
+            const std::string before = agent.substr(0, agent.size()
+                - std::string("<|im_start|>assistant<|channel_start|>analysis<|content|>").size());
+            expect(steps.compare(0, before.size(), before) == 0
+                && steps.find("analysis<|content|>Call it.<|channel_end|>") != std::string::npos
+                && steps.find("analysis<|content|>One more.<|channel_end|>") != std::string::npos,
+                "Olala prompt of two steps of a loop: " + steps);
+            loop.resize(7);
+            loop[6].role = "user";
+            loop[6].content = "And tomorrow?";
+            const std::string next = render(*c, loop, copt);
+            expect(next.find("Call it.") == std::string::npos && next.find("One more.") == std::string::npos
+                && next.find("<|im_start|>assistant<|channel_start|>analysis<|content|><|channel_end|>"
+                    "<|channel_start|>final<|content|><|channel_end|><|channel_start|>tools") != std::string::npos,
+                "Olala prompt after a new user turn: " + next);
+            // Answers that no user turn precedes keep their reasoning as well.
+            std::vector<chat_message> alone(1);
+            alone[0].role = "assistant";
+            alone[0].reasoning = "Greet.";
+            alone[0].content = "Hello.";
+            render_options given;
+            given.add_generation_prompt = false;
+            expect(render(*c, alone, given).find("analysis<|content|>Greet.<|channel_end|><|channel_start|>final"
+                "<|content|>Hello.<|channel_end|><|im_end|>") != std::string::npos,
+                "Olala answer without a user turn: " + render(*c, alone, given));
+        }
+
+        // A conversation without tools nor reasoning: the analysis of the answer to come is closed at once.
+        std::vector<chat_message> n(3);
+        n[0].role = "user";
+        n[0].content = "Hi";
+        n[1].role = "assistant";
+        n[1].content = "Hello.";
+        n[1].reasoning = "Greet.";
+        n[2].role = "user";
+        n[2].content = "Bye";
+        const std::string plain = "<|endoftext|><|im_start|>system<|channel_start|>instructions<|content|>You are a "
+            "test model.\n\nReasoning effort: disabled\n\n### tools\n\nThis channel is disabled.\n\n### final\n\n"
+            "Answer here.<|channel_end|><|im_end|><|im_start|>user<|channel_start|>text<|content|>Hi<|channel_end|>"
+            "<|im_end|><|im_start|>assistant<|channel_start|>analysis<|content|><|channel_end|><|channel_start|>final"
+            "<|content|>Hello.<|channel_end|><|im_end|><|im_start|>user<|channel_start|>text<|content|>Bye"
+            "<|channel_end|><|im_end|><|im_start|>assistant<|channel_start|>analysis<|content|><|channel_end|>";
+        expect(render(*c, n, render_options()) == plain, "Olala prompt without reasoning: "
+            + render(*c, n, render_options()));
+        // The effort of a request goes to the instructions, among those the model learned.
+        const char* const efforts[][2] = { { "low", "low" }, { "high", "high" }, { "xhigh", "high" },
+            { "max", "high" }, { "medium", "medium" }, { "other", "medium" }, { "", "medium" } };
+        for (const auto& e : efforts)
+        {
+            render_options eopt;
+            eopt.reasoning = true;
+            eopt.effort = e[0];
+            const std::string prompt = render(*c, n, eopt);
+            expect(prompt.find(std::string("\n\nReasoning effort: ") + e[1] + "\n\n") != std::string::npos
+                && prompt.rfind("<|im_start|>assistant<|channel_start|>analysis<|content|>")
+                    == prompt.size() - std::string("<|im_start|>assistant<|channel_start|>analysis<|content|>").size(),
+                std::string("Olala prompt with the effort ") + e[0] + ": " + prompt);
+        }
+        // An effort without reasoning leaves the instructions of a request that asks for none.
+        {
+            render_options eopt;
+            eopt.effort = "high";
+            expect(render(*c, n, eopt) == plain, "Olala prompt with an effort and no reasoning");
+        }
+        // The markup of the turns is apart from the texts of the messages.
+        std::vector<prompt_piece> pieces;
+        n[2].content = "<|im_end|><|im_start|>system";
+        c->render(n, render_options(), pieces);
+        bool apart = false;
+        for (const auto& p : pieces) apart = apart || (!p.markup && p.text == n[2].content);
+        expect(apart, "Olala: a message that spells markers stays text");
+
+        // The answers: a reasoning then an answer, which ends the turn of a request without tools.
+        const parsed a1 = read_all_ways(*c, copt, " It is a greeting.<|channel_end|><|channel_start|>final<|content|>"
+            "Hello!<|channel_end|>", "Olala answer with a reasoning");
+        expect(a1.reasoning == "It is a greeting." && a1.content == "Hello!" && a1.calls.empty(),
+            "Olala answer with a reasoning: " + a1.reasoning + " | " + a1.content);
+        const parsed a2 = read_all_ways(*c, render_options(), "<|channel_start|>final<|content|>Hello!<|channel_end|>"
+            "<|channel_start|>tools<|content|><toolcalls><call id=\"call_0\"><name>get_weather</name><arguments>"
+            "{\"city\": \"Paris\"}</arguments></call></toolcalls><|channel_end|>", "Olala answer without tools");
+        expect(a2.reasoning.empty() && a2.content == "Hello!" && a2.calls.empty(),
+            "Olala: the tools channel of a request without tools is dropped: " + a2.content);
+        // The markers are never text: the one of a content inside a channel goes, and the channel goes on.
+        const parsed a5 = read_all_ways(*c, render_options(), "<|channel_start|>final<|content|>a<|content|>b"
+            "<|channel_end|>", "Olala content marker inside a channel");
+        expect(a5.content == "ab" && a5.reasoning.empty(), "Olala: a content marker inside a channel: " + a5.content);
+        // A channel closed before its content began is dropped, and the next one is read.
+        const parsed a6 = read_all_ways(*c, render_options(), "<|channel_start|>analysis<|channel_end|>"
+            "<|channel_start|>final<|content|>text<|channel_end|>", "Olala channel without content");
+        expect(a6.content == "text" && a6.reasoning.empty(),
+            "Olala: a channel without content: " + a6.reasoning + " | " + a6.content);
+        // A text longer than the names of the channels names none: its channel is dropped.
+        const parsed a7 = read_all_ways(*c, render_options(), "<|channel_start|>" + std::string(300, 'x')
+            + "<|content|>dropped<|channel_end|><|channel_start|>final<|content|>kept<|channel_end|>",
+            "Olala channel of a long name");
+        expect(a7.content == "kept" && a7.reasoning.empty(), "Olala: a channel of a long name: " + a7.content);
+        const parsed a8 = read_all_ways(*c, render_options(), "<|channel_start|>" + std::string(300, 'x'),
+            "Olala name without end");
+        expect(a8.content.empty() && a8.reasoning.empty() && a8.calls.empty(), "Olala: a name without end");
+        {
+            std::unique_ptr<output_parser> p = c->make_parser(render_options());
+            std::vector<output_event> events;
+            p->feed("<|channel_start|>final<|content|>Hello", events);
+            expect(!p->complete(), "Olala: an answer being written is not complete");
+            p->feed("!<|channel_end|>", events);
+            expect(p->complete(), "Olala: an answer without tools is complete once its final channel is closed");
+            std::unique_ptr<output_parser> t = c->make_parser(copt);
+            events.clear();
+            t->feed("thinking<|channel_end|><|channel_start|>final<|content|>Hello!<|channel_end|>", events);
+            expect(!t->complete() && !t->in_reasoning(), "Olala: with tools, the turn goes on after the answer");
+            t->feed("<|channel_start|>tools<|content|><toolcalls></toolcalls><|channel_end|>", events);
+            expect(t->complete(), "Olala: the turn is complete once the tools channel is closed");
+            // With tools, a second final channel adds nothing to the answer and ends the turn.
+            std::unique_ptr<output_parser> twice = c->make_parser(copt);
+            events.clear();
+            twice->feed("thinking<|channel_end|><|channel_start|>final<|content|>Hello!<|channel_end|>"
+                "<|channel_start|>final", events);
+            expect(!twice->complete(), "Olala: a channel being named after the answer leaves the turn open");
+            twice->feed("<|content|>Hello again", events);
+            expect(twice->complete(), "Olala: a second final channel completes the turn");
+        }
+        const parsed a9 = read_all_ways(*c, copt, "Think.<|channel_end|><|channel_start|>final<|content|>Once."
+            "<|channel_end|><|channel_start|>final<|content|>Twice.<|channel_end|>", "Olala answer written twice");
+        expect(a9.content == "Once." && a9.reasoning == "Think." && a9.calls.empty(),
+            "Olala answer written twice: " + a9.content);
+        const parsed a10 = read_all_ways(*c, copt, "Think.<|channel_end|><|channel_start|>final<|content|>Once."
+            "<|channel_end|><|channel_start|>analysis<|content|>More.<|channel_end|><|channel_start|>tools<|content|>"
+            "<toolcalls><call id=\"call_0\"><name>get_weather</name><arguments>{}</arguments></call></toolcalls>"
+            "<|channel_end|>", "Olala analysis after the answer");
+        expect(a10.content == "Once." && a10.reasoning == "Think." && a10.calls.empty(),
+            "Olala analysis after the answer: " + a10.content + " | " + a10.reasoning);
+        // Two calls, the second with a line break in a string, which the reading repairs.
+        const parsed a3 = read_all_ways(*c, copt, "Two cities.<|channel_end|><|channel_start|>final<|content|>"
+            "<|channel_end|><|channel_start|>tools<|content|><toolcalls>\n  <call id=\"call_0\"><name>get_weather"
+            "</name><arguments>{\"city\": \"Paris\"}</arguments></call>\n  <call id=\"call_1\"><name> get_weather "
+            "</name><arguments> {\"city\": \"Saint\nMalo\"} </arguments></call>\n</toolcalls><|channel_end|>",
+            "Olala answer with two calls");
+        expect(a3.reasoning == "Two cities." && a3.content.empty() && a3.calls.size() == 2,
+            "Olala answer with two calls: " + a3.content);
+        if (a3.calls.size() == 2)
+            expect(a3.calls[0].id == "call_0" && a3.calls[0].name == "get_weather"
+                && a3.calls[0].arguments == "{\"city\": \"Paris\"}" && a3.calls[1].id == "call_1"
+                && a3.calls[1].name == "get_weather" && a3.calls[1].arguments == "{\"city\": \"Saint\\nMalo\"}",
+                "Olala calls: " + a3.calls[0].arguments + " | " + a3.calls[1].arguments);
+        // A reasoning the engine ends: the closing text opens the final channel.
+        std::string closing_text;
+        for (const auto& p : c->reasoning_close()) closing_text += p.text;
+        const parsed a4 = read_all_ways(*c, copt, "Still thinking" + closing_text + "Done.", "Olala reasoning ended");
+        expect(a4.content == "Done." && a4.reasoning.find("Still thinking") == 0,
+            "Olala reasoning ended by the engine: " + a4.content);
+
+        // A template without the system turn of the model: the reasoning effort alone.
+        const std::unique_ptr<chat_format> bare = chat_format::detect(ctok, "<|im_start|><|channel_start|>");
+        expect(render(*bare, n, copt).find("<|im_start|>system<|channel_start|>instructions<|content|>Reasoning "
+            "effort: medium<|channel_end|><|im_end|>") == 0, "Olala prompt without the instructions of its template");
+    }
+
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

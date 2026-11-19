@@ -405,9 +405,10 @@ namespace albireo
     /*!
         ensures
             - Returns a short description of a GGUF file read from its metadata: "name",
-              "arch", "parameters", "quantization", "gguf_name" (general.name), and
-              "publisher" when the header names the company that made the model
-              (general.organization, else general.author).
+              "arch", "parameters", "quantization" (the file type the header declares, else
+              the format of most of its bytes: dlib::gguf_quantization_name()), "gguf_name"
+              (general.name), and "publisher" when the header names the company that made
+              the model (general.organization, else general.author).
             - For a decoder: "context", "experts", "embedding", "roles", "reasoning",
               "tools", "inputs", the identity of a file of Albireo ("albireo_id") and
               "reads_images", true for an architecture that reads images (reads_images())

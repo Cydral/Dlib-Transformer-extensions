@@ -13,6 +13,11 @@
 
     Every field of the header is recorded with its offset, its size and a label, so that a
     test can damage one field at a time and check that the loader refuses the file.
+
+    build_hybrid() writes a tiny model of the olala architecture instead: four layers of
+    width 64, two Mamba-3 layers with several inputs and outputs and two differential
+    attentions, each followed by a mixture of experts in a latent space beside a shared
+    expert, with the same vocabulary.
 */
 
 #include <cstdint>
@@ -102,21 +107,10 @@ namespace albireo_test
             out_ = tiny_gguf();
             const long d = 64, ff = 128, heads = 4, kv_heads = 2, layers = 2;
             const long hd = head_dim_;
-            std::vector<std::string> tokens = byte_tokens();
-            std::vector<int32_t> types(tokens.size(), 1);
-            const char* control[] = { "<|endoftext|>", "<|im_start|>", "<|im_end|>" };
-            const char* user_defined[] = { "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
-                "<think>", "</think>" };
-            for (const char* t : control) { tokens.push_back(t); types.push_back(3); }
-            for (const char* t : user_defined) { tokens.push_back(t); types.push_back(4); }
-            while (tokens.size() % 32 != 0)
-            {
-                tokens.push_back("[PAD" + std::to_string(tokens.size()) + "]");
-                types.push_back(5);
-            }
-            const long vocab = static_cast<long>(tokens.size());
+            std::vector<std::string> tokens;
+            std::vector<int32_t> types;
+            const long vocab = vocabulary(tokens, types);
 
-            struct tensor { std::string name; std::vector<uint64_t> dims; };
             std::vector<tensor> list;
             list.push_back({ "token_embd.weight", { uint64_t(d), uint64_t(vocab) } });
             for (long l = 0; l < layers; ++l)
@@ -175,6 +169,177 @@ namespace albireo_test
             kv_str("tokenizer.chat_template", chat_template); ++kv;
             for (size_t i = 0; i < 8; ++i) out_.bytes[kv_count_at + i] = static_cast<unsigned char>(kv >> (8 * i));
 
+            write_tensors(list);
+            return out_;
+        }
+
+        /*
+            A model of the olala architecture.  The values of its vectors stand around those of
+            a trained model: scales and factors around one, steps of the states below one.
+        */
+        tiny_gguf build_hybrid()
+        {
+            out_ = tiny_gguf();
+            const long d = 64, layers = 4;
+            const long ssm_heads = 8, ssm_hd = 16, state = 16, rank = 2, angles = 4;
+            const long heads = 8, kv_heads = 2, hd = 32, tpa = 2, signal = heads - kv_heads;
+            const long experts = 8, used = 2, hidden = 32, latent = 16, shared = 48;
+            const std::string types = "MVMV";
+            std::vector<std::string> tokens;
+            std::vector<int32_t> token_types;
+            const long vocab = vocabulary(tokens, token_types);
+
+            auto u = [](long v) { return static_cast<uint64_t>(v); };
+            std::vector<tensor> list;
+            // The hidden states have a length of one: an output matrix of this size gives logits of a few units.
+            list.push_back({ "output.weight", { u(d), u(vocab) }, 0.0f, 8.0f });
+            list.push_back({ "token_embd.weight", { u(d), u(vocab) } });
+            for (long l = 0; l < layers; ++l)
+            {
+                const std::string p = "blk." + std::to_string(l) + ".";
+                list.push_back({ p + "geo_mixer_scale", { 1 }, 1.0f, 0.2f });
+                list.push_back({ p + "geo_mixer_bias", { 1 }, 0.02f, 0.02f });
+                list.push_back({ p + "geo_mlp_scale", { 1 }, 1.0f, 0.2f });
+                list.push_back({ p + "geo_mlp_bias", { 1 }, 0.02f, 0.02f });
+                if (types[static_cast<size_t>(l)] == 'M')
+                {
+                    list.push_back({ p + "ssm_in.weight", { u(d), u(ssm_heads * (2 * ssm_hd + 3)) }, 0.0f, 0.8f });
+                    list.push_back({ p + "ssm_in_dyn.weight", { u(d), u(2 * rank * state + angles) }, 0.0f, 0.8f });
+                    list.push_back({ p + "attn_output.weight", { u(ssm_heads * ssm_hd), u(d) } });
+                    list.push_back({ p + "ssm_b_norm.weight", { u(state) }, 1.0f, 0.2f });
+                    list.push_back({ p + "ssm_c_norm.weight", { u(state) }, 1.0f, 0.2f });
+                    list.push_back({ p + "ssm_b_bias", { u(state), u(rank), u(ssm_heads) }, 1.0f, 0.6f });
+                    list.push_back({ p + "ssm_c_bias", { u(state), u(rank), u(ssm_heads) }, 1.0f, 0.6f });
+                    list.push_back({ p + "ssm_dt_bias", { u(ssm_heads) }, -1.0f, 1.0f });
+                    list.push_back({ p + "ssm_d", { u(ssm_heads) }, 1.0f, 0.6f });
+                    list.push_back({ p + "ssm_mimo_x", { u(ssm_hd), u(rank), u(ssm_heads) }, 0.5f, 0.4f });
+                    list.push_back({ p + "ssm_mimo_z", { u(ssm_hd), u(rank), u(ssm_heads) }, 1.0f, 0.6f });
+                    list.push_back({ p + "ssm_mimo_o", { u(ssm_hd), u(rank), u(ssm_heads) }, 0.5f, 0.4f });
+                }
+                else
+                {
+                    list.push_back({ p + "attn_q.weight", { u(d), u(heads * hd) }, 0.0f, 0.8f });
+                    list.push_back({ p + "attn_wa_k.weight", { u(d), u(kv_heads * tpa) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_wb_k.weight", { u(d), u(tpa * hd) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_wa_v.weight", { u(d), u(kv_heads * tpa) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_wb_v.weight", { u(d), u(tpa * hd) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_shift_k.weight", { u(d), u(kv_heads) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_shift_v.weight", { u(d), u(kv_heads) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_lambda.weight", { u(d), u(kv_heads) }, 0.0f, 1.6f });
+                    list.push_back({ p + "attn_gate.weight", { u(d), u(signal * hd) }, 0.0f, 0.8f });
+                    list.push_back({ p + "attn_output.weight", { u(signal * hd), u(d) } });
+                    list.push_back({ p + "attn_q_norm.weight", { u(hd) }, 1.0f, 0.2f });
+                    list.push_back({ p + "attn_k_norm.weight", { u(hd) }, 1.0f, 0.2f });
+                    list.push_back({ p + "attn_softmax_scaler", { u(heads) }, 2.0f, 2.0f });
+                }
+                list.push_back({ p + "ffn_gate_inp.weight", { u(d), u(experts) }, 0.0f, 4.0f });
+                list.push_back({ p + "exp_probs_b", { u(experts) }, 0.0f, 0.1f });
+                list.push_back({ p + "ffn_latent_down.weight", { u(d), u(latent) }, 0.0f, 0.8f });
+                list.push_back({ p + "ffn_latent_up.weight", { u(latent), u(d) } });
+                list.push_back({ p + "ffn_up_exps.weight", { u(latent), u(hidden), u(experts) }, 0.0f, 0.8f });
+                list.push_back({ p + "ffn_down_exps.weight", { u(hidden), u(latent), u(experts) } });
+                list.push_back({ p + "ffn_up_shexp.weight", { u(d), u(shared) }, 0.0f, 0.8f });
+                list.push_back({ p + "ffn_down_shexp.weight", { u(shared), u(d) } });
+            }
+
+            u32(0x46554747u);
+            u32(3);
+            field("tensor_count", 8);
+            u64(list.size());
+            field("kv_count", 8);
+            const size_t kv_count_at = out_.bytes.size();
+            u64(0);
+            uint64_t kv = 0;
+            kv_str("general.architecture", "olala"); ++kv;
+            kv_str("general.name", "tiny hybrid"); ++kv;
+            kv_u64("olala.block_count", layers); ++kv;
+            kv_u64("olala.context_length", 4096); ++kv;
+            kv_u64("olala.embedding_length", d); ++kv;
+            kv_u64("olala.feed_forward_length", 0); ++kv;
+            kv_u64("olala.attention.head_count", heads); ++kv;
+            kv_u64("olala.attention.head_count_kv", kv_heads); ++kv;
+            kv_u64("olala.attention.key_length", hd); ++kv;
+            kv_u64("olala.attention.value_length", hd); ++kv;
+            kv_f32("olala.attention.layer_norm_rms_epsilon", 1e-6f); ++kv;
+            kv_u64("olala.attention.sliding_window", 2048); ++kv;
+            kv_f32("olala.attn_logit_softcapping", 2.0f); ++kv;
+            kv_u64("olala.expert_count", experts); ++kv;
+            kv_u64("olala.expert_used_count", used); ++kv;
+            kv_u64("olala.expert_feed_forward_length", hidden); ++kv;
+            kv_u64("olala.expert_shared_feed_forward_length", shared); ++kv;
+            kv_u64("olala.expert_shared_count", 1); ++kv;
+            kv_f32("olala.expert_weights_scale", 2.45f); ++kv;
+            kv_u64("olala.expert_gating_func", 2); ++kv;
+            kv_u64("olala.moe_latent_size", latent); ++kv;
+            kv_u64("olala.ssm.inner_size", ssm_heads * ssm_hd); ++kv;
+            kv_u64("olala.ssm.state_size", state); ++kv;
+            kv_u64("olala.ssm.group_count", 1); ++kv;
+            kv_u64("olala.mamba_mimo_dim", rank); ++kv;
+            kv_u64("olala.mamba_headdim", ssm_hd); ++kv;
+            kv_u64("olala.num_signal_heads", signal); ++kv;
+            kv_u64("olala.num_noise_heads", kv_heads); ++kv;
+            kv_u64("olala.tpa_rank", tpa); ++kv;
+            kv_u64("olala.num_rope_angles", angles); ++kv;
+            kv_str("olala.layer_types", types); ++kv;
+            kv_f32("olala.gate_bias", 1.15f); ++kv;
+            kv_u64("olala.gate_attn", 1); ++kv;
+            kv_u64("olala.geodesic_update", 1); ++kv;
+            kv_u64("olala.final_norm", 0); ++kv;
+            kv_str("tokenizer.ggml.model", "gpt2"); ++kv;
+            kv_str("tokenizer.ggml.pre", "qwen2"); ++kv;
+            kv_strings("tokenizer.ggml.tokens", tokens); ++kv;
+            kv_ints("tokenizer.ggml.token_type", token_types); ++kv;
+            kv_strings("tokenizer.ggml.merges", { "\xc4\xa0 t", "h e" }); ++kv;
+            kv_u64("tokenizer.ggml.eos_token_id", 258); ++kv;
+            kv_u64("tokenizer.ggml.add_bos_token", 0); ++kv;
+            // The words of the template that tell the format and its capabilities: channels, effort, tools.
+            kv_str("tokenizer.chat_template", "{%- if tools %}{%- endif %}Reasoning effort: {{ reasoning_effort }}"
+                "{{- '<|im_start|>' + message.role + '<|channel_start|>' }}"); ++kv;
+            for (size_t i = 0; i < 8; ++i) out_.bytes[kv_count_at + i] = static_cast<unsigned char>(kv >> (8 * i));
+            write_tensors(list);
+            return out_;
+        }
+
+    private:
+        long head_dim_ = 16;
+        bool biases_ = false;
+
+        /*
+            A tensor in single precision.  Its values are drawn around center, spread wide; without
+            them, a vector holds ones (a norm) and the other tensors, biases included, values
+            around zero.
+        */
+        struct tensor
+        {
+            tensor(const std::string& n, const std::vector<uint64_t>& shape, float c = 0.0f, float s = -1.0f)
+                : name(n), dims(shape), center(c), spread(s) {}
+            std::string name;
+            std::vector<uint64_t> dims;
+            float center;
+            float spread;
+        };
+
+        // The byte-level vocabulary with its control tokens, padded to a multiple of 32; returns its size.
+        static long vocabulary(std::vector<std::string>& tokens, std::vector<int32_t>& types)
+        {
+            tokens = byte_tokens();
+            types.assign(tokens.size(), 1);
+            const char* control[] = { "<|endoftext|>", "<|im_start|>", "<|im_end|>" };
+            const char* user_defined[] = { "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+                "<think>", "</think>" };
+            for (const char* t : control) { tokens.push_back(t); types.push_back(3); }
+            for (const char* t : user_defined) { tokens.push_back(t); types.push_back(4); }
+            while (tokens.size() % 32 != 0)
+            {
+                tokens.push_back("[PAD" + std::to_string(tokens.size()) + "]");
+                types.push_back(5);
+            }
+            return static_cast<long>(tokens.size());
+        }
+
+        // The descriptions of the tensors, which end the header, then their values.
+        void write_tensors(const std::vector<tensor>& list)
+        {
             uint64_t offset = 0;
             std::vector<uint64_t> offsets;
             for (const auto& t : list)
@@ -206,21 +371,20 @@ namespace albireo_test
                 for (uint64_t x : list[i].dims) n *= x;
                 // The vectors are norms, of ones, except the biases.
                 const bool norm = list[i].dims.size() == 1 && list[i].name.find(".bias") == std::string::npos;
+                const bool given = list[i].spread >= 0.0f;
+                const float center = given ? list[i].center : norm ? 1.0f : 0.0f;
+                const float spread = given ? list[i].spread : norm ? 0.0f : 0.4f;
                 for (uint64_t k = 0; k < n; ++k)
                 {
                     state = state * 1664525u + 1013904223u;
-                    const float v = norm ? 1.0f : (static_cast<float>(state >> 8) / 16777216.0f - 0.5f) * 0.4f;
+                    const float v = center + (static_cast<float>(state >> 8) / 16777216.0f - 0.5f) * spread;
                     unsigned char b[4];
                     std::memcpy(b, &v, 4);
                     out_.bytes.insert(out_.bytes.end(), b, b + 4);
                 }
             }
-            return out_;
         }
 
-    private:
-        long head_dim_ = 16;
-        bool biases_ = false;
 
         static std::vector<std::string> byte_tokens()
         {

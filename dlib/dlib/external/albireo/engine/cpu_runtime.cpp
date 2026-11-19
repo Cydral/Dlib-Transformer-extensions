@@ -23,12 +23,36 @@ namespace albireo
             s.rows = count;
             return s;
         }
+
+        const double pi = 3.14159265358979323846;
+
+        /*
+            The scalars of a head of a Mamba-3 layer (step, decay, trapezoid weight, angles) are
+            computed in double precision: a step of several units multiplies the rounding of
+            single precision into angles off by 1e-5, and they cost a few operations per head
+            and per token.
+        */
+        inline double softplus(double x) { return x > 20.0 ? x : std::log1p(std::exp(x)); }
+        inline double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+        // The pairs (i, i + n / 2) of a row of n values turned by the angles of cos and sin.
+        inline void rotate_halves(float* row, const float* cos, const float* sin, long n, long angles)
+        {
+            float* second = row + n / 2;
+            for (long i = 0; i < angles; ++i)
+            {
+                const float a = row[i], b = second[i];
+                row[i] = a * cos[i] - b * sin[i];
+                second[i] = a * sin[i] + b * cos[i];
+            }
+        }
     }
 
     cpu_runtime::cpu_runtime(std::shared_ptr<model_file> file, const model_config& config, thread_pool& pool,
         size_t kv_budget_bytes, long kv_block_positions, kv_format kv_type)
         : file_(std::move(file)), cfg_(config), pool_(pool),
-          kv_(config.n_layers, config.n_kv_heads, config.head_dim, kv_block_positions, kv_budget_bytes, kv_type)
+          kv_(config.attention_layers(), config.n_kv_heads, config.head_dim, kv_block_positions, kv_budget_bytes,
+              kv_type)
     {
         const model_file& f = *file_;
         const long d = cfg_.d_model;
@@ -39,6 +63,11 @@ namespace albireo
         layers_.resize(static_cast<size_t>(cfg_.n_layers));
         for (long i = 0; i < cfg_.n_layers; ++i)
         {
+            if (cfg_.hybrid())
+            {
+                load_hybrid_layer(f, i);
+                continue;
+            }
             const std::string p = "blk." + std::to_string(i) + ".";
             layer& L = layers_[static_cast<size_t>(i)];
             L.attn_norm = f.floats(p + "attn_norm.weight", static_cast<size_t>(d));
@@ -97,7 +126,7 @@ namespace albireo
                 L.w_down = f.matrix(p + "ffn_down.weight", d, cfg_.d_ffn);
             }
         }
-        output_norm_ = f.floats("output_norm.weight", static_cast<size_t>(d));
+        if (!cfg_.hybrid()) output_norm_ = f.floats("output_norm.weight", static_cast<size_t>(d));
         token_embd_ = f.matrix("token_embd.weight", cfg_.vocab, d);
         output_ = cfg_.tied_embeddings ? token_embd_ : f.matrix("output.weight", cfg_.vocab, d);
 
@@ -113,6 +142,24 @@ namespace albireo
             w.sum.resize(rows);
             w.scratch.resize(static_cast<size_t>(qk_attention_scratch(hd)));
         }
+        if (cfg_.hybrid())
+        {
+            const size_t R = static_cast<size_t>(cfg_.ssm_rank), N = static_cast<size_t>(cfg_.ssm_state);
+            const size_t P = static_cast<size_t>(cfg_.ssm_head_dim);
+            mixer_work_.resize(static_cast<size_t>(pool_.size()));
+            for (auto& w : mixer_work_)
+            {
+                w.k.resize(R * N);
+                w.q.resize(R * N);
+                w.cos.resize(static_cast<size_t>(cfg_.ssm_angles));
+                w.sin.resize(static_cast<size_t>(cfg_.ssm_angles));
+                w.before.resize(R);
+                w.now.resize(R);
+                w.y.resize(R);
+                w.o.resize(R * P);
+                w.gate.resize(R * P);
+            }
+        }
 
         // The position component of each rotary pair: the time, except the pairs of the row
         // and column sections, interleaved as the reference implementation of Qwen3-VL lays
@@ -124,6 +171,87 @@ namespace albireo
                 if (j % 3 == 1 && j < 3 * cfg_.rope_sections[1]) pair_component_[static_cast<size_t>(j)] = 1;
                 else if (j % 3 == 2 && j < 3 * cfg_.rope_sections[2]) pair_component_[static_cast<size_t>(j)] = 2;
             }
+    }
+
+    void cpu_runtime::load_hybrid_layer(const model_file& f, long i)
+    {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        layer& L = layers_[static_cast<size_t>(i)];
+        const long d = cfg_.d_model;
+        const long hd = cfg_.head_dim;
+        const size_t H = static_cast<size_t>(cfg_.ssm_heads), P = static_cast<size_t>(cfg_.ssm_head_dim);
+        const size_t N = static_cast<size_t>(cfg_.ssm_state), R = static_cast<size_t>(cfg_.ssm_rank);
+        const size_t S = static_cast<size_t>(cfg_.ssm_angles);
+        if (cfg_.ssm_rank > qk_state_rank)
+            throw std::runtime_error("the states of the Mamba-3 layers take more inputs than the kernels hold");
+        auto scalar = [&](const char* name) { return f.floats(p + name, 1)[0]; };
+        L.mixer_scale = scalar("geo_mixer_scale");
+        L.mixer_bias = scalar("geo_mixer_bias");
+        L.ffn_scale = scalar("geo_mlp_scale");
+        L.ffn_bias = scalar("geo_mlp_bias");
+        if (kv_layers_.empty()) kv_layers_.assign(static_cast<size_t>(cfg_.n_layers), -1);
+        state_offsets_.resize(static_cast<size_t>(cfg_.n_layers));
+        state_offsets_[static_cast<size_t>(i)] = state_floats_;
+        if (cfg_.layer_types[static_cast<size_t>(i)] == 'M')
+        {
+            /*
+                A row of ssm_in holds, for each head, its gate and its input (ssm_head_dim values
+                each), then its step, its decay and its trapezoid weight; a row of ssm_in_dyn
+                holds the inputs of the states, their outputs (ssm_rank rows of ssm_state values
+                each), then the turns of the angles.
+            */
+            const long inner = cfg_.ssm_inner();
+            L.ssm_in = f.matrix(p + "ssm_in.weight", static_cast<long>(H * (2 * P + 3)), d);
+            L.ssm_dyn = f.matrix(p + "ssm_in_dyn.weight", static_cast<long>(2 * R * N + S), d);
+            L.wo = f.matrix(p + "attn_output.weight", d, inner);
+            L.ssm_b_norm = f.floats(p + "ssm_b_norm.weight", N);
+            L.ssm_c_norm = f.floats(p + "ssm_c_norm.weight", N);
+            L.ssm_b_bias = f.floats(p + "ssm_b_bias", H * R * N);
+            L.ssm_c_bias = f.floats(p + "ssm_c_bias", H * R * N);
+            L.ssm_dt_bias = f.floats(p + "ssm_dt_bias", H);
+            L.ssm_d = f.floats(p + "ssm_d", H);
+            L.mimo_x = f.floats(p + "ssm_mimo_x", H * R * P);
+            L.mimo_z = f.floats(p + "ssm_mimo_z", H * R * P);
+            L.mimo_o = f.floats(p + "ssm_mimo_o", H * R * P);
+            // The angles, the states of the channels, then the inputs and the input of the previous token.
+            state_floats_ += H * S + H * P * N + H * R * N + H * P;
+        }
+        else
+        {
+            const long KV = cfg_.n_kv_heads;
+            const long rank = cfg_.tpa_rank;
+            L.wq = f.matrix(p + "attn_q.weight", cfg_.q_dim(), d);
+            L.wa_k = f.matrix(p + "attn_wa_k.weight", KV * rank, d);
+            L.wb_k = f.matrix(p + "attn_wb_k.weight", rank * hd, d);
+            L.wa_v = f.matrix(p + "attn_wa_v.weight", KV * rank, d);
+            L.wb_v = f.matrix(p + "attn_wb_v.weight", rank * hd, d);
+            L.shift_k = f.matrix(p + "attn_shift_k.weight", KV, d);
+            L.shift_v = f.matrix(p + "attn_shift_v.weight", KV, d);
+            L.noise = f.matrix(p + "attn_lambda.weight", KV, d);
+            L.attn_gate = f.matrix(p + "attn_gate.weight", cfg_.signal_heads() * hd, d);
+            L.wo = f.matrix(p + "attn_output.weight", d, cfg_.signal_heads() * hd);
+            L.q_norm = f.floats(p + "attn_q_norm.weight", static_cast<size_t>(hd));
+            L.k_norm = f.floats(p + "attn_k_norm.weight", static_cast<size_t>(hd));
+            L.softmax_scaler = f.floats(p + "attn_softmax_scaler", static_cast<size_t>(cfg_.n_heads));
+            long used = 0;
+            for (long v : kv_layers_) used += v >= 0 ? 1 : 0;
+            kv_layers_[static_cast<size_t>(i)] = used;
+            // The key and the value of the last token, before their shift.
+            state_floats_ += 2 * static_cast<size_t>(cfg_.kv_dim());
+        }
+        const long n_exp = cfg_.n_experts;
+        const long dl = cfg_.d_latent;
+        L.router = f.matrix(p + "ffn_gate_inp.weight", n_exp, d);
+        L.expert_bias = f.floats(p + "exp_probs_b", static_cast<size_t>(n_exp));
+        L.latent_down = f.matrix(p + "ffn_latent_down.weight", dl, d);
+        L.latent_up = f.matrix(p + "ffn_latent_up.weight", d, dl);
+        for (long e = 0; e < n_exp; ++e)
+        {
+            L.e_up.push_back(f.expert_matrix(p + "ffn_up_exps.weight", cfg_.d_ffn_expert, dl, e, n_exp));
+            L.e_down.push_back(f.expert_matrix(p + "ffn_down_exps.weight", dl, cfg_.d_ffn_expert, e, n_exp));
+        }
+        L.shared_up = f.matrix(p + "ffn_up_shexp.weight", cfg_.d_ffn_shared, d);
+        L.shared_down = f.matrix(p + "ffn_down_shexp.weight", d, cfg_.d_ffn_shared);
     }
 
     void cpu_runtime::set_context(long positions)
@@ -147,7 +275,8 @@ namespace albireo
         layer_pass_wait_ = 0;
         attention_wait_ = 0;
         attention_interval_ = 0;
-        if (!offload_ || cfg_.is_moe()) return;
+        // The layers of a device are those of a dense decoder made of attentions.
+        if (!offload_ || cfg_.is_moe() || cfg_.hybrid()) return;
         dense_model m;
         m.d_model = cfg_.d_model;
         m.q_dim = cfg_.q_dim();
@@ -206,16 +335,24 @@ namespace albireo
 
     int cpu_runtime::create_sequence()
     {
+        // The states of a hybrid decoder first, which may lack memory: no slot is then taken.
+        recurrent_sequence states;
+        if (cfg_.hybrid()) states.live.values.assign(state_floats_, 0.0f);
         if (!free_sequences_.empty())
         {
             const int s = free_sequences_.back();
-            free_sequences_.pop_back();
             sequences_[static_cast<size_t>(s)].reset(new kv_sequence());
+            free_sequences_.pop_back();
             sequence_pools_[static_cast<size_t>(s)] = &kv_;
+            if (cfg_.hybrid()) recurrent_[static_cast<size_t>(s)] = std::move(states);
             return s;
         }
+        sequences_.reserve(sequences_.size() + 1);
+        sequence_pools_.reserve(sequence_pools_.size() + 1);
+        if (cfg_.hybrid()) recurrent_.reserve(recurrent_.size() + 1);
         sequences_.emplace_back(new kv_sequence());
         sequence_pools_.push_back(&kv_);
+        if (cfg_.hybrid()) recurrent_.push_back(std::move(states));
         return static_cast<int>(sequences_.size() - 1);
     }
 
@@ -225,6 +362,8 @@ namespace albireo
         sequences_[static_cast<size_t>(seq)]->clear(pool_of(seq));
         sequences_[static_cast<size_t>(seq)].reset();
         sequence_pools_[static_cast<size_t>(seq)] = &kv_;
+        // The states of the sequence go back to the system.
+        if (cfg_.hybrid()) recurrent_[static_cast<size_t>(seq)] = recurrent_sequence();
         free_sequences_.push_back(seq);
     }
 
@@ -241,6 +380,20 @@ namespace albireo
         // The copies of the device forget the rows the sequence gives up in the block it keeps last.
         if (layer_pass_ && length >= 0 && length < s.length && length % B != 0)
             layer_pass_->truncated(pool, s.blocks[static_cast<size_t>(length / B)], length % B);
+        if (cfg_.hybrid() && length < s.length)
+        {
+            recurrent_sequence& r = recurrent_[static_cast<size_t>(seq)];
+            const recurrent_state* kept = state_at(seq, length);
+            if (length > 0 && !kept)
+                throw std::logic_error("cpu_runtime: a hybrid decoder goes back to the lengths of its saved states "
+                    "only (restorable_length())");
+            if (length <= 0) std::fill(r.live.values.begin(), r.live.values.end(), 0.0f);
+            else if (kept != &r.live) r.live.values = kept->values;
+            r.live.length = std::max<long>(0, length);
+            while (!r.saved.empty() && r.saved.back().length > length) r.saved.pop_back();
+            r.reading = -1;
+            r.own = false;
+        }
         s.truncate(pool, length);
     }
 
@@ -254,8 +407,45 @@ namespace albireo
         const kv_sequence& s = *sequences_.at(static_cast<size_t>(src));
         kv_sequence& d = *sequences_.at(static_cast<size_t>(dst));
         if (&pool_of(src) != &pool_of(dst)) throw std::logic_error("cpu_runtime: sequences of two pools");
+        if (cfg_.hybrid())
+        {
+            const recurrent_state* from = state_at(src, length);
+            if (length > 0 && !from)
+                throw std::logic_error("cpu_runtime: a hybrid decoder copies a sequence up to the lengths of its "
+                    "saved states only (restorable_length())");
+            // The states are copied apart first: the source may be the destination, and the keys may lack room.
+            recurrent_sequence copy;
+            if (length > 0) copy.live.values = from->values;
+            else copy.live.values.assign(state_floats_, 0.0f);
+            copy.live.length = std::max<long>(0, length);
+            // The copy may go back to the prefix it shares.
+            if (length > 0) copy.saved.push_back(copy.live);
+            if (!d.share_prefix(pool_of(dst), s, length)) return false;
+            recurrent_[static_cast<size_t>(dst)] = std::move(copy);
+            return true;
+        }
         // The full blocks are shared; each sequence copies a shared block before writing in it.
         return d.share_prefix(pool_of(dst), s, length);
+    }
+
+    const cpu_runtime::recurrent_state* cpu_runtime::state_at(int seq, long length) const
+    {
+        const recurrent_sequence& r = recurrent_.at(static_cast<size_t>(seq));
+        if (r.live.length == length) return &r.live;
+        for (const recurrent_state& s : r.saved)
+            if (s.length == length) return &s;
+        return nullptr;
+    }
+
+    long cpu_runtime::restorable_length(int seq, long length) const
+    {
+        if (!cfg_.hybrid()) return length;
+        const recurrent_sequence& r = recurrent_.at(static_cast<size_t>(seq));
+        long best = 0;
+        if (r.live.length <= length) best = r.live.length;
+        for (const recurrent_state& s : r.saved)
+            if (s.length <= length) best = std::max(best, s.length);
+        return best;
     }
 
     // Building blocks
@@ -503,6 +693,7 @@ namespace albireo
         const float scale = cfg_.attention_scale > 0.0
             ? static_cast<float>(cfg_.attention_scale)
             : 1.0f / std::sqrt(static_cast<float>(hd));
+        const float cap = static_cast<float>(cfg_.attn_softcap);
 
         // The tiles: consecutive tokens of one segment, whose positions are consecutive too.
         const long per_tile = std::max<long>(1, tile_rows / rep);
@@ -573,6 +764,8 @@ namespace albireo
                     qk_attention_scores(w.q.data(), rows,
                         reinterpret_cast<const uint16_t*>(kv.keys(block, layer_index, kvh)) + first * hd, m, hd,
                         w.s.data(), B, w.scratch.data());
+                if (cap > 0.0f)
+                    for (long r = 0; r < rows; ++r) qk_softcap(w.s.data() + r * B, cap, m);
                 for (long a = 0; a < tile.count; ++a)
                 {
                     // Each token sees the positions up to its own.
@@ -1030,6 +1223,11 @@ namespace albireo
 
     void cpu_runtime::forward(const forward_batch& batch, std::vector<float>& logits)
     {
+        if (cfg_.hybrid())
+        {
+            run_hybrid(batch, logits);
+            return;
+        }
         if (layer_pass_ && !batch.tokens.empty() && takes_layer_pass(batch))
         {
             try
@@ -1240,6 +1438,485 @@ namespace albireo
                 qk_scale(logits.data(), static_cast<float>(1.0 / cfg_.logit_scale), R * cfg_.vocab);
         }
         return true;
+    }
+
+    // Hybrid decoders
+
+    void cpu_runtime::geodesic_update(const float* g, float scale, float bias, long layer, long T)
+    {
+        /*
+            Each hidden state x turns on its sphere towards the part of g that is tangent to it,
+            by the angle the size of that part gives, a quarter of a turn of the half plane at
+            most, scaled, shifted and divided by the depth of the layer.  The sums run in double
+            precision: the outputs of the mixers reach 1e14.
+        */
+        const long d = cfg_.d_model;
+        const double quarter = pi / 4.0;
+        auto one = [&](long t) {
+            float* x = x_.data() + t * d;
+            const float* u = g + t * d;
+            double xx = 0.0, xu = 0.0;
+            for (long i = 0; i < d; ++i)
+            {
+                xx += static_cast<double>(x[i]) * x[i];
+                xu += static_cast<double>(x[i]) * u[i];
+            }
+            const double along = xu / std::max(xx, 1e-12);
+            double tt = 0.0;
+            for (long i = 0; i < d; ++i)
+            {
+                const double v = u[i] - along * x[i];
+                tt += v * v;
+            }
+            const double norm = std::max(std::sqrt(tt), 1e-8);
+            const double radius = std::max(std::sqrt(xx), 1e-6);
+            double theta = std::min(norm / radius, quarter);
+            theta = std::min((theta * scale + bias) / static_cast<double>(layer + 1), quarter);
+            const double c = std::cos(theta), s = std::sin(theta) * radius / norm;
+            for (long i = 0; i < d; ++i) x[i] = static_cast<float>(x[i] * c + (u[i] - along * x[i]) * s);
+        };
+        if (T >= 16)
+            pool_.parallel_for(T, [&](long t, int) { one(t); });
+        else
+            for (long t = 0; t < T; ++t) one(t);
+    }
+
+    void cpu_runtime::mamba3_mixer(long li, const forward_batch& batch)
+    {
+        const layer& L = layers_[static_cast<size_t>(li)];
+        const long T = static_cast<long>(batch.tokens.size());
+        const long d = cfg_.d_model;
+        const long H = cfg_.ssm_heads, P = cfg_.ssm_head_dim, N = cfg_.ssm_state, R = cfg_.ssm_rank;
+        const long S = cfg_.ssm_angles;
+        const long head_row = 2 * P + 3;
+        const long in_width = H * head_row;
+        const long dyn_width = 2 * R * N + S;
+        const long inner = H * P;
+        const float eps = static_cast<float>(cfg_.rms_eps);
+
+        proj_.resize(static_cast<size_t>(T * in_width));
+        dyn_.resize(static_cast<size_t>(T * dyn_width));
+        product(L.ssm_in, x_.data(), T, d, proj_.data(), in_width);
+        product(L.ssm_dyn, x_.data(), T, d, dyn_.data(), dyn_width);
+
+        // The inputs and the outputs of the states, normalized, and the turn of each angle for a step of one.
+        turns_.resize(static_cast<size_t>(T * S));
+        for (long t = 0; t < T; ++t)
+        {
+            float* row = dyn_.data() + t * dyn_width;
+            rms_norm_rows(row, L.ssm_b_norm.data(), row, R, N, eps);
+            rms_norm_rows(row + R * N, L.ssm_c_norm.data(), row + R * N, R, N, eps);
+            for (long i = 0; i < S; ++i)
+                turns_[static_cast<size_t>(t * S + i)] = std::tanh(static_cast<double>(row[2 * R * N + i])) * pi;
+        }
+
+        ctx_.resize(static_cast<size_t>(T * inner));
+        const long n_segments = static_cast<long>(batch.segments.size());
+        const size_t row_bytes = sizeof(float) * static_cast<size_t>(R * N);
+        // A head reads the tokens of a sequence in order; the heads and the sequences run in parallel.
+        pool_.parallel_for(n_segments * H, [&](long item, int thread) {
+            const forward_batch::segment& seg = batch.segments[static_cast<size_t>(item / H)];
+            const long h = item % H;
+            mixer_work& w = mixer_work_[static_cast<size_t>(thread)];
+            float* state = recurrent_[static_cast<size_t>(seg.sequence)].live.values.data()
+                + state_offsets_[static_cast<size_t>(li)];
+            float* angle = state + h * S;
+            float* channels = state + H * S + h * P * N;
+            float* k_before = state + H * S + H * P * N + h * R * N;
+            float* x_before = state + H * S + H * P * N + H * R * N + h * P;
+            const float* b_bias = L.ssm_b_bias.data() + h * R * N;
+            const float* c_bias = L.ssm_c_bias.data() + h * R * N;
+            const float* mx = L.mimo_x.data() + h * R * P;
+            const float* mz = L.mimo_z.data() + h * R * P;
+            const float* mo = L.mimo_o.data() + h * R * P;
+            const float skip = L.ssm_d[static_cast<size_t>(h)];
+            for (long j = 0; j < seg.count; ++j)
+            {
+                const long t = seg.start + j;
+                const float* z = proj_.data() + t * in_width + h * head_row;
+                const float* x = z + P;
+                const double step = softplus(static_cast<double>(x[P]) + L.ssm_dt_bias[static_cast<size_t>(h)]);
+                const double decay = std::min(-softplus(static_cast<double>(x[P + 1])), -1e-4);
+                const double trapezoid = sigmoid(static_cast<double>(x[P + 2]));
+                const double kept = std::exp(decay * step);
+                const float alpha = static_cast<float>(kept);
+                const float beta = static_cast<float>((1.0 - trapezoid) * step * kept);
+                const float gamma = static_cast<float>(trapezoid * step);
+
+                /*
+                    The angles of the head, kept within one turn.  The cosines and the sines come
+                    from the angles as the state holds them: a sequence that takes back a saved
+                    state computes the same numbers.
+                */
+                const double* turn = turns_.data() + t * S;
+                for (long i = 0; i < S; ++i)
+                {
+                    double sum = angle[i] + turn[i] * step;
+                    sum -= 2.0 * pi * std::floor((sum + pi) / (2.0 * pi));
+                    angle[i] = static_cast<float>(sum);
+                    w.cos[static_cast<size_t>(i)] = std::cos(angle[i]);
+                    w.sin[static_cast<size_t>(i)] = std::sin(angle[i]);
+                }
+
+                // The inputs and the outputs of the states of the head: their biases, then the rotation.
+                const float* bn = dyn_.data() + t * dyn_width;
+                const float* cn = bn + R * N;
+                for (long r = 0; r < R; ++r)
+                {
+                    float* k = w.k.data() + r * N;
+                    float* q = w.q.data() + r * N;
+                    for (long n = 0; n < N; ++n)
+                    {
+                        k[n] = bn[r * N + n] + b_bias[r * N + n];
+                        q[n] = cn[r * N + n] + c_bias[r * N + n];
+                    }
+                    rotate_halves(k, w.cos.data(), w.sin.data(), N, S);
+                    rotate_halves(q, w.cos.data(), w.sin.data(), N, S);
+                }
+
+                /*
+                    The state of each channel takes its inputs by the trapezoid rule, the input of
+                    this token and the one of the previous token, and gives its outputs, which
+                    the input of the channel joins directly.
+                */
+                for (long p = 0; p < P; ++p)
+                {
+                    for (long r = 0; r < R; ++r)
+                    {
+                        w.now[static_cast<size_t>(r)] = gamma * x[p] * mx[r * P + p];
+                        w.before[static_cast<size_t>(r)] = beta * x_before[p] * mx[r * P + p];
+                    }
+                    qk_state_step(channels + p * N, alpha, w.before.data(), k_before, w.now.data(), w.k.data(),
+                        w.q.data(), R, N, w.y.data());
+                    for (long r = 0; r < R; ++r)
+                    {
+                        w.o[static_cast<size_t>(r * P + p)] = w.y[static_cast<size_t>(r)] + skip * x[p] * mx[r * P + p];
+                        w.gate[static_cast<size_t>(r * P + p)] = z[p] * mz[r * P + p];
+                    }
+                }
+                qk_silu_mul(w.gate.data(), w.o.data(), R * P);
+                float* out = ctx_.data() + t * inner + h * P;
+                for (long p = 0; p < P; ++p)
+                {
+                    float sum = 0.0f;
+                    for (long r = 0; r < R; ++r) sum += w.gate[static_cast<size_t>(r * P + p)] * mo[r * P + p];
+                    out[p] = sum;
+                }
+
+                // What the next token reads of this one.
+                std::memcpy(k_before, w.k.data(), row_bytes);
+                std::memcpy(x_before, x, sizeof(float) * static_cast<size_t>(P));
+            }
+        });
+
+        tmp_.resize(static_cast<size_t>(T * d));
+        product(L.wo, ctx_.data(), T, inner, tmp_.data(), d);
+    }
+
+    void cpu_runtime::differential_attention(long li, const forward_batch& batch)
+    {
+        const layer& L = layers_[static_cast<size_t>(li)];
+        const long T = static_cast<long>(batch.tokens.size());
+        const long d = cfg_.d_model;
+        const long H = cfg_.n_heads, KV = cfg_.n_kv_heads, hd = cfg_.head_dim;
+        const long qd = cfg_.q_dim(), kvd = cfg_.kv_dim();
+        const long rank = cfg_.tpa_rank;
+        const long group = H / KV;
+        const float eps = static_cast<float>(cfg_.rms_eps);
+
+        q_.resize(static_cast<size_t>(T * qd));
+        k_.resize(static_cast<size_t>(T * kvd));
+        v_.resize(static_cast<size_t>(T * kvd));
+        product(L.wq, x_.data(), T, d, q_.data(), qd);
+
+        // A key, or a value, of a head: the mean of rank products of a factor of the head and a row of its width.
+        auto tensor_products = [&](const weight_matrix& wa, const weight_matrix& wb, float* out) {
+            factor_a_.resize(static_cast<size_t>(T * KV * rank));
+            factor_b_.resize(static_cast<size_t>(T * rank * hd));
+            product(wa, x_.data(), T, d, factor_a_.data(), KV * rank);
+            product(wb, x_.data(), T, d, factor_b_.data(), rank * hd);
+            const float inv = 1.0f / static_cast<float>(rank);
+            for (long t = 0; t < T; ++t)
+                for (long h = 0; h < KV; ++h)
+                {
+                    float* row = out + t * kvd + h * hd;
+                    std::fill(row, row + hd, 0.0f);
+                    for (long r = 0; r < rank; ++r)
+                    {
+                        const float a = factor_a_[static_cast<size_t>((t * KV + h) * rank + r)] * inv;
+                        const float* b = factor_b_.data() + (t * rank + r) * hd;
+                        for (long e = 0; e < hd; ++e) row[e] += a * b[e];
+                    }
+                }
+        };
+        tensor_products(L.wa_k, L.wb_k, k_.data());
+        tensor_products(L.wa_v, L.wb_v, v_.data());
+
+        /*
+            The shift: each key and each value leans on the one of the previous token of its
+            sequence, as it stood before its own shift.  The tokens of a segment are taken from
+            the last one, so that the row before each still holds what it held.
+        */
+        shift_.resize(static_cast<size_t>(T * 2 * KV));
+        product(L.shift_k, x_.data(), T, d, shift_.data(), 2 * KV);
+        product(L.shift_v, x_.data(), T, d, shift_.data() + KV, 2 * KV);
+        last_keys_.resize(static_cast<size_t>(2 * kvd));
+        for (const auto& seg : batch.segments)
+        {
+            if (seg.count <= 0) continue;
+            float* last = recurrent_[static_cast<size_t>(seg.sequence)].live.values.data()
+                + state_offsets_[static_cast<size_t>(li)];
+            const long end = seg.start + seg.count - 1;
+            std::copy(k_.data() + end * kvd, k_.data() + (end + 1) * kvd, last_keys_.data());
+            std::copy(v_.data() + end * kvd, v_.data() + (end + 1) * kvd, last_keys_.data() + kvd);
+            for (long t = end; t >= seg.start; --t)
+            {
+                const float* k_before = t > seg.start ? k_.data() + (t - 1) * kvd : last;
+                const float* v_before = t > seg.start ? v_.data() + (t - 1) * kvd : last + kvd;
+                if (t == seg.start && positions_[static_cast<size_t>(t)] == 0) break;
+                for (long h = 0; h < KV; ++h)
+                {
+                    const float ak = static_cast<float>(sigmoid(shift_[static_cast<size_t>(t * 2 * KV + h)]));
+                    const float av = static_cast<float>(sigmoid(shift_[static_cast<size_t>(t * 2 * KV + KV + h)]));
+                    float* k = k_.data() + t * kvd + h * hd;
+                    float* v = v_.data() + t * kvd + h * hd;
+                    for (long e = 0; e < hd; ++e)
+                    {
+                        k[e] = ak * k_before[h * hd + e] + (1.0f - ak) * k[e];
+                        v[e] = av * v_before[h * hd + e] + (1.0f - av) * v[e];
+                    }
+                }
+            }
+            std::copy(last_keys_.begin(), last_keys_.end(), last);
+        }
+
+        rms_norm_rows(q_.data(), L.q_norm.data(), q_.data(), T * H, hd, eps);
+        rms_norm_rows(k_.data(), L.k_norm.data(), k_.data(), T * KV, hd, eps);
+        // The queries grow with the logarithm of the positions they see, each head by its own factor.
+        for (long t = 0; t < T; ++t)
+        {
+            long seen = positions_[static_cast<size_t>(t)] + 1;
+            if (cfg_.attention_window > 0) seen = std::min(seen, cfg_.attention_window);
+            const float reach = static_cast<float>(std::log(static_cast<double>(seen)));
+            for (long h = 0; h < H; ++h)
+                qk_scale(q_.data() + t * qd + h * hd, L.softmax_scaler[static_cast<size_t>(h)] * reach, hd);
+        }
+
+        const long pool_layer = kv_layers_[static_cast<size_t>(li)];
+        store_keys_values(pool_layer, batch);
+        attention(pool_layer, batch, positions_);
+
+        /*
+            Each key and value head serves a group of query heads: the last one of the group
+            reads the noise, which the others give up in the proportion their token chooses;
+            the gate of the layer then opens each value of the result.
+        */
+        const long signal = group - 1;
+        const long width = cfg_.signal_heads() * hd;
+        noise_.resize(static_cast<size_t>(T * KV));
+        product(L.noise, x_.data(), T, d, noise_.data(), KV);
+        gate_.resize(static_cast<size_t>(T * width));
+        up_.resize(static_cast<size_t>(T * width));
+        product(L.attn_gate, x_.data(), T, d, gate_.data(), width);
+        const float gate_bias = static_cast<float>(cfg_.gate_bias);
+        if (gate_bias != 0.0f)
+            for (float& v : gate_) v += gate_bias;
+        for (long t = 0; t < T; ++t)
+            for (long g = 0; g < KV; ++g)
+            {
+                const float share = static_cast<float>(sigmoid(noise_[static_cast<size_t>(t * KV + g)]));
+                const float* heads = ctx_.data() + t * qd + g * group * hd;
+                const float* noise = heads + signal * hd;
+                float* out = up_.data() + t * width + g * signal * hd;
+                for (long i = 0; i < signal; ++i)
+                    for (long e = 0; e < hd; ++e) out[i * hd + e] = heads[i * hd + e] - share * noise[e];
+            }
+        qk_silu_mul(gate_.data(), up_.data(), T * width);
+
+        tmp_.resize(static_cast<size_t>(T * d));
+        product(L.wo, gate_.data(), T, width, tmp_.data(), d);
+    }
+
+    void cpu_runtime::latent_experts(const layer& L, long T)
+    {
+        const long d = cfg_.d_model;
+        const long n_exp = cfg_.n_experts;
+        const long top_k = cfg_.n_experts_used;
+        const long df = cfg_.d_ffn_expert;
+        const long dl = cfg_.d_latent;
+        const long ds = cfg_.d_ffn_shared;
+        const float weights_scale = static_cast<float>(cfg_.expert_weights_scale);
+        auto squared_relu = [](float* v, long n) {
+            for (long i = 0; i < n; ++i)
+            {
+                const float r = v[i] > 0.0f ? v[i] : 0.0f;
+                v[i] = r * r;
+            }
+        };
+
+        /*
+            The router gives each expert a sigmoid; a token takes the experts of the largest
+            sigmoids once their biases are added, with the sigmoids themselves, brought to a sum
+            of one, as their weights.
+        */
+        router_logits_.resize(static_cast<size_t>(T * n_exp));
+        product(L.router, x_.data(), T, d, router_logits_.data(), n_exp);
+        std::vector<std::vector<std::pair<long, float>>>& routed = routed_;
+        routed.resize(static_cast<size_t>(n_exp));
+        for (auto& list : routed) list.clear();
+        std::vector<float>& scores = router_probs_;
+        scores.resize(static_cast<size_t>(2 * n_exp));
+        float* ranked = scores.data() + n_exp;
+        std::vector<long>& order = router_order_;
+        order.resize(static_cast<size_t>(n_exp));
+        for (long t = 0; t < T; ++t)
+        {
+            const float* row = router_logits_.data() + t * n_exp;
+            for (long e = 0; e < n_exp; ++e)
+            {
+                scores[static_cast<size_t>(e)] = static_cast<float>(sigmoid(row[e]));
+                ranked[e] = scores[static_cast<size_t>(e)] + L.expert_bias[static_cast<size_t>(e)];
+                order[static_cast<size_t>(e)] = e;
+            }
+            std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                [&](long a, long b) { return ranked[a] > ranked[b] || (ranked[a] == ranked[b] && a < b); });
+            float selected = 0.0f;
+            for (long k = 0; k < top_k; ++k) selected += scores[static_cast<size_t>(order[static_cast<size_t>(k)])];
+            for (long k = 0; k < top_k; ++k)
+            {
+                const long e = order[static_cast<size_t>(k)];
+                float w = scores[static_cast<size_t>(e)];
+                if (cfg_.expert_weights_norm) w /= selected + 1e-20f;
+                routed[static_cast<size_t>(e)].push_back(std::make_pair(t, w * weights_scale));
+            }
+        }
+
+        // The experts work in the latent space, which one projection enters and one leaves.
+        latent_.resize(static_cast<size_t>(T * dl));
+        product(L.latent_down, x_.data(), T, d, latent_.data(), dl);
+        routed_latent_.assign(static_cast<size_t>(T * dl), 0.0f);
+        aligned_floats& xe = expert_x_;
+        aligned_floats& ue = expert_up_;
+        aligned_floats& ye = expert_y_;
+        const qk_path path = T >= qk_float_product_tokens ? qk_path::prompt : qk_path::integer;
+        for (long e = 0; e < n_exp; ++e)
+        {
+            const auto& list = routed[static_cast<size_t>(e)];
+            const long m = static_cast<long>(list.size());
+            if (m == 0) continue;
+            xe.resize(static_cast<size_t>(m * dl));
+            for (long i = 0; i < m; ++i)
+                std::memcpy(xe.data() + i * dl, latent_.data() + list[static_cast<size_t>(i)].first * dl,
+                    sizeof(float) * static_cast<size_t>(dl));
+            ue.resize(static_cast<size_t>(m * df));
+            ye.resize(static_cast<size_t>(m * dl));
+            product(L.e_up[static_cast<size_t>(e)], xe.data(), m, dl, ue.data(), df, path);
+            squared_relu(ue.data(), m * df);
+            product(L.e_down[static_cast<size_t>(e)], ue.data(), m, df, ye.data(), dl, path);
+            for (long i = 0; i < m; ++i)
+            {
+                const float w = list[static_cast<size_t>(i)].second;
+                float* dst = routed_latent_.data() + list[static_cast<size_t>(i)].first * dl;
+                const float* src = ye.data() + i * dl;
+                for (long j = 0; j < dl; ++j) dst[j] += w * src[j];
+            }
+        }
+        tmp_.resize(static_cast<size_t>(T * d));
+        product(L.latent_up, routed_latent_.data(), T, dl, tmp_.data(), d);
+
+        // The shared expert reads every token.
+        gate_.resize(static_cast<size_t>(T * ds));
+        up_.resize(static_cast<size_t>(T * d));
+        product(L.shared_up, x_.data(), T, d, gate_.data(), ds);
+        squared_relu(gate_.data(), T * ds);
+        product(L.shared_down, gate_.data(), T, ds, up_.data(), d);
+        qk_add(tmp_.data(), up_.data(), T * d);
+    }
+
+    void cpu_runtime::run_hybrid(const forward_batch& batch, std::vector<float>& logits)
+    {
+        const long T = static_cast<long>(batch.tokens.size());
+        if (T == 0) { logits.clear(); return; }
+        if (!batch.positions.empty() || !batch.embedding_rows.empty())
+            throw std::runtime_error("cpu_runtime: a hybrid decoder reads tokens of text only");
+        const long d = cfg_.d_model;
+        const long B = kv_.block_positions();
+        if (scratch_.empty()) scratch_.resize(1);
+
+        // Positions of the tokens, which continue their sequences and the states of their layers.
+        positions_.assign(static_cast<size_t>(T), 0);
+        for (const auto& s : batch.segments)
+        {
+            kv_sequence& seq = *sequences_.at(static_cast<size_t>(s.sequence));
+            if (static_cast<long>(seq.blocks.size()) * B < seq.length + s.count)
+                throw std::runtime_error("cpu_runtime: sequence storage was not reserved");
+            if (s.count > 0 && pool_of(s.sequence).shared(seq.blocks[static_cast<size_t>(seq.length / B)]))
+                throw std::runtime_error("cpu_runtime: a sequence would write in a block other sequences hold");
+            if (recurrent_.at(static_cast<size_t>(s.sequence)).live.length != seq.length)
+                throw std::logic_error("cpu_runtime: the states of a sequence stand at another length than its keys");
+            for (long j = 0; j < s.count; ++j) positions_[static_cast<size_t>(s.start + j)] = seq.length + j;
+        }
+
+        // The embeddings enter the sphere the blocks keep them on.
+        embed(batch.tokens);
+        for (long t = 0; t < T; ++t)
+        {
+            float* x = x_.data() + t * d;
+            double ss = 0.0;
+            for (long i = 0; i < d; ++i) ss += static_cast<double>(x[i]) * x[i];
+            qk_scale(x, static_cast<float>(1.0 / std::max(std::sqrt(ss), 1e-12)), d);
+        }
+
+        for (long li = 0; li < cfg_.n_layers; ++li)
+        {
+            const layer& L = layers_[static_cast<size_t>(li)];
+            if (cfg_.layer_types[static_cast<size_t>(li)] == 'M') mamba3_mixer(li, batch);
+            else differential_attention(li, batch);
+            geodesic_update(tmp_.data(), L.mixer_scale, L.mixer_bias, li, T);
+            latent_experts(L, T);
+            geodesic_update(tmp_.data(), L.ffn_scale, L.ffn_bias, li, T);
+        }
+
+        for (const auto& s : batch.segments)
+        {
+            sequences_[static_cast<size_t>(s.sequence)]->length += s.count;
+            recurrent_sequence& r = recurrent_[static_cast<size_t>(s.sequence)];
+            const long start = r.live.length;
+            r.live.length += s.count;
+            if (s.count < 2 && !s.prompt)
+            {
+                // A generated token: the next prompt saves states of its own.
+                r.reading = -1;
+                r.own = false;
+                continue;
+            }
+            // A pass of the prompt the pass before was reading, or the first one of another prompt.
+            if (r.reading != start) r.own = false;
+            r.reading = r.live.length;
+            // A lone token saves no state: the one of the chunk before it stays that of its prompt.
+            if (s.count < 2) continue;
+            // The end of a chunk of a prompt: its state replaces the one of the chunk before it.
+            if (r.own && !r.saved.empty()) r.saved.pop_back();
+            else if (r.saved.size() >= saved_states) r.saved.erase(r.saved.begin());
+            r.saved.push_back(r.live);
+            r.own = true;
+        }
+
+        // The logits of the requested rows read the hidden states as they stand.
+        const long R = static_cast<long>(batch.logit_rows.size());
+        hidden_out_.resize(static_cast<size_t>(R * d));
+        for (long r = 0; r < R; ++r)
+        {
+            const float* x = x_.data() + batch.logit_rows[static_cast<size_t>(r)] * d;
+            std::copy(x, x + d, hidden_out_.begin() + r * d);
+        }
+        if (batch.hidden_only)
+        {
+            logits.clear();
+            return;
+        }
+        logits.resize(static_cast<size_t>(R * cfg_.vocab));
+        if (R > 0) product(output_, hidden_out_.data(), R, d, logits.data(), cfg_.vocab);
     }
 
 }

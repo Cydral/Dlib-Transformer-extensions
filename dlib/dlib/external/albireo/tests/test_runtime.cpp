@@ -10,17 +10,31 @@
     runtime, then checks that the runtime gives the same results however the work is
     cut: the whole sequence in one pass, a prompt followed by one token at a time, two
     sequences sharing a batch, and a sequence truncated and extended again; the keys and
-    values in 8 bits then agree with those in half precision.
+    values in 8 bits then agree with those in half precision.  A sequence goes back to the
+    lengths its runtime restores (model_runtime::restorable_length()): any length for the
+    decoders that keep keys and values only, the lengths of its saved states for a hybrid
+    decoder, whose tokens after them are then read again.
 
     With "exact", the products run on floats (qk_set_exact_products) and the comparison
     with the reference is tight; otherwise the activations are quantized as in normal
     operation and the comparison bears on the distributions.
 
-        test_runtime synthetic [folder]
+        test_runtime synthetic [folder [hybrid.golden]]
 
     checks the attention on the tiny model of tiny_gguf.h, written in folder: the split of
     the positions among the threads of a single step against the attention of one task per
-    key/value head, with keys and values in half precision and in 8 bits.
+    key/value head, with keys and values in half precision and in 8 bits.  It then checks
+    the tiny hybrid decoder of tiny_gguf.h (Mamba-3 layers, differential attentions, experts
+    in a latent space, geodesic updates): the logits of hybrid_tokens tokens against those of
+    tests/reference_forward.py, which hybrid.golden holds, when the file is given; then the
+    same results however the work is cut, with two threads and with twelve, and with keys
+    and values in 8 bits.
+
+        test_runtime hybrid-model file.gguf
+
+    writes the tiny hybrid decoder, to compute hybrid.golden again:
+
+        python3 reference_forward.py file.gguf hybrid.golden 1 2 3 ... 24
 */
 
 #include <algorithm>
@@ -201,6 +215,292 @@ namespace
             expect(q.mean_kl < 1e-3, "8-bit keys and values against half precision");
         }
         std::remove(path.c_str());
+        return 0;
+    }
+}
+
+namespace
+{
+    /*
+        The checks of a sequence however the work is cut, against the logits of the whole sequence
+        in one pass: a prompt then single steps (2), two sequences in one batch (3), a sequence
+        truncated and extended (4), sequences that share a prefix (5).
+    */
+    void consistency(cpu_runtime& rt, const model_config& cfg, const std::vector<int>& tokens,
+        const std::vector<float>& whole, bool exact)
+    {
+        const long T = static_cast<long>(tokens.size());
+        const long V = cfg.vocab;
+
+        // 2. A prompt, then one token at a time.
+        {
+            const long k = std::max<long>(1, T / 3);
+            const int seq = rt.create_sequence();
+            std::vector<float> got(static_cast<size_t>(T * V));
+            std::vector<float> logits;
+            forward_batch b;
+            expect(rt.reserve_sequence(seq, k), "reserve prompt");
+            b.tokens.assign(tokens.begin(), tokens.begin() + k);
+            b.segments.push_back({ seq, 0, k });
+            for (long i = 0; i < k; ++i) b.logit_rows.push_back(i);
+            rt.forward(b, logits);
+            std::copy(logits.begin(), logits.end(), got.begin());
+            for (long i = k; i < T; ++i)
+            {
+                expect(rt.reserve_sequence(seq, i + 1), "reserve step");
+                b.clear();
+                b.tokens.push_back(tokens[static_cast<size_t>(i)]);
+                b.segments.push_back({ seq, 0, 1 });
+                b.logit_rows.push_back(0);
+                rt.forward(b, logits);
+                std::copy(logits.begin(), logits.end(), got.begin() + i * V);
+            }
+            // The prompt goes through the float products and the single steps through the
+            // integer kernels, so the two passes agree as distributions, not bit for bit.
+            const stats d = compare(whole.data(), got.data(), T, V);
+            report("prompt then single steps", d);
+            if (exact)
+                expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale), "single steps against one pass");
+            else
+                expect(d.mean_kl < 0.05 && d.top1 >= 0.85, "single steps against one pass");
+
+            // 4. Truncation: drop the last third, or what follows the last state before it, and compute it again.
+            const long m = rt.restorable_length(seq, std::max<long>(1, 2 * T / 3));
+            expect(cfg.hybrid() ? m == k : m == std::max<long>(1, 2 * T / 3), "length a sequence goes back to");
+            rt.truncate_sequence(seq, m);
+            expect(rt.sequence_length(seq) == m, "length after truncation");
+            // The blocks beyond the kept positions went back to the pool.
+            expect(rt.reserve_sequence(seq, T), "reserve after truncation");
+            b.clear();
+            b.tokens.assign(tokens.begin() + m, tokens.end());
+            b.segments.push_back({ seq, 0, T - m });
+            for (long i = 0; i < T - m; ++i) b.logit_rows.push_back(i);
+            rt.forward(b, logits);
+            const stats r = compare(whole.data() + m * V, logits.data(), T - m, V);
+            report("truncated and extended", r);
+            if (exact)
+                expect(r.max_abs <= 1e-3 * std::max(1.0, r.scale), "truncated sequence");
+            else
+                expect(r.mean_kl < 0.05 && r.top1 >= 0.85, "truncated sequence");
+            rt.release_sequence(seq);
+        }
+
+        // 3. Two sequences in one batch: the whole sequence, and its second half as a
+        //    sequence of its own that starts at position 0.
+        {
+            const long h = T / 2;
+            std::vector<int> second(tokens.begin() + h, tokens.end());
+            const std::vector<float> alone = run_whole(rt, second);
+
+            const int a = rt.create_sequence();
+            const int c = rt.create_sequence();
+            expect(rt.reserve_sequence(a, T) && rt.reserve_sequence(c, T - h), "reserve batch");
+            forward_batch b;
+            b.tokens = second;
+            b.tokens.insert(b.tokens.end(), tokens.begin(), tokens.end());
+            b.segments.push_back({ c, 0, T - h });
+            b.segments.push_back({ a, T - h, T });
+            for (long i = 0; i < static_cast<long>(b.tokens.size()); ++i) b.logit_rows.push_back(i);
+            std::vector<float> logits;
+            rt.forward(b, logits);
+            const stats d1 = compare(alone.data(), logits.data(), T - h, V);
+            const stats d2 = compare(whole.data(), logits.data() + (T - h) * V, T, V);
+            report("batched, short sequence", d1);
+            report("batched, long sequence", d2);
+            expect(d1.max_abs <= 1e-3 * std::max(1.0, d1.scale), "batched short sequence");
+            expect(d2.max_abs <= 1e-3 * std::max(1.0, d2.scale), "batched long sequence");
+            rt.release_sequence(a);
+            rt.release_sequence(c);
+            expect(rt.kv_bytes_used() == 0, "every block returned");
+        }
+
+        // 5. A sequence that starts with the positions of another: the full blocks are shared,
+        //    the last one copied, and a sequence that writes in a shared block copies it first.
+        {
+            const long B = 16;
+            const long h = std::min(T - 1, B + 1 + T / 4);
+            // Passes of fewer tokens go through the integer kernels: they agree with the whole
+            // pass as distributions.
+            auto agree = [&](const stats& d, long batch_tokens) {
+                if (exact || batch_tokens >= qk_float_product_tokens) return d.max_abs <= 1e-3 * std::max(1.0, d.scale);
+                return d.mean_kl < 0.05 && d.top1 >= 0.85;
+            };
+            std::vector<float> logits;
+            const int a = rt.create_sequence();
+            expect(rt.reserve_sequence(a, h), "reserve before sharing");
+            forward_batch b;
+            b.tokens.assign(tokens.begin(), tokens.begin() + h);
+            b.segments.push_back({ a, 0, h });
+            rt.forward(b, logits);
+            const size_t before = rt.kv_bytes_used();
+            const int c = rt.create_sequence();
+            expect(rt.copy_sequence(a, c, h), "share a prefix");
+            expect(rt.sequence_length(c) == h, "length of the shared prefix");
+            const size_t copied = static_cast<size_t>(h % B != 0 ? B : 0) * rt.kv_bytes_per_token();
+            expect(rt.kv_bytes_used() - before == copied, "full blocks held once");
+
+            // Both sequences go on from the shared prefix, in one batch.
+            expect(rt.reserve_sequence(a, T) && rt.reserve_sequence(c, T), "reserve after sharing");
+            b.clear();
+            b.tokens.assign(tokens.begin() + h, tokens.end());
+            b.tokens.insert(b.tokens.end(), tokens.begin() + h, tokens.end());
+            b.segments.push_back({ a, 0, T - h });
+            b.segments.push_back({ c, T - h, T - h });
+            for (long i = 0; i < 2 * (T - h); ++i) b.logit_rows.push_back(i);
+            rt.forward(b, logits);
+            const stats d1 = compare(whole.data() + h * V, logits.data(), T - h, V);
+            const stats d2 = compare(whole.data() + h * V, logits.data() + (T - h) * V, T - h, V);
+            report("shared prefix, first sequence", d1);
+            report("shared prefix, second sequence", d2);
+            expect(agree(d1, 2 * (T - h)), "first sequence after sharing");
+            expect(agree(d2, 2 * (T - h)), "second sequence after sharing");
+
+            // The first sequence rewrites a shared block with other tokens; the second one keeps
+            // its positions.
+            const long cut = rt.restorable_length(a, B / 2);
+            rt.truncate_sequence(a, cut);
+            expect(rt.reserve_sequence(a, T), "reserve a shared block for writing");
+            b.clear();
+            b.tokens.assign(static_cast<size_t>(T - cut), tokens[0]);
+            b.segments.push_back({ a, 0, T - cut });
+            rt.forward(b, logits);
+            // The second sequence reads its last token again, after the tokens that follow the state it goes back to.
+            const long back = rt.restorable_length(c, T - 1);
+            expect(cfg.hybrid() ? back == h : back == T - 1, "length the second sequence goes back to");
+            rt.truncate_sequence(c, back);
+            expect(rt.reserve_sequence(c, T), "reserve the last position again");
+            b.clear();
+            b.tokens.assign(tokens.begin() + back, tokens.end());
+            b.segments.push_back({ c, 0, T - back });
+            b.logit_rows.push_back(T - back - 1);
+            rt.forward(b, logits);
+            const stats d3 = compare(whole.data() + (T - 1) * V, logits.data(), 1, V);
+            report("shared prefix after a write of the other sequence", d3);
+            expect(agree(d3, T - back), "positions of a shared block kept");
+            rt.release_sequence(a);
+            rt.release_sequence(c);
+            expect(rt.kv_bytes_used() == 0, "every shared block returned");
+        }
+    }
+}
+
+namespace
+{
+    // The tokens of the checks of the tiny hybrid decoder: the identifiers 1 to hybrid_tokens.
+    const long hybrid_tokens = 24;
+
+    int synthetic_hybrid(const std::string& folder, const std::string& golden)
+    {
+        const std::string path = folder + "test_runtime_hybrid.gguf";
+        const albireo_test::tiny_gguf model = albireo_test::tiny_gguf_writer().build_hybrid();
+        if (!model.save(path, model.bytes))
+        {
+            std::printf("cannot write %s\n", path.c_str());
+            return 2;
+        }
+        {
+            auto file = std::make_shared<model_file>(path);
+            const model_config cfg = read_model_config(*file);
+            std::printf("%s\n", describe(cfg).c_str());
+            const long T = hybrid_tokens, V = cfg.vocab;
+            std::vector<int> tokens(static_cast<size_t>(T));
+            for (long i = 0; i < T; ++i) tokens[static_cast<size_t>(i)] = static_cast<int>(i + 1);
+
+            // The products on floats, so that the comparisons bear on the layers themselves.
+            qk_set_exact_products(true);
+            thread_pool narrow(2), wide(12);
+            cpu_runtime rt(file, cfg, narrow, size_t(64) << 20, 16);
+            expect(rt.kv_bytes_per_token() == 2 * 2 * 2 * 64, "bytes of the keys and values of a token");
+            const std::vector<float> whole = run_whole(rt, tokens);
+            if (!golden.empty())
+            {
+                std::vector<float> ref(static_cast<size_t>(T * V));
+                std::ifstream in(golden.c_str(), std::ios::binary);
+                in.read(reinterpret_cast<char*>(ref.data()), static_cast<std::streamsize>(ref.size() * sizeof(float)));
+                if (!in)
+                {
+                    std::printf("cannot read %ld x %ld logits from %s\n", T, V, golden.c_str());
+                    return 2;
+                }
+                const stats s = compare(ref.data(), whole.data(), T, V);
+                report("hybrid decoder, reference", s);
+                expect(s.max_abs <= 1e-3 * std::max(1.0, s.scale) && s.mean_kl < 1e-6,
+                    "hybrid decoder against its reference");
+            }
+            consistency(rt, cfg, tokens, whole, true);
+
+            /*
+                The states a sequence saves along its prompts: the state of a chunk replaces the one of
+                the chunk before it, a lone token of the prompt between two chunks included, and the
+                prompt that follows generated tokens saves a state of its own.
+            */
+            {
+                const int seq = rt.create_sequence();
+                auto pass = [&](long from, long count, bool prompt) {
+                    forward_batch b;
+                    b.tokens.assign(tokens.begin() + from, tokens.begin() + from + count);
+                    b.segments.push_back({ seq, 0, count, prompt });
+                    std::vector<float> logits;
+                    expect(rt.reserve_sequence(seq, from + count), "reserve a pass");
+                    rt.forward(b, logits);
+                };
+                pass(0, 6, true);
+                pass(6, 4, true);
+                expect(rt.restorable_length(seq, 9) == 0 && rt.restorable_length(seq, 10) == 10,
+                    "the state of a chunk replaces the one of the chunk before");
+                pass(10, 1, true);
+                pass(11, 5, true);
+                expect(rt.restorable_length(seq, 15) == 0 && rt.restorable_length(seq, 16) == 16,
+                    "a lone token of a prompt goes on with its prompt");
+                pass(16, 1, false);
+                pass(17, 4, true);
+                expect(rt.restorable_length(seq, 20) == 16 && rt.restorable_length(seq, 21) == 21,
+                    "the prompt after a generated token saves a state of its own");
+                pass(21, 1, false);
+                pass(22, 2, true);
+                expect(rt.restorable_length(seq, 20) == 0 && rt.restorable_length(seq, 23) == 21
+                    && rt.restorable_length(seq, 24) == 24, "a sequence keeps the states of its last two prompts");
+                // A copy goes back to the length it shares.
+                const int twin = rt.create_sequence();
+                expect(rt.copy_sequence(seq, twin, 21) && rt.restorable_length(twin, 23) == 21,
+                    "copy at a saved length");
+                rt.release_sequence(twin);
+                rt.release_sequence(seq);
+                expect(rt.kv_bytes_used() == 0, "every block of the saved states returned");
+            }
+
+            // The heads of the Mamba-3 layers and the tiles of the attention on twelve threads.
+            cpu_runtime many(file, cfg, wide, size_t(64) << 20, 16);
+            const stats w = compare(whole.data(), run_whole(many, tokens).data(), T, V);
+            report("hybrid decoder, twelve threads", w);
+            expect(w.max_abs <= 1e-4 * std::max(1.0, w.scale), "twelve threads against two");
+
+            cpu_runtime rt8(file, cfg, narrow, size_t(64) << 20, 16, kv_format::q8);
+            const stats q = compare(whole.data(), run_whole(rt8, tokens).data(), T, V);
+            report("hybrid decoder, 8-bit keys", q);
+            expect(q.mean_kl < 1e-3, "8-bit keys and values of the hybrid decoder");
+            qk_set_exact_products(false);
+        }
+        std::remove(path.c_str());
+        return 0;
+    }
+}
+
+int main(int argc, char** argv)
+{
+    if (argc >= 3 && std::string(argv[1]) == "hybrid-model")
+    {
+        const albireo_test::tiny_gguf model = albireo_test::tiny_gguf_writer().build_hybrid();
+        if (model.save(argv[2], model.bytes)) return 0;
+        std::printf("cannot write %s\n", argv[2]);
+        return 2;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "synthetic")
+    {
+        const std::string folder = argc > 2 ? std::string(argv[2]) + "/" : std::string();
+        int status = synthetic(folder);
+        if (status == 0) status = synthetic_hybrid(folder, argc > 3 ? argv[3] : "");
+        if (status != 0) return status;
         if (failures)
         {
             std::printf("%d checks FAILED\n", failures);
@@ -209,12 +509,6 @@ namespace
         std::printf("all checks passed\n");
         return 0;
     }
-}
-
-int main(int argc, char** argv)
-{
-    if (argc >= 2 && std::string(argv[1]) == "synthetic")
-        return synthetic(argc > 2 ? std::string(argv[2]) + "/" : std::string());
     if (argc < 4)
     {
         std::printf("usage: test_runtime model.gguf reference.bin [exact] id...\n");
@@ -280,156 +574,15 @@ int main(int argc, char** argv)
         expect(s.top1 >= 0.85, "argmax against the reference");
     }
 
-    // 2. A prompt, then one token at a time.
-    {
-        const long k = std::max<long>(1, T / 3);
-        const int seq = rt.create_sequence();
-        std::vector<float> got(static_cast<size_t>(T * V));
-        std::vector<float> logits;
-        forward_batch b;
-        expect(rt.reserve_sequence(seq, k), "reserve prompt");
-        b.tokens.assign(tokens.begin(), tokens.begin() + k);
-        b.segments.push_back({ seq, 0, k });
-        for (long i = 0; i < k; ++i) b.logit_rows.push_back(i);
-        rt.forward(b, logits);
-        std::copy(logits.begin(), logits.end(), got.begin());
-        for (long i = k; i < T; ++i)
-        {
-            expect(rt.reserve_sequence(seq, i + 1), "reserve step");
-            b.clear();
-            b.tokens.push_back(tokens[static_cast<size_t>(i)]);
-            b.segments.push_back({ seq, 0, 1 });
-            b.logit_rows.push_back(0);
-            rt.forward(b, logits);
-            std::copy(logits.begin(), logits.end(), got.begin() + i * V);
-        }
-        // The prompt goes through the float products and the single steps through the
-        // integer kernels, so the two passes agree as distributions, not bit for bit.
-        const stats d = compare(whole.data(), got.data(), T, V);
-        report("prompt then single steps", d);
-        if (exact)
-            expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale), "single steps against one pass");
-        else
-            expect(d.mean_kl < 0.05 && d.top1 >= 0.85, "single steps against one pass");
-
-        // 4. Truncation: drop the last third and compute it again.
-        const long m = std::max<long>(1, 2 * T / 3);
-        rt.truncate_sequence(seq, m);
-        expect(rt.sequence_length(seq) == m, "length after truncation");
-        // The blocks beyond the kept positions went back to the pool.
-        expect(rt.reserve_sequence(seq, T), "reserve after truncation");
-        b.clear();
-        b.tokens.assign(tokens.begin() + m, tokens.end());
-        b.segments.push_back({ seq, 0, T - m });
-        for (long i = 0; i < T - m; ++i) b.logit_rows.push_back(i);
-        rt.forward(b, logits);
-        const stats r = compare(whole.data() + m * V, logits.data(), T - m, V);
-        report("truncated and extended", r);
-        if (exact)
-            expect(r.max_abs <= 1e-3 * std::max(1.0, r.scale), "truncated sequence");
-        else
-            expect(r.mean_kl < 0.05 && r.top1 >= 0.85, "truncated sequence");
-        rt.release_sequence(seq);
-    }
-
-    // 3. Two sequences in one batch: the whole sequence, and its second half as a
-    //    sequence of its own that starts at position 0.
-    {
-        const long h = T / 2;
-        std::vector<int> second(tokens.begin() + h, tokens.end());
-        const std::vector<float> alone = run_whole(rt, second);
-
-        const int a = rt.create_sequence();
-        const int c = rt.create_sequence();
-        expect(rt.reserve_sequence(a, T) && rt.reserve_sequence(c, T - h), "reserve batch");
-        forward_batch b;
-        b.tokens = second;
-        b.tokens.insert(b.tokens.end(), tokens.begin(), tokens.end());
-        b.segments.push_back({ c, 0, T - h });
-        b.segments.push_back({ a, T - h, T });
-        for (long i = 0; i < static_cast<long>(b.tokens.size()); ++i) b.logit_rows.push_back(i);
-        std::vector<float> logits;
-        rt.forward(b, logits);
-        const stats d1 = compare(alone.data(), logits.data(), T - h, V);
-        const stats d2 = compare(whole.data(), logits.data() + (T - h) * V, T, V);
-        report("batched, short sequence", d1);
-        report("batched, long sequence", d2);
-        expect(d1.max_abs <= 1e-3 * std::max(1.0, d1.scale), "batched short sequence");
-        expect(d2.max_abs <= 1e-3 * std::max(1.0, d2.scale), "batched long sequence");
-        rt.release_sequence(a);
-        rt.release_sequence(c);
-        expect(rt.kv_bytes_used() == 0, "every block returned");
-    }
-
-    // 5. A sequence that starts with the positions of another: the full blocks are shared,
-    //    the last one copied, and a sequence that writes in a shared block copies it first.
-    {
-        const long B = 16;
-        const long h = std::min(T - 1, B + 1 + T / 4);
-        // Passes of fewer tokens go through the integer kernels: they agree with the whole
-        // pass as distributions.
-        auto agree = [&](const stats& d, long batch_tokens) {
-            if (exact || batch_tokens >= qk_float_product_tokens) return d.max_abs <= 1e-3 * std::max(1.0, d.scale);
-            return d.mean_kl < 0.05 && d.top1 >= 0.85;
-        };
-        std::vector<float> logits;
-        const int a = rt.create_sequence();
-        expect(rt.reserve_sequence(a, h), "reserve before sharing");
-        forward_batch b;
-        b.tokens.assign(tokens.begin(), tokens.begin() + h);
-        b.segments.push_back({ a, 0, h });
-        rt.forward(b, logits);
-        const size_t before = rt.kv_bytes_used();
-        const int c = rt.create_sequence();
-        expect(rt.copy_sequence(a, c, h), "share a prefix");
-        expect(rt.sequence_length(c) == h, "length of the shared prefix");
-        const size_t copied = static_cast<size_t>(h % B != 0 ? B : 0) * rt.kv_bytes_per_token();
-        expect(rt.kv_bytes_used() - before == copied, "full blocks held once");
-
-        // Both sequences go on from the shared prefix, in one batch.
-        expect(rt.reserve_sequence(a, T) && rt.reserve_sequence(c, T), "reserve after sharing");
-        b.clear();
-        b.tokens.assign(tokens.begin() + h, tokens.end());
-        b.tokens.insert(b.tokens.end(), tokens.begin() + h, tokens.end());
-        b.segments.push_back({ a, 0, T - h });
-        b.segments.push_back({ c, T - h, T - h });
-        for (long i = 0; i < 2 * (T - h); ++i) b.logit_rows.push_back(i);
-        rt.forward(b, logits);
-        const stats d1 = compare(whole.data() + h * V, logits.data(), T - h, V);
-        const stats d2 = compare(whole.data() + h * V, logits.data() + (T - h) * V, T - h, V);
-        report("shared prefix, first sequence", d1);
-        report("shared prefix, second sequence", d2);
-        expect(agree(d1, 2 * (T - h)), "first sequence after sharing");
-        expect(agree(d2, 2 * (T - h)), "second sequence after sharing");
-
-        // The first sequence rewrites a shared block with other tokens; the second one keeps
-        // its positions.
-        const long cut = B / 2;
-        rt.truncate_sequence(a, cut);
-        expect(rt.reserve_sequence(a, T), "reserve a shared block for writing");
-        b.clear();
-        b.tokens.assign(static_cast<size_t>(T - cut), tokens[0]);
-        b.segments.push_back({ a, 0, T - cut });
-        rt.forward(b, logits);
-        rt.truncate_sequence(c, T - 1);
-        expect(rt.reserve_sequence(c, T), "reserve the last position again");
-        b.clear();
-        b.tokens.push_back(tokens[static_cast<size_t>(T - 1)]);
-        b.segments.push_back({ c, 0, 1 });
-        b.logit_rows.push_back(0);
-        rt.forward(b, logits);
-        const stats d3 = compare(whole.data() + (T - 1) * V, logits.data(), 1, V);
-        report("shared prefix after a write of the other sequence", d3);
-        expect(agree(d3, 1), "positions of a shared block kept");
-        rt.release_sequence(a);
-        rt.release_sequence(c);
-        expect(rt.kv_bytes_used() == 0, "every shared block returned");
-    }
+    consistency(rt, cfg, tokens, whole, exact);
 
     /*
         6. The keys and values in 8 bits against those in half precision, over the whole
            sequence: their differences stay below those of the integer products of the single
-           steps (2), a few thousandths of KL on the models of the catalog.
+           steps (2), a few thousandths of KL on the models of the catalog.  The attentions of a
+           hybrid decoder subtract the output of a head from those of the others, and their
+           rounding weighs more on the result (0.007 on Olala 1.0 mini 7A1B in Q5_K_M): its bound
+           is wider, and the engine keeps its keys and values in half precision by default.
     */
     if (cfg.head_dim % kv_q8_group == 0)
     {
@@ -437,7 +590,7 @@ int main(int argc, char** argv)
         const std::vector<float> q8 = run_whole(rt8, tokens);
         const stats d = compare(whole.data(), q8.data(), T, V);
         report("8-bit keys and values", d);
-        expect(d.mean_kl < 0.005, "8-bit keys and values as a distribution");
+        expect(d.mean_kl < (cfg.hybrid() ? 0.02 : 0.005), "8-bit keys and values as a distribution");
         expect(d.top1 >= 0.9, "8-bit keys and values, argmax");
         expect(rt8.kv_bytes_used() == 0, "every 8-bit block returned");
     }

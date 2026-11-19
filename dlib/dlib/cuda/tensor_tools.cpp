@@ -1981,6 +1981,41 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void geodesic_update(
+        tensor& x,
+        const tensor& g,
+        float scale,
+        float bias,
+        long depth)
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::geodesic_update(x, g, scale, bias, depth);
+#else
+        cpu::geodesic_update(x, g, scale, bias, depth);
+#endif
+    }
+
+    void mamba3_step(
+        tensor& out,
+        tensor& state,
+        const tensor& in,
+        const tensor& dyn,
+        const tensor& norms,
+        const tensor& bias,
+        const tensor& misc,
+        const tensor& mxz,
+        const tensor& mo,
+        float eps)
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::mamba3_step(out, state, in, dyn, norms, bias, misc, mxz, mo, eps);
+#else
+        cpu::mamba3_step(out, state, in, dyn, norms, bias, misc, mxz, mo, eps);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void gguf_matvec (
         tensor& dest,
         const tensor& src,

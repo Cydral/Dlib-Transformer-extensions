@@ -75,6 +75,36 @@ namespace dlib
                 self-attention geometry without any shifting machinery, exactly
                 like the template path.
 
+            HYBRID DECODERS
+                When spec().hybrid() is true (the olala family), the layers are
+                not all attentions: spec().layer_types names a Mamba-3 layer
+                ('M') or a differential attention ('V') for each of them. Such a
+                model takes a path of its own:
+                  - no hidden state is normalized: each block turns the hidden
+                    state on its sphere towards the output of its mixer, then
+                    towards the output of its feed-forward
+                    (tt::geodesic_update), and the logits read the last hidden
+                    state as it stands;
+                  - a Mamba-3 layer keeps the states of its channels between
+                    tokens (tt::mamba3_step);
+                  - an attention layer builds keys and values as means of
+                    tensor products, leans each on the one of the previous
+                    token, normalizes queries and keys per head, scales the
+                    queries with the logarithm of the positions they see, caps
+                    the scores, and subtracts from the heads of each group the
+                    head that reads the noise, before a gate;
+                  - the feed-forward is a mixture of experts in a latent space
+                    beside a shared expert, routed by sigmoids, with the square
+                    of a rectified linear unit as activation.
+                The tokens are read one after the other: forward_prefill()
+                calls the incremental path for each token of the prompt.  The
+                layers cannot give up the tokens they read, so the context does
+                not slide: step() throws std::runtime_error once the capacity is
+                reached, and set_context() refuses a capacity beyond the window
+                of the attention.  Without set_context(), forward_prefill() is a
+                pure full forward that keeps what it needs for its own tokens.
+                The model loads from its GGUF file only: save() throws for it.
+
             THREAD SAFETY
                 A single generation thread is assumed. Distinct instances are
                 independent.
@@ -221,6 +251,9 @@ namespace dlib
                   compacting the remaining rows; rotary positions follow the
                   compacted indices, so the attention geometry stays coherent.
                 - #cache_length() grows by one (net of any eviction).
+            throws
+                - std::runtime_error
+                    For a hybrid decoder whose context is full.
         !*/
 
         const model_spec& spec() const;
@@ -242,6 +275,9 @@ namespace dlib
                   previous format), "rtm_2" for mixture-of-experts models
                   (adds the global scale factors and the router and expert
                   weights).
+            throws
+                - std::runtime_error
+                    For a hybrid decoder, which the archive does not hold.
         !*/
 
         void load(std::istream& in);

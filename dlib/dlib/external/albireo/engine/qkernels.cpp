@@ -1235,6 +1235,33 @@ namespace albireo
             for (; i < n; ++i) s += h2f(h[i]) * x[i];
             return s;
         }
+
+        // Eight BF16 weights as floats: each holds the upper half of the bits of its value.
+        inline __m256 bf16_ps(const uint16_t* h)
+        {
+            return _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h))), 16));
+        }
+
+        float dot_bf16_avx2(const uint8_t* w, const float* x, long n)
+        {
+            const uint16_t* h = reinterpret_cast<const uint16_t*>(w);
+            __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+            __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+            long i = 0;
+            for (; i + 32 <= n; i += 32)
+            {
+                s0 = _mm256_fmadd_ps(bf16_ps(h + i), _mm256_loadu_ps(x + i), s0);
+                s1 = _mm256_fmadd_ps(bf16_ps(h + i + 8), _mm256_loadu_ps(x + i + 8), s1);
+                s2 = _mm256_fmadd_ps(bf16_ps(h + i + 16), _mm256_loadu_ps(x + i + 16), s2);
+                s3 = _mm256_fmadd_ps(bf16_ps(h + i + 24), _mm256_loadu_ps(x + i + 24), s3);
+            }
+            for (; i + 8 <= n; i += 8)
+                s0 = _mm256_fmadd_ps(bf16_ps(h + i), _mm256_loadu_ps(x + i), s0);
+            float s = hsum_ps(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
+            for (; i < n; ++i) s += bf2f(h[i]) * x[i];
+            return s;
+        }
     }
 #endif
 
@@ -1607,6 +1634,7 @@ namespace albireo
         case ggml_type::Q6_K: return dot_q6_K_avx2(w, static_cast<const block_q8_K*>(act), n);
         case ggml_type::F32: return dot_f32_avx2(reinterpret_cast<const float*>(w), static_cast<const float*>(act), n);
         case ggml_type::F16: return dot_f16_avx2(w, static_cast<const float*>(act), n);
+        case ggml_type::BF16: return dot_bf16_avx2(w, static_cast<const float*>(act), n);
         default: break;
         }
 #endif
@@ -1719,13 +1747,20 @@ namespace albireo
         case ggml_type::F32: std::memcpy(dst, w, static_cast<size_t>(n) * 4); return;
         case ggml_type::F16: qk_half_to_float_row(reinterpret_cast<const uint16_t*>(w), dst, n); return;
         case ggml_type::BF16:
-            for (long i = 0; i < n; ++i)
+        {
+            long i = 0;
+#if ALBIREO_QK_AVX2
+            for (; i + 8 <= n; i += 8)
+                _mm256_storeu_ps(dst + i, bf16_ps(reinterpret_cast<const uint16_t*>(w + 2 * i)));
+#endif
+            for (; i < n; ++i)
             {
                 uint16_t h;
                 std::memcpy(&h, w + 2 * i, 2);
                 dst[i] = bf2f(h);
             }
             return;
+        }
         case ggml_type::Q4_0: fn = dlib::gguf_dq_q4_0; qk = 32; bytes = 18; break;
         case ggml_type::Q4_1: fn = dlib::gguf_dq_q4_1; qk = 32; bytes = 20; break;
         case ggml_type::Q5_0: fn = dlib::gguf_dq_q5_0; qk = 32; bytes = 22; break;
@@ -2909,6 +2944,59 @@ namespace albireo
         }
 #endif
         for (; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+    }
+
+    void qk_softcap(float* x, float cap, long n)
+    {
+        const float inv = 1.0f / cap;
+        long i = 0;
+#if ALBIREO_QK_AVX2
+        // tanh(u) == 1 - 2 / (exp(2 u) + 1)
+        const __m256 twice = _mm256_set1_ps(2.0f * inv), capv = _mm256_set1_ps(cap);
+        const __m256 one = _mm256_set1_ps(1.0f), two = _mm256_set1_ps(2.0f);
+        for (; i + 8 <= n; i += 8)
+        {
+            const __m256 e = exp256_ps(_mm256_mul_ps(_mm256_loadu_ps(x + i), twice));
+            _mm256_storeu_ps(x + i, _mm256_mul_ps(capv, _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(e, one)))));
+        }
+#endif
+        for (; i < n; ++i) x[i] = cap * std::tanh(x[i] * inv);
+    }
+
+    void qk_state_step(float* s, float alpha, const float* before, const float* kb, const float* now, const float* k,
+        const float* q, long rank, long n, float* y)
+    {
+        long i = 0;
+        for (long r = 0; r < rank; ++r) y[r] = 0.0f;
+#if ALBIREO_QK_AVX2
+        __m256 vb[qk_state_rank], vn[qk_state_rank], acc[qk_state_rank];
+        for (long r = 0; r < rank; ++r)
+        {
+            vb[r] = _mm256_set1_ps(before[r]);
+            vn[r] = _mm256_set1_ps(now[r]);
+            acc[r] = _mm256_setzero_ps();
+        }
+        const __m256 va = _mm256_set1_ps(alpha);
+        for (; i + 8 <= n; i += 8)
+        {
+            __m256 v = _mm256_mul_ps(va, _mm256_loadu_ps(s + i));
+            for (long r = 0; r < rank; ++r)
+            {
+                v = _mm256_fmadd_ps(vb[r], _mm256_loadu_ps(kb + r * n + i), v);
+                v = _mm256_fmadd_ps(vn[r], _mm256_loadu_ps(k + r * n + i), v);
+            }
+            _mm256_storeu_ps(s + i, v);
+            for (long r = 0; r < rank; ++r) acc[r] = _mm256_fmadd_ps(v, _mm256_loadu_ps(q + r * n + i), acc[r]);
+        }
+        for (long r = 0; r < rank; ++r) y[r] = hsum_ps(acc[r]);
+#endif
+        for (; i < n; ++i)
+        {
+            float v = alpha * s[i];
+            for (long r = 0; r < rank; ++r) v += before[r] * kb[r * n + i] + now[r] * k[r * n + i];
+            s[i] = v;
+            for (long r = 0; r < rank; ++r) y[r] += v * q[r * n + i];
+        }
     }
 
     // Attention by tiles

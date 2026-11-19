@@ -103,6 +103,16 @@ namespace dlib
               ggml_type documentation (in particular the grid-based i-quants).
     !*/
 
+    const char* ggml_type_name(
+        ggml_type t
+    );
+    /*!
+        ensures
+            - Returns the name of the given ggml tensor type as the tools of the GGUF
+              ecosystem write it ("F32", "Q4_K", "BF16"...), or "unknown" for a value that
+              is none of the types of ggml_type.
+    !*/
+
     // ---------------------------------------------------------------------------------
 
     struct gguf_value
@@ -443,6 +453,23 @@ namespace dlib
         throws
             - std::runtime_error when the value is a string, not a finite number, or a
               number outside lo .. hi.
+    !*/
+
+    std::string gguf_quantization_name(
+        const gguf_reader& g
+    );
+    /*!
+        ensures
+            - Returns the format the file is known by:
+                - the name of the file type its header declares in general.file_type, as
+                  the tools that quantize number and name it ("Q4_K_M", "Q5_K_M", "Q6_K",
+                  "Q8_0", "BF16"...), when that value is an integer that names a type and
+                  the file holds at least one tensor in the base format of that type;
+                - else the name of the ggml type that holds most of the bytes of its
+                  tensors (ggml_type_name());
+                - an empty string for a file without tensors.
+            - A file of a mixed recipe, whose embeddings or sensitive matrices keep a
+              wider format than its base format, is thereby named after its base format.
     !*/
 
 }

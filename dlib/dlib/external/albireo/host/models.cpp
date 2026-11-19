@@ -412,21 +412,10 @@ namespace albireo
                 ? g.get_str("general.organization") : g.get_str("general.author", "");
             if (!publisher.empty()) d["publisher"] = publisher;
             uint64_t params = 0;
-            std::map<std::string, uint64_t> by_type;
-            for (const auto& t : g.tensors())
-            {
-                params += t.n_elements();
-                by_type[std::to_string(static_cast<unsigned>(t.type))] += t.nbytes;
-            }
+            for (const auto& t : g.tensors()) params += t.n_elements();
             d["parameters"] = static_cast<unsigned long long>(params);
-            static const std::map<std::string, std::string> names = { { "0", "F32" }, { "1", "F16" }, { "2", "Q4_0" },
-                { "3", "Q4_1" }, { "6", "Q5_0" }, { "7", "Q5_1" }, { "8", "Q8_0" }, { "10", "Q2_K" }, { "11", "Q3_K" },
-                { "12", "Q4_K" }, { "13", "Q5_K" }, { "14", "Q6_K" }, { "20", "IQ4_NL" }, { "30", "BF16" } };
-            uint64_t most = 0;
-            std::string q;
-            for (const auto& kv : by_type)
-                if (kv.second > most) { most = kv.second; q = kv.first; }
-            d["quantization"] = names.count(q) ? names.at(q) : q;
+            // The file type the header declares, else the format of most of the bytes.
+            d["quantization"] = dlib::gguf_quantization_name(g);
             // The widths of the vision tokens, bounded so that a damaged header gives no width.
             auto width_of = [](int64_t width, int64_t layers) -> long long {
                 if (width <= 0 || width > (int64_t(1) << 20) || layers < 0 || layers > 256) return 0;
@@ -456,7 +445,15 @@ namespace albireo
                 d["image_size"] = static_cast<long long>(g.get_int("clip.vision.image_size", 0));
                 return d;
             }
-            d["context"] = static_cast<long long>(g.get_int(arch + ".context_length", 0));
+            /*
+                The context the engine serves: the one the header declares, within the window of
+                the attentions of a hybrid decoder (the header then names the mixer of each layer),
+                beyond which the model was not trained to read.
+            */
+            long long context = g.get_int(arch + ".context_length", 0);
+            const long long window = g.get_int(arch + ".attention.sliding_window", 0);
+            if (!g.get_str(arch + ".layer_types", "").empty() && window > 0 && window < context) context = window;
+            d["context"] = context;
             d["experts"] = static_cast<long long>(g.get_int(arch + ".expert_count", 0));
             /*
                 A decoder that reads images: Qwen3-VL, a LLaVA decoder, whose vocabulary holds
@@ -491,8 +488,9 @@ namespace albireo
                       ChatML templates that describe tools; Phi-4-mini, Foundation-Sec and the
                       other formats call none;
                     - reasoning: the ChatML templates that open the reasoning or switch it, Granite
-                      4.2, Foundation-Sec-8B-Reasoning, the distilled DeepSeek-R1 models and the
-                      templates with [THINK];
+                      4.2, the templates that write the answers in channels with a reasoning
+                      effort (Olala), Foundation-Sec-8B-Reasoning, the distilled DeepSeek-R1 models
+                      and the templates with [THINK];
                     - reasoning always: the thinking variants of Qwen3 and Qwen3-VL, whose template
                       opens the reasoning without a switch, Foundation-Sec-8B-Reasoning, whose
                       files carry a template without <|end|> that takes the reasoning out of the
@@ -504,11 +502,12 @@ namespace albireo
             const bool granite4 = chatml && holds("<function=") && holds("<think></think>");
             const bool opens = chatml && holds("<|im_start|>assistant\\n<think>\\n'");
             const bool switchable = chatml && holds("enable_thinking");
+            const bool channels = chatml && holds("<|channel_start|>") && holds("reasoning_effort");
             const bool foundation_sec = !chatml && holds("<|assistant|>") && holds("'</think>' in content")
                 && !holds("<|end|>");
             const bool deepseek = holds("<｜User｜>") && holds("<｜Assistant｜>") && holds("</think>");
-            d["reasoning"] = !embedding && (granite4 || opens || switchable || foundation_sec || deepseek
-                || holds("[THINK]"));
+            d["reasoning"] = !embedding && (granite4 || opens || switchable || channels || foundation_sec
+                || deepseek || holds("[THINK]"));
             d["reasoning_always"] = !embedding && ((opens && !switchable) || foundation_sec || deepseek);
             d["tools"] = !embedding && (holds("[INST]") || holds("<|start_header_id|>") || holds("<|start_of_role|>")
                 || granite4 || (chatml && (holds("<tool_call>") || holds("tools"))));

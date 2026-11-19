@@ -4270,6 +4270,263 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void _cuda_geodesic_update(
+            float* x, const float* g, long rows, long nc, float scale, float bias, float depth)
+        {
+            // One row per thread: its sums run in double precision, the rows being few.
+            for (auto r : grid_stride_range(0, rows))
+            {
+                float* xr = x + r * nc;
+                const float* gr = g + r * nc;
+                double xx = 0, xg = 0;
+                for (long i = 0; i < nc; ++i)
+                {
+                    xx += (double)xr[i] * xr[i];
+                    xg += (double)xr[i] * gr[i];
+                }
+                const double along = xg / (xx > 1e-12 ? xx : 1e-12);
+                double tt = 0;
+                for (long i = 0; i < nc; ++i)
+                {
+                    const double v = gr[i] - along * xr[i];
+                    tt += v * v;
+                }
+                double norm = ::sqrt(tt);
+                if (norm < 1e-8) norm = 1e-8;
+                double radius = ::sqrt(xx);
+                if (radius < 1e-6) radius = 1e-6;
+                const double quarter = 0.78539816339744830962;
+                double theta = norm / radius;
+                if (theta > quarter) theta = quarter;
+                theta = (theta * scale + bias) / depth;
+                if (theta > quarter) theta = quarter;
+                const double c = ::cos(theta);
+                const double s = ::sin(theta) * radius / norm;
+                for (long i = 0; i < nc; ++i)
+                    xr[i] = (float)(xr[i] * c + (gr[i] - along * xr[i]) * s);
+            }
+        }
+
+        void geodesic_update(
+            tensor& x,
+            const tensor& g,
+            float scale,
+            float bias,
+            long depth
+        )
+        {
+            DLIB_CASSERT(have_same_dimensions(x, g));
+            DLIB_CASSERT(depth > 0);
+            DLIB_CASSERT(!is_same_object(x, g));
+            if (x.size() == 0) return;
+            const long rows = static_cast<long>(x.size()) / x.nc();
+            launch_kernel(_cuda_geodesic_update, max_jobs(rows),
+                x.device(), g.device(), rows, x.nc(), scale, bias, static_cast<float>(depth));
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        // The inputs and outputs of a state, and the rotated pairs of a row, that the kernels below hold.
+        const long mamba3_max_rank = 8;
+        const long mamba3_max_angles = 256;
+
+        /* The step of a Mamba-3 layer runs as four kernels, one after the other: the angles of
+           the heads, then the states of the channels with their outputs, then what the next
+           token reads of this one, the inputs of the states and the inputs of the channels.
+           Every thread computes what it needs of its head, a few sums and a few cosines. */
+
+        __device__ inline double cuda_mamba3_softplus(double x)
+        {
+            return x > 20.0 ? x : ::log1p(::exp(x));
+        }
+
+        // 1/sqrt(mean of the squares of a row + eps)
+        __device__ inline float cuda_mamba3_row_scale(const float* row, long N, float eps)
+        {
+            float ss = 0;
+            for (long n = 0; n < N; ++n) ss += row[n] * row[n];
+            return 1.0f / std::sqrt(ss / N + eps);
+        }
+
+        /* Value n of row r of the inputs (which == 0) or of the outputs (which == 1) of the
+           states of head h: the row of dyn normalized, its bias added, its pairs (i, i + N/2),
+           i < S, turned by the angles of the head. */
+        __device__ inline float cuda_mamba3_value(
+            const float* dyn, const float* norms, const float* bias, float cs, float sn,
+            float row_scale, long which, long h, long r, long n, long N, long R, long S)
+        {
+            // cs and sn: the cosine and the sine of the angle of the pair of n, when n has one.
+            const float* row = dyn + (which * R + r) * N;
+            const float* gamma = norms + which * N;
+            const float* b = bias + ((h * 2 + which) * R + r) * N;
+            const long half = N / 2;
+            if (n < S)
+            {
+                const float u = row[n] * row_scale * gamma[n] + b[n];
+                const float v = row[n + half] * row_scale * gamma[n + half] + b[n + half];
+                return u * cs - v * sn;
+            }
+            if (n >= half && n < half + S)
+            {
+                const long i = n - half;
+                const float u = row[i] * row_scale * gamma[i] + b[i];
+                const float v = row[n] * row_scale * gamma[n] + b[n];
+                return u * sn + v * cs;
+            }
+            return row[n] * row_scale * gamma[n] + b[n];
+        }
+
+        __global__ void _cuda_mamba3_angles(
+            float* state, const float* in, const float* dyn, const float* misc,
+            long H, long P, long N, long R, long S)
+        {
+            for (auto i : grid_stride_range(0, H * S))
+            {
+                const long h = i / S;
+                const long a = i % S;
+                const double pi = 3.14159265358979323846;
+                const double step = cuda_mamba3_softplus((double)in[h * (2 * P + 3) + 2 * P] + misc[h]);
+                double sum = state[i] + ::tanh((double)dyn[2 * R * N + a]) * pi * step;
+                sum -= 2 * pi * ::floor((sum + pi) / (2 * pi));
+                state[i] = (float)sum;
+            }
+        }
+
+        __global__ void _cuda_mamba3_channels(
+            float* out, float* state, const float* in, const float* dyn, const float* norms,
+            const float* bias, const float* misc, const float* mxz, const float* mo,
+            long H, long P, long N, long R, long S, float eps)
+        {
+            for (auto i : grid_stride_range(0, H * P))
+            {
+                const long h = i / P;
+                const long p = i % P;
+                const float* head = in + h * (2 * P + 3);
+                const float z = head[p];
+                const float x = head[P + p];
+                const double step = cuda_mamba3_softplus((double)head[2 * P] + misc[h]);
+                double decay = -cuda_mamba3_softplus((double)head[2 * P + 1]);
+                if (decay > -1e-4) decay = -1e-4;
+                const double trapezoid = 1.0 / (1.0 + ::exp(-(double)head[2 * P + 2]));
+                const double kept = ::exp(decay * step);
+                const float alpha = (float)kept;
+                const float beta = (float)((1.0 - trapezoid) * step * kept);
+                const float gamma = (float)(trapezoid * step);
+
+                const float* angle = state + h * S;
+                float* s = state + H * S + (h * P + p) * N;
+                const float* kb = state + H * S + H * P * N + h * R * N;
+                const float xb = state[H * S + H * P * N + H * R * N + h * P + p];
+                const float* mx = mxz + h * 2 * R * P;
+                const float* mz = mx + R * P;
+
+                float cs[mamba3_max_angles], sn[mamba3_max_angles];
+                for (long a = 0; a < S; ++a)
+                {
+                    cs[a] = ::cos(angle[a]);
+                    sn[a] = ::sin(angle[a]);
+                }
+                float in_scale[mamba3_max_rank], out_scale[mamba3_max_rank];
+                float now[mamba3_max_rank], before[mamba3_max_rank], y[mamba3_max_rank];
+                for (long r = 0; r < R; ++r)
+                {
+                    in_scale[r] = cuda_mamba3_row_scale(dyn + r * N, N, eps);
+                    out_scale[r] = cuda_mamba3_row_scale(dyn + (R + r) * N, N, eps);
+                    now[r] = gamma * x * mx[r * P + p];
+                    before[r] = beta * xb * mx[r * P + p];
+                    y[r] = 0;
+                }
+                const long half = N / 2;
+                for (long n = 0; n < N; ++n)
+                {
+                    const long a = n < S ? n : (n >= half && n < half + S ? n - half : -1);
+                    const float c = a >= 0 ? cs[a] : 1.0f;
+                    const float t = a >= 0 ? sn[a] : 0.0f;
+                    float v = alpha * s[n];
+                    for (long r = 0; r < R; ++r)
+                        v += before[r] * kb[r * N + n] + now[r] * cuda_mamba3_value(dyn, norms, bias, c, t,
+                            in_scale[r], 0, h, r, n, N, R, S);
+                    s[n] = v;
+                    for (long r = 0; r < R; ++r)
+                        y[r] += v * cuda_mamba3_value(dyn, norms, bias, c, t, out_scale[r], 1, h, r, n, N, R, S);
+                }
+                float sum = 0;
+                for (long r = 0; r < R; ++r)
+                {
+                    const float gate = z * mz[r * P + p];
+                    const float o = y[r] + misc[H + h] * x * mx[r * P + p];
+                    sum += gate / (1.0f + std::exp(-gate)) * o * mo[(h * R + r) * P + p];
+                }
+                out[i] = sum;
+            }
+        }
+
+        __global__ void _cuda_mamba3_keep_inputs(
+            float* state, const float* dyn, const float* norms, const float* bias,
+            long H, long P, long N, long R, long S, float eps)
+        {
+            for (auto i : grid_stride_range(0, H * R * N))
+            {
+                const long n = i % N;
+                const long r = (i / N) % R;
+                const long h = i / (N * R);
+                const float* angle = state + h * S;
+                const long half = N / 2;
+                const long a = n < S ? n : (n >= half && n < half + S ? n - half : -1);
+                const float c = a >= 0 ? ::cos(angle[a]) : 1.0f;
+                const float t = a >= 0 ? ::sin(angle[a]) : 0.0f;
+                const float scale = cuda_mamba3_row_scale(dyn + r * N, N, eps);
+                state[H * S + H * P * N + i] = cuda_mamba3_value(dyn, norms, bias, c, t, scale, 0, h, r, n, N, R, S);
+            }
+        }
+
+        __global__ void _cuda_mamba3_keep_channels(
+            float* state, const float* in, long H, long P, long N, long R, long S)
+        {
+            for (auto i : grid_stride_range(0, H * P))
+                state[H * S + H * P * N + H * R * N + i] = in[(i / P) * (2 * P + 3) + P + i % P];
+        }
+
+        void mamba3_step(
+            tensor& out,
+            tensor& state,
+            const tensor& in,
+            const tensor& dyn,
+            const tensor& norms,
+            const tensor& bias,
+            const tensor& misc,
+            const tensor& mxz,
+            const tensor& mo,
+            float eps
+        )
+        {
+            const long N = static_cast<long>(norms.size()) / 2;
+            const long H = static_cast<long>(misc.size()) / 2;
+            DLIB_CASSERT(N >= 2 && N % 2 == 0 && H > 0);
+            const long R = static_cast<long>(bias.size()) / (2 * N * H);
+            DLIB_CASSERT(R > 0 && R <= mamba3_max_rank);
+            const long P = static_cast<long>(mo.size()) / (H * R);
+            const long S = static_cast<long>(dyn.size()) - 2 * R * N;
+            DLIB_CASSERT(P > 0 && S >= 0 && S <= N / 2 && S <= mamba3_max_angles);
+            DLIB_CASSERT(static_cast<long>(bias.size()) == 2 * H * R * N && static_cast<long>(mo.size()) == H * R * P);
+            DLIB_CASSERT(static_cast<long>(mxz.size()) == 2 * H * R * P);
+            DLIB_CASSERT(static_cast<long>(in.size()) == H * (2 * P + 3) && static_cast<long>(out.size()) == H * P);
+            DLIB_CASSERT(static_cast<long>(state.size()) == H * S + H * P * N + H * R * N + H * P);
+
+            if (S > 0)
+                launch_kernel(_cuda_mamba3_angles, max_jobs(H * S),
+                    state.device(), in.device(), dyn.device(), misc.device(), H, P, N, R, S);
+            launch_kernel(_cuda_mamba3_channels, max_jobs(H * P),
+                out.device(), state.device(), in.device(), dyn.device(), norms.device(), bias.device(),
+                misc.device(), mxz.device(), mo.device(), H, P, N, R, S, eps);
+            launch_kernel(_cuda_mamba3_keep_inputs, max_jobs(H * R * N),
+                state.device(), dyn.device(), norms.device(), bias.device(), H, P, N, R, S, eps);
+            launch_kernel(_cuda_mamba3_keep_channels, max_jobs(H * P),
+                state.device(), in.device(), H, P, N, R, S);
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __global__ void _cuda_cross_entropy_compute_max(
             float* max_vals,
             const float* out_data,

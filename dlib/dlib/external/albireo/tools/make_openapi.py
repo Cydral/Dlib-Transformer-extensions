@@ -204,6 +204,8 @@ schemas = {
             "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max"],
                                  "description": "none disables the reasoning; low gives it the budget of a short "
                                                 "reasoning, high lifts its bound by default (reasoning_budget). "
+                                                "A model whose prompt names the effort of its reasoning (Olala) "
+                                                "receives low, medium or high, medium without one. "
                                                 "For albireo-relay, the level of effort of the external model among "
                                                 "those it takes (efforts in /albireo/v1/relay), its own without "
                                                 "one."},
@@ -236,7 +238,12 @@ schemas = {
                                         "user waits for limits the tokens of prompts a pass reads. The web "
                                         "application asks it to read ahead the beginning of a discussion after a "
                                         "summary."},
-            "chat_template_kwargs": {"type": "object", "properties": {"enable_thinking": {"type": "boolean"}}},
+            "chat_template_kwargs": {"type": "object", "properties": {
+                "enable_thinking": {"type": "boolean"},
+                "reasoning_effort": {"type": "string", "enum": ["disabled", "none", "low", "medium", "high"],
+                                     "description": "The same setting as reasoning_effort of the request, where "
+                                                    "the cards of some models give it; reasoning_effort of the "
+                                                    "request applies when both are given."}}},
             "n": {"type": "integer", "enum": [1]}}}],
         "example": {"model": "albireo-general", "messages": [{"role": "user", "content": "Hello!"}],
                     "max_tokens": 200}},

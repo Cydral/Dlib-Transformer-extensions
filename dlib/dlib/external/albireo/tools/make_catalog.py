@@ -28,7 +28,8 @@ when one could not be checked.
 A model that reads images names its projector, the image encoder published beside the
 decoder ("projector": repository, file and quantization of the mmproj GGUF file); its entry
 then carries the files, the size and the SHA-256 of the projector, which the service
-downloads with the decoder.  "inputs" gives what a model reads, text and images; "tools",
+downloads with the decoder.  "context" gives the trained context of a model whose file declares
+more positions than the model reads.  "inputs" gives what a model reads, text and images; "tools",
 "reasoning" and "reasoning_always" what the model does, verified model by model within what
 its chat format gives it in the engine: "tools" when it calls the tools of the agent and of
 the web in the form of its format, "reasoning" when it reasons on request, "reasoning_always"
@@ -537,6 +538,44 @@ MODELS = [
         },
     },
     {
+        "id": "olala-1.0-mini-7a1b",
+        "name": "Olala 1.0 mini 7A1B",
+        "publisher": "OVHai LLM",
+        "hub": ("OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF", "Olala-v1.0-mini-7A1B-q6_k.gguf"),
+        "quantization": "Q6_K",
+        # The positions a query of its attention sees, which bound the sequences the engine reads.
+        "context": 32768,
+        "roles": ["general"],
+        "inputs": ["text"],
+        "tools": True,
+        "reasoning": True,
+        "reasoning_always": False,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "Hybrid model from OVHai LLM (France) with 6.8 billion parameters, about 1 billion of which compute "
+                  "each token: Mamba-3 layers, a few attention layers and a mixture of 256 experts, for answers at the "
+                  "pace of a small model on a processor. It reasons on request and calls tools, reads text alone, and "
+                  "suits computers with 16 GB of memory.",
+            "fr": "Modèle hybride d'OVHai LLM (France) de 6,8 milliards de paramètres, dont environ 1 milliard "
+                  "calcule chaque jeton : couches Mamba-3, quelques couches d'attention et mélange de 256 experts, "
+                  "pour des réponses au rythme d'un petit modèle sur un processeur. Il raisonne sur demande et "
+                  "appelle des outils, lit le texte seul et convient aux ordinateurs dotés de 16 Go de mémoire.",
+            "de": "Hybrides Modell von OVHai LLM (Frankreich) mit 6,8 Milliarden Parametern, von denen rund 1 "
+                  "Milliarde jedes Token berechnet: Mamba-3-Schichten, einige Attention-Schichten und eine Mischung "
+                  "aus 256 Experten, für Antworten im Tempo eines kleinen Modells auf einem Prozessor. Es denkt auf "
+                  "Wunsch nach und ruft Werkzeuge auf, liest nur Text und eignet sich für Computer mit 16 GB "
+                  "Arbeitsspeicher.",
+            "it": "Modello ibrido di OVHai LLM (Francia) con 6,8 miliardi di parametri, di cui circa 1 miliardo "
+                  "calcola ogni token: strati Mamba-3, alcuni strati di attenzione e una miscela di 256 esperti, per "
+                  "risposte al ritmo di un piccolo modello su un processore. Ragiona su richiesta e chiama "
+                  "strumenti, legge solo testo ed è adatto ai computer con 16 GB di memoria.",
+            "es": "Modelo híbrido de OVHai LLM (Francia) con 6800 millones de parámetros, de los que unos 1000 "
+                  "millones calculan cada token: capas Mamba-3, algunas capas de atención y una mezcla de 256 "
+                  "expertos, para respuestas al ritmo de un modelo pequeño en un procesador. Razona a petición y "
+                  "llama herramientas, lee solo texto y conviene a los ordenadores con 16 GB de memoria.",
+        },
+    },
+    {
         "id": "qwen3-vl-30b-a3b-thinking",
         "name": "Qwen3-VL 30B A3B Thinking",
         "publisher": "Alibaba",
@@ -837,7 +876,8 @@ def from_hub(model, cache):
     out = {k: v for k, v in model.items() if k not in ("hub", "projector")}
     out["arch"] = gguf.get("architecture", "")
     out["parameters"] = gguf.get("total", 0)
-    out["context"] = gguf.get("context_length", 0)
+    # The context its entry gives, when the model reads less than its file declares.
+    out["context"] = model.get("context") or gguf.get("context_length", 0)
     out["source"] = "https://huggingface.co/" + repo
     out["size"] = size
     out["sha256"] = sha

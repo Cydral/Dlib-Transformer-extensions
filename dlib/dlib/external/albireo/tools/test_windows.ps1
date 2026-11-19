@@ -12,7 +12,7 @@
     missing are skipped.
 
     Steps: the quantized kernels; the loading of damaged model files and of a file of more than
-    2 GiB; the sequence mixers in preparation; a question to each processor engine; with the
+    2 GiB; the attention and a tiny hybrid decoder; a question to each processor engine; with the
     OpenVINO tree, test_offload on the device of -Device (CPU by default, which every machine
     has), test_ov_graph on the processor, with the graph of the graphics processor on the
     processor too, and on the graphics processor when -Device names it, and a question to each
@@ -102,29 +102,19 @@ $samplerTest = Join-Path $main "tests\test_sampler.exe"
 if (Test-Path $samplerTest) { Invoke-Check "sampler" "all checks passed" $samplerTest @() | Out-Null }
 else { Add-Result "sampler" "SKIP" "no $samplerTest (build_windows.ps1 -Tests)" 0 }
 
-# The sequence mixers in preparation (Mamba-3, tensor product and differential attention) against their
-# reference results, with the instructions of AVX2, skipped by the processors without them, and in their
-# portable form.
-$mixerResults = Join-Path $PSScriptRoot "..\tests\data\mixers.golden"
-foreach ($family in @("", "_portable")) {
-    $mixerTest = Join-Path $main "tests\test_mixers$family.exe"
-    $name = "sequence mixers" + $family.Replace("_", " ")
-    if (-not (Test-Path $mixerTest)) {
-        Add-Result $name "SKIP" "no $mixerTest (build_windows.ps1 -Tests)" 0
-        continue
-    }
-    $out = (& $mixerTest $mixerResults 2>&1 | ForEach-Object { "$_" }) -join "`n"
-    if ($out -match "skipped, the processor lacks ([^(]*)") { Add-Result $name "SKIP" "lacks $($Matches[1])" 0 }
-    else { Invoke-Check $name "all checks passed" $mixerTest @($mixerResults) | Out-Null }
-}
-
 # The attention of the steps split among the threads, against one task per key/value head, with keys and values
-# in half precision and in 8 bits, on a tiny model written in the folder of the logs.
-$runtimeTest = Join-Path $main "tests\test_runtime.exe"
-if (Test-Path $runtimeTest) {
-    Invoke-Check "attention" "all checks passed" $runtimeTest @("synthetic", $logs) | Out-Null
+# in half precision and in 8 bits, on a tiny model written in the folder of the logs; then a tiny hybrid decoder
+# (Mamba-3 layers, differential attentions, experts in a latent space) against the logits of its reference and
+# however its sequences are cut.  With the kernels of AVX2, then with the portable ones.
+$hybridResults = Join-Path $PSScriptRoot "..\tests\data\hybrid.golden"
+foreach ($family in @("", "_portable")) {
+    $runtimeTest = Join-Path $main "tests\test_runtime$family.exe"
+    $name = "attention and hybrid decoder" + $family.Replace("_", " ")
+    if (Test-Path $runtimeTest) {
+        Invoke-Check $name "all checks passed" $runtimeTest @("synthetic", $logs, $hybridResults) | Out-Null
+    }
+    else { Add-Result $name "SKIP" "no $runtimeTest (build_windows.ps1 -Tests)" 0 }
 }
-else { Add-Result "attention" "SKIP" "no $runtimeTest (build_windows.ps1 -Tests)" 0 }
 
 # The engine steps run with the PATH of a service, System32 and the Windows folder only: the
 # libraries an engine loads by name must come from the folders of Albireo, not from the PATH of

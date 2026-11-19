@@ -60,6 +60,19 @@ namespace albireo
                 DeepStack slices keep the products, as does every pass after a failure of the
                 device.
 
+                The hybrid decoders (model_config::layer_types) take a path of their own:
+                their residual stream is not normalized, each block turning it on its sphere
+                towards the output of its mixer, then towards the output of its mixture of
+                experts.  A Mamba-3 layer keeps, for each sequence, the state of its channels,
+                the angles of its rotations and what the trapezoid rule reads of the previous
+                token, in single precision; an attention layer keeps its keys and values in
+                the kv_pool, which holds the attention layers only, and the last key and value
+                before their shift.  The tokens of a sequence are read in order by each layer,
+                the heads of a Mamba-3 layer in parallel.  Such a state cannot give back the
+                tokens it read: the runtime saves it at the end of the passes that read several
+                tokens of a sequence, the chunks of a prompt, and a sequence goes back to these
+                lengths only (restorable_length()), saved_states of them at most.
+
                 A batch that gives the rotary positions of its tokens (forward_batch::
                 positions) rotates each pair of a head by the position component its
                 section names (model_config::rope_sections), and the rows it gives as
@@ -79,6 +92,7 @@ namespace albireo
         void truncate_sequence(int seq, long length) override;
         bool reserve_sequence(int seq, long length) override;
         bool copy_sequence(int src, int dst, long length) override;
+        long restorable_length(int seq, long length) const override;
 
         void forward(const forward_batch& batch, std::vector<float>& logits) override;
 
@@ -86,7 +100,7 @@ namespace albireo
         size_t kv_bytes_budget() const override { return kv_.max_blocks() * kv_.block_bytes(); }
         size_t kv_bytes_per_token() const override
         {
-            return 2 * static_cast<size_t>(cfg_.n_layers) * cfg_.n_kv_heads * kv_row_bytes(kv_.format(), cfg_.head_dim);
+            return 2 * static_cast<size_t>(kv_.layers()) * cfg_.n_kv_heads * kv_row_bytes(kv_.format(), cfg_.head_dim);
         }
         kv_format kv_type() const { return kv_.format(); }
         // The check of the memory of the system before each new block of keys and values (kv_pool::set_guard).
@@ -130,6 +144,53 @@ namespace albireo
             weight_matrix w_gate, w_up, w_down;
             weight_matrix router;
             std::vector<weight_matrix> e_gate, e_up, e_down;
+
+            /*
+                The layers of a hybrid decoder, which use wq, wo, q_norm, k_norm, router, e_up
+                and e_down above with their own tensors: the projections of a Mamba-3 layer
+                and the constants of its heads, the factors of the keys and values of an
+                attention with the projections of their shifts, of the weights of the noise
+                heads and of the gate, the projections to and from the latent space of the
+                experts, the shared expert, and the scale and bias of the two geodesic updates.
+            */
+            weight_matrix ssm_in, ssm_dyn;
+            std::vector<float> ssm_b_norm, ssm_c_norm, ssm_b_bias, ssm_c_bias, ssm_dt_bias, ssm_d;
+            std::vector<float> mimo_x, mimo_z, mimo_o;
+            weight_matrix wa_k, wb_k, wa_v, wb_v, shift_k, shift_v, noise, attn_gate;
+            std::vector<float> softmax_scaler;
+            weight_matrix latent_down, latent_up, shared_up, shared_down;
+            std::vector<float> expert_bias;
+            float mixer_scale = 1.0f, mixer_bias = 0.0f, ffn_scale = 1.0f, ffn_bias = 0.0f;
+        };
+
+        // The states of the layers of a hybrid decoder for a sequence of length tokens.
+        struct recurrent_state
+        {
+            long length = 0;
+            std::vector<float> values;
+        };
+
+        // What a sequence of a hybrid decoder keeps beside its keys and values.
+        struct recurrent_sequence
+        {
+            recurrent_state live;
+            // The states saved, by increasing length.
+            std::vector<recurrent_state> saved;
+            // The length the prompt being read reached at the end of the pass before, -1 when the
+            // next pass begins another prompt.
+            long reading = -1;
+            // Whether the last saved state is one of the chunks of that prompt, which its next
+            // chunk replaces.
+            bool own = false;
+        };
+
+        // The states a sequence of a hybrid decoder keeps saved, at most.
+        static const size_t saved_states = 2;
+
+        // The buffers of one thread of a Mamba-3 layer.
+        struct mixer_work
+        {
+            aligned_floats k, q, cos, sin, before, now, y, o, gate;
         };
 
         // The rows of queries of an attention tile, at most: the scores of a tile over one
@@ -198,6 +259,16 @@ namespace albireo
         void attention(long layer, const forward_batch& batch, const std::vector<long>& positions);
         void moe_ffn(const layer& L, long n_tokens);
         void embed(const std::vector<int>& tokens);
+        // The forward pass of a hybrid decoder, and its blocks: each writes in tmp_ the output
+        // that geodesic_update() then turns the hidden states towards.
+        void load_hybrid_layer(const model_file& f, long layer);
+        void run_hybrid(const forward_batch& batch, std::vector<float>& logits);
+        void mamba3_mixer(long layer, const forward_batch& batch);
+        void differential_attention(long layer, const forward_batch& batch);
+        void latent_experts(const layer& L, long n_tokens);
+        void geodesic_update(const float* g, float scale, float bias, long layer, long n_tokens);
+        // The state of a sequence of a hybrid decoder at one of the lengths it holds, or null.
+        const recurrent_state* state_at(int seq, long length) const;
         /*
             The forward pass, with the layers on the device through layer_pass_ when on_device is
             true; false when the device did not take the pass, which then did nothing.
@@ -249,6 +320,19 @@ namespace albireo
         kv_pool& pool_of(int seq) const { return *sequence_pools_[static_cast<size_t>(seq)]; }
 
         std::vector<layer> layers_;
+        /*
+            Hybrid decoders: the layer of the pool that holds the keys and values of each
+            attention layer (-1 for the others), the place of the state of each layer in the
+            values of a recurrent_state and their number, and the states of the sequences.
+        */
+        std::vector<long> kv_layers_;
+        std::vector<size_t> state_offsets_;
+        size_t state_floats_ = 0;
+        std::vector<recurrent_sequence> recurrent_;
+        std::vector<mixer_work> mixer_work_;
+        aligned_floats proj_, dyn_, factor_a_, factor_b_, shift_, noise_, latent_, routed_latent_;
+        std::vector<float> last_keys_;
+        std::vector<double> turns_;
         weight_matrix token_embd_, output_;
         std::vector<float> output_norm_;
 

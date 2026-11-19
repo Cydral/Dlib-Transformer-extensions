@@ -48,6 +48,93 @@ namespace albireo
         const int64_t max_context = int64_t(1) << 26;
         const int64_t max_vocab = int64_t(1) << 24;
         const int64_t max_experts = 4096;
+        const int64_t max_state = 4096;
+        const int64_t max_rank = 64;
+        // The channels of a Mamba-3 layer, and the floats a sequence keeps for one layer and for all of them.
+        const int64_t max_ssm_inner = 1 << 16;
+        const int64_t max_layer_state = int64_t(1) << 26;
+        const int64_t max_sequence_state = int64_t(1) << 28;
+
+        /*
+            The fields of a hybrid decoder (model_config::layer_types), after the dimensions every
+            architecture declares.  The engine computes the layout of Olala 1.0: geodesic updates,
+            no final normalization, a gated attention output, experts routed by sigmoids in a
+            latent space beside one shared expert.
+        */
+        void read_hybrid_config(const model_file& f, model_config& c)
+        {
+            const dlib::gguf_reader& g = f.reader();
+            const std::string a = c.arch;
+            auto flag = [&](const char* key, bool def) {
+                const std::string k = a + "." + key;
+                return g.has(k) ? g.get_int(k, def ? 1 : 0) != 0 : def;
+            };
+            auto refuse = [&](const std::string& what) {
+                throw std::runtime_error("this " + a + " model " + what + ", which this engine does not compute");
+            };
+            c.layer_types = g.get_str(a + ".layer_types", "");
+            if (static_cast<long>(c.layer_types.size()) != c.n_layers)
+                throw std::runtime_error("the model metadata names the types of other layers than its own");
+            for (char t : c.layer_types)
+                if (t != 'M' && t != 'V') refuse(std::string("holds layers of type '") + t + "'");
+            if (c.layer_types.find('V') == std::string::npos) refuse("holds no attention layer");
+            if (!flag("geodesic_update", false)) refuse("updates its residual stream without geodesics");
+            if (flag("final_norm", false)) refuse("normalizes its last hidden state");
+            if (!flag("gate_attn", false)) refuse("leaves the output of its attention without a gate");
+            if (g.has(a + ".rope.dimension_count")) refuse("declares rotary positions");
+
+            c.ssm_head_dim = bounded_int(g, a + ".mamba_headdim", 0, 1, max_head_dim);
+            c.ssm_state = bounded_int(g, a + ".ssm.state_size", 0, 2, max_state);
+            c.ssm_rank = bounded_int(g, a + ".mamba_mimo_dim", 0, 1, max_rank);
+            c.ssm_angles = bounded_int(g, a + ".num_rope_angles", 0, 0, max_state);
+            const long inner = bounded_int(g, a + ".ssm.inner_size", 0, 1, max_ssm_inner);
+            if (inner % c.ssm_head_dim != 0 || c.ssm_state % 2 != 0 || c.ssm_angles > c.ssm_state / 2)
+                throw std::runtime_error("the model metadata holds an invalid geometry of its Mamba-3 layers");
+            c.ssm_heads = inner / c.ssm_head_dim;
+            /*
+                What a sequence keeps for a layer (cpu_runtime::recurrent_state), counted on 64 bits:
+                the runtime indexes these floats with a long, and keeps them for every sequence.
+            */
+            const int64_t layer_state = static_cast<int64_t>(c.ssm_heads) * c.ssm_angles
+                + static_cast<int64_t>(inner) * c.ssm_state
+                + static_cast<int64_t>(c.ssm_heads) * c.ssm_rank * c.ssm_state + inner;
+            // An attention keeps the last key and the last value of its heads before their shift.
+            const int64_t shift_state = 2 * static_cast<int64_t>(c.n_kv_heads) * c.head_dim;
+            if (layer_state > max_layer_state || shift_state > max_layer_state
+                || std::max(layer_state, shift_state) * c.n_layers > max_sequence_state)
+                throw std::runtime_error("the model metadata gives its layers states beyond what this engine keeps "
+                    "for a sequence");
+            if (bounded_int(g, a + ".ssm.group_count", 1, 1, max_heads) != 1) refuse("groups the heads of its states");
+
+            c.tpa_rank = bounded_int(g, a + ".tpa_rank", 0, 1, max_rank);
+            const long noise = bounded_int(g, a + ".num_noise_heads", 0, 1, max_heads);
+            const long signal = bounded_int(g, a + ".num_signal_heads", 0, 1, max_heads);
+            if (noise != c.n_kv_heads || signal + noise != c.n_heads || c.n_heads / c.n_kv_heads < 2)
+                throw std::runtime_error("the model metadata holds an invalid geometry of its attention heads");
+            c.attention_window = bounded_int(g, a + ".attention.sliding_window", 0, 0, max_context);
+            c.attn_softcap = finite_double(g, a + ".attn_logit_softcapping", 0.0);
+            if (c.attn_softcap < 0.0) throw std::runtime_error("the model metadata holds a negative cap of the scores");
+            c.gate_bias = finite_double(g, a + ".gate_bias", 0.0);
+            // The scores of a head are divided by its width.
+            c.attention_scale = 1.0 / static_cast<double>(c.head_dim);
+            // A query sees its window: the engine reads no sequence beyond it.
+            if (c.attention_window > 0)
+                c.ctx_train = c.ctx_train > 0 ? std::min(c.ctx_train, c.attention_window) : c.attention_window;
+
+            c.n_experts = bounded_int(g, a + ".expert_count", 0, 1, max_experts);
+            c.n_experts_used = bounded_int(g, a + ".expert_used_count", 0, 1, c.n_experts);
+            c.d_ffn_expert = bounded_int(g, a + ".expert_feed_forward_length", 0, 1, max_ffn);
+            c.d_ffn_shared = bounded_int(g, a + ".expert_shared_feed_forward_length", 0, 1, max_ffn);
+            c.d_latent = bounded_int(g, a + ".moe_latent_size", 0, 1, max_width);
+            c.expert_weights_scale = finite_double(g, a + ".expert_weights_scale", 1.0);
+            // The weights of the experts a token takes sum to one before the scale.
+            c.expert_weights_norm = c.n_experts_used > 1;
+            if (bounded_int(g, a + ".expert_gating_func", 0, 0, 16) != 2) refuse("routes its experts without sigmoids");
+            if (bounded_int(g, a + ".expert_shared_count", 0, 0, max_experts) != 1)
+                refuse("holds another number of shared experts than one");
+            c.qk_norm = true;
+            c.tied_embeddings = false;
+        }
     }
 
     model_config read_model_config(const model_file& f)
@@ -62,7 +149,8 @@ namespace albireo
         const bool qwen_like = a == "qwen2" || a == "qwen3" || a == "qwen3vl";
         const bool moe_arch = a == "mixtral" || a == "granitemoe" || a == "qwen3moe" || a == "qwen3vlmoe";
         const bool phi = a == "phi3";
-        if (!llama_like && !qwen_like && !moe_arch && !phi)
+        const bool hybrid = a == "olala";
+        if (!llama_like && !qwen_like && !moe_arch && !phi && !hybrid)
             throw std::runtime_error("the architecture '" + a + "' is not supported by this engine");
 
         if (!g.has(a + ".block_count") || !g.has(a + ".attention.head_count") || !g.has(a + ".embedding_length"))
@@ -98,6 +186,13 @@ namespace albireo
         if (c.head_dim <= 0 || c.head_dim % 2 != 0 || c.head_dim_v != c.head_dim)
             throw std::runtime_error("unsupported head geometry");
         if (c.rms_eps < 0) throw std::runtime_error("the model metadata holds a negative normalization epsilon");
+        if (hybrid)
+        {
+            read_hybrid_config(f, c);
+            c.chat_template = g.get_str("tokenizer.chat_template", "");
+            c.tokenizer_pre = g.get_str("tokenizer.ggml.pre", "");
+            return c;
+        }
 
         // Rotary embedding.
         c.rope = qwen_like || a == "qwen3moe" || a == "qwen3vlmoe" || phi ? rope_style::neox : rope_style::norm;
@@ -299,6 +394,16 @@ namespace albireo
     std::string describe(const model_config& c)
     {
         std::ostringstream o;
+        if (c.hybrid())
+        {
+            o << c.name << " (" << c.arch << ", " << c.n_layers << " layers " << c.layer_types << ", width "
+              << c.d_model << ", Mamba-3 heads " << c.ssm_heads << " of " << c.ssm_head_dim << " with states of "
+              << c.ssm_state << " and rank " << c.ssm_rank << ", attention heads " << c.n_heads << "/" << c.n_kv_heads
+              << " of " << c.head_dim << ", " << c.n_experts << " experts top-" << c.n_experts_used << " of "
+              << c.d_ffn_expert << " in a latent space of " << c.d_latent << " beside a shared expert of "
+              << c.d_ffn_shared << ", vocabulary " << c.vocab << ", context " << c.ctx_train << ")";
+            return o.str();
+        }
         o << c.name << " (" << c.arch << ", " << c.n_layers << " layers, width " << c.d_model
           << ", heads " << c.n_heads << "/" << c.n_kv_heads << " of " << c.head_dim
           << ", ffn " << c.d_ffn;

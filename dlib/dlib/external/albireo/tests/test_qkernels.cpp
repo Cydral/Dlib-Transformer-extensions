@@ -471,6 +471,71 @@ namespace
                 check(std::fabs(got[i] - r) <= 2e-6 * std::fabs(r) + 1e-30, "silu", got[i], r);
             }
         }
+        // The cap of the scores of an attention, over the scores a softmax reads and beyond its cap.
+        {
+            std::uniform_real_distribution<float> wide(-40.0f, 40.0f);
+            const float edges[] = { -5000.0f, 5000.0f, 0.0f, 1e-6f };
+            const size_t n = 1003;
+            for (float cap : { 150.0f, 2.0f })
+            {
+                std::vector<float> x(n);
+                for (size_t i = 0; i < n; ++i) x[i] = i < 4 ? edges[i] : wide(rng);
+                std::vector<float> got = x;
+                qk_softcap(got.data(), cap, static_cast<long>(n));
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const double r = cap * std::tanh(static_cast<double>(x[i]) / cap);
+                    check(std::fabs(got[i] - r) <= 2e-6 * std::fabs(r) + 4e-7 * cap, "softcap", got[i], r);
+                }
+            }
+        }
+        // A step of the state of a channel of a Mamba-3 layer, for every rank and lengths with a tail.
+        {
+            std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+            for (long rank = 1; rank <= qk_state_rank; ++rank)
+                for (long n : { 5L, 16L, 131L })
+                {
+                    std::vector<float> s(static_cast<size_t>(n)), kb(static_cast<size_t>(rank * n));
+                    std::vector<float> k(kb.size()), q(kb.size());
+                    std::vector<float> before(static_cast<size_t>(rank)), now(before.size()), y(before.size());
+                    for (auto& v : s) v = unit(rng);
+                    for (size_t i = 0; i < kb.size(); ++i)
+                    {
+                        kb[i] = unit(rng);
+                        k[i] = unit(rng);
+                        q[i] = unit(rng);
+                    }
+                    for (size_t r = 0; r < before.size(); ++r)
+                    {
+                        before[r] = unit(rng);
+                        now[r] = unit(rng);
+                    }
+                    const float alpha = 0.9f;
+                    std::vector<double> want(s.begin(), s.end());
+                    std::vector<double> out(before.size(), 0.0);
+                    for (long i = 0; i < n; ++i)
+                    {
+                        double v = alpha * want[static_cast<size_t>(i)];
+                        for (long r = 0; r < rank; ++r)
+                        {
+                            const size_t at = static_cast<size_t>(r * n + i);
+                            v += static_cast<double>(before[static_cast<size_t>(r)]) * kb[at]
+                                + static_cast<double>(now[static_cast<size_t>(r)]) * k[at];
+                        }
+                        want[static_cast<size_t>(i)] = v;
+                        for (long r = 0; r < rank; ++r)
+                            out[static_cast<size_t>(r)] += v * q[static_cast<size_t>(r * n + i)];
+                    }
+                    qk_state_step(s.data(), alpha, before.data(), kb.data(), now.data(), k.data(), q.data(), rank, n,
+                        y.data());
+                    for (long i = 0; i < n; ++i)
+                        check(std::fabs(s[static_cast<size_t>(i)] - want[static_cast<size_t>(i)]) <= 1e-5, "state step",
+                            s[static_cast<size_t>(i)], want[static_cast<size_t>(i)]);
+                    for (long r = 0; r < rank; ++r)
+                        check(std::fabs(y[static_cast<size_t>(r)] - out[static_cast<size_t>(r)]) <= 1e-4,
+                            "outputs of a state step", y[static_cast<size_t>(r)], out[static_cast<size_t>(r)]);
+                }
+        }
         std::printf("  conversions and vector helpers\n");
     }
 

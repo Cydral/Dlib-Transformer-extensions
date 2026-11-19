@@ -53,6 +53,10 @@ namespace dlib
                 mixtral  - Mixture-of-experts Mistral variants
                 granite_moe - IBM Granite mixture-of-experts models (declare
                            global embedding/residual/attention/logit scales)
+                olala    - Olala hybrid decoders of OVHai LLM (Mamba-3 layers with
+                           several inputs and outputs, differential attentions with
+                           tensor product keys and values, experts in a latent space,
+                           geodesic updates of the residual stream)
                 unknown  - Any architecture string not listed above
         !*/
     };
@@ -118,6 +122,27 @@ namespace dlib
                 qk_norm             - True when the model applies per-head RMSNorm
                                       to Q and K (detected from the presence of
                                       blk.0.attn_q_norm.weight)
+                layer_types         - Hybrid decoders: one letter per layer, 'M' for a
+                                      Mamba-3 layer and 'V' for a differential
+                                      attention; empty for the other decoders
+                ssm_heads, ssm_head_dim, ssm_state, ssm_rank, ssm_angles
+                                    - Geometry of the Mamba-3 layers: heads, channels
+                                      of a head, values of the state of a channel,
+                                      inputs and outputs of a state, rotated pairs
+                tpa_rank            - Tensor products that make a key or a value
+                attention_window    - Positions a query sees at most; 0 for all
+                attn_softcap        - Cap of the attention scores; 0 for none
+                gate_bias           - Added to the gate of the attention output
+                d_ffn_expert, d_ffn_shared, d_latent
+                                    - Hidden width of a routed expert, of the shared
+                                      expert, and width of the latent space of the
+                                      routed experts
+                expert_weights_scale - Multiplier of the weights of the routed experts
+                hybrid_supported    - False when the file declares a variant of the
+                                      hybrid layers the runtime engine does not compute,
+                                      or a geometry beyond the one tt::mamba3_step()
+                                      takes (ssm_rank up to 8, ssm_angles up to 256,
+                                      states of a layer up to 2^26 values)
         !*/
 
         std::string arch_name;
@@ -135,6 +160,20 @@ namespace dlib
         bool tied_embeddings;
         bool quantized;
         bool qk_norm;
+        std::string layer_types;
+        long ssm_heads, ssm_head_dim, ssm_state, ssm_rank, ssm_angles;
+        long tpa_rank, attention_window;
+        double attn_softcap, gate_bias;
+        long d_ffn_expert, d_ffn_shared, d_latent;
+        double expert_weights_scale;
+        bool hybrid_supported;
+
+        bool hybrid() const;
+        /*!
+            ensures
+                - returns true when layer_types is not empty: the model is a hybrid
+                  decoder, which only the runtime engine computes.
+        !*/
     };
 
     // ---------------------------------------------------------------------------------
