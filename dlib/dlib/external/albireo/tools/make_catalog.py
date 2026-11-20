@@ -43,6 +43,11 @@ model is installed, and one default embedding model, which it downloads in every
 search in the documents of the conversations and of the projects relies on it.  An embedding
 model holds the "embedding" role alone.
 
+"since" gives the first version of Albireo whose engines serve a model, for a model of an
+architecture or of a format the earlier versions do not read.  The versions from 1.0.27 on leave
+out of their catalog the models of the versions after them; a default model is one that every
+version serves, and names none.
+
 The catalog is then signed with albireo-sign (sign <private key> catalog.json), and both
 files are kept in dist/albireo of the repository, from which publish_release.py carries them
 to the folder of the chain of the website.
@@ -51,6 +56,7 @@ to the folder of the chain of the website.
 import http.client
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -551,6 +557,8 @@ MODELS = [
         "reasoning": True,
         "reasoning_always": False,
         "license": "Apache-2.0",
+        # The hybrid decoders are served from this version on.
+        "since": "1.0.26",
         "description": {
             "en": "Hybrid model from OVHai LLM (France) with 6.8 billion parameters, about 1 billion of which compute "
                   "each token: Mamba-3 layers, a few attention layers and a mixture of 256 experts, for answers at the "
@@ -923,6 +931,8 @@ def check_models(models):
               "%s: a model reads images when it names a projector, and only then" % m["id"])
         check(not m.get("reasoning_always") or m.get("reasoning"),
               "%s: a model that always reasons is a model that reasons" % m["id"])
+        check("since" not in m or (re.fullmatch(r"[0-9]+(\.[0-9]+){2}", m["since"]) and not m.get("default")),
+              "%s: \"since\" names a version x.y.z, and a default model names none" % m["id"])
     ids = [m["id"] for m in models]
     check(len(ids) == len(set(ids)), "identifiers listed twice: %s"
           % ", ".join(sorted({i for i in ids if ids.count(i) > 1})))

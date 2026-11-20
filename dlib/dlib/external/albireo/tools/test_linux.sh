@@ -84,8 +84,8 @@ done
 # The attention of the steps split among the threads, against one task per key/value head, with
 # keys and values in half precision and in 8 bits, on a tiny model written in the work folder;
 # then a tiny hybrid decoder (Mamba-3 layers, differential attentions, experts in a latent space)
-# against the logits of its reference and however its sequences are cut.  With the kernels of
-# AVX2, then with the portable ones.
+# against the logits of its reference and however its sequences are cut, and a tiny mixture of
+# experts.  With the kernels of AVX2, then with the portable ones.
 for family in "" _portable; do
   test=$BUILD/tests/test_runtime$family
   name="attention and hybrid decoder${family:+ ${family#_}}"
@@ -95,8 +95,9 @@ for family in "" _portable; do
   fi
 done
 
-# The attention of a device on the same tiny model, through the host code of dlib, when the tree
-# was configured with ALBIREO_ENGINE_DLIB=ON.
+# The attention of a device on the same tiny model, then the groups of products of the tiny
+# mixture and of the tiny hybrid decoder, through the host code of dlib, when the tree was
+# configured with ALBIREO_ENGINE_DLIB=ON.
 if [ -x "$BUILD/tests/test_offload" ]; then
   step "attention of the device" "all checks passed" "$BUILD/tests/test_offload" synthetic "$WORK"
 else skip "attention of the device" "no $BUILD/tests/test_offload (ALBIREO_ENGINE_DLIB=ON)"

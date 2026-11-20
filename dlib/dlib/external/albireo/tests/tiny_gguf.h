@@ -9,7 +9,8 @@
     tokens of ChatML, a chat template naming them (by default that of a model whose
     reasoning a request switches, or the one given to build()), and weights in single
     precision drawn from a fixed sequence.  The file computes nothing meaningful, and loads
-    and runs as a published model does.
+    and runs as a published model does.  experts() gives each layer a mixture of experts in
+    place of its feed-forward block (the qwen3moe architecture).
 
     Every field of the header is recorded with its offset, its size and a label, so that a
     test can damage one field at a time and check that the loader refuses the file.
@@ -87,6 +88,14 @@ namespace albireo_test
             return *this;
         }
 
+        // A mixture of count experts in every layer, of which used answer a token, each of width 20.
+        tiny_gguf_writer& experts(long count, long used)
+        {
+            experts_ = count;
+            experts_used_ = used;
+            return *this;
+        }
+
         // The chat template of a model whose reasoning a request switches.
         static std::string switchable_template()
         {
@@ -107,6 +116,9 @@ namespace albireo_test
             out_ = tiny_gguf();
             const long d = 64, ff = 128, heads = 4, kv_heads = 2, layers = 2;
             const long hd = head_dim_;
+            // A width no vector of the kernels divides.
+            const long expert_ff = 20;
+            const std::string arch = experts_ > 0 ? "qwen3moe" : "qwen3";
             std::vector<std::string> tokens;
             std::vector<int32_t> types;
             const long vocab = vocabulary(tokens, types);
@@ -130,6 +142,15 @@ namespace albireo_test
                 list.push_back({ p + "attn_q_norm.weight", { uint64_t(hd) } });
                 list.push_back({ p + "attn_k_norm.weight", { uint64_t(hd) } });
                 list.push_back({ p + "ffn_norm.weight", { uint64_t(d) } });
+                if (experts_ > 0)
+                {
+                    const uint64_t n = static_cast<uint64_t>(experts_);
+                    list.push_back({ p + "ffn_gate_inp.weight", { uint64_t(d), n }, 0.0f, 4.0f });
+                    list.push_back({ p + "ffn_gate_exps.weight", { uint64_t(d), uint64_t(expert_ff), n } });
+                    list.push_back({ p + "ffn_up_exps.weight", { uint64_t(d), uint64_t(expert_ff), n } });
+                    list.push_back({ p + "ffn_down_exps.weight", { uint64_t(expert_ff), uint64_t(d), n } });
+                    continue;
+                }
                 list.push_back({ p + "ffn_gate.weight", { uint64_t(d), uint64_t(ff) } });
                 list.push_back({ p + "ffn_up.weight", { uint64_t(d), uint64_t(ff) } });
                 list.push_back({ p + "ffn_down.weight", { uint64_t(ff), uint64_t(d) } });
@@ -144,19 +165,25 @@ namespace albireo_test
             const size_t kv_count_at = out_.bytes.size();
             u64(0);
             uint64_t kv = 0;
-            kv_str("general.architecture", "qwen3"); ++kv;
+            kv_str("general.architecture", arch); ++kv;
             kv_str("general.name", "tiny"); ++kv;
-            kv_u64("qwen3.block_count", layers); ++kv;
-            kv_u64("qwen3.context_length", 4096); ++kv;
-            kv_u64("qwen3.embedding_length", d); ++kv;
-            kv_u64("qwen3.feed_forward_length", ff); ++kv;
-            kv_u64("qwen3.attention.head_count", heads); ++kv;
-            kv_u64("qwen3.attention.head_count_kv", kv_heads); ++kv;
-            kv_u64("qwen3.attention.key_length", hd); ++kv;
-            kv_u64("qwen3.attention.value_length", hd); ++kv;
-            kv_u64("qwen3.rope.dimension_count", hd); ++kv;
-            kv_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6f); ++kv;
-            kv_f32("qwen3.rope.freq_base", 1000000.0f); ++kv;
+            kv_u64(arch + ".block_count", layers); ++kv;
+            kv_u64(arch + ".context_length", 4096); ++kv;
+            kv_u64(arch + ".embedding_length", d); ++kv;
+            kv_u64(arch + ".feed_forward_length", ff); ++kv;
+            kv_u64(arch + ".attention.head_count", heads); ++kv;
+            kv_u64(arch + ".attention.head_count_kv", kv_heads); ++kv;
+            kv_u64(arch + ".attention.key_length", hd); ++kv;
+            kv_u64(arch + ".attention.value_length", hd); ++kv;
+            kv_u64(arch + ".rope.dimension_count", hd); ++kv;
+            kv_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-6f); ++kv;
+            kv_f32(arch + ".rope.freq_base", 1000000.0f); ++kv;
+            if (experts_ > 0)
+            {
+                kv_u64(arch + ".expert_count", static_cast<uint64_t>(experts_)); ++kv;
+                kv_u64(arch + ".expert_used_count", static_cast<uint64_t>(experts_used_)); ++kv;
+                kv_u64(arch + ".expert_feed_forward_length", expert_ff); ++kv;
+            }
             kv_u64("general.alignment", 32); ++kv;
             kv_str("tokenizer.ggml.model", "gpt2"); ++kv;
             kv_str("tokenizer.ggml.pre", "qwen2"); ++kv;
@@ -303,6 +330,8 @@ namespace albireo_test
     private:
         long head_dim_ = 16;
         bool biases_ = false;
+        long experts_ = 0;
+        long experts_used_ = 0;
 
         /*
             A tensor in single precision.  Its values are drawn around center, spread wide; without

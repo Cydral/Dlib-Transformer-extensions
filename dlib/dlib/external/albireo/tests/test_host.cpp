@@ -659,6 +659,34 @@ int main(int argc, char** argv)
     official_files.serve("other.bin", other);
     official_files.serve("model-2.bin", newer_tiny);
 
+    // An entry of the catalog for a later version of Albireo is left out, and stays in the database.
+    {
+        albireo::store db(albireo::join_path(work, "since.db"));
+        json catalog = json::object();
+        catalog["updated"] = "2026-10-30T00:00:00Z";
+        json list = json::array();
+        list.push_back(catalog_entry("tiny", served, base_url + "/official/model.bin"));
+        json current = catalog_entry("current", other, base_url + "/official/other.bin");
+        current["since"] = ALBIREO_VERSION;
+        list.push_back(current);
+        json later = catalog_entry("later", other, base_url + "/official/other.bin");
+        later["since"] = "999.0.0";
+        list.push_back(later);
+        catalog["models"] = list;
+        db.set_value("catalog", catalog.dump());
+        albireo::model_manager m(db, albireo::join_path(work, "models-since"));
+        json entry;
+        check(m.catalog()["models"].size() == 2 && m.catalog_status()["models"].as_int() == 2,
+            "the catalog serves the models of this version");
+        check(m.catalog_entry("tiny", entry) && m.catalog_entry("current", entry) && !m.catalog_entry("later", entry),
+            "a model of a later version has no entry");
+        albireo::user_error error;
+        check(!m.start_download("later", error) && error.code == "not_in_catalog",
+            "a model of a later version is not downloaded (" + error.code + ")");
+        check(json::parse_or_null(db.value("catalog"))["models"].size() == 3,
+            "the database keeps the catalog as it was signed");
+    }
+
     {
         albireo::store db(albireo::join_path(work, "albireo.db"));
         json catalog = json::object();

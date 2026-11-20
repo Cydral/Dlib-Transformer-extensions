@@ -291,6 +291,26 @@ namespace albireo
             float* Y, long y_stride, const std::function<void()>& host) = 0;
 
         /*!
+            requires
+                - items holds count products of fewer than qk_float_product_tokens tokens, none
+                  of which writes what another one reads or writes, and host computes them all
+                  on the processor, as qk_matmul_group() does.
+            ensures
+                - Returns true after calling host when the object leaves every product of the
+                  group to the processor without measuring any: the products then share one
+                  parallel section of the processor instead of one each.
+                - Returns false, nothing being computed, when the device computes or measures
+                  one of the products: the runtime then hands them over one by one (matmul()).
+        !*/
+        virtual bool matmul_group(const qk_product* items, long count, const std::function<void()>& host)
+        {
+            (void)items;
+            (void)count;
+            (void)host;
+            return false;
+        }
+
+        /*!
             ensures
                 - Tells whether the model has requests in progress or waiting.  When the
                   device lacks room, copies of the models without requests leave it, the

@@ -289,6 +289,21 @@ namespace albireo
         // otherwise.
         void product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
             qk_path path = qk_path::automatic);
+        /*
+            The products of group_, which read nothing of one another, for a pass of n_tokens
+            tokens: in one parallel section for the few tokens of a generation step
+            (qk_matmul_group()), unless the offload measures or computes one of them, and one
+            after the other, as product() computes them, for the passes of a prompt.
+        */
+        void products(long n_tokens);
+        void add_product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride);
+        /*
+            The rows of the buffers of the experts for the tokens routed_ gives each expert, and
+            their number.  Together, the experts follow one another, expert_rows_ holding the
+            first row of each, -1 for an expert no token reaches; otherwise each expert takes
+            the buffers in turn.
+        */
+        long lay_out_experts(long n_experts, bool together);
 
         std::shared_ptr<model_file> file_;
         model_config cfg_;
@@ -351,6 +366,9 @@ namespace albireo
         std::vector<long> router_order_;
         std::vector<std::vector<std::pair<long, float>>> routed_;
         std::vector<qk_scratch> scratch_;
+        std::vector<qk_product> group_;
+        // The first row of each expert a few tokens reach in the buffers of the experts, -1 for the others.
+        std::vector<long> expert_rows_;
         std::vector<attention_work> attention_work_;
         std::vector<attention_tile> tiles_;
         // The partial sums of the ranges of a split attention, and the sequence of each token of a batch.

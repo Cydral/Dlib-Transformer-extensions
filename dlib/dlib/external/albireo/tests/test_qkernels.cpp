@@ -383,6 +383,91 @@ namespace
         std::printf("  8-bit products of the prompt (%s): each token as computed in another pass\n", panels.c_str());
     }
 
+    /*
+        The products of a group against the same products computed one by one: a matrix of each
+        format, of sizes, numbers of tokens and strides that differ, three of them reading the
+        same activations, as the experts of a mixture read the row of their token.  The bytes
+        of the results are compared, the margins of their rows included.
+    */
+    void test_matmul_group(std::mt19937& rng)
+    {
+        std::uniform_real_distribution<float> value(-1.0f, 1.0f);
+        const std::vector<fmt> all = formats();
+        const long count = static_cast<long>(all.size());
+        std::vector<std::vector<uint8_t>> data(all.size());
+        std::vector<weight_matrix> W(all.size());
+        std::vector<std::vector<float>> X(all.size()), alone(all.size()), together(all.size());
+        std::vector<qk_product> items(all.size());
+        for (long i = 0; i < count; ++i)
+        {
+            const fmt& f = all[static_cast<size_t>(i)];
+            const long cols = i < 3 || i % 2 == 0 ? 512 : 768;
+            const long rows = 5 + (37 * i) % 150;
+            for (long r = 0; r < rows; ++r)
+            {
+                const std::vector<uint8_t> row = random_row(f, cols, rng);
+                data[static_cast<size_t>(i)].insert(data[static_cast<size_t>(i)].end(), row.begin(), row.end());
+            }
+            weight_matrix& w = W[static_cast<size_t>(i)];
+            w.type = f.type;
+            w.data = data[static_cast<size_t>(i)].data();
+            w.rows = rows;
+            w.cols = cols;
+            w.row_bytes = qk_row_bytes(f.type, cols);
+            qk_product& p = items[static_cast<size_t>(i)];
+            p.W = &w;
+            // The kernels of the float formats read rows that follow one another where they lie.
+            p.n_tokens = i < 3 ? 3 : 1 + i % 7;
+            p.x_stride = cols + (i % 2 == 0 ? 0 : 3);
+            p.y_stride = rows + i % 4;
+            if (i == 1 || i == 2)
+            {
+                p.x_stride = items[0].x_stride;
+                p.X = items[0].X;
+            }
+            else
+            {
+                X[static_cast<size_t>(i)].resize(static_cast<size_t>(p.n_tokens * p.x_stride));
+                for (auto& e : X[static_cast<size_t>(i)]) e = value(rng);
+                p.X = X[static_cast<size_t>(i)].data();
+            }
+            alone[static_cast<size_t>(i)].assign(static_cast<size_t>(p.n_tokens * p.y_stride), 7.0f);
+            together[static_cast<size_t>(i)] = alone[static_cast<size_t>(i)];
+        }
+        auto same = [&]() {
+            for (long i = 0; i < count; ++i)
+                if (std::memcmp(alone[static_cast<size_t>(i)].data(), together[static_cast<size_t>(i)].data(),
+                    alone[static_cast<size_t>(i)].size() * sizeof(float)) != 0)
+                    return false;
+            return true;
+        };
+        for (int threads : { 1, 2, 4, 12 })
+        {
+            thread_pool pool(threads);
+            qk_scratch scratch;
+            for (long i = 0; i < count; ++i)
+            {
+                const qk_product& p = items[static_cast<size_t>(i)];
+                qk_matmul(*p.W, p.X, p.n_tokens, p.x_stride, alone[static_cast<size_t>(i)].data(), p.y_stride, pool,
+                    scratch, false, qk_path::integer);
+            }
+            for (long i = 0; i < count; ++i) items[static_cast<size_t>(i)].Y = together[static_cast<size_t>(i)].data();
+            qk_matmul_group(items.data(), count, pool, scratch);
+            check(same(), "products of a group as computed one by one");
+            // A group again in the buffers of the first one, then a group of one product.
+            qk_matmul_group(items.data(), count, pool, scratch);
+            qk_matmul_group(items.data() + 5, 1, pool, scratch);
+            check(same(), "products of a group computed again");
+            qk_set_grouped_products(false);
+            for (auto& y : together) std::fill(y.begin(), y.end(), 7.0f);
+            qk_matmul_group(items.data(), count, pool, scratch);
+            qk_set_grouped_products(true);
+            check(same(), "products of a group without their common section");
+            for (auto& y : together) std::fill(y.begin(), y.end(), 7.0f);
+        }
+        std::printf("  groups of products: every format, 1 to 7 tokens, on 1 to 12 threads, as computed one by one\n");
+    }
+
     void test_helpers(std::mt19937& rng)
     {
         // Every finite half converts to float and back unchanged.
@@ -795,6 +880,7 @@ int main()
     test_dequantization(rng);
     test_dots(rng);
     test_matmul(rng, pool);
+    test_matmul_group(rng);
     test_helpers(rng);
     test_attention_tiles(rng);
     test_attention_q8(rng);

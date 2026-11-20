@@ -836,6 +836,38 @@ namespace albireo
 #endif
         }
 
+        bool matmul_group(const qk_product* items, long count, const std::function<void()>& host) override
+        {
+            last_use_ = now_ns();
+            bool offered = false;
+            for (long i = 0; i < count; ++i) offered = offered || items[i].n_tokens >= d_.min_tokens;
+            bool settled = !offered || d_.disabled.load(std::memory_order_relaxed) || !d_.bind_thread();
+            if (!settled)
+            {
+                check_card();
+                // As in matmul(), for products of few tokens once the copies exceed the memory of the card.
+                settled = d_.resident.load(std::memory_order_relaxed) > d_.card_bytes;
+            }
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            // The routing of dlib measures every product it is offered.
+            if (!settled) return false;
+#else
+            if (!settled)
+            {
+                for (long i = 0; i < count; ++i)
+                    if (items[i].n_tokens >= d_.min_tokens && !left_to_host(items[i], count)) return false;
+                // The products count for their shapes, whose next checks come as they would one by one.
+                for (long i = 0; i < count; ++i)
+                    if (items[i].n_tokens >= d_.min_tokens) ++routes_[route_key(items[i])].calls;
+            }
+#endif
+            const clock_type::time_point t0 = clock_type::now();
+            host();
+            d_.host_products += static_cast<unsigned long long>(count);
+            d_.host_us += static_cast<unsigned long long>(seconds_since(t0) * 1e6);
+            return true;
+        }
+
         std::string description() const override
         {
             return d_.name;
@@ -1433,6 +1465,30 @@ namespace albireo
             if (it == routes_.end()) return true;
             const route& r = it->second;
             return !r.failed && !r.no_room && (!r.decided || r.on_device);
+        }
+
+        static std::tuple<long, long, int> route_key(const qk_product& p)
+        {
+            return std::make_tuple(p.W->rows, p.W->cols, token_class(p.n_tokens));
+        }
+
+        /*
+            Whether routed_here() would compute a product on the processor without measuring the
+            device, were the count products of a group to reach it one by one: a shape that failed
+            or lacks room on the device, or one the processor keeps, until its next check, which
+            waits for a matrix the device holds.
+        */
+        bool left_to_host(const qk_product& p, long count) const
+        {
+            if (d_.forced != 0) return d_.forced < 0;
+            const auto it = routes_.find(route_key(p));
+            if (it == routes_.end()) return false;
+            const route& r = it->second;
+            const unsigned long long calls = r.calls + static_cast<unsigned long long>(count);
+            if (r.failed) return true;
+            if (r.no_room) return r.room_generation == d_.generation.load() && calls < r.retry_at;
+            if (!r.decided || r.on_device) return false;
+            return calls < r.next_check || !r.known_probe(p.W->data);
         }
 
         void decide(route& r, const std::tuple<long, long, int>& key)

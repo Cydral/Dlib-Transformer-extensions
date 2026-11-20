@@ -17,7 +17,9 @@
 
     With "exact", the products run on floats (qk_set_exact_products) and the comparison
     with the reference is tight; otherwise the activations are quantized as in normal
-    operation and the comparison bears on the distributions.
+    operation and the comparison bears on the distributions, and the passes of a few tokens
+    then give the same logits, bit for bit, whether the products of a layer share their
+    parallel sections (qk_matmul_group) or take one each.
 
         test_runtime synthetic [folder [hybrid.golden]]
 
@@ -28,7 +30,9 @@
     in a latent space, geodesic updates): the logits of hybrid_tokens tokens against those of
     tests/reference_forward.py, which hybrid.golden holds, when the file is given; then the
     same results however the work is cut, with two threads and with twelve, and with keys
-    and values in 8 bits.
+    and values in 8 bits.  The tiny mixture of experts of tiny_gguf.h follows, cut the same
+    ways.  Both models also compare their passes of a few tokens with and without the
+    common sections of their products.
 
         test_runtime hybrid-model file.gguf
 
@@ -163,6 +167,52 @@ namespace
         }
         rt.release_sequence(seq);
         return got;
+    }
+
+    // The logits of every token of a sequence read by passes of chunk tokens.
+    std::vector<float> run_chunks(cpu_runtime& rt, const std::vector<int>& tokens, long chunk)
+    {
+        const long T = static_cast<long>(tokens.size());
+        const int seq = rt.create_sequence();
+        std::vector<float> got, logits;
+        forward_batch b;
+        for (long from = 0; from < T; from += chunk)
+        {
+            const long count = std::min(chunk, T - from);
+            expect(rt.reserve_sequence(seq, from + count), "reserve a chunk");
+            b.clear();
+            b.tokens.assign(tokens.begin() + from, tokens.begin() + from + count);
+            b.segments.push_back({ seq, 0, count });
+            for (long i = 0; i < count; ++i) b.logit_rows.push_back(i);
+            rt.forward(b, logits);
+            got.insert(got.end(), logits.begin(), logits.end());
+        }
+        rt.release_sequence(seq);
+        return got;
+    }
+
+    /*
+        The passes of a few tokens, whose products go through the integer kernels: single steps
+        after a prompt, then passes of five tokens, with the products of a layer in common
+        sections of the pool and with one section each.  The logits are the same bit for bit.
+    */
+    void grouped_products(cpu_runtime& rt, const std::vector<int>& tokens)
+    {
+        const long prompt = std::max<long>(1, static_cast<long>(tokens.size()) / 3);
+        const std::vector<float> steps = run_steps(rt, tokens, prompt);
+        const std::vector<float> chunks = run_chunks(rt, tokens, 5);
+        qk_set_grouped_products(false);
+        const std::vector<float> steps_alone = run_steps(rt, tokens, prompt);
+        const std::vector<float> chunks_alone = run_chunks(rt, tokens, 5);
+        qk_set_grouped_products(true);
+        auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return !a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        const bool ok = same(steps, steps_alone) && same(chunks, chunks_alone);
+        std::printf("  %-34s %s\n", "products in common sections",
+            ok ? "the bits of the products one by one" : "other bits than the products one by one");
+        expect(same(steps, steps_alone), "single steps with the products of a layer in common sections");
+        expect(same(chunks, chunks_alone), "passes of five tokens with the products of a layer in common sections");
     }
 
     int synthetic(const std::string& folder)
@@ -480,6 +530,41 @@ namespace
             report("hybrid decoder, 8-bit keys", q);
             expect(q.mean_kl < 1e-3, "8-bit keys and values of the hybrid decoder");
             qk_set_exact_products(false);
+            grouped_products(many, tokens);
+        }
+        std::remove(path.c_str());
+        return 0;
+    }
+
+    // The tiny mixture of experts: 8 experts per layer, of which 3 answer a token.
+    int synthetic_moe(const std::string& folder)
+    {
+        const std::string path = folder + "test_runtime_moe.gguf";
+        const albireo_test::tiny_gguf model = albireo_test::tiny_gguf_writer().experts(8, 3).build();
+        if (!model.save(path, model.bytes))
+        {
+            std::printf("cannot write %s\n", path.c_str());
+            return 2;
+        }
+        {
+            auto file = std::make_shared<model_file>(path);
+            const model_config cfg = read_model_config(*file);
+            std::printf("%s\n", describe(cfg).c_str());
+            std::vector<int> tokens(40);
+            uint32_t state = 11;
+            for (auto& t : tokens)
+            {
+                state = state * 1664525u + 1013904223u;
+                t = static_cast<int>((state >> 8) % 256);
+            }
+            thread_pool wide(12);
+            cpu_runtime rt(file, cfg, wide, size_t(64) << 20, 16);
+            // The products on floats, so that the comparisons bear on the layers themselves.
+            qk_set_exact_products(true);
+            consistency(rt, cfg, tokens, run_whole(rt, tokens), true);
+            qk_set_exact_products(false);
+            grouped_products(rt, tokens);
+            expect(rt.kv_bytes_used() == 0, "every block of the mixture returned");
         }
         std::remove(path.c_str());
         return 0;
@@ -500,6 +585,7 @@ int main(int argc, char** argv)
         const std::string folder = argc > 2 ? std::string(argv[2]) + "/" : std::string();
         int status = synthetic(folder);
         if (status == 0) status = synthetic_hybrid(folder, argc > 3 ? argv[3] : "");
+        if (status == 0) status = synthetic_moe(folder);
         if (status != 0) return status;
         if (failures)
         {
@@ -575,6 +661,8 @@ int main(int argc, char** argv)
     }
 
     consistency(rt, cfg, tokens, whole, exact);
+    // The exact products take one section each whatever the groups.
+    if (!exact) grouped_products(rt, tokens);
 
     /*
         6. The keys and values in 8 bits against those in half precision, over the whole

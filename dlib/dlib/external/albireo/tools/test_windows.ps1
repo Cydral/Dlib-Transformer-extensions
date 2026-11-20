@@ -12,7 +12,9 @@
     missing are skipped.
 
     Steps: the quantized kernels; the loading of damaged model files and of a file of more than
-    2 GiB; the attention and a tiny hybrid decoder; a question to each processor engine; with the
+    2 GiB; the sampler; the attention, a tiny hybrid decoder and a tiny mixture of experts; the
+    chat formats; the interface of an engine under concurrent requests, with the portable
+    engine; a question to each processor engine; with the
     OpenVINO tree, test_offload on the device of -Device (CPU by default, which every machine
     has), test_ov_graph on the processor, with the graph of the graphics processor on the
     processor too, and on the graphics processor when -Device names it, and a question to each
@@ -105,7 +107,7 @@ else { Add-Result "sampler" "SKIP" "no $samplerTest (build_windows.ps1 -Tests)" 
 # The attention of the steps split among the threads, against one task per key/value head, with keys and values
 # in half precision and in 8 bits, on a tiny model written in the folder of the logs; then a tiny hybrid decoder
 # (Mamba-3 layers, differential attentions, experts in a latent space) against the logits of its reference and
-# however its sequences are cut.  With the kernels of AVX2, then with the portable ones.
+# however its sequences are cut, and a tiny mixture of experts.  With the kernels of AVX2, then with the portable ones.
 $hybridResults = Join-Path $PSScriptRoot "..\tests\data\hybrid.golden"
 foreach ($family in @("", "_portable")) {
     $runtimeTest = Join-Path $main "tests\test_runtime$family.exe"
@@ -115,6 +117,18 @@ foreach ($family in @("", "_portable")) {
     }
     else { Add-Result $name "SKIP" "no $runtimeTest (build_windows.ps1 -Tests)" 0 }
 }
+
+# The chat formats against the prompts of their templates, then the C interface of an engine under concurrent
+# requests, on a tiny model the test writes in the folder of the logs, with the portable engine.
+$formatTest = Join-Path $main "tests\test_chat_format.exe"
+if (Test-Path $formatTest) { Invoke-Check "chat format" "all checks passed" $formatTest @() | Out-Null }
+else { Add-Result "chat format" "SKIP" "no $formatTest (build_windows.ps1 -Tests)" 0 }
+$interfaceTest = Join-Path $main "tests\test_engine_api.exe"
+$portableEngine = Join-Path $main "bin\engines\albireo-engine-cpu.dll"
+if ((Test-Path $interfaceTest) -and (Test-Path $portableEngine)) {
+    Invoke-Check "engine interface" "all checks passed" $interfaceTest @($portableEngine, $logs) | Out-Null
+}
+else { Add-Result "engine interface" "SKIP" "no $interfaceTest or no portable engine" 0 }
 
 # The engine steps run with the PATH of a service, System32 and the Windows folder only: the
 # libraries an engine loads by name must come from the folders of Albireo, not from the PATH of

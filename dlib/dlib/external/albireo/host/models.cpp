@@ -34,6 +34,7 @@
 #include "../common/builtin_models.h"
 #include "../common/log.h"
 #include "../common/platform.h"
+#include "../common/version.h"
 #include "crypto.h"
 #include "http_fetch.h"
 #include "distribution.h"
@@ -43,6 +44,24 @@ namespace albireo
 
     namespace
     {
+        /*
+            The catalog this version serves.  An entry may name in "since" the first version of
+            Albireo whose engines serve its model, an architecture they did not read before for
+            instance: the versions before it leave the entry out, and offer no model they could
+            not load.  The database keeps the catalog as it was signed, where a later version
+            finds the entry again.
+        */
+        json served_catalog(const json& signed_catalog)
+        {
+            if (!signed_catalog["models"].is_array()) return signed_catalog;
+            json served = signed_catalog;
+            json models = json::array();
+            for (const auto& e : signed_catalog["models"].elements())
+                if (compare_versions(e["since"].as_string(), ALBIREO_VERSION) <= 0) models.push_back(e);
+            served["models"] = models;
+            return served;
+        }
+
         /*
             A file written at given offsets by several threads: the partial file of a download,
             created or opened again at its own name, never through a link there, with a single
@@ -602,7 +621,7 @@ namespace albireo
         // The folder by its own path: a link placed later on its way shows (direct_path()).
         const std::string resolved = final_path(dir_);
         if (!resolved.empty()) dir_ = resolved;
-        catalog_ = json::parse_or_null(db_.value("catalog", "{}"));
+        catalog_ = served_catalog(json::parse_or_null(db_.value("catalog", "{}")));
         if (!catalog_.is_object()) catalog_ = json::object();
     }
 
@@ -640,6 +659,8 @@ namespace albireo
             error = "the catalog is not valid: " + error;
             return false;
         }
+        const size_t listed = c["models"].size();
+        c = served_catalog(c);
         {
             std::lock_guard<std::mutex> lock(m_);
             catalog_state_ = "ok";
@@ -665,8 +686,10 @@ namespace albireo
         }
         ++generation_;
         result["models"] = static_cast<long long>(c["models"].size());
+        const size_t later = listed - c["models"].size();
         log_info("models: catalog of " + std::to_string(c["models"].size()) + " models, published "
-            + c["updated"].as_string());
+            + c["updated"].as_string()
+            + (later > 0 ? ", and " + std::to_string(later) + " that later versions of Albireo serve" : std::string()));
         return true;
     }
 

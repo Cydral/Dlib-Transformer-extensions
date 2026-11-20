@@ -124,6 +124,19 @@ namespace albireo
     {
         std::vector<uint8_t> act;
         std::vector<float> row;
+
+        // The activations of each product of a group and the rows of each of its tasks (qk_matmul_group()).
+        struct group_item
+        {
+            const uint8_t* act;
+            size_t act_bytes;
+        };
+        struct group_task
+        {
+            long item, first, end;
+        };
+        std::vector<group_item> items;
+        std::vector<group_task> tasks;
     };
 
     /*!
@@ -192,6 +205,45 @@ namespace albireo
     void qk_matmul(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
         float* Y, long y_stride, thread_pool& pool, qk_scratch& scratch, bool accumulate = false,
         qk_path path = qk_path::automatic);
+
+    // One product of a group (qk_matmul_group()), with the arguments of qk_matmul().
+    struct qk_product
+    {
+        const weight_matrix* W;
+        const float* X;
+        long n_tokens;
+        long x_stride;
+        float* Y;
+        long y_stride;
+    };
+
+    /*!
+        requires
+            - No product of the group writes what another one reads or writes.
+        ensures
+            - Computes each product of items as qk_matmul() does with the integer kernels, bit
+              for bit, the rows of all the matrices sharing one parallel section of the pool.
+            - A generation step computes several hundred products, most of them over a few
+              hundred rows in the experts of a mixture, and a section costs the hand-over of
+              every thread of the pool, which lasts longer than the rows of such a product on
+              a processor with many cores: the products of a layer that read nothing of one
+              another then share their sections.  The activations are quantized on the
+              calling thread, which suits the few tokens of a generation step.
+            - Computes the products one after the other when qk_set_grouped_products() turned
+              the common sections off, and with the exact products of
+              qk_set_exact_products().
+    !*/
+    void qk_matmul_group(const qk_product* items, long count, thread_pool& pool, qk_scratch& scratch);
+
+    /*!
+        ensures
+            - Turns the common sections of qk_matmul_group() on or off (on by default) for
+              every group that starts after the call, for the tests that compare both ways.
+              qk_grouped_products() tells which: a runtime that lays out its buffers for a
+              group computes its products in turn, each in its own buffers, when they are off.
+    !*/
+    void qk_set_grouped_products(bool on);
+    bool qk_grouped_products();
 
     // Name of the instruction set the kernels were compiled for.
     const char* qk_isa();

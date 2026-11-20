@@ -614,6 +614,35 @@ namespace albireo
             [&]() { qk_matmul(W, X, n, x_stride, Y, y_stride, pool_, scratch_[0], false, path); });
     }
 
+    void cpu_runtime::add_product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y,
+        long y_stride)
+    {
+        qk_product p;
+        p.W = &W;
+        p.X = X;
+        p.n_tokens = n;
+        p.x_stride = x_stride;
+        p.Y = Y;
+        p.y_stride = y_stride;
+        group_.push_back(p);
+    }
+
+    void cpu_runtime::products(long n_tokens)
+    {
+        const long count = static_cast<long>(group_.size());
+        const bool few = n_tokens < qk_float_product_tokens;
+        if (few && (!offload_ || host_only_))
+            qk_matmul_group(group_.data(), count, pool_, scratch_[0]);
+        else if (!few || !offload_->matmul_group(group_.data(), count,
+            [&]() { qk_matmul_group(group_.data(), count, pool_, scratch_[0]); }))
+        {
+            // The kernels of the size of the pass, which the tokens of an expert may not reach.
+            const qk_path path = few ? qk_path::integer : qk_path::prompt;
+            for (const qk_product& p : group_) product(*p.W, p.X, p.n_tokens, p.x_stride, p.Y, p.y_stride, path);
+        }
+        group_.clear();
+    }
+
     void cpu_runtime::embed(const std::vector<int>& tokens)
     {
         const long d = cfg_.d_model;
@@ -900,35 +929,100 @@ namespace albireo
             }
         }
 
+        /*
+            The rows of the experts follow one another in the buffers, in the order of the
+            experts.  With the few tokens of a generation step, the experts compute their gates
+            and their first products together, then their second ones; with a prompt, each
+            expert in turn, in buffers that stay in the caches.
+        */
         tmp_.assign(static_cast<size_t>(T * d), 0.0f);
         aligned_floats& xe = expert_x_;
         aligned_floats& ge = expert_gate_;
         aligned_floats& ue = expert_up_;
         aligned_floats& ye = expert_y_;
-        const qk_path path = T >= qk_float_product_tokens ? qk_path::prompt : qk_path::integer;
-        for (long e = 0; e < n_exp; ++e)
-        {
+        const bool few = T < qk_float_product_tokens;
+        const bool together = few && qk_grouped_products();
+        const long reached = lay_out_experts(n_exp, together);
+        xe.resize(static_cast<size_t>(reached * d));
+        ge.resize(static_cast<size_t>(reached * df));
+        ue.resize(static_cast<size_t>(reached * df));
+        ye.resize(static_cast<size_t>(reached * d));
+        auto gather = [&](long e, float* x) {
             const auto& list = routed[static_cast<size_t>(e)];
-            const long m = static_cast<long>(list.size());
-            if (m == 0) continue;
-            xe.resize(static_cast<size_t>(m * d));
-            for (long i = 0; i < m; ++i)
-                std::memcpy(xe.data() + i * d, xn_.data() + list[static_cast<size_t>(i)].first * d, sizeof(float) * d);
-            ge.resize(static_cast<size_t>(m * df));
-            ue.resize(static_cast<size_t>(m * df));
-            product(L.e_gate[static_cast<size_t>(e)], xe.data(), m, d, ge.data(), df, path);
-            product(L.e_up[static_cast<size_t>(e)], xe.data(), m, d, ue.data(), df, path);
-            qk_silu_mul(ge.data(), ue.data(), static_cast<long>(ge.size()));
-            ye.resize(static_cast<size_t>(m * d));
-            product(L.e_down[static_cast<size_t>(e)], ge.data(), m, df, ye.data(), d, path);
-            for (long i = 0; i < m; ++i)
+            for (size_t i = 0; i < list.size(); ++i)
+                std::memcpy(x + static_cast<long>(i) * d, xn_.data() + list[i].first * d,
+                    sizeof(float) * static_cast<size_t>(d));
+        };
+        auto scatter = [&](long e, const float* y) {
+            const auto& list = routed[static_cast<size_t>(e)];
+            for (size_t i = 0; i < list.size(); ++i)
             {
-                const float w = list[static_cast<size_t>(i)].second;
-                float* dst = tmp_.data() + list[static_cast<size_t>(i)].first * d;
-                const float* src = ye.data() + i * d;
+                const float w = list[i].second;
+                float* dst = tmp_.data() + list[i].first * d;
+                const float* src = y + static_cast<long>(i) * d;
                 for (long j = 0; j < d; ++j) dst[j] += w * src[j];
             }
+        };
+        if (together)
+        {
+            for (long e = 0; e < n_exp; ++e)
+            {
+                const long first = expert_rows_[static_cast<size_t>(e)];
+                if (first < 0) continue;
+                const long m = static_cast<long>(routed[static_cast<size_t>(e)].size());
+                gather(e, xe.data() + first * d);
+                add_product(L.e_gate[static_cast<size_t>(e)], xe.data() + first * d, m, d, ge.data() + first * df, df);
+                add_product(L.e_up[static_cast<size_t>(e)], xe.data() + first * d, m, d, ue.data() + first * df, df);
+            }
+            products(T);
+            for (long e = 0; e < n_exp; ++e)
+            {
+                const long first = expert_rows_[static_cast<size_t>(e)];
+                if (first < 0) continue;
+                const long m = static_cast<long>(routed[static_cast<size_t>(e)].size());
+                // One call per expert, as in the loop below, since the kernel ends a run of values with other code.
+                qk_silu_mul(ge.data() + first * df, ue.data() + first * df, m * df);
+                add_product(L.e_down[static_cast<size_t>(e)], ge.data() + first * df, m, df, ye.data() + first * d, d);
+            }
+            products(T);
+            for (long e = 0; e < n_exp; ++e)
+                if (expert_rows_[static_cast<size_t>(e)] >= 0)
+                    scatter(e, ye.data() + expert_rows_[static_cast<size_t>(e)] * d);
         }
+        else
+        {
+            // The experts follow the size of the pass, which their own tokens may not reach.
+            const qk_path path = few ? qk_path::integer : qk_path::prompt;
+            for (long e = 0; e < n_exp; ++e)
+            {
+                const long m = static_cast<long>(routed[static_cast<size_t>(e)].size());
+                if (m == 0) continue;
+                gather(e, xe.data());
+                product(L.e_gate[static_cast<size_t>(e)], xe.data(), m, d, ge.data(), df, path);
+                product(L.e_up[static_cast<size_t>(e)], xe.data(), m, d, ue.data(), df, path);
+                qk_silu_mul(ge.data(), ue.data(), m * df);
+                product(L.e_down[static_cast<size_t>(e)], ge.data(), m, df, ye.data(), d, path);
+                scatter(e, ye.data());
+            }
+        }
+    }
+
+    long cpu_runtime::lay_out_experts(long n_experts, bool together)
+    {
+        long rows = 0;
+        if (together) expert_rows_.assign(static_cast<size_t>(n_experts), -1);
+        for (long e = 0; e < n_experts; ++e)
+        {
+            const long m = static_cast<long>(routed_[static_cast<size_t>(e)].size());
+            if (!together)
+                rows = std::max(rows, m);
+            else if (m > 0)
+            {
+                expert_rows_[static_cast<size_t>(e)] = rows;
+                rows += m;
+            }
+        }
+        return rows;
     }
 
     // Forward pass
@@ -1496,8 +1590,9 @@ namespace albireo
 
         proj_.resize(static_cast<size_t>(T * in_width));
         dyn_.resize(static_cast<size_t>(T * dyn_width));
-        product(L.ssm_in, x_.data(), T, d, proj_.data(), in_width);
-        product(L.ssm_dyn, x_.data(), T, d, dyn_.data(), dyn_width);
+        add_product(L.ssm_in, x_.data(), T, d, proj_.data(), in_width);
+        add_product(L.ssm_dyn, x_.data(), T, d, dyn_.data(), dyn_width);
+        products(T);
 
         // The inputs and the outputs of the states, normalized, and the turn of each angle for a step of one.
         turns_.resize(static_cast<size_t>(T * S));
@@ -1624,17 +1719,35 @@ namespace albireo
         const long group = H / KV;
         const float eps = static_cast<float>(cfg_.rms_eps);
 
+        /*
+            The products that read the hidden states, none of which reads another: the queries,
+            the factors of the keys then those of the values, the shifts, the share of the
+            noise and the gate of the layer.
+        */
+        const long signal = group - 1;
+        const long width = cfg_.signal_heads() * hd;
+        const long fa = T * KV * rank, fb = T * rank * hd;
         q_.resize(static_cast<size_t>(T * qd));
         k_.resize(static_cast<size_t>(T * kvd));
         v_.resize(static_cast<size_t>(T * kvd));
-        product(L.wq, x_.data(), T, d, q_.data(), qd);
+        factor_a_.resize(static_cast<size_t>(2 * fa));
+        factor_b_.resize(static_cast<size_t>(2 * fb));
+        shift_.resize(static_cast<size_t>(T * 2 * KV));
+        noise_.resize(static_cast<size_t>(T * KV));
+        gate_.resize(static_cast<size_t>(T * width));
+        add_product(L.wq, x_.data(), T, d, q_.data(), qd);
+        add_product(L.wa_k, x_.data(), T, d, factor_a_.data(), KV * rank);
+        add_product(L.wb_k, x_.data(), T, d, factor_b_.data(), rank * hd);
+        add_product(L.wa_v, x_.data(), T, d, factor_a_.data() + fa, KV * rank);
+        add_product(L.wb_v, x_.data(), T, d, factor_b_.data() + fb, rank * hd);
+        add_product(L.shift_k, x_.data(), T, d, shift_.data(), 2 * KV);
+        add_product(L.shift_v, x_.data(), T, d, shift_.data() + KV, 2 * KV);
+        add_product(L.noise, x_.data(), T, d, noise_.data(), KV);
+        add_product(L.attn_gate, x_.data(), T, d, gate_.data(), width);
+        products(T);
 
         // A key, or a value, of a head: the mean of rank products of a factor of the head and a row of its width.
-        auto tensor_products = [&](const weight_matrix& wa, const weight_matrix& wb, float* out) {
-            factor_a_.resize(static_cast<size_t>(T * KV * rank));
-            factor_b_.resize(static_cast<size_t>(T * rank * hd));
-            product(wa, x_.data(), T, d, factor_a_.data(), KV * rank);
-            product(wb, x_.data(), T, d, factor_b_.data(), rank * hd);
+        auto tensor_products = [&](const float* factors_a, const float* factors_b, float* out) {
             const float inv = 1.0f / static_cast<float>(rank);
             for (long t = 0; t < T; ++t)
                 for (long h = 0; h < KV; ++h)
@@ -1643,23 +1756,20 @@ namespace albireo
                     std::fill(row, row + hd, 0.0f);
                     for (long r = 0; r < rank; ++r)
                     {
-                        const float a = factor_a_[static_cast<size_t>((t * KV + h) * rank + r)] * inv;
-                        const float* b = factor_b_.data() + (t * rank + r) * hd;
+                        const float a = factors_a[(t * KV + h) * rank + r] * inv;
+                        const float* b = factors_b + (t * rank + r) * hd;
                         for (long e = 0; e < hd; ++e) row[e] += a * b[e];
                     }
                 }
         };
-        tensor_products(L.wa_k, L.wb_k, k_.data());
-        tensor_products(L.wa_v, L.wb_v, v_.data());
+        tensor_products(factor_a_.data(), factor_b_.data(), k_.data());
+        tensor_products(factor_a_.data() + fa, factor_b_.data() + fb, v_.data());
 
         /*
             The shift: each key and each value leans on the one of the previous token of its
             sequence, as it stood before its own shift.  The tokens of a segment are taken from
             the last one, so that the row before each still holds what it held.
         */
-        shift_.resize(static_cast<size_t>(T * 2 * KV));
-        product(L.shift_k, x_.data(), T, d, shift_.data(), 2 * KV);
-        product(L.shift_v, x_.data(), T, d, shift_.data() + KV, 2 * KV);
         last_keys_.resize(static_cast<size_t>(2 * kvd));
         for (const auto& seg : batch.segments)
         {
@@ -1711,13 +1821,7 @@ namespace albireo
             reads the noise, which the others give up in the proportion their token chooses;
             the gate of the layer then opens each value of the result.
         */
-        const long signal = group - 1;
-        const long width = cfg_.signal_heads() * hd;
-        noise_.resize(static_cast<size_t>(T * KV));
-        product(L.noise, x_.data(), T, d, noise_.data(), KV);
-        gate_.resize(static_cast<size_t>(T * width));
         up_.resize(static_cast<size_t>(T * width));
-        product(L.attn_gate, x_.data(), T, d, gate_.data(), width);
         const float gate_bias = static_cast<float>(cfg_.gate_bias);
         if (gate_bias != 0.0f)
             for (float& v : gate_) v += gate_bias;
@@ -1754,13 +1858,20 @@ namespace albireo
             }
         };
 
+        // The products that read the hidden states: the router, the entry of the latent space and the shared expert.
+        router_logits_.resize(static_cast<size_t>(T * n_exp));
+        latent_.resize(static_cast<size_t>(T * dl));
+        gate_.resize(static_cast<size_t>(T * ds));
+        add_product(L.router, x_.data(), T, d, router_logits_.data(), n_exp);
+        add_product(L.latent_down, x_.data(), T, d, latent_.data(), dl);
+        add_product(L.shared_up, x_.data(), T, d, gate_.data(), ds);
+        products(T);
+
         /*
             The router gives each expert a sigmoid; a token takes the experts of the largest
             sigmoids once their biases are added, with the sigmoids themselves, brought to a sum
             of one, as their weights.
         */
-        router_logits_.resize(static_cast<size_t>(T * n_exp));
-        product(L.router, x_.data(), T, d, router_logits_.data(), n_exp);
         std::vector<std::vector<std::pair<long, float>>>& routed = routed_;
         routed.resize(static_cast<size_t>(n_exp));
         for (auto& list : routed) list.clear();
@@ -1791,45 +1902,87 @@ namespace albireo
             }
         }
 
-        // The experts work in the latent space, which one projection enters and one leaves.
-        latent_.resize(static_cast<size_t>(T * dl));
-        product(L.latent_down, x_.data(), T, d, latent_.data(), dl);
+        /*
+            The experts work in the latent space, which one projection enters and one leaves.
+            Their rows follow one another in the buffers, in the order of the experts.  With the
+            few tokens of a generation step, the experts compute their first products together,
+            then their second ones; with a prompt, each expert in turn, in buffers that stay in
+            the caches.
+        */
         routed_latent_.assign(static_cast<size_t>(T * dl), 0.0f);
         aligned_floats& xe = expert_x_;
         aligned_floats& ue = expert_up_;
         aligned_floats& ye = expert_y_;
-        const qk_path path = T >= qk_float_product_tokens ? qk_path::prompt : qk_path::integer;
-        for (long e = 0; e < n_exp; ++e)
-        {
+        const bool few = T < qk_float_product_tokens;
+        const bool together = few && qk_grouped_products();
+        const long reached = lay_out_experts(n_exp, together);
+        xe.resize(static_cast<size_t>(reached * dl));
+        ue.resize(static_cast<size_t>(reached * df));
+        ye.resize(static_cast<size_t>(reached * dl));
+        auto gather = [&](long e, float* x) {
             const auto& list = routed[static_cast<size_t>(e)];
-            const long m = static_cast<long>(list.size());
-            if (m == 0) continue;
-            xe.resize(static_cast<size_t>(m * dl));
-            for (long i = 0; i < m; ++i)
-                std::memcpy(xe.data() + i * dl, latent_.data() + list[static_cast<size_t>(i)].first * dl,
+            for (size_t i = 0; i < list.size(); ++i)
+                std::memcpy(x + static_cast<long>(i) * dl, latent_.data() + list[i].first * dl,
                     sizeof(float) * static_cast<size_t>(dl));
-            ue.resize(static_cast<size_t>(m * df));
-            ye.resize(static_cast<size_t>(m * dl));
-            product(L.e_up[static_cast<size_t>(e)], xe.data(), m, dl, ue.data(), df, path);
-            squared_relu(ue.data(), m * df);
-            product(L.e_down[static_cast<size_t>(e)], ue.data(), m, df, ye.data(), dl, path);
-            for (long i = 0; i < m; ++i)
+        };
+        auto scatter = [&](long e, const float* y) {
+            const auto& list = routed[static_cast<size_t>(e)];
+            for (size_t i = 0; i < list.size(); ++i)
             {
-                const float w = list[static_cast<size_t>(i)].second;
-                float* dst = routed_latent_.data() + list[static_cast<size_t>(i)].first * dl;
-                const float* src = ye.data() + i * dl;
+                const float w = list[i].second;
+                float* dst = routed_latent_.data() + list[i].first * dl;
+                const float* src = y + static_cast<long>(i) * dl;
                 for (long j = 0; j < dl; ++j) dst[j] += w * src[j];
             }
+        };
+        if (together)
+        {
+            for (long e = 0; e < n_exp; ++e)
+            {
+                const long first = expert_rows_[static_cast<size_t>(e)];
+                if (first < 0) continue;
+                const long m = static_cast<long>(routed[static_cast<size_t>(e)].size());
+                gather(e, xe.data() + first * dl);
+                add_product(L.e_up[static_cast<size_t>(e)], xe.data() + first * dl, m, dl, ue.data() + first * df, df);
+            }
+            products(T);
+            squared_relu(ue.data(), reached * df);
+            for (long e = 0; e < n_exp; ++e)
+            {
+                const long first = expert_rows_[static_cast<size_t>(e)];
+                if (first < 0) continue;
+                const long m = static_cast<long>(routed[static_cast<size_t>(e)].size());
+                add_product(L.e_down[static_cast<size_t>(e)], ue.data() + first * df, m, df, ye.data() + first * dl,
+                    dl);
+            }
+            products(T);
+            for (long e = 0; e < n_exp; ++e)
+                if (expert_rows_[static_cast<size_t>(e)] >= 0)
+                    scatter(e, ye.data() + expert_rows_[static_cast<size_t>(e)] * dl);
         }
-        tmp_.resize(static_cast<size_t>(T * d));
-        product(L.latent_up, routed_latent_.data(), T, dl, tmp_.data(), d);
+        else
+        {
+            // The experts follow the size of the pass, which their own tokens may not reach.
+            const qk_path path = few ? qk_path::integer : qk_path::prompt;
+            for (long e = 0; e < n_exp; ++e)
+            {
+                const long m = static_cast<long>(routed[static_cast<size_t>(e)].size());
+                if (m == 0) continue;
+                gather(e, xe.data());
+                product(L.e_up[static_cast<size_t>(e)], xe.data(), m, dl, ue.data(), df, path);
+                squared_relu(ue.data(), m * df);
+                product(L.e_down[static_cast<size_t>(e)], ue.data(), m, df, ye.data(), dl, path);
+                scatter(e, ye.data());
+            }
+        }
 
-        // The shared expert reads every token.
-        gate_.resize(static_cast<size_t>(T * ds));
+        // The exit of the latent space, and the shared expert, which reads every token.
+        tmp_.resize(static_cast<size_t>(T * d));
         up_.resize(static_cast<size_t>(T * d));
-        product(L.shared_up, x_.data(), T, d, gate_.data(), ds);
         squared_relu(gate_.data(), T * ds);
-        product(L.shared_down, gate_.data(), T, ds, up_.data(), d);
+        add_product(L.latent_up, routed_latent_.data(), T, dl, tmp_.data(), d);
+        add_product(L.shared_down, gate_.data(), T, ds, up_.data(), d);
+        products(T);
         qk_add(tmp_.data(), up_.data(), T * d);
     }
 

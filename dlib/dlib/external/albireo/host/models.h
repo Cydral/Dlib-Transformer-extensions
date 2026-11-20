@@ -33,6 +33,13 @@ namespace albireo
                 read from that folder alone; the installed models, the downloads in progress
                 and the imports from removable media.
 
+            MODELS OF LATER VERSIONS
+                A catalog entry may name in "since" the first version of Albireo whose engines
+                serve its model.  The versions before it leave the entry out of the catalog
+                they serve: the model is neither listed nor downloaded, and an installed file
+                is described from its own header.  The database keeps the signed catalog
+                whole, and the version that follows an update finds the entry.
+
             MODELS THAT READ IMAGES
                 Such a model comes as two GGUF files: its decoder, and a projector
                 (mmproj-*.gguf, general.architecture "clip") that holds the vision encoder.

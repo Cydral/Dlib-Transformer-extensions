@@ -42,7 +42,10 @@
     whose copies leave it, wait for the ceiling the release left to rise once the card has room
     again (ALBIREO_TEST_CARD_RAISE_MS gives the period of the rise), and come back, then leave
     again within the period of that rise, their bytes bounding the next rises and the period
-    doubling.
+    doubling.  The tiny mixture of experts and the tiny hybrid decoder of tiny_gguf.h follow,
+    whose steps hand the products of a layer over by groups: a device that leaves them to the
+    processor gives the logits of the runtime alone, bit for bit, and the measured routing
+    and the device those of the processor to their rounding.
 */
 
 #include <algorithm>
@@ -252,6 +255,69 @@ namespace
         return out;
     }
 
+    /*
+        The steps of a mixture of experts, or of a hybrid decoder, whose layers hand their
+        products over by groups (matmul_offload::matmul_group()), after a prompt of 12 tokens:
+        with the routing "host", the device leaves every group to the processor, which
+        computes it in one parallel section and gives the logits of the runtime alone, bit for
+        bit; with the measured routing, a group goes to the processor once the routes of its
+        shapes are settled there; with the routing "device", every product runs on the device.
+    */
+    void grouped_products(const std::string& path, const std::string& device, bool hybrid, thread_pool& pool)
+    {
+        albireo_test::tiny_gguf_writer writer;
+        const albireo_test::tiny_gguf model = hybrid ? writer.build_hybrid() : writer.experts(8, 3).build();
+        if (!model.save(path, model.bytes))
+        {
+            expect(false, "write the model of the groups of products");
+            return;
+        }
+        auto file = std::make_shared<model_file>(path);
+        const model_config cfg = read_model_config(*file);
+        std::printf("%s\n", describe(cfg).c_str());
+        const long V = cfg.vocab;
+        std::vector<int> tokens(40);
+        uint32_t state = 5;
+        for (auto& t : tokens) t = next_token(state);
+        const long prompt = 12;
+        const long T = static_cast<long>(tokens.size());
+        double ms = 0;
+        std::vector<float> reference;
+        {
+            cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+            reference = run(rt, tokens, prompt, ms);
+        }
+        const char* routings[3] = { "host", "auto", "device" };
+        for (const char* routing : routings)
+        {
+            tensor_device dev(device_config(device, 0, routing), pool, print_log);
+            std::vector<float> got;
+            json st;
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+                rt.set_offload(dev.make_offload());
+                got = run(rt, tokens, prompt, ms);
+                st = dev.stats();
+            }
+            const stats d = compare(reference.data(), got.data(), T, V);
+            report((std::string("groups of products, routing ") + routing).c_str(), d);
+            expect(st["failures"].as_int() == 0, "no device failure with groups of products");
+            if (std::string(routing) == "host")
+            {
+                expect(d.max_abs == 0, "groups left to the processor against the runtime alone");
+                expect(st["device_products"].as_int() == 0 && st["host_products"].as_int() > 0,
+                    "every product of a device that routes to the processor on the processor");
+            }
+            else
+            {
+                expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97,
+                    "groups of products through the device");
+                if (std::string(routing) == "device")
+                    expect(st["device_products"].as_int() > 0, "the products of the groups on the device");
+            }
+        }
+    }
+
     int synthetic(const std::string& folder, const std::string& device)
     {
         std::string backend, runtime, reason, reason_code;
@@ -446,6 +512,8 @@ namespace
             expect(gone["weights_bytes"].as_int() == 0 && gone["card_cap_bytes"].is_null()
                 && gone["card_short_bytes"].is_null(), "the ceiling and its bound left with the last copies");
         }
+        std::remove(path.c_str());
+        for (int hybrid = 0; hybrid < 2; ++hybrid) grouped_products(path, device, hybrid != 0, pool);
         std::remove(path.c_str());
         if (failures)
         {

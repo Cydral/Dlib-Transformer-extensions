@@ -2727,6 +2727,54 @@ namespace albireo
 
     void qk_set_integer_prompt(bool on) { integer_prompt.store(on); }
 
+    namespace
+    {
+        std::atomic<bool> grouped_products{true};
+
+        /*
+            The rows [r0, r1) of a product on the integer kernels, with the activations of its
+            tokens as these kernels read them.  With several tokens, the tokens go by tiles:
+            the rows and the activations of a tile then stay in the caches while every pair is
+            computed.
+        */
+        void integer_rows(const weight_matrix& W, const uint8_t* act, size_t act_bytes, long n_tokens, long r0,
+            long r1, float* Y, long y_stride, bool accumulate)
+        {
+            const long n = W.cols;
+            const long tile = 16;
+            for (long t0 = 0; t0 < n_tokens; t0 += tile)
+            {
+                const long t1 = std::min(n_tokens, t0 + tile);
+                for (long r = r0; r < r1; ++r)
+                {
+                    const uint8_t* wrow = W.data + static_cast<size_t>(r) * W.row_bytes;
+                    // Up to four tokens at a time, for which the weights of the row are unpacked
+                    // once; a token left alone goes to qk_dot() directly.
+                    long t = t0;
+                    for (; t + 1 < t1; t += 4)
+                    {
+                        const long nt = std::min<long>(4, t1 - t);
+                        const uint8_t* rows[4];
+                        float v[4];
+                        for (long i = 0; i < nt; ++i) rows[i] = act + static_cast<size_t>(t + i) * act_bytes;
+                        dot_rows(W.type, wrow, rows, nt, n, v);
+                        for (long i = 0; i < nt; ++i)
+                        {
+                            float& out = Y[(t + i) * y_stride + r];
+                            out = accumulate ? out + v[i] : v[i];
+                        }
+                    }
+                    for (; t < t1; ++t)
+                    {
+                        const float v = qk_dot(W.type, wrow, act + static_cast<size_t>(t) * act_bytes, n);
+                        float& out = Y[t * y_stride + r];
+                        out = accumulate ? out + v : v;
+                    }
+                }
+            }
+        }
+    }
+
     void qk_matmul(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
         float* Y, long y_stride, thread_pool& pool, qk_scratch& scratch, bool accumulate, qk_path path)
     {
@@ -2789,46 +2837,89 @@ namespace albireo
         group = std::min<long>(group, 128);
         if (n_tokens > 1) group = std::max<long>(1, std::min<long>(group, 32));
         const long n_groups = (rows + group - 1) / group;
-        const ggml_type type = W.type;
-        const uint8_t* data = W.data;
-        const size_t row_bytes = W.row_bytes;
-
-        // With several tokens, the tokens go by tiles: the rows of a group and the
-        // activations of a tile then stay in the caches while every pair is computed.
-        const long tile = 16;
         pool.parallel_for(n_groups, [&](long g, int) {
             const long r0 = g * group;
-            const long r1 = std::min(rows, r0 + group);
-            for (long t0 = 0; t0 < n_tokens; t0 += tile)
+            integer_rows(W, act, act_bytes, n_tokens, r0, std::min(rows, r0 + group), Y, y_stride, accumulate);
+        });
+    }
+
+    void qk_set_grouped_products(bool on) { grouped_products.store(on); }
+    bool qk_grouped_products() { return grouped_products.load(std::memory_order_relaxed); }
+
+    void qk_matmul_group(const qk_product* items, long count, thread_pool& pool, qk_scratch& scratch)
+    {
+        if (count <= 0) return;
+        if (count == 1 || !qk_grouped_products() || exact_products.load(std::memory_order_relaxed))
+        {
+            for (long i = 0; i < count; ++i)
+                qk_matmul(*items[i].W, items[i].X, items[i].n_tokens, items[i].x_stride, items[i].Y,
+                    items[i].y_stride, pool, scratch, false, qk_path::integer);
+            return;
+        }
+
+        /*
+            The activations of each product, quantized once for all the rows of its matrix: the
+            rows given when the kernels read them as they are, a place in the buffer otherwise.
+            A null pointer stands for a place until the buffer has its size.
+        */
+        std::vector<qk_scratch::group_item>& prepared = scratch.items;
+        prepared.resize(static_cast<size_t>(count));
+        size_t bytes = 0;
+        size_t work = 0;
+        for (long i = 0; i < count; ++i)
+        {
+            const qk_product& p = items[i];
+            qk_scratch::group_item& a = prepared[static_cast<size_t>(i)];
+            a.act = nullptr;
+            a.act_bytes = 0;
+            if (!p.W->valid() || p.n_tokens <= 0) continue;
+            const act_format f = qk_activation_format(p.W->type);
+            a.act_bytes = qk_activation_row_bytes(f, p.W->cols);
+            if (f == act_format::f32 && p.x_stride == p.W->cols)
+                a.act = reinterpret_cast<const uint8_t*>(p.X);
+            else
+                bytes += a.act_bytes * static_cast<size_t>(p.n_tokens);
+            work += static_cast<size_t>(p.W->rows) * static_cast<size_t>(p.W->cols) * static_cast<size_t>(p.n_tokens);
+        }
+        scratch.act.resize(bytes);
+        uint8_t* place = scratch.act.data();
+        for (long i = 0; i < count; ++i)
+        {
+            const qk_product& p = items[i];
+            qk_scratch::group_item& a = prepared[static_cast<size_t>(i)];
+            if (a.act || a.act_bytes == 0) continue;
+            for (long t = 0; t < p.n_tokens; ++t)
+                qk_quantize_row(qk_activation_format(p.W->type), p.X + t * p.x_stride,
+                    place + static_cast<size_t>(t) * a.act_bytes, p.W->cols);
+            a.act = place;
+            place += a.act_bytes * static_cast<size_t>(p.n_tokens);
+        }
+
+        // The rows of every matrix by tasks of about the same number of weights, eight a thread.
+        const size_t share = std::max<size_t>(1, work / (static_cast<size_t>(pool.size()) * 8));
+        std::vector<qk_scratch::group_task>& tasks = scratch.tasks;
+        tasks.clear();
+        for (long i = 0; i < count; ++i)
+        {
+            const qk_product& p = items[i];
+            if (prepared[static_cast<size_t>(i)].act_bytes == 0) continue;
+            const size_t row_work = static_cast<size_t>(p.W->cols) * static_cast<size_t>(p.n_tokens);
+            long group = static_cast<long>(std::min<size_t>(128, std::max<size_t>(1, share / row_work)));
+            if (p.n_tokens > 1) group = std::min<long>(group, 32);
+            for (long r = 0; r < p.W->rows; r += group)
             {
-                const long t1 = std::min(n_tokens, t0 + tile);
-                for (long r = r0; r < r1; ++r)
-                {
-                    const uint8_t* wrow = data + static_cast<size_t>(r) * row_bytes;
-                    // Up to four tokens at a time, for which the weights of the row are unpacked
-                    // once; a token left alone goes to qk_dot() directly.
-                    long t = t0;
-                    for (; t + 1 < t1; t += 4)
-                    {
-                        const long nt = std::min<long>(4, t1 - t);
-                        const uint8_t* rows[4];
-                        float v[4];
-                        for (long i = 0; i < nt; ++i) rows[i] = act + static_cast<size_t>(t + i) * act_bytes;
-                        dot_rows(type, wrow, rows, nt, n, v);
-                        for (long i = 0; i < nt; ++i)
-                        {
-                            float& out = Y[(t + i) * y_stride + r];
-                            out = accumulate ? out + v[i] : v[i];
-                        }
-                    }
-                    for (; t < t1; ++t)
-                    {
-                        const float v = qk_dot(type, wrow, act + static_cast<size_t>(t) * act_bytes, n);
-                        float& out = Y[t * y_stride + r];
-                        out = accumulate ? out + v : v;
-                    }
-                }
+                qk_scratch::group_task task;
+                task.item = i;
+                task.first = r;
+                task.end = std::min(p.W->rows, r + group);
+                tasks.push_back(task);
             }
+        }
+        pool.parallel_for(static_cast<long>(tasks.size()), [&](long g, int) {
+            const qk_scratch::group_task& task = tasks[static_cast<size_t>(g)];
+            const qk_product& p = items[task.item];
+            const qk_scratch::group_item& a = prepared[static_cast<size_t>(task.item)];
+            integer_rows(*p.W, a.act, a.act_bytes, p.n_tokens, task.first, task.end, p.Y, p.y_stride, false);
         });
     }
 

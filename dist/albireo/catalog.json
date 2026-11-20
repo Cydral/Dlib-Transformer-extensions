@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-11-19T16:04:09Z",
+  "updated": "2026-11-20T18:26:20Z",
   "models": [
     {
       "id": "qwen3-vl-4b-instruct",
@@ -681,6 +681,7 @@
       "reasoning": true,
       "reasoning_always": false,
       "license": "Apache-2.0",
+      "since": "1.0.26",
       "description": {
         "en": "Hybrid model from OVHai LLM (France) with 6.8 billion parameters, about 1 billion of which compute each token: Mamba-3 layers, a few attention layers and a mixture of 256 experts, for answers at the pace of a small model on a processor. It reasons on request and calls tools, reads text alone, and suits computers with 16 GB of memory.",
         "fr": "Modèle hybride d'OVHai LLM (France) de 6,8 milliards de paramètres, dont environ 1 milliard calcule chaque jeton : couches Mamba-3, quelques couches d'attention et mélange de 256 experts, pour des réponses au rythme d'un petit modèle sur un processeur. Il raisonne sur demande et appelle des outils, lit le texte seul et convient aux ordinateurs dotés de 16 Go de mémoire.",
