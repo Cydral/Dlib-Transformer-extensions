@@ -130,6 +130,8 @@ namespace albireo
         {
             const uint8_t* act;
             size_t act_bytes;
+            // The product before it whose quantized activations it reads, or -1.
+            long same;
         };
         struct group_task
         {
@@ -158,6 +160,16 @@ namespace albireo
         for AVX2 from twelve (README.md).
     !*/
     const long qk_float_product_tokens = 8;
+
+    /*!
+        The weights a task of the integer kernels reads at least, times the tokens of its
+        product: a few microseconds of one core, against the fraction of a microsecond a
+        thread spends taking a task (thread_pool).  The rows of a product go to as many
+        tasks as this leaves, eight a thread at most, so that a product of a few tens of
+        thousands of weights runs whole on the calling thread and a product of a few hundred
+        thousand on the threads it can feed.
+    !*/
+    const long qk_task_weights = 32768;
 
     /*!
         ensures
@@ -224,11 +236,11 @@ namespace albireo
             - Computes each product of items as qk_matmul() does with the integer kernels, bit
               for bit, the rows of all the matrices sharing one parallel section of the pool.
             - A generation step computes several hundred products, most of them over a few
-              hundred rows in the experts of a mixture, and a section costs the hand-over of
-              every thread of the pool, which lasts longer than the rows of such a product on
-              a processor with many cores: the products of a layer that read nothing of one
-              another then share their sections.  The activations are quantized on the
-              calling thread, which suits the few tokens of a generation step.
+              hundred rows in the experts of a mixture, each of which alone feeds a few
+              threads or none (qk_task_weights): the products of a layer that read nothing
+              of one another share one section, whose tasks are sized over the rows of all
+              of them.  The activations are quantized on the calling thread, which suits
+              the few tokens of a generation step.
             - Computes the products one after the other when qk_set_grouped_products() turned
               the common sections off, and with the exact products of
               qk_set_exact_products().

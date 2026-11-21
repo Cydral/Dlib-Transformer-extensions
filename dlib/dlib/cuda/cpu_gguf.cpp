@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -395,6 +396,174 @@ namespace dlib
                     for (long i = 0; i < hd; ++i) dst[i] *= inv;
                 }
             }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        void expert_routes (
+            tensor& picks,
+            tensor& weights,
+            const tensor& logits,
+            const tensor& bias,
+            long top_k,
+            bool normalize,
+            float scale
+        )
+        {
+            const long experts = static_cast<long>(bias.size());
+            DLIB_CASSERT(experts > 0 && logits.size() % static_cast<size_t>(experts) == 0);
+            DLIB_CASSERT(top_k > 0 && top_k <= experts && top_k <= 64);
+            const size_t n = logits.size() / static_cast<size_t>(experts);
+            DLIB_CASSERT(picks.size() == n * static_cast<size_t>(top_k) && weights.size() == picks.size());
+            DLIB_CASSERT(!is_same_object(picks, weights) && !is_same_object(picks, logits)
+                && !is_same_object(weights, logits) && !is_same_object(picks, bias)
+                && !is_same_object(weights, bias));
+            if (n == 0) return;
+            const float* l = logits.host();
+            const float* b = bias.host();
+            float* p = picks.host_write_only();
+            float* w = weights.host_write_only();
+            std::vector<float> scores(static_cast<size_t>(experts)), ranked(static_cast<size_t>(experts));
+            int32_t chosen[64];
+            for (size_t t = 0; t < n; ++t)
+            {
+                const float* row = l + t * static_cast<size_t>(experts);
+                for (long e = 0; e < experts; ++e)
+                {
+                    const float s = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(row[e]))));
+                    scores[static_cast<size_t>(e)] = s;
+                    ranked[static_cast<size_t>(e)] = s + b[e];
+                }
+                // The rank of an expert is the number of experts before it, as the kernel of the device counts it.
+                for (long k = 0; k < top_k; ++k) chosen[k] = 0;
+                for (long e = 0; e < experts; ++e)
+                {
+                    const float mine = ranked[static_cast<size_t>(e)];
+                    long rank = 0;
+                    for (long o = 0; o < experts; ++o)
+                    {
+                        const float other = ranked[static_cast<size_t>(o)];
+                        if (other > mine || (other == mine && o < e)) ++rank;
+                    }
+                    if (rank < top_k) chosen[rank] = static_cast<int32_t>(e);
+                }
+                float selected = 0;
+                for (long k = 0; k < top_k; ++k) selected += scores[static_cast<size_t>(chosen[k])];
+                for (long k = 0; k < top_k; ++k)
+                {
+                    float share = scores[static_cast<size_t>(chosen[k])];
+                    if (normalize) share /= selected + 1e-20f;
+                    const size_t at = t * static_cast<size_t>(top_k) + static_cast<size_t>(k);
+                    std::memcpy(p + at, &chosen[k], sizeof(int32_t));
+                    w[at] = share * scale;
+                }
+            }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        void gguf_matvec_picked (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            int type,
+            long rows,
+            long cols,
+            size_t row_bytes,
+            const tensor& picks,
+            long per_row
+        )
+        {
+            DLIB_CASSERT(gguf_blocks::known_format(type) && rows > 0 && cols > 0 && per_row > 0);
+            DLIB_CASSERT(static_cast<long long>(rows) <= std::numeric_limits<int>::max()
+                && static_cast<long long>(cols) <= std::numeric_limits<int>::max());
+            DLIB_CASSERT(row_bytes != 0 && row_bytes == gguf_blocks::row_bytes(type, cols));
+            DLIB_CASSERT(!is_same_object(dest, src) && !is_same_object(dest, weights) && !is_same_object(dest, picks));
+            const size_t count = picks.size();
+            DLIB_CASSERT(count % static_cast<size_t>(per_row) == 0);
+            DLIB_CASSERT(src.size() == count / static_cast<size_t>(per_row) * static_cast<size_t>(cols));
+            DLIB_CASSERT(dest.size() == count * static_cast<size_t>(rows));
+            if (count == 0) return;
+            const size_t matrix_bytes = static_cast<size_t>(rows) * row_bytes;
+            const size_t matrices = weights.size() * sizeof(float) / matrix_bytes;
+            const uint8_t* w = reinterpret_cast<const uint8_t*>(weights.host());
+            const float* x = src.host();
+            const float* pk = picks.host();
+            float* y = dest.host_write_only();
+            const long groups = cols / 32;
+            float v[32];
+            for (size_t j = 0; j < count; ++j)
+            {
+                int32_t pick;
+                std::memcpy(&pick, pk + j, sizeof(pick));
+                DLIB_CASSERT(pick >= 0 && static_cast<size_t>(pick) < matrices);
+                const uint8_t* m = w + static_cast<size_t>(pick) * matrix_bytes;
+                const float* xj = x + j / static_cast<size_t>(per_row) * static_cast<size_t>(cols);
+                for (long r = 0; r < rows; ++r)
+                {
+                    const uint8_t* wr = m + static_cast<size_t>(r) * row_bytes;
+                    float acc = 0;
+                    for (long g = 0; g < groups; ++g)
+                    {
+                        gguf_blocks::decode_group(type, wr, g, v);
+                        const float* xg = xj + g * 32;
+                        float s = 0;
+                        for (int i = 0; i < 32; ++i) s += v[i] * xg[i];
+                        acc += s;
+                    }
+                    y[j * static_cast<size_t>(rows) + static_cast<size_t>(r)] = acc;
+                }
+            }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        void squared_relu (
+            tensor& x
+        )
+        {
+            float* p = x.host();
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                const float r = p[i] > 0.0f ? p[i] : 0.0f;
+                p[i] = r * r;
+            }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        void mix_rows (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            long per_row
+        )
+        {
+            DLIB_CASSERT(per_row > 0 && weights.size() % static_cast<size_t>(per_row) == 0);
+            const size_t n = weights.size() / static_cast<size_t>(per_row);
+            DLIB_CASSERT(!is_same_object(dest, src) && !is_same_object(dest, weights));
+            if (n == 0)
+            {
+                DLIB_CASSERT(dest.size() == 0 && src.size() == 0);
+                return;
+            }
+            DLIB_CASSERT(dest.size() % n == 0);
+            const size_t width = dest.size() / n;
+            DLIB_CASSERT(src.size() == weights.size() * width);
+            const float* s = src.host();
+            const float* w = weights.host();
+            float* d = dest.host_write_only();
+            for (size_t t = 0; t < n; ++t)
+                for (size_t i = 0; i < width; ++i)
+                {
+                    float sum = 0;
+                    for (size_t j = 0; j < static_cast<size_t>(per_row); ++j)
+                    {
+                        const size_t row = t * static_cast<size_t>(per_row) + j;
+                        sum += w[row] * s[row * width + i];
+                    }
+                    d[t * width + i] = sum;
+                }
         }
 
     // ----------------------------------------------------------------------------------------

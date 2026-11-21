@@ -42,6 +42,8 @@
         --cache-dir DIR      folder of the cache of the engine, where the graph of OpenVINO writes
                              the file of its weights, as in the service
         --routing MODE       auto, device (every product on the device) or host
+        --spin MICROSECONDS  how long the threads of the engine wait for the next parallel section
+                             before they sleep ("spin_us"), 2000 by default
         --projector FILE     image encoder of a model that reads images (mmproj GGUF)
         --image FILE         a PNG or JPEG image given before each question, as a data URL;
                              repeat it for several images
@@ -344,6 +346,7 @@ int main(int argc, char** argv)
     double presence = -1000.0;
     bool parallel = false, turns = false, tools = false, warm = true, floats = false;
     long draft = -1;
+    long spin = -1;
     double pause = 0;
     int threads = 0;
     long context = 4096;
@@ -383,6 +386,7 @@ int main(int argc, char** argv)
         else if (a == "--graph" && i + 1 < argc) graph = argv[++i];
         else if (a == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
         else if (a == "--routing" && i + 1 < argc) routing = argv[++i];
+        else if (a == "--spin" && i + 1 < argc) spin = std::atol(argv[++i]);
         else if (a == "--reference" && i + 1 < argc) reference = argv[++i];
         else if (a == "--projector" && i + 1 < argc) projector = argv[++i];
         else if (a == "--image" && i + 1 < argc) images.push_back(argv[++i]);
@@ -468,6 +472,7 @@ int main(int argc, char** argv)
     if (!graph.empty()) config["graph"] = graph;
     if (!cache_dir.empty()) config["cache_dir"] = cache_dir;
     if (!routing.empty()) config["routing"] = routing;
+    if (spin >= 0) config["spin_us"] = static_cast<long long>(spin);
     if (!warm) config["warm_history"] = false;
     if (floats) config["integer_prompt"] = false;
     char err[1024] = { 0 };

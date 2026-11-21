@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -269,14 +270,24 @@ namespace albireo
     void cpu_runtime::set_offload(std::unique_ptr<matmul_offload> offload)
     {
         layer_pass_.reset();
+        // The states the device of the previous offload alone holds come back first.
+        if (hybrid_pass_) fetch_all_states();
+        hybrid_pass_.reset();
         offload_ = std::move(offload);
         layer_pass_checked_ = false;
         layer_pass_memory_failures_ = 0;
         layer_pass_wait_ = 0;
         attention_wait_ = 0;
         attention_interval_ = 0;
-        // The layers of a device are those of a dense decoder made of attentions.
-        if (!offload_ || cfg_.is_moe() || cfg_.hybrid()) return;
+        if (!offload_) return;
+        if (cfg_.hybrid())
+        {
+            hybrid_model h;
+            if (describe_hybrid(h)) hybrid_pass_ = offload_->make_hybrid_pass(h);
+            return;
+        }
+        // The other layers of a device are those of a dense decoder made of attentions.
+        if (cfg_.is_moe()) return;
         dense_model m;
         m.d_model = cfg_.d_model;
         m.q_dim = cfg_.q_dim();
@@ -331,6 +342,96 @@ namespace albireo
         return o.str();
     }
 
+    bool cpu_runtime::describe_hybrid(hybrid_model& m) const
+    {
+        m.d_model = cfg_.d_model;
+        m.rms_eps = static_cast<float>(cfg_.rms_eps);
+        m.ssm_heads = cfg_.ssm_heads;
+        m.ssm_head_dim = cfg_.ssm_head_dim;
+        m.ssm_state = cfg_.ssm_state;
+        m.ssm_rank = cfg_.ssm_rank;
+        m.ssm_angles = cfg_.ssm_angles;
+        m.n_experts = cfg_.n_experts;
+        m.n_experts_used = cfg_.n_experts_used;
+        m.expert_weights_norm = cfg_.expert_weights_norm;
+        m.expert_weights_scale = static_cast<float>(cfg_.expert_weights_scale);
+        m.state_floats = state_floats_;
+        m.output = output_;
+        // The matrices of the experts of a layer as one matrix, when they follow one another in the file.
+        auto joined = [&](const std::vector<weight_matrix>& experts, weight_matrix& all) {
+            if (experts.empty() || !experts[0].valid()) return false;
+            const weight_matrix& first = experts[0];
+            const size_t bytes = static_cast<size_t>(first.rows) * first.row_bytes;
+            for (size_t e = 1; e < experts.size(); ++e)
+                if (experts[e].type != first.type || experts[e].rows != first.rows || experts[e].cols != first.cols
+                    || experts[e].row_bytes != first.row_bytes || experts[e].data != first.data + e * bytes)
+                    return false;
+            all = first;
+            all.rows = first.rows * static_cast<long>(experts.size());
+            return true;
+        };
+        for (long i = 0; i < cfg_.n_layers; ++i)
+        {
+            const layer& L = layers_[static_cast<size_t>(i)];
+            hybrid_layer l;
+            l.mamba = cfg_.layer_types[static_cast<size_t>(i)] == 'M';
+            if (l.mamba)
+            {
+                l.ssm_in = L.ssm_in;
+                l.ssm_dyn = L.ssm_dyn;
+                l.b_norm = L.ssm_b_norm.data();
+                l.c_norm = L.ssm_c_norm.data();
+                l.b_bias = L.ssm_b_bias.data();
+                l.c_bias = L.ssm_c_bias.data();
+                l.dt_bias = L.ssm_dt_bias.data();
+                l.skip = L.ssm_d.data();
+                l.mimo_x = L.mimo_x.data();
+                l.mimo_z = L.mimo_z.data();
+                l.mimo_o = L.mimo_o.data();
+            }
+            else
+            {
+                l.wq = L.wq;
+                l.wa_k = L.wa_k;
+                l.wb_k = L.wb_k;
+                l.wa_v = L.wa_v;
+                l.wb_v = L.wb_v;
+                l.shift_k = L.shift_k;
+                l.shift_v = L.shift_v;
+                l.noise = L.noise;
+                l.gate = L.attn_gate;
+            }
+            l.wo = L.wo;
+            l.router = L.router;
+            l.latent_down = L.latent_down;
+            l.latent_up = L.latent_up;
+            if (!joined(L.e_up, l.experts_up) || !joined(L.e_down, l.experts_down)) return false;
+            l.shared_up = L.shared_up;
+            l.shared_down = L.shared_down;
+            l.expert_bias = L.expert_bias.data();
+            l.mixer_scale = L.mixer_scale;
+            l.mixer_bias = L.mixer_bias;
+            l.ffn_scale = L.ffn_scale;
+            l.ffn_bias = L.ffn_bias;
+            l.state_offset = state_offsets_[static_cast<size_t>(i)];
+            m.layers.push_back(l);
+        }
+        return true;
+    }
+
+    void cpu_runtime::set_busy(bool busy)
+    {
+        // A model without requests may give the room of its copies: its states leave the device first.
+        if (!busy && hybrid_pass_) fetch_all_states();
+        if (offload_) offload_->set_busy(busy);
+    }
+
+    void cpu_runtime::trim_memory()
+    {
+        if (hybrid_pass_) fetch_all_states();
+        kv_.trim();
+    }
+
     // Sequences
 
     int cpu_runtime::create_sequence()
@@ -362,8 +463,9 @@ namespace albireo
         sequences_[static_cast<size_t>(seq)]->clear(pool_of(seq));
         sequences_[static_cast<size_t>(seq)].reset();
         sequence_pools_[static_cast<size_t>(seq)] = &kv_;
-        // The states of the sequence go back to the system.
+        // The states of the sequence go back to the system, and leave the device.
         if (cfg_.hybrid()) recurrent_[static_cast<size_t>(seq)] = recurrent_sequence();
+        if (hybrid_pass_) hybrid_pass_->forget(seq);
         free_sequences_.push_back(seq);
     }
 
@@ -393,6 +495,13 @@ namespace albireo
             while (!r.saved.empty() && r.saved.back().length > length) r.saved.pop_back();
             r.reading = -1;
             r.own = false;
+            // The host holds the states again: those of the device, further in the sequence, go.
+            if (length <= 0 || kept != &r.live)
+            {
+                r.on_host = true;
+                r.lost = false;
+                if (hybrid_pass_) hybrid_pass_->forget(seq);
+            }
         }
         s.truncate(pool, length);
     }
@@ -413,6 +522,8 @@ namespace albireo
             if (length > 0 && !from)
                 throw std::logic_error("cpu_runtime: a hybrid decoder copies a sequence up to the lengths of its "
                     "saved states only (restorable_length())");
+            // The states the device alone holds come back before their copy; lost, they are not copied.
+            if (length > 0 && from == &recurrent_[static_cast<size_t>(src)].live && !fetch_states(src)) return false;
             // The states are copied apart first: the source may be the destination, and the keys may lack room.
             recurrent_sequence copy;
             if (length > 0) copy.live.values = from->values;
@@ -422,6 +533,7 @@ namespace albireo
             if (length > 0) copy.saved.push_back(copy.live);
             if (!d.share_prefix(pool_of(dst), s, length)) return false;
             recurrent_[static_cast<size_t>(dst)] = std::move(copy);
+            if (hybrid_pass_) hybrid_pass_->forget(dst);
             return true;
         }
         // The full blocks are shared; each sequence copies a shared block before writing in it.
@@ -431,7 +543,7 @@ namespace albireo
     const cpu_runtime::recurrent_state* cpu_runtime::state_at(int seq, long length) const
     {
         const recurrent_sequence& r = recurrent_.at(static_cast<size_t>(seq));
-        if (r.live.length == length) return &r.live;
+        if (!r.lost && r.live.length == length) return &r.live;
         for (const recurrent_state& s : r.saved)
             if (s.length == length) return &s;
         return nullptr;
@@ -442,7 +554,7 @@ namespace albireo
         if (!cfg_.hybrid()) return length;
         const recurrent_sequence& r = recurrent_.at(static_cast<size_t>(seq));
         long best = 0;
-        if (r.live.length <= length) best = r.live.length;
+        if (!r.lost && r.live.length <= length) best = r.live.length;
         for (const recurrent_state& s : r.saved)
             if (s.length <= length) best = std::max(best, s.length);
         return best;
@@ -1319,7 +1431,34 @@ namespace albireo
     {
         if (cfg_.hybrid())
         {
-            run_hybrid(batch, logits);
+            if (hybrid_pass_ && !batch.tokens.empty())
+            {
+                try
+                {
+                    // A check that the keys and values or the device put off waits for a few passes.
+                    if (!layer_pass_checked_ && layer_pass_wait_ > 0)
+                        --layer_pass_wait_;
+                    else if (!layer_pass_checked_)
+                    {
+                        check_hybrid_pass();
+                        if (hybrid_pass_ && !layer_pass_checked_) layer_pass_wait_ = layer_pass_check_interval;
+                    }
+                    if (hybrid_pass_ && layer_pass_checked_ && run_hybrid(batch, logits, true))
+                    {
+                        layer_pass_memory_failures_ = 0;
+                        return;
+                    }
+                }
+                catch (const device_failure& e)
+                {
+                    // The pass is computed again below, from the states its sequences had before it.
+                    if (hybrid_pass_ && !e.memory)
+                        drop_hybrid_pass(std::string("the device failed: ") + e.what());
+                    else if (hybrid_pass_ && ++layer_pass_memory_failures_ >= max_layer_pass_memory_failures)
+                        drop_hybrid_pass(std::string("the device lacked memory several times in a row: ") + e.what());
+                }
+            }
+            run_hybrid(batch, logits, false);
             return;
         }
         if (layer_pass_ && !batch.tokens.empty() && takes_layer_pass(batch))
@@ -1431,9 +1570,11 @@ namespace albireo
             else
             {
                 rms_norm_rows(x_.data(), L.attn_norm.data(), xn_.data(), T, d, eps);
-                product(L.wq, xn_.data(), T, d, q_.data(), qd);
-                product(L.wk, xn_.data(), T, d, k_.data(), kvd);
-                product(L.wv, xn_.data(), T, d, v_.data(), kvd);
+                // The queries, keys and values read the same rows and nothing of one another.
+                add_product(L.wq, xn_.data(), T, d, q_.data(), qd);
+                add_product(L.wk, xn_.data(), T, d, k_.data(), kvd);
+                add_product(L.wv, xn_.data(), T, d, v_.data(), kvd);
+                products(T);
             }
             if (!L.bq.empty())
                 for (long t = 0; t < T; ++t)
@@ -1491,8 +1632,9 @@ namespace albireo
                 const long df = cfg_.d_ffn;
                 gate_.resize(static_cast<size_t>(T * df));
                 up_.resize(static_cast<size_t>(T * df));
-                product(L.w_gate, xn_.data(), T, d, gate_.data(), df);
-                product(L.w_up, xn_.data(), T, d, up_.data(), df);
+                add_product(L.w_gate, xn_.data(), T, d, gate_.data(), df);
+                add_product(L.w_up, xn_.data(), T, d, up_.data(), df);
+                products(T);
                 const long n = T * df;
                 auto gated = [&](long a, long b) { qk_silu_mul(gate_.data() + a, up_.data() + a, b - a); };
                 if (n >= 65536)
@@ -1708,7 +1850,7 @@ namespace albireo
         product(L.wo, ctx_.data(), T, inner, tmp_.data(), d);
     }
 
-    void cpu_runtime::differential_attention(long li, const forward_batch& batch)
+    void cpu_runtime::differential_attention(long li, const forward_batch& batch, bool on_device)
     {
         const layer& L = layers_[static_cast<size_t>(li)];
         const long T = static_cast<long>(batch.tokens.size());
@@ -1735,16 +1877,25 @@ namespace albireo
         shift_.resize(static_cast<size_t>(T * 2 * KV));
         noise_.resize(static_cast<size_t>(T * KV));
         gate_.resize(static_cast<size_t>(T * width));
-        add_product(L.wq, x_.data(), T, d, q_.data(), qd);
-        add_product(L.wa_k, x_.data(), T, d, factor_a_.data(), KV * rank);
-        add_product(L.wb_k, x_.data(), T, d, factor_b_.data(), rank * hd);
-        add_product(L.wa_v, x_.data(), T, d, factor_a_.data() + fa, KV * rank);
-        add_product(L.wb_v, x_.data(), T, d, factor_b_.data() + fb, rank * hd);
-        add_product(L.shift_k, x_.data(), T, d, shift_.data(), 2 * KV);
-        add_product(L.shift_v, x_.data(), T, d, shift_.data() + KV, 2 * KV);
-        add_product(L.noise, x_.data(), T, d, noise_.data(), KV);
-        add_product(L.attn_gate, x_.data(), T, d, gate_.data(), width);
-        products(T);
+        if (on_device)
+        {
+            // The device holds the hidden states, and sends these products in one copy.
+            hybrid_pass_->attention_inputs(li, q_.data(), factor_a_.data(), factor_b_.data(), shift_.data(),
+                noise_.data(), gate_.data());
+        }
+        else
+        {
+            add_product(L.wq, x_.data(), T, d, q_.data(), qd);
+            add_product(L.wa_k, x_.data(), T, d, factor_a_.data(), KV * rank);
+            add_product(L.wb_k, x_.data(), T, d, factor_b_.data(), rank * hd);
+            add_product(L.wa_v, x_.data(), T, d, factor_a_.data() + fa, KV * rank);
+            add_product(L.wb_v, x_.data(), T, d, factor_b_.data() + fb, rank * hd);
+            add_product(L.shift_k, x_.data(), T, d, shift_.data(), 2 * KV);
+            add_product(L.shift_v, x_.data(), T, d, shift_.data() + KV, 2 * KV);
+            add_product(L.noise, x_.data(), T, d, noise_.data(), KV);
+            add_product(L.attn_gate, x_.data(), T, d, gate_.data(), width);
+            products(T);
+        }
 
         // A key, or a value, of a head: the mean of rank products of a factor of the head and a row of its width.
         auto tensor_products = [&](const float* factors_a, const float* factors_b, float* out) {
@@ -1837,6 +1988,12 @@ namespace albireo
             }
         qk_silu_mul(gate_.data(), up_.data(), T * width);
 
+        if (on_device)
+        {
+            // The device projects the result and turns the hidden states towards it.
+            hybrid_pass_->attention_output(li, gate_.data());
+            return;
+        }
         tmp_.resize(static_cast<size_t>(T * d));
         product(L.wo, gate_.data(), T, width, tmp_.data(), d);
     }
@@ -1986,10 +2143,202 @@ namespace albireo
         qk_add(tmp_.data(), up_.data(), T * d);
     }
 
-    void cpu_runtime::run_hybrid(const forward_batch& batch, std::vector<float>& logits)
+    bool cpu_runtime::fetch_states(int seq)
+    {
+        if (!cfg_.hybrid()) return true;
+        recurrent_sequence& r = recurrent_.at(static_cast<size_t>(seq));
+        if (r.lost) return false;
+        if (r.on_host) return true;
+        if (!hybrid_pass_ || !hybrid_pass_->holds(seq))
+        {
+            r.lost = true;
+            return false;
+        }
+        try
+        {
+            hybrid_pass_->fetch(seq, r.live.values.data());
+        }
+        catch (const device_failure&)
+        {
+            r.lost = true;
+            return false;
+        }
+        r.on_host = true;
+        return true;
+    }
+
+    void cpu_runtime::fetch_all_states()
+    {
+        for (size_t seq = 0; seq < recurrent_.size(); ++seq)
+            if (!recurrent_[seq].on_host && !recurrent_[seq].lost) fetch_states(static_cast<int>(seq));
+    }
+
+    void cpu_runtime::save_attention_states(const forward_batch& batch)
+    {
+        const size_t kept = 2 * static_cast<size_t>(cfg_.kv_dim());
+        attention_states_.clear();
+        for (const auto& s : batch.segments)
+        {
+            const float* values = recurrent_[static_cast<size_t>(s.sequence)].live.values.data();
+            for (long li = 0; li < cfg_.n_layers; ++li)
+                if (cfg_.layer_types[static_cast<size_t>(li)] != 'M')
+                    attention_states_.insert(attention_states_.end(), values + state_offsets_[static_cast<size_t>(li)],
+                        values + state_offsets_[static_cast<size_t>(li)] + kept);
+        }
+    }
+
+    /*
+        After a pass the device failed: what the attention layers kept of the last token of each
+        sequence returns, and the states of the Mamba-3 layers come back from the copy the device
+        made before the pass.  A sequence whose states the device cannot give is marked lost.
+    */
+    void cpu_runtime::restore_states(const forward_batch& batch)
+    {
+        const size_t kept = 2 * static_cast<size_t>(cfg_.kv_dim());
+        size_t at = 0;
+        for (const auto& s : batch.segments)
+        {
+            recurrent_sequence& r = recurrent_[static_cast<size_t>(s.sequence)];
+            float* values = r.live.values.data();
+            for (long li = 0; li < cfg_.n_layers; ++li)
+            {
+                if (cfg_.layer_types[static_cast<size_t>(li)] == 'M') continue;
+                if (at + kept <= attention_states_.size())
+                    std::copy(attention_states_.begin() + static_cast<std::ptrdiff_t>(at),
+                        attention_states_.begin() + static_cast<std::ptrdiff_t>(at + kept),
+                        values + state_offsets_[static_cast<size_t>(li)]);
+                at += kept;
+            }
+            if (hybrid_pass_ && hybrid_pass_->recover(s.sequence, values))
+                r.on_host = true;
+            else
+                r.lost = true;
+        }
+    }
+
+    void cpu_runtime::drop_hybrid_pass(const std::string& why)
+    {
+        // The states the device alone holds come back while it may still give them.
+        fetch_all_states();
+        hybrid_pass_->report(false, why);
+        hybrid_pass_.reset();
+    }
+
+    /*
+        probe_layer_pass() for a hybrid decoder: n tokens in a sequence of their own through the
+        layers of the device, then through the processor alone, and the comparison of their
+        logits.  The attempts read different tokens.
+    */
+    int cpu_runtime::probe_hybrid_pass(long n, int attempt, std::string& detail)
+    {
+        const long V = cfg_.vocab;
+        const long B = kv_.block_positions();
+        const size_t per_token = 2 * static_cast<size_t>(cfg_.attention_layers())
+            * static_cast<size_t>(cfg_.n_kv_heads) * kv_row_bytes(kv_.format(), cfg_.head_dim);
+        std::unique_ptr<kv_pool> own(new kv_pool(cfg_.attention_layers(), cfg_.n_kv_heads, cfg_.head_dim, B,
+            per_token * static_cast<size_t>((n + B - 1) / B * B), kv_.format()));
+        const int seq = create_sequence();
+        sequence_pools_[static_cast<size_t>(seq)] = own.get();
+        struct release
+        {
+            cpu_runtime& rt;
+            int seq;
+            ~release() { rt.release_sequence(seq); }
+        } guard{ *this, seq };
+        if (!reserve_sequence(seq, n)) return -1;
+        forward_batch b;
+        for (long i = 0; i < n; ++i)
+            b.tokens.push_back(static_cast<int>((1009 + 7919 * (i + 131 * static_cast<long>(attempt))) % V));
+        b.segments.push_back({ seq, 0, n });
+        for (long i = 0; i < n; ++i) b.logit_rows.push_back(i);
+        std::vector<float> reference, device;
+        if (!run_hybrid(b, device, true)) return -1;
+        // The truncation gives the blocks back and starts the states again.
+        truncate_sequence(seq, 0);
+        if (!reserve_sequence(seq, n)) return -1;
+        {
+            struct processor_only
+            {
+                bool& flag;
+                ~processor_only() { flag = false; }
+            } scope{ host_only_ };
+            host_only_ = true;
+            run_hybrid(b, reference, false);
+        }
+        double worst = 0;
+        long same = 0;
+        bool apart = false;
+        for (long r = 0; r < n; ++r)
+        {
+            const float* a = reference.data() + r * V;
+            const float* d = device.data() + r * V;
+            double diff = 0, norm = 0;
+            long ia = 0, id = 0;
+            for (long v = 0; v < V; ++v)
+            {
+                diff += (static_cast<double>(a[v]) - d[v]) * (static_cast<double>(a[v]) - d[v]);
+                norm += static_cast<double>(a[v]) * a[v];
+                if (a[v] > a[ia]) ia = v;
+                if (d[v] > d[id]) id = v;
+            }
+            const double relative = std::sqrt(diff / std::max(norm, 1e-30));
+            // Written so that a value that is not a number sets the row apart.
+            if (!(relative <= probe_tolerance)) apart = true;
+            if (relative > worst) worst = relative;
+            if (ia == id) ++same;
+        }
+        std::ostringstream o;
+        o << "logits of " << n << " probe tokens within " << worst * 100 << "% of those of the processor"
+            << (apart && worst <= probe_tolerance ? ", some not numbers" : "") << ", " << same << " of " << n
+            << " most likely tokens the same";
+        detail = o.str();
+        const long misses = std::max<long>(1, n / 16);
+        return !apart && same >= n - misses ? 1 : 0;
+    }
+
+    /*
+        Keeps the hybrid pass when passes of the device agree with the processor: a probe of
+        probe_tokens tokens, whose products read the blocks of the weights in place, and one of
+        tiled_tokens() tokens, whose products go through the tiles of the weights expanded.  Two
+        experts whose scores stand within the rounding of the products may change places between
+        the device and the processor, the token then reading another expert: a probe that
+        differs runs once more on other tokens before the device gives the layers up.  The state
+        stays unchecked when the keys and values or the device lack room for a probe.
+    */
+    void cpu_runtime::check_hybrid_pass()
+    {
+        long first = probe_tokens;
+        first = std::max(first, hybrid_pass_->min_tokens());
+        if (cfg_.ctx_train > 0) first = std::min(first, cfg_.ctx_train);
+        const long tiled = hybrid_pass_->tiled_tokens();
+        std::string details, detail;
+        auto note = [&details](const std::string& d) { details += (details.empty() ? "" : "; ") + d; };
+        for (long n : { first, tiled })
+        {
+            if (n != first && (n <= first || (cfg_.ctx_train > 0 && n > cfg_.ctx_train))) continue;
+            int outcome = probe_hybrid_pass(n, 0, detail);
+            if (outcome < 0) return;
+            if (outcome == 0)
+            {
+                note(detail + ", probed again");
+                outcome = probe_hybrid_pass(n, 1, detail);
+                if (outcome < 0) return;
+            }
+            note(detail);
+            if (outcome == 0)
+            {
+                drop_hybrid_pass(details);
+                return;
+            }
+        }
+        layer_pass_checked_ = true;
+        hybrid_pass_->report(true, details);
+    }
+
+    bool cpu_runtime::run_hybrid(const forward_batch& batch, std::vector<float>& logits, bool on_device)
     {
         const long T = static_cast<long>(batch.tokens.size());
-        if (T == 0) { logits.clear(); return; }
+        if (T == 0) { logits.clear(); return true; }
         if (!batch.positions.empty() || !batch.embedding_rows.empty())
             throw std::runtime_error("cpu_runtime: a hybrid decoder reads tokens of text only");
         const long d = cfg_.d_model;
@@ -2005,10 +2354,18 @@ namespace albireo
                 throw std::runtime_error("cpu_runtime: sequence storage was not reserved");
             if (s.count > 0 && pool_of(s.sequence).shared(seq.blocks[static_cast<size_t>(seq.length / B)]))
                 throw std::runtime_error("cpu_runtime: a sequence would write in a block other sequences hold");
-            if (recurrent_.at(static_cast<size_t>(s.sequence)).live.length != seq.length)
+            const recurrent_sequence& r = recurrent_.at(static_cast<size_t>(s.sequence));
+            if (r.lost)
+                throw std::runtime_error("cpu_runtime: the states of a sequence were lost with the device");
+            if (r.live.length != seq.length)
                 throw std::logic_error("cpu_runtime: the states of a sequence stand at another length than its keys");
             for (long j = 0; j < s.count; ++j) positions_[static_cast<size_t>(s.start + j)] = seq.length + j;
         }
+        // The processor reads the states of the sequences of its passes from the host.
+        if (!on_device)
+            for (const auto& s : batch.segments)
+                if (!fetch_states(s.sequence))
+                    throw std::runtime_error("cpu_runtime: the states of a sequence were lost with the device");
 
         // The embeddings enter the sphere the blocks keep them on.
         embed(batch.tokens);
@@ -2020,14 +2377,54 @@ namespace albireo
             qk_scale(x, static_cast<float>(1.0 / std::max(std::sqrt(ss), 1e-12)), d);
         }
 
-        for (long li = 0; li < cfg_.n_layers; ++li)
+        const long R = static_cast<long>(batch.logit_rows.size());
+        bool device_logits = false;
+        if (on_device)
         {
-            const layer& L = layers_[static_cast<size_t>(li)];
-            if (cfg_.layer_types[static_cast<size_t>(li)] == 'M') mamba3_mixer(li, batch);
-            else differential_attention(li, batch);
-            geodesic_update(tmp_.data(), L.mixer_scale, L.mixer_bias, li, T);
-            latent_experts(L, T);
-            geodesic_update(tmp_.data(), L.ffn_scale, L.ffn_bias, li, T);
+            device_segments_.clear();
+            for (const auto& s : batch.segments)
+            {
+                recurrent_sequence& r = recurrent_[static_cast<size_t>(s.sequence)];
+                hybrid_pass::segment g;
+                g.sequence = s.sequence;
+                g.start = s.start;
+                g.count = s.count;
+                g.state = r.live.values.data();
+                g.current = r.on_host;
+                device_segments_.push_back(g);
+            }
+            // What the attention layers change on the host during the pass, kept for a pass the device fails.
+            save_attention_states(batch);
+            try
+            {
+                if (!hybrid_pass_->begin(x_.data(), T, device_segments_)) return false;
+                for (long li = 0; li < cfg_.n_layers; ++li)
+                {
+                    if (cfg_.layer_types[static_cast<size_t>(li)] == 'M') hybrid_pass_->mixer(li);
+                    else differential_attention(li, batch, true);
+                    hybrid_pass_->experts(li);
+                }
+                const bool wanted = !batch.hidden_only && R > 0;
+                if (wanted) logits.resize(static_cast<size_t>(R * cfg_.vocab));
+                device_logits = hybrid_pass_->end(batch.logit_rows, x_.data(), wanted ? logits.data() : nullptr);
+            }
+            catch (const device_failure&)
+            {
+                restore_states(batch);
+                throw;
+            }
+        }
+        else
+        {
+            for (long li = 0; li < cfg_.n_layers; ++li)
+            {
+                const layer& L = layers_[static_cast<size_t>(li)];
+                if (cfg_.layer_types[static_cast<size_t>(li)] == 'M') mamba3_mixer(li, batch);
+                else differential_attention(li, batch, false);
+                geodesic_update(tmp_.data(), L.mixer_scale, L.mixer_bias, li, T);
+                latent_experts(L, T);
+                geodesic_update(tmp_.data(), L.ffn_scale, L.ffn_bias, li, T);
+            }
         }
 
         for (const auto& s : batch.segments)
@@ -2036,6 +2433,8 @@ namespace albireo
             recurrent_sequence& r = recurrent_[static_cast<size_t>(s.sequence)];
             const long start = r.live.length;
             r.live.length += s.count;
+            // The device moved the states of the Mamba-3 layers ahead of those of the host.
+            if (on_device && s.count > 0) r.on_host = false;
             if (s.count < 2 && !s.prompt)
             {
                 // A generated token: the next prompt saves states of its own.
@@ -2048,6 +2447,8 @@ namespace albireo
             r.reading = r.live.length;
             // A lone token saves no state: the one of the chunk before it stays that of its prompt.
             if (s.count < 2) continue;
+            // The states come back from the device to be saved; lost, the sequence keeps its older ones.
+            if (!fetch_states(s.sequence)) continue;
             // The end of a chunk of a prompt: its state replaces the one of the chunk before it.
             if (r.own && !r.saved.empty()) r.saved.pop_back();
             else if (r.saved.size() >= saved_states) r.saved.erase(r.saved.begin());
@@ -2056,7 +2457,6 @@ namespace albireo
         }
 
         // The logits of the requested rows read the hidden states as they stand.
-        const long R = static_cast<long>(batch.logit_rows.size());
         hidden_out_.resize(static_cast<size_t>(R * d));
         for (long r = 0; r < R; ++r)
         {
@@ -2066,10 +2466,12 @@ namespace albireo
         if (batch.hidden_only)
         {
             logits.clear();
-            return;
+            return true;
         }
+        if (device_logits) return true;
         logits.resize(static_cast<size_t>(R * cfg_.vocab));
         if (R > 0) product(output_, hidden_out_.data(), R, d, logits.data(), cfg_.vocab);
+        return true;
     }
 
 }

@@ -427,10 +427,23 @@ namespace albireo
             return std::chrono::duration_cast<std::chrono::nanoseconds>(
                 clock_type::now().time_since_epoch()).count();
         }
+
+        /*
+            The failure the variable ALBIREO_TEST_HYBRID_FAILURE of the tests asks of a hybrid pass:
+            "N" makes the N-th layer the passes compute from then on fail as a device does,
+            "memory:N" as a device that lacks memory does, and "lost:N" as a device that cannot
+            give back the states it holds.  Empty without the variable.
+        */
+        std::string test_hybrid_failure()
+        {
+            const char* v = std::getenv("ALBIREO_TEST_HYBRID_FAILURE");
+            return v ? std::string(v) : std::string();
+        }
     }
 
     class tensor_offload;
     class tensor_layer_pass;
+    class tensor_hybrid_pass;
 
     struct tensor_device::impl
     {
@@ -749,6 +762,7 @@ namespace albireo
             {
                 freed += it->second.bytes;
                 it = weights_.erase(it);
+                ++copies_erased_;
             }
             if (freed > 0) d_.release(freed);
             // The copies of the keys and values go last: the next pass of the model copies its blocks again.
@@ -770,6 +784,7 @@ namespace albireo
             if (last == weights_.end()) return release_pass_pages();
             const size_t bytes = last->second.bytes;
             weights_.erase(last);
+            ++copies_erased_;
             d_.resident -= bytes;
             return bytes;
         }
@@ -916,11 +931,16 @@ namespace albireo
         }
 
         std::unique_ptr<layer_pass> make_layer_pass(const dense_model& model) override;
+        std::unique_ptr<hybrid_pass> make_hybrid_pass(const hybrid_model& model) override;
 
     private:
         friend class tensor_layer_pass;
+        friend class tensor_hybrid_pass;
 
-        // The bytes of the budget the pages of the layer pass hold, and their release (tensor_layer_pass).
+        /*
+            The bytes of the budget the pages of the layer pass hold, or the states of the sequences
+            of the hybrid pass, and their release: the pages, and the states the host holds too.
+        */
         size_t pass_room() const;
         size_t release_pass_pages();
 
@@ -1715,6 +1735,10 @@ namespace albireo
         std::vector<float> expanded_;
         // The layer pass of the model, which keeps copies of its keys and values.
         tensor_layer_pass* pass_ = nullptr;
+        // The hybrid pass of the model, which keeps the states of its sequences.
+        tensor_hybrid_pass* hybrid_ = nullptr;
+        // The copies of matrices that left the device so far: a pass gathers its copies again once it moves.
+        unsigned long long copies_erased_ = 0;
     };
 
     /*
@@ -2543,14 +2567,955 @@ namespace albireo
 #endif
     };
 
+    /*
+        The layers of a hybrid decoder on the device of a tensor_offload (hybrid_pass).  The
+        hidden states of the tokens of a pass stay in a tensor of the device, with the products
+        of the layers, which read the copies of the offload, the steps of the Mamba-3 layers
+        (tt::mamba3_step()), the experts (tt::expert_routes(), tt::gguf_matvec_picked(),
+        tt::squared_relu(), tt::mix_rows()) and the geodesic updates (tt::geodesic_update()).
+        An attention layer sends the processor its products that read the hidden states in one
+        copy and receives the gated outputs of the attention, through pinned host memory, the
+        device being waited for once per attention layer.
+
+        The states of the Mamba-3 layers of a sequence live in one tensor of the device, in the
+        layout of the runtime, with a second tensor that holds what they were before the pass
+        under way.  A state takes room in the budget of the copies; the states the host holds
+        too (after fetch()) leave first when room lacks, and with the copies of an idle model.
+    */
+    class tensor_hybrid_pass : public hybrid_pass
+    {
+    public:
+        tensor_hybrid_pass(tensor_offload& o, const hybrid_model& m) : o_(o), m_(m)
+        {
+            const long H = m.ssm_heads, P = m.ssm_head_dim, N = m.ssm_state, R = m.ssm_rank, S = m.ssm_angles;
+            layer_state_ = H * S + H * P * N + H * R * N + H * P;
+            for (const hybrid_layer& L : m_.layers)
+            {
+                if (L.mamba)
+                {
+                    in_width_ = std::max(in_width_, L.ssm_in.rows);
+                    dyn_width_ = std::max(dyn_width_, L.ssm_dyn.rows);
+                }
+                else
+                {
+                    attention_width_ = std::max(attention_width_, attention_row(L));
+                }
+                inner_width_ = std::max(inner_width_, L.wo.cols);
+                shared_width_ = std::max(shared_width_, L.shared_up.rows);
+            }
+            // make_room() reaches the states of an idle model through its offload, under this lock.
+            std::lock_guard<std::mutex> lock(o_.d_.registry_m);
+            o_.hybrid_ = this;
+        }
+
+        ~tensor_hybrid_pass() override
+        {
+            std::lock_guard<std::mutex> lock(o_.d_.registry_m);
+            o_.hybrid_ = nullptr;
+            states_.clear();
+            if (reserved_ > 0) o_.d_.release(reserved_);
+            reserved_ = 0;
+        }
+
+        /*
+            Whether the device can compute the layers of m: Mamba-3 layers within the bounds of the
+            kernels of dlib, and experts whose matrices lie one after the other in formats that
+            the device reads in place.
+        */
+        static bool computes(const tensor_offload& o, const hybrid_model& m, std::string& why)
+        {
+            if (m.layers.empty() || m.n_experts <= 0 || m.n_experts > 1024 || m.n_experts_used <= 0
+                || m.n_experts_used > 64 || m.n_experts_used > m.n_experts)
+            {
+                why = "a mixture of experts beyond those the device chooses";
+                return false;
+            }
+            if (m.ssm_rank > 8 || m.ssm_angles > 256 || m.ssm_state % 2 != 0)
+            {
+                why = "Mamba-3 layers beyond those the kernels of the device hold";
+                return false;
+            }
+            for (const hybrid_layer& L : m.layers)
+            {
+                for (const weight_matrix* W : { &L.experts_up, &L.experts_down })
+                    if (!o.quantizable(*W) || W->rows % m.n_experts != 0)
+                    {
+                        why = "experts in a format the device does not read in place";
+                        return false;
+                    }
+                if (L.experts_up.cols != L.experts_down.rows / m.n_experts
+                    || L.experts_down.cols != L.experts_up.rows / m.n_experts)
+                {
+                    why = "experts whose two matrices do not fit each other";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool begin(const float* x, long n, const std::vector<segment>& segments) override
+        {
+            auto& d = o_.d_;
+            o_.last_use_ = now_ns();
+            n_ = 0;
+            if (broken_ || n <= 0 || n < d.min_tokens || d.disabled.load() || !d.bind_thread()) return false;
+            // The copies of the previous pass may leave the card before gather_copies() takes them again.
+            o_.check_card();
+            // Once the copies exceed the card, a generated token waits for the extended memory.
+            if (n < qk_float_product_tokens && d.resident.load(std::memory_order_relaxed) > d.card_bytes) return false;
+            read_test_failure();
+            try
+            {
+                if (!gather_copies()) return false;
+                if (constants_.empty()) copy_constants();
+                ++clock_;
+                for (const segment& s : segments)
+                {
+                    auto it = states_.find(s.sequence);
+                    if (it != states_.end() && s.current && !it->second.synced)
+                    {
+                        // The host changed the states the device held: its own are the ones that count.
+                        drop(it);
+                        it = states_.end();
+                    }
+                    if (it == states_.end())
+                    {
+                        if (!s.current)
+                            throw std::logic_error("hybrid pass: the states of a sequence are neither on the host nor "
+                                "on the device");
+                        if (!make_state(s.sequence)) return false;
+                        it = states_.find(s.sequence);
+                        dlib::device_scope pin({ &it->second.values });
+                        upload_state(it->second.values, s.state);
+                    }
+                    it->second.used = clock_;
+                }
+                const size_t rows = static_cast<size_t>(n);
+                const size_t d_model = static_cast<size_t>(m_.d_model);
+                const size_t picks = rows * static_cast<size_t>(m_.n_experts_used);
+                const hybrid_layer& first = m_.layers.front();
+                tensor_offload::reserve_buffer(x_, rows * d_model);
+                tensor_offload::reserve_buffer(g_, rows * d_model);
+                tensor_offload::reserve_buffer(up_, rows * d_model);
+                tensor_offload::reserve_buffer(proj_, rows * static_cast<size_t>(in_width_));
+                tensor_offload::reserve_buffer(dyn_, rows * static_cast<size_t>(dyn_width_));
+                tensor_offload::reserve_buffer(inner_, rows * static_cast<size_t>(inner_width_));
+                tensor_offload::reserve_buffer(attention_, rows * static_cast<size_t>(attention_width_));
+                tensor_offload::reserve_buffer(router_, rows * static_cast<size_t>(m_.n_experts));
+                tensor_offload::reserve_buffer(picks_, picks);
+                tensor_offload::reserve_buffer(weights_, picks);
+                tensor_offload::reserve_buffer(latent_, rows * static_cast<size_t>(first.experts_up.cols));
+                tensor_offload::reserve_buffer(expert_up_, picks * static_cast<size_t>(first.experts_down.cols));
+                tensor_offload::reserve_buffer(expert_out_, picks * static_cast<size_t>(first.experts_up.cols));
+                tensor_offload::reserve_buffer(routed_, rows * static_cast<size_t>(first.experts_up.cols));
+                tensor_offload::reserve_buffer(shared_, rows * static_cast<size_t>(shared_width_));
+                // The tiles of the expansions of the larger passes, so that no layer allocates.
+                if (n >= expanded_product_tokens) reserve_tiles(rows);
+
+                /*
+                    What the states were before the pass, for the sequences whose states the host
+                    does not hold: a pass the device fails then goes back to the processor.
+                */
+                for (const segment& s : segments)
+                {
+                    device_state& st = states_.at(s.sequence);
+                    st.on_host = s.current;
+                    st.has_before = false;
+                    if (!s.current)
+                    {
+                        dlib::device_scope pin({ &st.values, &st.before });
+                        copy_state(st.before, st.values);
+                        st.has_before = true;
+                    }
+                    st.synced = false;
+                }
+                segments_ = segments;
+                n_ = n;
+                dlib::device_scope pin({ &x_ });
+                dlib::alias_tensor_instance states = rows_of(x_, n_, m_.d_model);
+                upload(states, x, rows * d_model);
+            }
+            catch (const std::logic_error&)
+            {
+                settle();
+                throw;
+            }
+            catch (const std::exception& e)
+            {
+                settle();
+                n_ = 0;
+                // No room on the device for now: the processor computes the pass.
+                if (lack_of_memory(e)) return false;
+                throw device_failure(e.what(), false);
+            }
+            ++d.layer_passes;
+            d.layer_pass_tokens += static_cast<unsigned long long>(n);
+            return true;
+        }
+
+        void mixer(long layer) override
+        {
+            guarded([&]() {
+                const hybrid_layer& L = m_.layers[static_cast<size_t>(layer)];
+                const layer_copies& c = copies_[static_cast<size_t>(layer)];
+                const mamba_constants& k = constants_[static_cast<size_t>(layer)];
+                const long d = m_.d_model, in_w = L.ssm_in.rows, dyn_w = L.ssm_dyn.rows, inner = L.wo.cols;
+                dlib::device_scope pin({ &x_, &g_, &proj_, &dyn_, &inner_, &o_.tile_, &o_.tile_out_ });
+                dlib::alias_tensor_instance x = rows_of(x_, n_, d);
+                dlib::alias_tensor_instance proj = view(proj_, n_, in_w);
+                dlib::alias_tensor_instance dyn = view(dyn_, n_, dyn_w);
+                o_.product_on_device(L.ssm_in, *c.a->t, c.a->quantized, x, proj);
+                o_.product_on_device(L.ssm_dyn, *c.b->t, c.b->quantized, x, dyn);
+                // The tokens of a sequence in order, each a step of the states of the layer.
+                for (const segment& s : segments_)
+                {
+                    device_state& st = states_.at(s.sequence);
+                    dlib::device_scope pin_state({ &st.values });
+                    dlib::alias_tensor_instance state = view(st.values, 1, layer_state_,
+                        static_cast<long>(L.state_offset));
+                    for (long j = 0; j < s.count; ++j)
+                    {
+                        const long t = s.start + j;
+                        dlib::alias_tensor_instance in = view(proj_, 1, in_w, t * in_w);
+                        dlib::alias_tensor_instance turns = view(dyn_, 1, dyn_w, t * dyn_w);
+                        dlib::alias_tensor_instance out = view(inner_, 1, inner, t * inner);
+                        dlib::tt::mamba3_step(out, state, in, turns, k.norms, k.bias, k.misc, k.mxz, k.mo, m_.rms_eps);
+                    }
+                }
+                dlib::alias_tensor_instance mixed = view(inner_, n_, inner);
+                dlib::alias_tensor_instance g = rows_of(g_, n_, d);
+                o_.product_on_device(L.wo, *c.wo->t, c.wo->quantized, mixed, g);
+                dlib::tt::geodesic_update(x, g, L.mixer_scale, L.mixer_bias, layer + 1);
+            });
+        }
+
+        void attention_inputs(long layer, float* q, float* factors_a, float* factors_b, float* shift, float* noise,
+            float* gate) override
+        {
+            guarded([&]() {
+                const hybrid_layer& L = m_.layers[static_cast<size_t>(layer)];
+                const layer_copies& c = copies_[static_cast<size_t>(layer)];
+                const long d = m_.d_model;
+                dlib::device_scope pin({ &x_, &attention_, &o_.tile_, &o_.tile_out_ });
+                dlib::alias_tensor_instance x = rows_of(x_, n_, d);
+                // The products one after the other in one buffer, which crosses to the host in one copy.
+                const weight_matrix* matrices[9] = { &L.wq, &L.wa_k, &L.wa_v, &L.wb_k, &L.wb_v, &L.shift_k, &L.shift_v,
+                    &L.noise, &L.gate };
+                const tensor_offload::copy* copies[9] = { c.a, c.b, c.wa_v, c.wb_k, c.wb_v, c.shift_k, c.shift_v,
+                    c.noise, c.gate };
+                long at = 0;
+                for (int i = 0; i < 9; ++i)
+                {
+                    dlib::alias_tensor_instance y = view(attention_, n_, matrices[i]->rows, at);
+                    o_.product_on_device(*matrices[i], *copies[i]->t, copies[i]->quantized, x, y);
+                    at += n_ * matrices[i]->rows;
+                }
+                const float* all = download(view(attention_, at, 1), static_cast<size_t>(at));
+                const size_t n = static_cast<size_t>(n_);
+                const size_t qd = static_cast<size_t>(L.wq.rows), fa = static_cast<size_t>(L.wa_k.rows);
+                const size_t fb = static_cast<size_t>(L.wb_k.rows), kv = static_cast<size_t>(L.shift_k.rows);
+                std::memcpy(q, all, sizeof(float) * n * qd);
+                all += n * qd;
+                std::memcpy(factors_a, all, sizeof(float) * 2 * n * fa);
+                all += 2 * n * fa;
+                std::memcpy(factors_b, all, sizeof(float) * 2 * n * fb);
+                all += 2 * n * fb;
+                // The shifts of the keys then of the values of each token.
+                for (size_t t = 0; t < n; ++t)
+                {
+                    std::memcpy(shift + t * 2 * kv, all + t * kv, sizeof(float) * kv);
+                    std::memcpy(shift + t * 2 * kv + kv, all + (n + t) * kv, sizeof(float) * kv);
+                }
+                all += 2 * n * kv;
+                std::memcpy(noise, all, sizeof(float) * n * static_cast<size_t>(L.noise.rows));
+                all += n * static_cast<size_t>(L.noise.rows);
+                std::memcpy(gate, all, sizeof(float) * n * static_cast<size_t>(L.gate.rows));
+            });
+        }
+
+        void attention_output(long layer, const float* gated) override
+        {
+            guarded([&]() {
+                const hybrid_layer& L = m_.layers[static_cast<size_t>(layer)];
+                const layer_copies& c = copies_[static_cast<size_t>(layer)];
+                const long d = m_.d_model, width = L.wo.cols;
+                dlib::device_scope pin({ &x_, &g_, &inner_, &o_.tile_, &o_.tile_out_ });
+                dlib::alias_tensor_instance attended = view(inner_, n_, width);
+                upload(attended, gated, static_cast<size_t>(n_ * width));
+                dlib::alias_tensor_instance x = rows_of(x_, n_, d);
+                dlib::alias_tensor_instance g = rows_of(g_, n_, d);
+                o_.product_on_device(L.wo, *c.wo->t, c.wo->quantized, attended, g);
+                dlib::tt::geodesic_update(x, g, L.mixer_scale, L.mixer_bias, layer + 1);
+            });
+        }
+
+        void experts(long layer) override
+        {
+            guarded([&]() {
+                const hybrid_layer& L = m_.layers[static_cast<size_t>(layer)];
+                const layer_copies& c = copies_[static_cast<size_t>(layer)];
+                const long d = m_.d_model, E = m_.n_experts, K = m_.n_experts_used;
+                const long dl = L.experts_up.cols, df = L.experts_down.cols, ds = L.shared_up.rows;
+                dlib::device_scope pin({ &x_, &g_, &up_, &router_, &picks_, &weights_, &latent_, &expert_up_,
+                    &expert_out_, &routed_, &shared_, &o_.tile_, &o_.tile_out_ });
+                dlib::alias_tensor_instance x = rows_of(x_, n_, d);
+                dlib::alias_tensor_instance g = rows_of(g_, n_, d);
+                dlib::alias_tensor_instance up = rows_of(up_, n_, d);
+                // The router, the entry of the latent space and the shared expert read the hidden states.
+                dlib::alias_tensor_instance scores = view(router_, n_, E);
+                dlib::alias_tensor_instance latent = view(latent_, n_, dl);
+                dlib::alias_tensor_instance shared = view(shared_, n_, ds);
+                o_.product_on_device(L.router, *c.router->t, c.router->quantized, x, scores);
+                o_.product_on_device(L.latent_down, *c.latent_down->t, c.latent_down->quantized, x, latent);
+                o_.product_on_device(L.shared_up, *c.shared_up->t, c.shared_up->quantized, x, shared);
+                // The experts of each token, their two products and their weighted sum.
+                dlib::alias_tensor_instance picks = view(picks_, n_, K);
+                dlib::alias_tensor_instance weights = view(weights_, n_, K);
+                dlib::tt::expert_routes(picks, weights, scores, expert_bias_[static_cast<size_t>(layer)], K,
+                    m_.expert_weights_norm, m_.expert_weights_scale);
+                dlib::alias_tensor_instance raised = view(expert_up_, n_ * K, df);
+                dlib::alias_tensor_instance lowered = view(expert_out_, n_ * K, dl);
+                dlib::alias_tensor_instance routed = view(routed_, n_, dl);
+                dlib::tt::gguf_matvec_picked(raised, latent, *c.experts_up->t, static_cast<int>(L.experts_up.type), df,
+                    dl, L.experts_up.row_bytes, picks, K);
+                dlib::tt::squared_relu(raised);
+                dlib::tt::gguf_matvec_picked(lowered, raised, *c.experts_down->t,
+                    static_cast<int>(L.experts_down.type), dl, df, L.experts_down.row_bytes, picks, 1);
+                dlib::tt::mix_rows(routed, lowered, weights, K);
+                // The exit of the latent space, and the shared expert.
+                o_.product_on_device(L.latent_up, *c.latent_up->t, c.latent_up->quantized, routed, g);
+                dlib::tt::squared_relu(shared);
+                o_.product_on_device(L.shared_down, *c.shared_down->t, c.shared_down->quantized, shared, up);
+                dlib::tt::add(1, g, 1, up);
+                dlib::tt::geodesic_update(x, g, L.ffn_scale, L.ffn_bias, layer + 1);
+            });
+        }
+
+        bool end(const std::vector<long>& rows, float* x, float* logits) override
+        {
+            bool wrote = false;
+            guarded([&]() {
+                const long d = m_.d_model, V = m_.output.rows;
+                const long R = static_cast<long>(rows.size());
+                // The logits of the rows, from the hidden states the device still holds.
+                const bool with_logits = R > 0 && logits && output_ && static_cast<size_t>(R) * static_cast<size_t>(V)
+                    * sizeof(float) <= max_staged_bytes;
+                // Their buffer takes its size before the pins, as the buffers of begin().
+                if (with_logits)
+                    tensor_offload::reserve_buffer(logits_, static_cast<size_t>(R) * static_cast<size_t>(V));
+                dlib::device_scope pin({ &x_, &g_, &logits_, &o_.tile_, &o_.tile_out_ });
+                if (R == 0)
+                {
+#if defined(DLIB_USE_CUDA)
+                    /*
+                        A pass without logits, a part of a prompt, ends once the device has computed
+                        it, so that a failure of the device belongs to the pass that met it.
+                    */
+                    cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
+#endif
+                    return;
+                }
+                if (with_logits)
+                {
+                    dlib::alias_tensor_instance out = view(logits_, R, V);
+                    bool whole = R == n_;
+                    for (long r = 0; r < R && whole; ++r) whole = rows[static_cast<size_t>(r)] == r;
+                    if (whole)
+                    {
+                        dlib::alias_tensor_instance all = rows_of(x_, n_, d);
+                        o_.product_on_device(m_.output, *output_->t, output_->quantized, all, out);
+                    }
+                    else
+                    {
+                        // The rows asked, one after the other in the buffer of the outputs of the blocks.
+                        for (long r = 0; r < R; ++r)
+                            copy_row(g_, r * d, x_, rows[static_cast<size_t>(r)] * d, d);
+                        dlib::alias_tensor_instance some = rows_of(g_, R, d);
+                        o_.product_on_device(m_.output, *output_->t, output_->quantized, some, out);
+                    }
+                }
+                const size_t hidden = static_cast<size_t>(R == 1 ? d : n_ * d);
+                const size_t scores = with_logits ? static_cast<size_t>(R) * static_cast<size_t>(V) : 0;
+                const long first = R == 1 ? rows[0] * d : 0;
+                const float* all = download_two(view(x_, static_cast<long>(hidden), 1, first), hidden,
+                    with_logits ? &logits_ : nullptr, scores);
+                if (R == 1)
+                    std::memcpy(x + rows[0] * d, all, sizeof(float) * static_cast<size_t>(d));
+                else
+                    for (long r : rows) std::memcpy(x + r * d, all + r * d, sizeof(float) * static_cast<size_t>(d));
+                if (with_logits)
+                {
+                    std::memcpy(logits, all + hidden, sizeof(float) * scores);
+                    wrote = true;
+                }
+            });
+            n_ = 0;
+            return wrote;
+        }
+
+        bool holds(int sequence) const override
+        {
+            return states_.find(sequence) != states_.end();
+        }
+
+        void fetch(int sequence, float* state) override
+        {
+            auto it = states_.find(sequence);
+            if (it == states_.end()) throw std::logic_error("hybrid pass: the device holds no state of the sequence");
+            try
+            {
+                if (!o_.d_.bind_thread()) throw std::runtime_error("the device refused the thread");
+                dlib::device_scope pin({ &it->second.values });
+                download_state(it->second.values, state);
+            }
+            catch (const std::exception& e)
+            {
+                settle();
+                drop(it);
+                throw device_failure(e.what(), false);
+            }
+            it->second.synced = true;
+        }
+
+        bool recover(int sequence, float* state) override
+        {
+            n_ = 0;
+            auto it = states_.find(sequence);
+            // A sequence without states on the device had them on the host when its pass began.
+            if (it == states_.end()) return true;
+            bool ok = true;
+            if (!it->second.on_host)
+            {
+                try
+                {
+                    if (test_loses_) throw std::runtime_error("failure of the tests");
+                    if (!o_.d_.bind_thread()) throw std::runtime_error("the device refused the thread");
+                    dlib::resizable_tensor& from = it->second.has_before ? it->second.before : it->second.values;
+                    dlib::device_scope pin({ &from });
+                    download_state(from, state);
+                }
+                catch (const std::exception&)
+                {
+                    settle();
+                    ok = false;
+                }
+            }
+            drop(it);
+            return ok;
+        }
+
+        void forget(int sequence) override
+        {
+            auto it = states_.find(sequence);
+            if (it != states_.end()) drop(it);
+        }
+
+        long min_tokens() const override
+        {
+            return std::max<long>(1, o_.d_.min_tokens);
+        }
+
+        long tiled_tokens() const override
+        {
+            return expanded_product_tokens;
+        }
+
+        void report(bool ok, const std::string& detail) override
+        {
+            if (ok)
+                o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + o_.model() + "' run on the device, with "
+                    "the states of the Mamba-3 layers of its sequences, and exchange the inputs and outputs of the "
+                    "attention with the processor once per attention layer (" + detail + ")");
+            else
+                o_.d_.message(ALBIREO_LOG_WARNING, "device: the layers of '" + o_.model() + "' return to the "
+                    "processor, which hands their products to the device one by one (" + detail + ")");
+        }
+
+        // The bytes of the budget the states hold.
+        size_t state_room() const
+        {
+            return reserved_;
+        }
+
+        /*
+            Frees the states the host holds too, and returns the bytes of the budget they held, which
+            the caller gives back; the states the device alone holds stay.
+        */
+        size_t release_states()
+        {
+            size_t freed = 0;
+            for (auto it = states_.begin(); it != states_.end();)
+            {
+                if (!it->second.synced)
+                {
+                    ++it;
+                    continue;
+                }
+                freed += state_bytes();
+                it = states_.erase(it);
+            }
+            reserved_ -= freed;
+            return freed;
+        }
+
+    private:
+        // The copies of the matrices of a layer; a and b are ssm_in and ssm_dyn, or wq and wa_k.
+        struct layer_copies
+        {
+            const tensor_offload::copy* a = nullptr;
+            const tensor_offload::copy* b = nullptr;
+            const tensor_offload::copy* wa_v = nullptr;
+            const tensor_offload::copy* wb_k = nullptr;
+            const tensor_offload::copy* wb_v = nullptr;
+            const tensor_offload::copy* shift_k = nullptr;
+            const tensor_offload::copy* shift_v = nullptr;
+            const tensor_offload::copy* noise = nullptr;
+            const tensor_offload::copy* gate = nullptr;
+            const tensor_offload::copy* wo = nullptr;
+            const tensor_offload::copy* router = nullptr;
+            const tensor_offload::copy* latent_down = nullptr;
+            const tensor_offload::copy* latent_up = nullptr;
+            const tensor_offload::copy* experts_up = nullptr;
+            const tensor_offload::copy* experts_down = nullptr;
+            const tensor_offload::copy* shared_up = nullptr;
+            const tensor_offload::copy* shared_down = nullptr;
+        };
+
+        // The constants of a Mamba-3 layer, packed as tt::mamba3_step() takes them.
+        struct mamba_constants
+        {
+            dlib::resizable_tensor norms, bias, misc, mxz, mo;
+        };
+
+        // The states of the Mamba-3 layers of a sequence on the device.
+        struct device_state
+        {
+            dlib::resizable_tensor values;
+            // What values held before the pass under way, when has_before.
+            dlib::resizable_tensor before;
+            bool has_before = false;
+            // Whether the host held the states when the last pass of the sequence began.
+            bool on_host = false;
+            // Whether the host holds what values holds: after fetch(), until the next pass.
+            bool synced = false;
+            unsigned long long used = 0;
+        };
+
+        typedef std::unordered_map<int, device_state>::iterator state_iterator;
+
+        // The floats of a token in the buffer of the products of an attention layer.
+        static long attention_row(const hybrid_layer& L)
+        {
+            return L.wq.rows + L.wa_k.rows + L.wa_v.rows + L.wb_k.rows + L.wb_v.rows + L.shift_k.rows + L.shift_v.rows
+                + L.noise.rows + L.gate.rows;
+        }
+
+        size_t state_bytes() const
+        {
+            return 2 * m_.state_floats * sizeof(float);
+        }
+
+        void drop(state_iterator it)
+        {
+            states_.erase(it);
+            o_.d_.release(state_bytes());
+            reserved_ -= state_bytes();
+        }
+
+        /*
+            Room and tensors for the states of a sequence; false when the budget lacks room once
+            the states the host holds too, of the sequences outside the pass, have left.
+        */
+        bool make_state(int sequence)
+        {
+            auto& d = o_.d_;
+            const size_t bytes = state_bytes();
+            if (!d.reserve(bytes) && !(d.make_room(bytes, &o_) && d.reserve(bytes)))
+            {
+                for (auto it = states_.begin(); it != states_.end();)
+                {
+                    if (it->second.synced && it->second.used != clock_)
+                    {
+                        it = states_.erase(it);
+                        d.release(bytes);
+                        reserved_ -= bytes;
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+                if (!d.reserve(bytes)) return false;
+            }
+            reserved_ += bytes;
+            try
+            {
+                device_state& st = states_[sequence];
+                st.values.set_size(static_cast<long long>(m_.state_floats));
+                st.before.set_size(static_cast<long long>(m_.state_floats));
+            }
+            catch (...)
+            {
+                states_.erase(sequence);
+                d.release(bytes);
+                reserved_ -= bytes;
+                throw;
+            }
+            return true;
+        }
+
+        // The states of the layers of a sequence, as the host holds them, to a tensor of the device.
+        void upload_state(dlib::resizable_tensor& to, const float* state)
+        {
+#if defined(DLIB_USE_CUDA)
+            cuda_check(cudaMemcpy(to.device_write_only(), state, sizeof(float) * m_.state_floats,
+                cudaMemcpyHostToDevice), "copy of the states of a sequence to the device");
+#else
+            std::memcpy(to.host_write_only(), state, sizeof(float) * m_.state_floats);
+#endif
+        }
+
+        // The states of the Mamba-3 layers a tensor of the device holds, each to its place on the host.
+        void download_state(const dlib::resizable_tensor& from, float* state)
+        {
+            const size_t bytes = sizeof(float) * static_cast<size_t>(layer_state_);
+            for (const hybrid_layer& L : m_.layers)
+            {
+                if (!L.mamba) continue;
+#if defined(DLIB_USE_CUDA)
+                cuda_check(cudaMemcpy(state + L.state_offset, from.device() + L.state_offset, bytes,
+                    cudaMemcpyDeviceToHost), "copy of the states of a sequence from the device");
+#else
+                std::memcpy(state + L.state_offset, from.host() + L.state_offset, bytes);
+#endif
+            }
+        }
+
+        // to = from on the device, in the order of the default stream.
+        void copy_state(dlib::resizable_tensor& to, const dlib::resizable_tensor& from)
+        {
+#if defined(DLIB_USE_CUDA)
+            cuda_check(cudaMemcpyAsync(to.device_write_only(), from.device(), sizeof(float) * m_.state_floats,
+                cudaMemcpyDeviceToDevice, 0), "copy of the states of a sequence on the device");
+#else
+            std::memcpy(to.host_write_only(), from.host(), sizeof(float) * m_.state_floats);
+#endif
+        }
+
+        // Copies count floats of from, first_from floats in, to to, first_to floats in, on the device.
+        static void copy_row(dlib::resizable_tensor& to, long first_to, const dlib::resizable_tensor& from,
+            long first_from, long count)
+        {
+#if defined(DLIB_USE_CUDA)
+            cuda_check(cudaMemcpyAsync(to.device() + first_to, from.device() + first_from,
+                sizeof(float) * static_cast<size_t>(count), cudaMemcpyDeviceToDevice, 0),
+                "copy of hidden states on the device");
+#else
+            std::memcpy(to.host() + first_to, from.host() + first_from, sizeof(float) * static_cast<size_t>(count));
+#endif
+        }
+
+        /*
+            The copies of the matrices of every layer, and of the matrix of the logits when it finds
+            room, made when they are missing; false when one of the layers lacks room.  They are
+            gathered again once a copy of the model has left the device.
+        */
+        bool gather_copies()
+        {
+            if (gathered_ && erased_ == o_.copies_erased_) return true;
+            gathered_ = false;
+            copies_.assign(m_.layers.size(), layer_copies());
+            auto copy_of = [&](const weight_matrix& W) {
+                bool created = false;
+                return o_.resident_copy(W, created);
+            };
+            for (size_t i = 0; i < m_.layers.size(); ++i)
+            {
+                const hybrid_layer& L = m_.layers[i];
+                layer_copies& c = copies_[i];
+                if (L.mamba)
+                {
+                    c.a = copy_of(L.ssm_in);
+                    c.b = copy_of(L.ssm_dyn);
+                    if (!c.a || !c.b) return false;
+                }
+                else
+                {
+                    c.a = copy_of(L.wq);
+                    c.b = copy_of(L.wa_k);
+                    c.wa_v = copy_of(L.wa_v);
+                    c.wb_k = copy_of(L.wb_k);
+                    c.wb_v = copy_of(L.wb_v);
+                    c.shift_k = copy_of(L.shift_k);
+                    c.shift_v = copy_of(L.shift_v);
+                    c.noise = copy_of(L.noise);
+                    c.gate = copy_of(L.gate);
+                    if (!c.a || !c.b || !c.wa_v || !c.wb_k || !c.wb_v || !c.shift_k || !c.shift_v || !c.noise
+                        || !c.gate)
+                        return false;
+                }
+                c.wo = copy_of(L.wo);
+                c.router = copy_of(L.router);
+                c.latent_down = copy_of(L.latent_down);
+                c.latent_up = copy_of(L.latent_up);
+                c.experts_up = copy_of(L.experts_up);
+                c.experts_down = copy_of(L.experts_down);
+                c.shared_up = copy_of(L.shared_up);
+                c.shared_down = copy_of(L.shared_down);
+                if (!c.wo || !c.router || !c.latent_down || !c.latent_up || !c.experts_up || !c.experts_down
+                    || !c.shared_up || !c.shared_down)
+                    return false;
+                if (!c.experts_up->quantized || !c.experts_down->quantized)
+                {
+                    // A format the device was found to decode wrongly: its experts stay with the processor.
+                    broken_ = true;
+                    report(false, "the device keeps the matrices of the experts in single precision");
+                    return false;
+                }
+            }
+            // The matrix of the logits comes last: without room for it, the processor computes them.
+            output_ = copy_of(m_.output);
+            erased_ = o_.copies_erased_;
+            gathered_ = true;
+            return true;
+        }
+
+        // Copies count floats of the host to a tensor of one row on the device.
+        static void copy_floats(dlib::resizable_tensor& t, const std::vector<float>& values)
+        {
+            t.set_size(1, static_cast<long long>(values.size()));
+            std::memcpy(t.host_write_only(), values.data(), sizeof(float) * values.size());
+        }
+
+        // The constants of the Mamba-3 layers and the biases of the experts, to the device.
+        void copy_constants()
+        {
+            const size_t H = static_cast<size_t>(m_.ssm_heads), P = static_cast<size_t>(m_.ssm_head_dim);
+            const size_t N = static_cast<size_t>(m_.ssm_state), R = static_cast<size_t>(m_.ssm_rank);
+            std::vector<mamba_constants> constants(m_.layers.size());
+            std::vector<dlib::resizable_tensor> biases(m_.layers.size());
+            std::vector<float> packed;
+            for (size_t i = 0; i < m_.layers.size(); ++i)
+            {
+                const hybrid_layer& L = m_.layers[i];
+                packed.assign(L.expert_bias, L.expert_bias + m_.n_experts);
+                copy_floats(biases[i], packed);
+                if (!L.mamba) continue;
+                mamba_constants& k = constants[i];
+                packed.assign(L.b_norm, L.b_norm + N);
+                packed.insert(packed.end(), L.c_norm, L.c_norm + N);
+                copy_floats(k.norms, packed);
+                // The biases of the inputs then of the outputs of each head, as its factors below.
+                packed.clear();
+                for (size_t h = 0; h < H; ++h)
+                {
+                    packed.insert(packed.end(), L.b_bias + h * R * N, L.b_bias + (h + 1) * R * N);
+                    packed.insert(packed.end(), L.c_bias + h * R * N, L.c_bias + (h + 1) * R * N);
+                }
+                copy_floats(k.bias, packed);
+                packed.assign(L.dt_bias, L.dt_bias + H);
+                packed.insert(packed.end(), L.skip, L.skip + H);
+                copy_floats(k.misc, packed);
+                packed.clear();
+                for (size_t h = 0; h < H; ++h)
+                {
+                    packed.insert(packed.end(), L.mimo_x + h * R * P, L.mimo_x + (h + 1) * R * P);
+                    packed.insert(packed.end(), L.mimo_z + h * R * P, L.mimo_z + (h + 1) * R * P);
+                }
+                copy_floats(k.mxz, packed);
+                packed.assign(L.mimo_o, L.mimo_o + H * R * P);
+                copy_floats(k.mo, packed);
+            }
+            constants_.swap(constants);
+            expert_bias_.swap(biases);
+        }
+
+        // The tiles of the expansions of the products of rows tokens, for every matrix a layer expands.
+        void reserve_tiles(size_t rows)
+        {
+            long tile = 1;
+            size_t tile_values = 0;
+            auto count = [&](const weight_matrix& W) {
+                if (!W.valid()) return;
+                const long t = tensor_offload::tile_rows(W);
+                if (t < W.rows) tile = std::max(tile, t);
+                tile_values = std::max(tile_values, static_cast<size_t>(t) * W.cols);
+            };
+            for (const hybrid_layer& L : m_.layers)
+                for (const weight_matrix* W : { &L.ssm_in, &L.ssm_dyn, &L.wq, &L.wa_k, &L.wb_k, &L.wa_v, &L.wb_v,
+                    &L.shift_k, &L.shift_v, &L.noise, &L.gate, &L.wo, &L.router, &L.latent_down, &L.latent_up,
+                    &L.shared_up, &L.shared_down })
+                    count(*W);
+            // The logits of the rows of a pass that asks for all of them.
+            count(m_.output);
+            tensor_offload::reserve_buffer(o_.tile_, tile_values);
+            if (tile > 1) tensor_offload::reserve_buffer(o_.tile_out_, rows * static_cast<size_t>(tile));
+        }
+
+        // The n rows of cols floats of a buffer that start first floats in, as a tensor.
+        static dlib::alias_tensor_instance view(dlib::resizable_tensor& buffer, long n, long cols, long first = 0)
+        {
+            dlib::alias_tensor a(n, cols);
+            return a(buffer, static_cast<size_t>(first));
+        }
+
+        // The same rows as a tensor whose rows are its rows of nc() values, which tt::geodesic_update() turns.
+        static dlib::alias_tensor_instance rows_of(dlib::resizable_tensor& buffer, long n, long cols, long first = 0)
+        {
+            dlib::alias_tensor a(n, 1, 1, cols);
+            return a(buffer, static_cast<size_t>(first));
+        }
+
+        // Copies count floats of the host to the start of the view dst of the device.
+        void upload(dlib::tensor& dst, const float* src, size_t count)
+        {
+#if defined(DLIB_USE_CUDA)
+            // A copy of the buffer is still running only before the wait of the layer that follows.
+            float* staging = to_device_.reserve(count);
+            std::memcpy(staging, src, sizeof(float) * count);
+            cuda_check(cudaMemcpyAsync(dst.device(), staging, sizeof(float) * count, cudaMemcpyHostToDevice, 0),
+                "copy of the activations to the device");
+#else
+            std::memcpy(dst.host(), src, sizeof(float) * count);
+#endif
+        }
+
+        // The first count floats of the view src of the device, once the device has computed them.
+        const float* download(const dlib::tensor& src, size_t count)
+        {
+#if defined(DLIB_USE_CUDA)
+            float* staging = from_device_.reserve(count);
+            cuda_check(cudaMemcpyAsync(staging, src.device(), sizeof(float) * count, cudaMemcpyDeviceToHost, 0),
+                "copy of the activations from the device");
+            cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
+            return staging;
+#else
+            (void)count;
+            return src.host();
+#endif
+        }
+
+        /*
+            The first count floats of a, followed by the first more floats of b when b is not null,
+            in one buffer of the host, the device being waited for once.
+        */
+        const float* download_two(const dlib::tensor& a, size_t count, const dlib::tensor* b, size_t more)
+        {
+            if (!b) more = 0;
+#if defined(DLIB_USE_CUDA)
+            float* staging = from_device_.reserve(count + more);
+            cuda_check(cudaMemcpyAsync(staging, a.device(), sizeof(float) * count, cudaMemcpyDeviceToHost, 0),
+                "copy of the activations from the device");
+            if (more > 0)
+                cuda_check(cudaMemcpyAsync(staging + count, b->device(), sizeof(float) * more, cudaMemcpyDeviceToHost,
+                    0), "copy of the logits from the device");
+            cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
+            return staging;
+#else
+            joined_.resize(count + more);
+            std::memcpy(joined_.data(), a.host(), sizeof(float) * count);
+            if (more > 0) std::memcpy(joined_.data() + count, b->host(), sizeof(float) * more);
+            return joined_.data();
+#endif
+        }
+
+        // Runs f, a failure of the device becoming a device_failure.
+        template <typename F>
+        void guarded(F&& f)
+        {
+            try
+            {
+                if (test_fails_at_ > 0 && ++test_calls_ == test_fails_at_)
+                {
+                    test_fails_at_ = 0;
+                    throw std::runtime_error(test_memory_ ? "out of memory, failure of the tests"
+                        : "failure of the tests");
+                }
+                f();
+            }
+            catch (const device_failure&)
+            {
+                settle();
+                throw;
+            }
+            catch (const std::exception& e)
+            {
+                settle();
+                throw device_failure(e.what(), lack_of_memory(e));
+            }
+        }
+
+        // Reads the failure the tests ask for (test_hybrid_failure()), once each time they ask.
+        void read_test_failure()
+        {
+            const std::string asked = test_hybrid_failure();
+            if (asked == test_asked_) return;
+            test_asked_ = asked;
+            test_calls_ = 0;
+            test_loses_ = asked.compare(0, 5, "lost:") == 0;
+            test_memory_ = asked.compare(0, 7, "memory:") == 0;
+            const size_t colon = asked.find(':');
+            test_fails_at_ = std::max(0L, std::atol(asked.c_str() + (colon == std::string::npos ? 0 : colon + 1)));
+        }
+
+        // As tensor_layer_pass::settle().
+        static void settle()
+        {
+#if defined(DLIB_USE_CUDA)
+            cudaStreamSynchronize(0);
+#endif
+        }
+
+        tensor_offload& o_;
+        const hybrid_model m_;
+        long n_ = 0;
+        std::vector<segment> segments_;
+        // The floats of the state of a Mamba-3 layer, and the widths of the widest rows of the buffers.
+        long layer_state_ = 0;
+        long in_width_ = 1, dyn_width_ = 1, inner_width_ = 1, attention_width_ = 1, shared_width_ = 1;
+        std::vector<layer_copies> copies_;
+        const tensor_offload::copy* output_ = nullptr;
+        bool gathered_ = false;
+        unsigned long long erased_ = 0;
+        // The experts of the device cannot serve: the passes stay with the processor.
+        bool broken_ = false;
+        std::vector<mamba_constants> constants_;
+        std::vector<dlib::resizable_tensor> expert_bias_;
+        // The hidden states, the outputs of the blocks, and the buffers of the layers.
+        dlib::resizable_tensor x_, g_, up_, proj_, dyn_, inner_, attention_;
+        dlib::resizable_tensor router_, picks_, weights_, latent_, expert_up_, expert_out_, routed_, shared_, logits_;
+        std::unordered_map<int, device_state> states_;
+        size_t reserved_ = 0;
+        unsigned long long clock_ = 0;
+        // The failure the tests ask for: its text, the layer that fails, the layers computed since, its kind.
+        std::string test_asked_;
+        long test_fails_at_ = 0;
+        long test_calls_ = 0;
+        bool test_memory_ = false;
+        bool test_loses_ = false;
+#if defined(DLIB_USE_CUDA)
+        // The rows that cross the bus, each way.
+        pinned_floats to_device_, from_device_;
+#else
+        std::vector<float> joined_;
+#endif
+    };
+
     size_t tensor_offload::pass_room() const
     {
-        return pass_ ? pass_->page_room() : 0;
+        return (pass_ ? pass_->page_room() : 0) + (hybrid_ ? hybrid_->state_room() : 0);
     }
 
     size_t tensor_offload::release_pass_pages()
     {
-        return pass_ ? pass_->release_pages() : 0;
+        size_t freed = pass_ ? pass_->release_pages() : 0;
+        if (hybrid_)
+        {
+            const size_t states = hybrid_->release_states();
+            if (states > 0) d_.release(states);
+            freed += states;
+        }
+        return freed;
     }
 
     std::unique_ptr<layer_pass> tensor_offload::make_layer_pass(const dense_model& model)
@@ -2562,6 +3527,25 @@ namespace albireo
 #else
         if (d_.forced < 0 || model.layers.empty()) return std::unique_ptr<layer_pass>();
         return std::unique_ptr<layer_pass>(new tensor_layer_pass(*this, model));
+#endif
+    }
+
+    std::unique_ptr<hybrid_pass> tensor_offload::make_hybrid_pass(const hybrid_model& model)
+    {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+        // The routing of dlib takes products only.
+        (void)model;
+        return std::unique_ptr<hybrid_pass>();
+#else
+        if (d_.forced < 0) return std::unique_ptr<hybrid_pass>();
+        std::string why;
+        if (!tensor_hybrid_pass::computes(*this, model, why))
+        {
+            d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + model_ + "' stay with the processor, which "
+                "hands their products to the device one by one (" + why + ")");
+            return std::unique_ptr<hybrid_pass>();
+        }
+        return std::unique_ptr<hybrid_pass>(new tensor_hybrid_pass(*this, model));
 #endif
     }
 

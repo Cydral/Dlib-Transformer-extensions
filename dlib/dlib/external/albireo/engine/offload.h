@@ -251,6 +251,226 @@ namespace albireo
         }
     };
 
+    /*!
+        The weights of a hybrid decoder whose layers a hybrid_pass computes (cpu_runtime.h): a
+        Mamba-3 layer or a differential attention in each block, then a mixture of experts in
+        a latent space beside a shared expert, the hidden states turning on their sphere
+        towards the output of each.  The matrices and the constants belong to the runtime,
+        which keeps them while the hybrid_pass lives.
+
+        The matrices of the experts of a layer lie one after the other in two matrices: the
+        rows of expert e are the rows [e*r, (e + 1)*r) of experts_up, r == experts_up.rows /
+        n_experts, and likewise in experts_down.
+    !*/
+    struct hybrid_layer
+    {
+        // A Mamba-3 layer, or a differential attention.
+        bool mamba = false;
+
+        // Mamba-3: the projections of the hidden states, then the constants of the heads.
+        weight_matrix ssm_in, ssm_dyn;
+        const float* b_norm = nullptr;      // ssm_state values
+        const float* c_norm = nullptr;      // ssm_state values
+        const float* b_bias = nullptr;      // ssm_heads x ssm_rank x ssm_state values
+        const float* c_bias = nullptr;      // ssm_heads x ssm_rank x ssm_state values
+        const float* dt_bias = nullptr;     // ssm_heads values
+        const float* skip = nullptr;        // ssm_heads values
+        const float* mimo_x = nullptr;      // ssm_heads x ssm_rank x ssm_head_dim values
+        const float* mimo_z = nullptr;      // ssm_heads x ssm_rank x ssm_head_dim values
+        const float* mimo_o = nullptr;      // ssm_heads x ssm_rank x ssm_head_dim values
+
+        // An attention: the products that read the hidden states.
+        weight_matrix wq, wa_k, wb_k, wa_v, wb_v, shift_k, shift_v, noise, gate;
+
+        // The projection of the output of the mixer of either kind.
+        weight_matrix wo;
+
+        // The experts.
+        weight_matrix router, latent_down, latent_up, experts_up, experts_down, shared_up, shared_down;
+        const float* expert_bias = nullptr; // n_experts values
+
+        // The scale and the bias of the two geodesic updates of the block.
+        float mixer_scale = 1, mixer_bias = 0, ffn_scale = 1, ffn_bias = 0;
+
+        // Where the state of a Mamba-3 layer lies in the states of a sequence, in floats.
+        size_t state_offset = 0;
+    };
+
+    struct hybrid_model
+    {
+        long d_model = 0;
+        float rms_eps = 0;
+        long ssm_heads = 0;
+        long ssm_head_dim = 0;
+        long ssm_state = 0;
+        long ssm_rank = 0;
+        long ssm_angles = 0;
+        long n_experts = 0;
+        long n_experts_used = 0;
+        bool expert_weights_norm = true;
+        float expert_weights_scale = 1;
+        // The floats of the states of the layers of a sequence.
+        size_t state_floats = 0;
+        // The matrix of the logits.
+        weight_matrix output;
+        std::vector<hybrid_layer> layers;
+    };
+
+    class hybrid_pass
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The layers of a hybrid decoder computed on a device.  The hidden states of the
+                tokens of a pass stay on the device from the first layer to the last, with the
+                products, the Mamba-3 layers, the experts and the geodesic updates; the
+                processor keeps the attention proper of the attention layers, for which the
+                device sends it the products that read the hidden states and receives the
+                gated outputs, one exchange per attention layer.
+
+                The device also keeps the states of the Mamba-3 layers of the sequences it
+                computes, in the layout of the runtime (hybrid_layer::state_offset), which a
+                generated token would otherwise carry across the bus both ways.  The states of
+                a sequence then live on the device, and the runtime brings them back when it
+                needs them (fetch()): to save them at the end of a chunk of a prompt, to
+                compute a pass itself, or before its model rests.  Each pass keeps the states
+                its sequences had before it, so that a pass the device fails goes back to the
+                processor (recover()).
+
+                A pass calls begin(), then for each layer in turn mixer(), or
+                attention_inputs() and attention_output(), followed by experts(), then end().
+                The functions that compute throw device_failure when the device fails, the
+                pass then being lost.
+
+            THREAD SAFETY
+                One thread uses an object at a time: the thread that runs the forward passes
+                of its model.
+        !*/
+    public:
+        // The consecutive tokens of one sequence in a pass.
+        struct segment
+        {
+            int sequence = 0;
+            long start = 0;
+            long count = 0;
+            // The states of the layers of the sequence in the memory of the host.
+            float* state = nullptr;
+            // Whether these hold the states of the Mamba-3 layers as they stand before the pass.
+            bool current = false;
+        };
+
+        virtual ~hybrid_pass() {}
+
+        /*!
+            requires
+                - x holds n rows of d_model floats, the hidden states of the tokens of the pass
+                  before the first layer, and segments describes these tokens, each sequence
+                  once.
+                - The device holds the states of every sequence whose segment is not current
+                  (holds()).
+            ensures
+                - Starts a pass and returns true, the states of the sequences that are current
+                  on the host crossing to the device when it does not hold them; or returns
+                  false when the device does not take the pass now, for lack of room or
+                  because the pass is too small, the states it holds staying as they were.
+        !*/
+        virtual bool begin(const float* x, long n, const std::vector<segment>& segments) = 0;
+
+        /*!
+            requires
+                - begin() returned true, layer is a Mamba-3 layer and the layers before it were
+                  computed.
+            ensures
+                - Computes the mixer of layer for the tokens of the pass, the tokens of each
+                  sequence in order, and turns the hidden states towards its output.
+        !*/
+        virtual void mixer(long layer) = 0;
+
+        /*!
+            requires
+                - begin() returned true, layer is an attention layer and the layers before it
+                  were computed.
+            ensures
+                - Writes the products of layer that read the hidden states of the n tokens: the
+                  queries (n rows of wq.rows floats); the factors of the keys then those of the
+                  values, each as n rows of wa_k.rows floats into factors_a and n rows of
+                  wb_k.rows floats into factors_b; for each token, the shifts of its keys then
+                  those of its values (n rows of 2 * shift_k.rows floats); the shares of the
+                  noise (n rows of noise.rows floats); the gate (n rows of gate.rows floats).
+        !*/
+        virtual void attention_inputs(long layer, float* q, float* factors_a, float* factors_b, float* shift,
+            float* noise, float* gate) = 0;
+
+        /*!
+            requires
+                - attention_inputs() was called for layer, and gated holds the n rows of
+                  gate.rows floats the attention of the layer gave, its gate applied.
+            ensures
+                - Projects gated and turns the hidden states towards the projection.
+        !*/
+        virtual void attention_output(long layer, const float* gated) = 0;
+
+        /*!
+            requires
+                - the mixer or the attention of layer was computed.
+            ensures
+                - Computes the mixture of experts of layer and turns the hidden states towards
+                  its output.
+        !*/
+        virtual void experts(long layer) = 0;
+
+        /*!
+            requires
+                - every layer was computed.
+            ensures
+                - Writes the hidden states after the last layer of the given rows of the pass
+                  into x, row r at x + r * d_model, and ends the pass.
+                - When logits is not null and the device holds the matrix of the logits, also
+                  writes the logits of these rows, one row of output.rows floats after the
+                  other, and returns true; returns false otherwise, the runtime then computing
+                  them from x.
+        !*/
+        virtual bool end(const std::vector<long>& rows, float* x, float* logits) = 0;
+
+        // Whether the device holds the states of the Mamba-3 layers of a sequence.
+        virtual bool holds(int sequence) const = 0;
+
+        /*!
+            requires
+                - holds(sequence), and no pass is under way.
+            ensures
+                - Writes the states of the Mamba-3 layers of the sequence, as its last pass left
+                  them, into state, each layer at its place; the device keeps them.
+            throws
+                - device_failure when the device fails: the states of the sequence are lost.
+        !*/
+        virtual void fetch(int sequence, float* state) = 0;
+
+        /*!
+            requires
+                - a function of the last pass threw device_failure, and sequence belongs to
+                  that pass.
+            ensures
+                - Returns true once state holds the states of the Mamba-3 layers of the sequence
+                  as they stood before the pass: untouched when they were current on the host
+                  at begin(), written from the copy the device kept otherwise.  The device then
+                  holds no state of the sequence.
+                - Returns false when the device cannot give that copy: the states are lost.
+        !*/
+        virtual bool recover(int sequence, float* state) = 0;
+
+        // The device drops the states of a sequence: the runtime changed or released them.
+        virtual void forget(int sequence) = 0;
+
+        // The tokens a pass needs at least for begin() to take it.
+        virtual long min_tokens() const = 0;
+
+        // As layer_pass::tiled_tokens().
+        virtual long tiled_tokens() const { return 0; }
+
+        // As layer_pass::report().
+        virtual void report(bool ok, const std::string& detail) = 0;
+    };
+
     class matmul_offload
     {
         /*!
@@ -271,7 +491,9 @@ namespace albireo
                 A device that computes whole layers also gives a layer_pass
                 (make_layer_pass()), which takes the layers of a dense model, normalizations
                 included, and keeps the hidden states of a pass on the device; the products of
-                the other passes, and the final products of the logits, still come here.
+                the other passes, and the final products of the logits, still come here.  For a
+                hybrid decoder, it gives a hybrid_pass (make_hybrid_pass()), which also keeps
+                the states of the Mamba-3 layers of the sequences on the device.
 
             THREAD SAFETY
                 One thread uses an object at a time: the thread that runs the forward passes
@@ -349,6 +571,19 @@ namespace albireo
         {
             (void)model;
             return std::unique_ptr<layer_pass>();
+        }
+
+        /*!
+            ensures
+                - Returns an object that computes the layers of a hybrid decoder on the device,
+                  or null when the device takes products only or cannot compute this model.
+                  The object uses this one and the memory of the weights of model, and is
+                  destroyed before them.
+        !*/
+        virtual std::unique_ptr<hybrid_pass> make_hybrid_pass(const hybrid_model& model)
+        {
+            (void)model;
+            return std::unique_ptr<hybrid_pass>();
         }
     };
 

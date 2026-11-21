@@ -13,8 +13,8 @@ namespace dlib
         /*
             The processor versions of the operations of tensor_tools.h on weight matrices kept
             in their GGUF formats (gguf_blocks.h), of the row operations of the forward pass of
-            a decoder, and of its keys and values in pages (kv_pages.h).  tensor_tools.h
-            documents them.
+            a decoder, of its mixtures of experts, and of its keys and values in pages
+            (kv_pages.h).  tensor_tools.h documents them.
         */
 
         void gguf_matvec (
@@ -85,6 +85,39 @@ namespace dlib
             const tensor& tokens,
             const tensor& tables,
             long span
+        );
+
+        void expert_routes (
+            tensor& picks,
+            tensor& weights,
+            const tensor& logits,
+            const tensor& bias,
+            long top_k,
+            bool normalize,
+            float scale
+        );
+
+        void gguf_matvec_picked (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            int type,
+            long rows,
+            long cols,
+            size_t row_bytes,
+            const tensor& picks,
+            long per_row
+        );
+
+        void squared_relu (
+            tensor& x
+        );
+
+        void mix_rows (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            long per_row
         );
     }
 }

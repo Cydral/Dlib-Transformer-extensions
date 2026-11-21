@@ -4,6 +4,7 @@
 #include <dlib/data_io/gguf_dequantize.h>
 #include <dlib/data_io/gguf_model_spec.h>
 #include <dlib/data_io/gguf_reader.h>
+#include <dlib/cuda/gguf_blocks.h>
 #include <dlib/dnn.h>
 #include <dlib/dnn/runtime_transformer.h>
 #include <dlib/rand.h>
@@ -636,7 +637,272 @@ namespace
         }
     }
 
+    // The bytes of rows rows of cols random weights in a GGUF format, with scales of a finite size.
+    std::vector<uint8_t> random_weight_rows(int type, long rows, long cols, dlib::rand& rnd)
+    {
+        const size_t row_bytes = gguf_blocks::row_bytes(type, cols);
+        std::vector<uint8_t> bytes(static_cast<size_t>(rows) * row_bytes);
+        for (auto& b : bytes) b = static_cast<uint8_t>(rnd.get_random_32bit_number() & 0xFF);
+        auto half = [&](uint8_t* p) {
+            // A half between 2^-7 and 2^-4.
+            const uint32_t h = ((8 + rnd.get_random_32bit_number() % 3) << 10) | (rnd.get_random_32bit_number() % 1024);
+            p[0] = static_cast<uint8_t>(h & 0xFF);
+            p[1] = static_cast<uint8_t>(h >> 8);
+        };
+        for (long r = 0; r < rows; ++r)
+        {
+            uint8_t* row = bytes.data() + static_cast<size_t>(r) * row_bytes;
+            switch (type)
+            {
+            case gguf_blocks::f32:
+                for (long i = 0; i < cols; ++i)
+                {
+                    const float v = rnd.get_random_gaussian();
+                    std::memcpy(row + 4 * i, &v, 4);
+                }
+                break;
+            case gguf_blocks::bf16:
+                for (long i = 0; i < cols; ++i)
+                {
+                    const float v = rnd.get_random_gaussian();
+                    uint32_t bits;
+                    std::memcpy(&bits, &v, 4);
+                    row[2 * i] = static_cast<uint8_t>((bits >> 16) & 0xFF);
+                    row[2 * i + 1] = static_cast<uint8_t>(bits >> 24);
+                }
+                break;
+            case gguf_blocks::q8_0:
+                for (long g = 0; g < cols / 32; ++g) half(row + g * 34);
+                break;
+            case gguf_blocks::q4_K:
+                for (long b = 0; b < cols / 256; ++b)
+                {
+                    half(row + b * 144);
+                    half(row + b * 144 + 2);
+                }
+                break;
+            case gguf_blocks::q5_K:
+                for (long b = 0; b < cols / 256; ++b)
+                {
+                    half(row + b * 176);
+                    half(row + b * 176 + 2);
+                }
+                break;
+            default:
+                for (long b = 0; b < cols / 256; ++b) half(row + b * 210 + 208);
+                break;
+            }
+        }
+        return bytes;
+    }
+
+    // A tensor whose floats store bytes, as tt::gguf_matvec() reads the weights of a matrix.
+    void store_bytes(resizable_tensor& t, const std::vector<uint8_t>& bytes)
+    {
+        t.set_size(1, 1, 1, static_cast<long long>((bytes.size() + 3) / 4));
+        t = 0;
+        std::memcpy(t.host(), bytes.data(), bytes.size());
+    }
+
+    void store_integers(resizable_tensor& t, const std::vector<int32_t>& values)
+    {
+        t.set_size(1, 1, 1, static_cast<long long>(values.size()));
+        std::memcpy(t.host(), values.data(), values.size() * sizeof(int32_t));
+    }
+
+    /*
+        The operations of the mixtures of experts of the hybrid decoders against their
+        definitions: tt::expert_routes() against a sort of the ranked scores, with experts of
+        equal rank; tt::gguf_matvec_picked() against the products of the rows its picks name,
+        in double precision, with one row of activations for several matrices and with one
+        row each; tt::squared_relu() and tt::mix_rows().
+    */
+    void test_expert_operations()
+    {
+        dlib::rand rnd;
+        {
+            const long n = 5, experts = 37, top_k = 6;
+            resizable_tensor logits(n, experts), bias(1, experts), picks(n, top_k), weights(n, top_k);
+            for (float& v : logits) v = 2 * rnd.get_random_gaussian();
+            for (float& v : bias) v = 0.1f * rnd.get_random_gaussian();
+            // Eight experts of equal rank lead the second row: the six of lower index are taken.
+            for (long e = 0; e < experts; ++e)
+            {
+                logits.host()[experts + e] = e >= 20 && e % 2 == 0 ? 1.5f : -1.0f;
+                if (e >= 20) bias.host()[e] = 0;
+            }
+            for (int normalize = 0; normalize < 2; ++normalize)
+            {
+                const float scale = 2.45f;
+                tt::expert_routes(picks, weights, logits, bias, top_k, normalize != 0, scale);
+                for (long t = 0; t < n; ++t)
+                {
+                    std::vector<float> score(experts), ranked(experts);
+                    std::vector<long> order(experts);
+                    for (long e = 0; e < experts; ++e)
+                    {
+                        score[e] = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(
+                            logits.host()[t * experts + e]))));
+                        ranked[e] = score[e] + bias.host()[e];
+                        order[e] = e;
+                    }
+                    std::stable_sort(order.begin(), order.end(), [&](long a, long b) { return ranked[a] > ranked[b]; });
+                    float selected = 0;
+                    for (long k = 0; k < top_k; ++k) selected += score[order[k]];
+                    for (long k = 0; k < top_k; ++k)
+                    {
+                        int32_t pick;
+                        std::memcpy(&pick, picks.host() + t * top_k + k, sizeof(pick));
+                        DLIB_TEST_MSG(pick == order[k], "row " << t << " rank " << k << ": " << pick << " for "
+                            << order[k]);
+                        float want = score[order[k]];
+                        if (normalize) want /= selected + 1e-20f;
+                        DLIB_TEST(std::abs(weights.host()[t * top_k + k] - want * scale) < 1e-6);
+                    }
+                }
+            }
+        }
+        const int types[6] = { gguf_blocks::f32, gguf_blocks::bf16, gguf_blocks::q8_0, gguf_blocks::q4_K,
+            gguf_blocks::q5_K, gguf_blocks::q6_K };
+        for (int type : types)
+        {
+            const bool k_quant = type == gguf_blocks::q4_K || type == gguf_blocks::q5_K || type == gguf_blocks::q6_K;
+            const long cols = k_quant ? 512 : 96, rows = 11, matrices = 7;
+            const size_t row_bytes = gguf_blocks::row_bytes(type, cols);
+            const std::vector<uint8_t> bytes = random_weight_rows(type, rows * matrices, cols, rnd);
+            resizable_tensor w;
+            store_bytes(w, bytes);
+            for (long per_row : { 1L, 3L })
+            {
+                const std::vector<int32_t> chosen = { 4, 0, 6, 6, 2, 5 };
+                const long p = static_cast<long>(chosen.size());
+                resizable_tensor picks, x(p / per_row, cols), y(p, rows);
+                store_integers(picks, chosen);
+                for (float& v : x) v = rnd.get_random_gaussian();
+                tt::gguf_matvec_picked(y, x, w, type, rows, cols, row_bytes, picks, per_row);
+                double worst = 0;
+                float v[32];
+                for (long j = 0; j < p; ++j)
+                    for (long r = 0; r < rows; ++r)
+                    {
+                        const uint8_t* row = bytes.data() + static_cast<size_t>(chosen[j] * rows + r) * row_bytes;
+                        double sum = 0, size = 0;
+                        for (long g = 0; g < cols / 32; ++g)
+                        {
+                            gguf_blocks::decode_group(type, row, g, v);
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                const double term = static_cast<double>(v[i])
+                                    * x.host()[(j / per_row) * cols + g * 32 + i];
+                                sum += term;
+                                size += std::abs(term);
+                            }
+                        }
+                        worst = std::max(worst, std::abs(y.host()[j * rows + r] - sum) / (size + 1e-9));
+                    }
+                DLIB_TEST_MSG(worst < 1e-5, "type " << type << ", " << per_row << " per row: " << worst);
+            }
+        }
+        {
+            resizable_tensor x(3, 50), start;
+            for (float& v : x) v = rnd.get_random_gaussian();
+            start = x;
+            tt::squared_relu(x);
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                const float r = std::max(start.host()[i], 0.0f);
+                DLIB_TEST(x.host()[i] == r * r);
+            }
+            const long n = 4, per_row = 3, width = 21;
+            resizable_tensor src(n * per_row, width), weights(n, per_row), mixed(n, width);
+            for (float& v : src) v = rnd.get_random_gaussian();
+            for (float& v : weights) v = rnd.get_random_gaussian();
+            tt::mix_rows(mixed, src, weights, per_row);
+            for (long t = 0; t < n; ++t)
+                for (long i = 0; i < width; ++i)
+                {
+                    float sum = 0;
+                    for (long j = 0; j < per_row; ++j)
+                        sum += weights.host()[t * per_row + j] * src.host()[(t * per_row + j) * width + i];
+                    DLIB_TEST(std::abs(mixed.host()[t * width + i] - sum) < 1e-6);
+                }
+        }
+    }
+
 #ifdef DLIB_USE_CUDA
+    /*
+        The device kernels of the operations of the mixtures of experts against the processor:
+        the routes of tokens of 8 to 1,000 experts, the picked products for every kind of
+        kernel, matrices whose rows do not fill the last block of their warps and activations
+        that start on 16 bytes or not, then the squares and the weighted sums.
+    */
+    void test_expert_operations_devices()
+    {
+        dlib::rand rnd;
+        const long shapes[4][3] = { { 1, 8, 2 }, { 3, 256, 6 }, { 9, 1000, 64 }, { 2, 300, 1 } };
+        for (const auto& c : shapes)
+        {
+            const long n = c[0], experts = c[1], top_k = c[2];
+            resizable_tensor logits(n, experts), bias(1, experts);
+            for (float& v : logits) v = 2 * rnd.get_random_gaussian();
+            for (float& v : bias) v = 0.1f * rnd.get_random_gaussian();
+            resizable_tensor p1(n, top_k), w1(n, top_k), p2(n, top_k), w2(n, top_k);
+            cpu::expert_routes(p1, w1, logits, bias, top_k, true, 2.45f);
+            cuda::expert_routes(p2, w2, logits, bias, top_k, true, 2.45f);
+            DLIB_TEST_MSG(std::memcmp(p1.host(), p2.host(), p1.size() * sizeof(float)) == 0, "experts of " << experts);
+            DLIB_TEST_MSG(max(abs(mat(w1) - mat(w2))) < 1e-6, max(abs(mat(w1) - mat(w2))));
+        }
+        const int types[6] = { gguf_blocks::f32, gguf_blocks::bf16, gguf_blocks::q8_0, gguf_blocks::q4_K,
+            gguf_blocks::q5_K, gguf_blocks::q6_K };
+        for (int type : types)
+        {
+            const bool k_quant = type == gguf_blocks::q4_K || type == gguf_blocks::q5_K || type == gguf_blocks::q6_K;
+            for (int shape = 0; shape < 2; ++shape)
+            {
+                // Rows that fill their blocks of 8 warps or not; columns beyond one chunk of shared memory.
+                const long cols = k_quant ? (shape ? 1536 : 256) : (shape ? 1120 : 32);
+                const long rows = shape ? 21 : 16, matrices = 9;
+                const size_t row_bytes = gguf_blocks::row_bytes(type, cols);
+                resizable_tensor w;
+                store_bytes(w, random_weight_rows(type, rows * matrices, cols, rnd));
+                for (long per_row : { 1L, 4L })
+                {
+                    std::vector<int32_t> chosen(12);
+                    for (auto& e : chosen) e = static_cast<int32_t>(rnd.get_random_32bit_number() % matrices);
+                    const long p = static_cast<long>(chosen.size());
+                    resizable_tensor picks, y1(p, rows), y2(p, rows);
+                    store_integers(picks, chosen);
+                    // One float before the rows moves them off 16 bytes.
+                    for (long shift = 0; shift < 2; ++shift)
+                    {
+                        resizable_tensor room(1, 1, 1, (p / per_row) * cols + 4);
+                        for (float& v : room) v = rnd.get_random_gaussian();
+                        alias_tensor rows_of(p / per_row, cols);
+                        auto x = rows_of(room, static_cast<size_t>(shift));
+                        cpu::gguf_matvec_picked(y1, x, w, type, rows, cols, row_bytes, picks, per_row);
+                        cuda::gguf_matvec_picked(y2, x, w, type, rows, cols, row_bytes, picks, per_row);
+                        const float apart = max(abs(mat(y1) - mat(y2)));
+                        DLIB_TEST_MSG(apart < 2e-4 * (1 + max(abs(mat(y1)))), "type " << type << ", " << rows << "x"
+                            << cols << ", " << per_row << " per row, shift " << shift << ": " << apart);
+                    }
+                }
+            }
+        }
+        resizable_tensor x(7, 333), y;
+        for (float& v : x) v = rnd.get_random_gaussian();
+        y = x;
+        cpu::squared_relu(x);
+        cuda::squared_relu(y);
+        DLIB_TEST(max(abs(mat(x) - mat(y))) < 1e-6);
+        const long n = 5, per_row = 6, width = 384;
+        resizable_tensor src(n * per_row, width), weights(n, per_row), m1(n, width), m2(n, width);
+        for (float& v : src) v = rnd.get_random_gaussian();
+        for (float& v : weights) v = rnd.get_random_gaussian();
+        cpu::mix_rows(m1, src, weights, per_row);
+        cuda::mix_rows(m2, src, weights, per_row);
+        DLIB_TEST_MSG(max(abs(mat(m1) - mat(m2))) < 1e-5, max(abs(mat(m1) - mat(m2))));
+    }
+
     // The device kernels of tt::mamba3_step() against the processor, over several tokens of several geometries.
     void test_mamba3_step_devices()
     {
@@ -702,10 +968,14 @@ namespace
             print_spinner();
             test_geodesic_update();
             print_spinner();
+            test_expert_operations();
+            print_spinner();
             test_hybrid_decoder();
 #ifdef DLIB_USE_CUDA
             print_spinner();
             test_mamba3_step_devices();
+            print_spinner();
+            test_expert_operations_devices();
 #endif
         }
     } a;

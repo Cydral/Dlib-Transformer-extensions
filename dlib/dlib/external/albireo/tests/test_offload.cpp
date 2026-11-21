@@ -25,8 +25,8 @@
         3. with CUDA and the host code of dlib, keys and values in 8 bits, the device
            attending the steps over its copies of them, against the exact products with the
            same keys and values, compared as distributions;
-        4. the measured routing with the usual kernels, compared as distributions, and the
-           routes it chose.
+        4. the measured routing with the usual kernels, or with the exact products when the
+           device computes the layers whole, compared as distributions, and the routes it chose.
 
         test_offload synthetic [folder] [device]
 
@@ -46,6 +46,17 @@
     whose steps hand the products of a layer over by groups: a device that leaves them to the
     processor gives the logits of the runtime alone, bit for bit, and the measured routing
     and the device those of the processor to their rounding.
+
+    The layers of the tiny hybrid decoder then run on the device (hybrid_pass), with experts
+    in single precision and with experts in Q8_0 behind an exit of their latent space in
+    BF16: a script of passes (chunks of a prompt that save the states of the Mamba-3 layers,
+    one of them through the tiles of the weights expanded, single steps, sequences that step
+    together, copies at a saved length and at the length of a sequence whose states the
+    device alone holds, a sequence that goes back to a saved state) gives the logits of the
+    processor.  A device that fails during a step (ALBIREO_TEST_HYBRID_FAILURE) gives the
+    states back, the processor computing that step and the following passes; a device that
+    lacks memory during a step keeps the layers afterwards; a device that fails without
+    giving the states back loses them, the sequence then going back to its saved state.
 */
 
 #include <algorithm>
@@ -55,7 +66,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -318,6 +331,206 @@ namespace
         }
     }
 
+    /*
+        A pass of count tokens on each of the given sequences of a hybrid decoder, the tokens of
+        a sequence being a chunk of a prompt when they are several; the logits of its rows, or
+        of the last row of each sequence alone, go to out.
+    */
+    void hybrid_step(cpu_runtime& rt, const std::vector<int>& seqs, long count, bool last_only, uint32_t& state,
+        std::vector<float>& out)
+    {
+        forward_batch b;
+        for (int s : seqs)
+        {
+            const long start = static_cast<long>(b.tokens.size());
+            for (long i = 0; i < count; ++i) b.tokens.push_back(next_token(state));
+            b.segments.push_back({ s, start, count });
+            expect(rt.reserve_sequence(s, rt.sequence_length(s) + count), "reserve");
+            if (last_only) b.logit_rows.push_back(start + count - 1);
+        }
+        if (!last_only)
+            for (long i = 0; i < static_cast<long>(b.tokens.size()); ++i) b.logit_rows.push_back(i);
+        std::vector<float> logits;
+        rt.forward(b, logits);
+        out.insert(out.end(), logits.begin(), logits.end());
+    }
+
+    /*
+        The passes of the check of the layers of a hybrid decoder, with blocks of 16 positions: a
+        chunk of 20 tokens, 10 steps, a second sequence copied from the first at its saved
+        length, both stepping together 6 times, a chunk of 9 tokens of which the last row is
+        asked, a chunk of 70 tokens of the second sequence, 4 steps of both, the first sequence
+        going back to the 45 tokens of its saved state, a chunk of 3 tokens and 3 steps, a third
+        sequence copied from the first at its length, and 3 steps of both.  mark is called
+        before the fifth step and before the steps that follow the return to a saved state.
+    */
+    std::vector<float> hybrid_script(cpu_runtime& rt, const std::function<void(int)>& mark)
+    {
+        std::vector<float> out;
+        uint32_t state = 7;
+        const int a = rt.create_sequence();
+        hybrid_step(rt, { a }, 20, false, state, out);
+        for (int i = 0; i < 10; ++i)
+        {
+            if (i == 4) mark(1);
+            hybrid_step(rt, { a }, 1, false, state, out);
+        }
+        const int b = rt.create_sequence();
+        expect(rt.copy_sequence(a, b, 20), "copy of a sequence at its saved length");
+        for (int i = 0; i < 6; ++i) hybrid_step(rt, { a, b }, 1, false, state, out);
+        hybrid_step(rt, { a }, 9, true, state, out);
+        hybrid_step(rt, { b }, 70, true, state, out);
+        for (int i = 0; i < 4; ++i) hybrid_step(rt, { a, b }, 1, false, state, out);
+        expect(rt.restorable_length(a, 48) == 45, "the length of the saved state of a sequence");
+        rt.truncate_sequence(a, 45);
+        hybrid_step(rt, { a }, 3, false, state, out);
+        mark(2);
+        for (int i = 0; i < 3; ++i) hybrid_step(rt, { a }, 1, false, state, out);
+        const int c = rt.create_sequence();
+        expect(rt.copy_sequence(a, c, rt.sequence_length(a)), "copy of a sequence at its length");
+        for (int i = 0; i < 3; ++i) hybrid_step(rt, { a, c }, 1, false, state, out);
+        rt.release_sequence(c);
+        rt.release_sequence(b);
+        rt.release_sequence(a);
+        expect(rt.kv_bytes_used() == 0, "every block of the hybrid decoder returned");
+        return out;
+    }
+
+    /*
+        The layers of the tiny hybrid decoder on the device (hybrid_pass), against the processor
+        alone computing in single precision: the script above; the script with a device that
+        fails during a step, then with one that lacks memory during a step; and a sequence whose
+        states are lost with the device.
+    */
+    void hybrid_layers(const std::string& path, const std::string& device, thread_pool& pool)
+    {
+        const auto nothing = [](int) {};
+        for (int compact = 0; compact < 2; ++compact)
+        {
+            const albireo_test::tiny_gguf model = albireo_test::tiny_gguf_writer().latent(32)
+                .compact_experts(compact != 0).build_hybrid();
+            if (!model.save(path, model.bytes))
+            {
+                expect(false, "write the hybrid decoder of the layers of the device");
+                return;
+            }
+            auto file = std::make_shared<model_file>(path);
+            const model_config cfg = read_model_config(*file);
+            std::printf("%s%s\n", describe(cfg).c_str(), compact ? ", experts in Q8_0" : "");
+            const long V = cfg.vocab;
+            qk_set_exact_products(true);
+            std::vector<float> reference;
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+                reference = hybrid_script(rt, nothing);
+            }
+            const long rows = static_cast<long>(reference.size()) / V;
+
+            // Without a failure, then with a device that fails or lacks memory in the fifth step.
+            const char* cases[3] = { "", "3", "memory:3" };
+            for (const char* failure : cases)
+            {
+                const std::string asked = failure;
+                tensor_device dev(device_config(device, 0, "auto"), pool, print_log);
+                std::vector<float> got;
+                json before, after;
+                {
+                    cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+                    rt.set_offload(dev.make_offload());
+                    got = hybrid_script(rt, [&](int at) {
+                        if (at == 1)
+                        {
+                            before = dev.stats();
+                            if (!asked.empty()) set_variable("ALBIREO_TEST_HYBRID_FAILURE", failure);
+                        }
+                        if (at == 2) after = dev.stats();
+                    });
+                    set_variable("ALBIREO_TEST_HYBRID_FAILURE", nullptr);
+                }
+                const json st = dev.stats();
+                expect(got.size() == reference.size(), "the same rows of the hybrid decoder");
+                if (got.size() != reference.size()) continue;
+                const stats d = compare(reference.data(), got.data(), rows, V);
+                const std::string what = asked.empty() ? "layers of the hybrid decoder on the device"
+                    : asked == "3" ? "device that fails in a step" : "device that lacks memory in a step";
+                report(what.c_str(), d);
+                expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97, what.c_str());
+                std::printf("  passes on the device: %lld before the fifth step, %lld at the return to a saved state, "
+                    "%lld in all; states left on the device %lld bytes\n", before["layer_passes"].as_int(),
+                    after["layer_passes"].as_int(), st["layer_passes"].as_int(), st["weights_bytes"].as_int());
+                expect(before["layer_passes"].as_int() >= 5, "the layers of the hybrid decoder ran on the device");
+                if (asked == "3")
+                    expect(after["layer_passes"].as_int() == before["layer_passes"].as_int() + 1,
+                        "the processor computes the passes after a failure of the device");
+                else
+                    expect(st["layer_passes"].as_int() >= before["layer_passes"].as_int() + 25,
+                        "the device keeps the layers of the hybrid decoder");
+                expect(st["weights_bytes"].as_int() == 0, "the copies and the states left with the model");
+            }
+
+            /*
+                A device that fails in a step without giving the states back: the pass ends with an
+                error, the sequence goes back to the 20 tokens of its saved state, and the processor
+                continues it as a runtime that never had a device.
+            */
+            std::vector<int> tokens(27);
+            uint32_t state = 21;
+            for (auto& t : tokens) t = next_token(state);
+            auto feed = [&](cpu_runtime& rt, int seq, long first, long count, std::vector<float>& out) {
+                forward_batch b;
+                b.tokens.assign(tokens.begin() + first, tokens.begin() + first + count);
+                b.segments.push_back({ seq, 0, count });
+                b.logit_rows.push_back(count - 1);
+                expect(rt.reserve_sequence(seq, rt.sequence_length(seq) + count), "reserve");
+                std::vector<float> logits;
+                rt.forward(b, logits);
+                out.insert(out.end(), logits.begin(), logits.end());
+            };
+            std::vector<float> want, lost;
+            {
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+                const int seq = rt.create_sequence();
+                feed(rt, seq, 0, 20, want);
+                for (long i = 23; i < 27; ++i) feed(rt, seq, i, 1, want);
+                rt.release_sequence(seq);
+            }
+            {
+                tensor_device dev(device_config(device, 0, "auto"), pool, print_log);
+                cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+                rt.set_offload(dev.make_offload());
+                const int seq = rt.create_sequence();
+                feed(rt, seq, 0, 20, lost);
+                std::vector<float> unused;
+                for (long i = 20; i < 22; ++i) feed(rt, seq, i, 1, unused);
+                set_variable("ALBIREO_TEST_HYBRID_FAILURE", "lost:3");
+                bool thrown = false;
+                try
+                {
+                    feed(rt, seq, 22, 1, unused);
+                }
+                catch (const std::runtime_error&)
+                {
+                    thrown = true;
+                }
+                set_variable("ALBIREO_TEST_HYBRID_FAILURE", nullptr);
+                expect(thrown, "a pass whose states are lost with the device ends with an error");
+                expect(rt.restorable_length(seq, 22) == 20,
+                    "a sequence that lost its states goes back to its saved state");
+                rt.truncate_sequence(seq, 20);
+                for (long i = 23; i < 27; ++i) feed(rt, seq, i, 1, lost);
+                rt.release_sequence(seq);
+            }
+            expect(lost.size() == want.size(), "the same rows after the loss of the states");
+            if (lost.size() == want.size())
+            {
+                const stats d = compare(want.data(), lost.data(), static_cast<long>(want.size()) / V, V);
+                report("states lost with the device", d);
+                expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97, "states lost with the device");
+            }
+            qk_set_exact_products(false);
+        }
+    }
+
     int synthetic(const std::string& folder, const std::string& device)
     {
         std::string backend, runtime, reason, reason_code;
@@ -515,6 +728,8 @@ namespace
         std::remove(path.c_str());
         for (int hybrid = 0; hybrid < 2; ++hybrid) grouped_products(path, device, hybrid != 0, pool);
         std::remove(path.c_str());
+        hybrid_layers(path, device, pool);
+        std::remove(path.c_str());
         if (failures)
         {
             std::printf("%d checks FAILED\n", failures);
@@ -684,6 +899,7 @@ static int run_checks(int argc, char** argv)
         cpu_runtime rt(file, cfg, pool, kv, 16);
         usual = run(rt, tokens, k, host_ms);
         std::printf("processor, usual kernels: %.1f ms\n", host_ms);
+        report("usual kernels vs exact", compare(exact.data(), usual.data(), T, V));
     }
     {
         tensor_device dev(device_config(device, 0, "auto"), pool, print_log);
@@ -701,7 +917,14 @@ static int run_checks(int argc, char** argv)
         std::printf("routes: %s\n", st.dump().c_str());
         const stats d = compare(usual.data(), got.data(), T, V);
         report("measured routing vs processor", d);
-        expect(d.mean_kl < 0.05 && d.top1 >= 0.85, "measured routing");
+        /*
+            The layers the device computes whole take exact products: their logits then follow
+            those of the exact products, which the usual kernels leave by the rounding of their
+            activations.
+        */
+        const stats e = compare(exact.data(), got.data(), T, V);
+        report("measured routing vs exact", e);
+        expect((d.mean_kl < 0.05 && d.top1 >= 0.85) || (e.mean_kl < 0.01 && e.top1 >= 0.95), "measured routing");
         expect(st["failures"].as_int() == 0, "no device failure");
     }
 

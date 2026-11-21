@@ -3410,6 +3410,94 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void expert_routes (
+        tensor& picks,
+        tensor& weights,
+        const tensor& logits,
+        const tensor& bias,
+        long top_k,
+        bool normalize,
+        float scale
+    );
+    /*!
+        requires
+            - bias.size() == E for some E > 0, and logits.size() == n*E for some n
+            - 0 < top_k <= E and top_k <= 64
+            - picks.size() == weights.size() == n*top_k
+            - picks, weights, logits and bias are distinct objects
+            - With CUDA, E <= 1024.
+        ensures
+            - The choice of the experts of a mixture whose router gives each expert a sigmoid
+              (the hybrid decoders of the olala family).  For row t of logits, the score of
+              expert e is s[e] == sigmoid(logits[t*E + e]), computed in double precision, and
+              the experts are ranked by s[e] + bias[e], the larger first and the lower index
+              first among equals.
+            - picks[t*top_k + j] holds, in the bits of its float, the 32-bit signed integer
+              index of the expert of rank j of row t, for j < top_k.
+            - weights[t*top_k + j] == s of that expert, divided by the sum of the scores of
+              the top_k experts of the row plus 1e-20 when normalize is true, times scale.
+    !*/
+
+    void gguf_matvec_picked (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes,
+        const tensor& picks,
+        long per_row
+    );
+    /*!
+        requires
+            - type, cols and row_bytes as for gguf_matvec()
+            - weights holds, from its first byte, several matrices of rows rows and cols columns
+              in the GGUF format type, one after the other, as the matrices of the experts of a
+              mixture lie in a GGUF file.  With CUDA and the type Q4_K, the bytes of a matrix
+              are a multiple of four.
+            - picks.size() == p for some p, each of its floats holding the bits of a 32-bit
+              signed integer: the index of a matrix that weights holds
+            - per_row > 0 and p % per_row == 0
+            - src.size() == (p/per_row)*cols and dest.size() == p*rows
+            - dest is distinct from src, weights and picks
+        ensures
+            - performs: dest[j*rows + r] = sum over i of M[r][i]*src[(j/per_row)*cols + i], for
+              j < p and r < rows, M being the matrix of index picks[j].  Each row of src goes
+              through per_row matrices: the experts a token reaches all read its row
+              (per_row == their number), and each then sends a row of its own through its
+              second matrix (per_row == 1).
+            - A product reads the weights of its matrix once, in their compact form.
+    !*/
+
+    void squared_relu (
+        tensor& x
+    );
+    /*!
+        ensures
+            - #x[i] == max(x[i], 0)^2 for all i: the activation of the experts of the hybrid
+              decoders of the olala family.
+    !*/
+
+    void mix_rows (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        long per_row
+    );
+    /*!
+        requires
+            - per_row > 0, weights.size() == n*per_row for some n
+            - dest.size() == n*w for some w, and src.size() == n*per_row*w
+            - dest is distinct from src and weights
+        ensures
+            - performs: dest[t*w + i] = sum over j < per_row of
+              weights[t*per_row + j]*src[(t*per_row + j)*w + i], the sum running in the order
+              of j: the outputs of the experts of a token, weighted by its router.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
 }}
 
 #ifdef NO_MAKEFILE

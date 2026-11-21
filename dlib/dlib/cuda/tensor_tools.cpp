@@ -2144,6 +2144,69 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void expert_routes (
+        tensor& picks,
+        tensor& weights,
+        const tensor& logits,
+        const tensor& bias,
+        long top_k,
+        bool normalize,
+        float scale
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::expert_routes(picks, weights, logits, bias, top_k, normalize, scale);
+#else
+        cpu::expert_routes(picks, weights, logits, bias, top_k, normalize, scale);
+#endif
+    }
+
+    void gguf_matvec_picked (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes,
+        const tensor& picks,
+        long per_row
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_matvec_picked(dest, src, weights, type, rows, cols, row_bytes, picks, per_row);
+#else
+        cpu::gguf_matvec_picked(dest, src, weights, type, rows, cols, row_bytes, picks, per_row);
+#endif
+    }
+
+    void squared_relu (
+        tensor& x
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::squared_relu(x);
+#else
+        cpu::squared_relu(x);
+#endif
+    }
+
+    void mix_rows (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        long per_row
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::mix_rows(dest, src, weights, per_row);
+#else
+        cpu::mix_rows(dest, src, weights, per_row);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
 }}
 
 #endif // DLIB_TeNSOR_TOOLS_CPP_

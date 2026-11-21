@@ -18,9 +18,12 @@
     build_hybrid() writes a tiny model of the olala architecture instead: four layers of
     width 64, two Mamba-3 layers with several inputs and outputs and two differential
     attentions, each followed by a mixture of experts in a latent space beside a shared
-    expert, with the same vocabulary.
+    expert, with the same vocabulary.  latent() widens that latent space and
+    compact_experts() stores the experts in Q8_0 and the exit of the latent space in BF16,
+    for the tests of the devices, which read these formats in place.
 */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +96,24 @@ namespace albireo_test
         {
             experts_ = count;
             experts_used_ = used;
+            return *this;
+        }
+
+        // The width of the latent space of the experts of the hybrid decoder, 16 by default.
+        tiny_gguf_writer& latent(long width)
+        {
+            latent_ = width;
+            return *this;
+        }
+
+        /*
+            The experts of the hybrid decoder in Q8_0 and the exit of their latent space in BF16,
+            as the files of the family keep them, instead of single precision.  Their rows then
+            hold whole groups of 32 values: a latent space and experts of a multiple of 32.
+        */
+        tiny_gguf_writer& compact_experts(bool on)
+        {
+            compact_ = on;
             return *this;
         }
 
@@ -210,7 +231,7 @@ namespace albireo_test
             const long d = 64, layers = 4;
             const long ssm_heads = 8, ssm_hd = 16, state = 16, rank = 2, angles = 4;
             const long heads = 8, kv_heads = 2, hd = 32, tpa = 2, signal = heads - kv_heads;
-            const long experts = 8, used = 2, hidden = 32, latent = 16, shared = 48;
+            const long experts = 8, used = 2, hidden = 32, latent = latent_, shared = 48;
             const std::string types = "MVMV";
             std::vector<std::string> tokens;
             std::vector<int32_t> token_types;
@@ -263,8 +284,11 @@ namespace albireo_test
                 list.push_back({ p + "exp_probs_b", { u(experts) }, 0.0f, 0.1f });
                 list.push_back({ p + "ffn_latent_down.weight", { u(d), u(latent) }, 0.0f, 0.8f });
                 list.push_back({ p + "ffn_latent_up.weight", { u(latent), u(d) } });
+                if (compact_) list.back().type = type_bf16;
                 list.push_back({ p + "ffn_up_exps.weight", { u(latent), u(hidden), u(experts) }, 0.0f, 0.8f });
+                if (compact_) list.back().type = type_q8_0;
                 list.push_back({ p + "ffn_down_exps.weight", { u(hidden), u(latent), u(experts) } });
+                if (compact_) list.back().type = type_q8_0;
                 list.push_back({ p + "ffn_up_shexp.weight", { u(d), u(shared) }, 0.0f, 0.8f });
                 list.push_back({ p + "ffn_down_shexp.weight", { u(shared), u(d) } });
             }
@@ -332,11 +356,18 @@ namespace albireo_test
         bool biases_ = false;
         long experts_ = 0;
         long experts_used_ = 0;
+        long latent_ = 16;
+        bool compact_ = false;
+
+        // The types of the tensors, numbered as GGUF numbers them.
+        static const uint32_t type_f32 = 0;
+        static const uint32_t type_q8_0 = 8;
+        static const uint32_t type_bf16 = 30;
 
         /*
-            A tensor in single precision.  Its values are drawn around center, spread wide; without
-            them, a vector holds ones (a norm) and the other tensors, biases included, values
-            around zero.
+            A tensor, in single precision unless its type says otherwise.  Its values are drawn
+            around center, spread wide; without them, a vector holds ones (a norm) and the other
+            tensors, biases included, values around zero.
         */
         struct tensor
         {
@@ -346,7 +377,84 @@ namespace albireo_test
             std::vector<uint64_t> dims;
             float center;
             float spread;
+            uint32_t type = 0;
         };
+
+        // The bytes of n values of a tensor of the given type.
+        static uint64_t value_bytes(uint32_t type, uint64_t n)
+        {
+            if (type == type_q8_0) return n / 32 * 34;
+            if (type == type_bf16) return n * 2;
+            return n * 4;
+        }
+
+        // The largest half precision value at or below a positive float, 0 below the normal halves.
+        static uint16_t half_below(float f)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &f, 4);
+            const int exponent = static_cast<int>((bits >> 23) & 0xFF) - 127 + 15;
+            if (exponent <= 0) return 0;
+            if (exponent >= 31) return 0x7BFF;
+            return static_cast<uint16_t>((static_cast<uint32_t>(exponent) << 10) | ((bits & 0x7FFFFFu) >> 13));
+        }
+
+        static float half_value(uint16_t h)
+        {
+            if (h == 0) return 0.0f;
+            const uint32_t bits = ((static_cast<uint32_t>(h >> 10) - 15 + 127) << 23)
+                | (static_cast<uint32_t>(h & 0x3FF) << 13);
+            float f;
+            std::memcpy(&f, &bits, 4);
+            return f;
+        }
+
+        // Appends n values in the encoding of the type of their tensor.
+        void write_values(uint32_t type, const std::vector<float>& values)
+        {
+            if (type == type_bf16)
+            {
+                for (float v : values)
+                {
+                    uint32_t bits;
+                    std::memcpy(&bits, &v, 4);
+                    out_.bytes.push_back(static_cast<unsigned char>((bits >> 16) & 0xFF));
+                    out_.bytes.push_back(static_cast<unsigned char>(bits >> 24));
+                }
+                return;
+            }
+            if (type == type_q8_0)
+            {
+                // Groups of 32 values: a scale in half precision, then the values as multiples of it.
+                for (size_t g = 0; g + 32 <= values.size(); g += 32)
+                {
+                    float largest = 0.0f;
+                    for (size_t i = 0; i < 32; ++i)
+                        largest = std::max(largest, values[g + i] < 0 ? -values[g + i] : values[g + i]);
+                    // The next half above the scale, so that no value needs more than 127 steps.
+                    uint16_t h = half_below(largest / 127.0f);
+                    if (largest > 0.0f) ++h;
+                    // The smallest normal half at least: the readers take the lower ones for subnormals.
+                    if (largest > 0.0f && h < 0x0400) h = 0x0400;
+                    const float scale = half_value(h);
+                    out_.bytes.push_back(static_cast<unsigned char>(h & 0xFF));
+                    out_.bytes.push_back(static_cast<unsigned char>(h >> 8));
+                    for (size_t i = 0; i < 32; ++i)
+                    {
+                        const float steps = scale > 0.0f ? values[g + i] / scale : 0.0f;
+                        const int q = static_cast<int>(steps < 0 ? steps - 0.5f : steps + 0.5f);
+                        out_.bytes.push_back(static_cast<unsigned char>(static_cast<int8_t>(q)));
+                    }
+                }
+                return;
+            }
+            for (float v : values)
+            {
+                unsigned char b[4];
+                std::memcpy(b, &v, 4);
+                out_.bytes.insert(out_.bytes.end(), b, b + 4);
+            }
+        }
 
         // The byte-level vocabulary with its control tokens, padded to a multiple of 32; returns its size.
         static long vocabulary(std::vector<std::string>& tokens, std::vector<int32_t>& types)
@@ -382,13 +490,13 @@ namespace albireo_test
                     u64(t.dims[k]);
                 }
                 field("type " + t.name, 4);
-                u32(0);   // F32
+                u32(t.type);
                 field("offset " + t.name, 8);
                 u64(offset);
                 offsets.push_back(offset);
                 uint64_t n = 1;
                 for (uint64_t x : t.dims) n *= x;
-                offset += (n * 4 + 31) / 32 * 32;
+                offset += (value_bytes(t.type, n) + 31) / 32 * 32;
             }
             while (out_.bytes.size() % 32 != 0) out_.bytes.push_back(0);
             out_.header_end = out_.bytes.size();
@@ -403,14 +511,14 @@ namespace albireo_test
                 const bool given = list[i].spread >= 0.0f;
                 const float center = given ? list[i].center : norm ? 1.0f : 0.0f;
                 const float spread = given ? list[i].spread : norm ? 0.0f : 0.4f;
+                std::vector<float> values(static_cast<size_t>(n));
                 for (uint64_t k = 0; k < n; ++k)
                 {
                     state = state * 1664525u + 1013904223u;
-                    const float v = center + (static_cast<float>(state >> 8) / 16777216.0f - 0.5f) * spread;
-                    unsigned char b[4];
-                    std::memcpy(b, &v, 4);
-                    out_.bytes.insert(out_.bytes.end(), b, b + 4);
+                    values[static_cast<size_t>(k)] = center + (static_cast<float>(state >> 8) / 16777216.0f - 0.5f)
+                        * spread;
                 }
+                write_values(list[i].type, values);
             }
         }
 

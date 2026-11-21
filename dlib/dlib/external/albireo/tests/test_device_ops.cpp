@@ -21,10 +21,17 @@
     qk_rotate_row() and qk_float_to_q8_row()), for heads of 32 to 256 values in half
     precision and in 8 bits; tt::paged_attention() against the attention in double precision
     over pages that hold the rows the processor wrote, for tokens near and far from the start
-    of their sequences, with several query heads per key/value head.  The program ends with
-    the time of the products of one and of eight tokens with the matrices of a model of 2
-    billion parameters, and the rate at which they read the weights, and with the time of the
-    attention of a generated token over 4,096 positions.
+    of their sequences, with several query heads per key/value head.  The operations of the
+    hybrid decoders follow: tt::expert_routes() against a sort of the scores, experts of
+    equal rank included; tt::gguf_matvec_picked() for every format against products in
+    double precision with the rows of the matrices its picks name; tt::squared_relu() and
+    tt::mix_rows() against their definitions; tt::mamba3_step() and tt::geodesic_update()
+    against the processor code of dlib, with the geometry of the layers of Olala 1.0 mini.
+    The program ends with the time of the products of one and of eight tokens with the
+    matrices of a model of 2 billion parameters, and the rate at which they read the
+    weights, with the time of the attention of a generated token over 4,096 positions, and
+    with the time of one token in a block of a hybrid decoder of the size of those of
+    Olala 1.0 mini, operation by operation and as the hybrid pass chains them.
 */
 
 #include <algorithm>
@@ -35,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -667,6 +675,231 @@ namespace
     }
 
     /*
+        The operations of the mixtures of experts of the hybrid decoders: the routes of tokens
+        over 8 to 1,000 experts against a sort of their ranked scores, with experts of equal
+        rank; the products through picked matrices, for every format, with matrices whose rows
+        fill their blocks of warps or not, activations on 16 bytes or one float further, one
+        row of activations for several matrices and one row each; the squares and the weighted
+        sums.
+    */
+    void check_experts(std::mt19937& rng)
+    {
+        const long routes[4][3] = { { 1, 8, 2 }, { 3, 256, 6 }, { 5, 1000, 64 }, { 2, 300, 1 } };
+        for (const auto& c : routes)
+        {
+            const long n = c[0], experts = c[1], top_k = c[2];
+            dlib::resizable_tensor logits(n, experts), bias(1, experts), picks(n, top_k), weights(n, top_k);
+            random_floats(logits.host_write_only(), logits.size(), 4.0f, rng);
+            random_floats(bias.host_write_only(), bias.size(), 0.1f, rng);
+            // The second half of the experts of the first token share one rank.
+            for (long e = experts / 2; e < experts; ++e)
+            {
+                logits.host()[e] = 2.5f;
+                bias.host()[e] = 0.0f;
+            }
+            for (int normalize = 0; normalize < 2; ++normalize)
+            {
+                dlib::tt::expert_routes(picks, weights, logits, bias, top_k, normalize != 0, 2.45f);
+                bool same = true;
+                double worst = 0;
+                for (long t = 0; t < n; ++t)
+                {
+                    std::vector<float> score(static_cast<size_t>(experts)), ranked(static_cast<size_t>(experts));
+                    std::vector<long> order(static_cast<size_t>(experts));
+                    for (long e = 0; e < experts; ++e)
+                    {
+                        const size_t at = static_cast<size_t>(e);
+                        score[at] = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(
+                            logits.host()[t * experts + e]))));
+                        ranked[at] = score[at] + bias.host()[e];
+                        order[at] = e;
+                    }
+                    std::stable_sort(order.begin(), order.end(), [&](long a, long b) {
+                        return ranked[static_cast<size_t>(a)] > ranked[static_cast<size_t>(b)];
+                    });
+                    float selected = 0;
+                    for (long k = 0; k < top_k; ++k)
+                        selected += score[static_cast<size_t>(order[static_cast<size_t>(k)])];
+                    for (long k = 0; k < top_k; ++k)
+                    {
+                        int32_t pick;
+                        std::memcpy(&pick, picks.host() + t * top_k + k, sizeof(pick));
+                        const long expert = order[static_cast<size_t>(k)];
+                        // Scores the device and the processor round apart may exchange two neighbours.
+                        if (pick != expert && !(pick >= 0 && pick < experts
+                            && std::fabs(ranked[static_cast<size_t>(pick)] - ranked[static_cast<size_t>(expert)])
+                                < 1e-6f))
+                            same = false;
+                        if (pick < 0 || pick >= experts) continue;
+                        float want = score[static_cast<size_t>(pick)];
+                        if (normalize) want /= selected + 1e-20f;
+                        worst = std::max<double>(worst, std::fabs(weights.host()[t * top_k + k] - want * 2.45f));
+                    }
+                }
+                expect(same, "experts of " + std::to_string(experts) + ", " + std::to_string(top_k) + " a token");
+                expect(worst <= 1e-5, "weights of the experts (error " + std::to_string(worst) + ")");
+            }
+        }
+
+        double worst = 0;
+        for (const format& f : formats())
+        {
+            const bool blocks_of_256 = f.block_values == 256;
+            for (int shape = 0; shape < 2; ++shape)
+            {
+                const long cols = blocks_of_256 ? (shape ? 1536 : 256) : (shape ? 1120 : 32);
+                const long rows = shape ? 21 : 16, matrices = 9;
+                const size_t rb = gb::row_bytes(f.type, cols);
+                std::vector<uint8_t> bytes(static_cast<size_t>(rows * matrices) * rb);
+                for (long r = 0; r < rows * matrices; ++r)
+                    random_row(f, bytes.data() + static_cast<size_t>(r) * rb, cols, rng);
+                dlib::resizable_tensor w;
+                load_weights(w, bytes);
+                std::vector<float> ref(static_cast<size_t>(rows * matrices * cols));
+                for (long r = 0; r < rows * matrices; ++r)
+                    qk_dequantize_row(static_cast<dlib::ggml_type>(f.type), bytes.data() + static_cast<size_t>(r) * rb,
+                        ref.data() + r * cols, cols);
+                for (long per_row : { 1L, 4L })
+                {
+                    std::vector<int32_t> chosen(12);
+                    for (auto& e : chosen) e = static_cast<int32_t>(rng() % static_cast<unsigned>(matrices));
+                    const long p = static_cast<long>(chosen.size());
+                    dlib::resizable_tensor picks, y(p, rows);
+                    put_integers(picks, chosen);
+                    for (int shift = 0; shift < 2; ++shift)
+                    {
+                        dlib::resizable_tensor x((p / per_row) * cols + shift);
+                        random_floats(x.host_write_only(), x.size(), 1.0f, rng);
+                        dlib::alias_tensor xa(p / per_row, cols);
+                        const dlib::alias_tensor_instance xs = xa(x, static_cast<size_t>(shift));
+                        dlib::tt::gguf_matvec_picked(y, xs, w, f.type, rows, cols, rb, picks, per_row);
+                        const float* got = y.host();
+                        const float* xp = x.host() + shift;
+                        for (long j = 0; j < p; ++j)
+                            for (long r = 0; r < rows; ++r)
+                            {
+                                const float* row = ref.data() + (chosen[static_cast<size_t>(j)] * rows + r) * cols;
+                                double sum = 0, magnitude = 0;
+                                for (long i = 0; i < cols; ++i)
+                                {
+                                    const double term = static_cast<double>(row[i]) * xp[(j / per_row) * cols + i];
+                                    sum += term;
+                                    magnitude += std::fabs(term);
+                                }
+                                worst = std::max(worst, std::fabs(got[j * rows + r] - sum) / (magnitude + 1e-6));
+                            }
+                    }
+                }
+            }
+        }
+        expect(worst <= 2e-5, "products through picked matrices (relative error " + std::to_string(worst) + ")");
+
+        dlib::resizable_tensor x(5, 333), start;
+        random_floats(x.host_write_only(), x.size(), 3.0f, rng);
+        start = x;
+        dlib::tt::squared_relu(x);
+        double worst_square = 0;
+        for (size_t i = 0; i < x.size(); ++i)
+        {
+            const float r = std::max(start.host()[i], 0.0f);
+            worst_square = std::max<double>(worst_square, std::fabs(x.host()[i] - r * r));
+        }
+        expect(worst_square <= 1e-6, "squared_relu (error " + std::to_string(worst_square) + ")");
+        const long n = 5, per_row = 6, width = 384;
+        dlib::resizable_tensor src(n * per_row, width), weights(n, per_row), mixed(n, width);
+        random_floats(src.host_write_only(), src.size(), 2.0f, rng);
+        random_floats(weights.host_write_only(), weights.size(), 1.0f, rng);
+        dlib::tt::mix_rows(mixed, src, weights, per_row);
+        double worst_mix = 0;
+        for (long t = 0; t < n; ++t)
+            for (long i = 0; i < width; ++i)
+            {
+                double sum = 0;
+                for (long j = 0; j < per_row; ++j)
+                    sum += static_cast<double>(weights.host()[t * per_row + j])
+                        * src.host()[(t * per_row + j) * width + i];
+                worst_mix = std::max(worst_mix, std::fabs(mixed.host()[t * width + i] - sum));
+            }
+        expect(worst_mix <= 1e-5, "mix_rows (error " + std::to_string(worst_mix) + ")");
+        std::printf("  experts: products through picked matrices within %.2g of their magnitude, squares %.2g, "
+            "weighted sums %.2g\n", worst, worst_square, worst_mix);
+    }
+
+    // The tensors of a Mamba-3 layer of H heads of P channels, states of N values, R inputs and S turned pairs.
+    struct mamba_layer
+    {
+        long H, P, N, R, S;
+        dlib::resizable_tensor norms, bias, misc, mxz, mo;
+
+        mamba_layer(long h, long p, long n, long r, long s, std::mt19937& rng) : H(h), P(p), N(n), R(r), S(s)
+        {
+            norms.set_size(1, 2 * N);
+            bias.set_size(1, H * 2 * R * N);
+            misc.set_size(1, 2 * H);
+            mxz.set_size(1, H * 2 * R * P);
+            mo.set_size(1, H * R * P);
+            std::normal_distribution<float> g(0.0f, 1.0f);
+            for (float& v : norms) v = 1 + 0.2f * g(rng);
+            for (float& v : bias) v = 1 + 0.3f * g(rng);
+            for (float& v : misc) v = 0.5f * g(rng);
+            for (float& v : mxz) v = 0.7f + 0.3f * g(rng);
+            for (float& v : mo) v = 0.5f + 0.2f * g(rng);
+        }
+
+        long state_floats() const { return H * S + H * P * N + H * R * N + H * P; }
+    };
+
+    /*
+        tt::mamba3_step() and tt::geodesic_update() against the processor code of dlib over the
+        tokens of a sequence, with a small geometry and with that of the layers of Olala 1.0 mini
+        (48 heads of 64 channels, states of 128 values, 4 inputs and 32 turned pairs).
+    */
+    void check_mamba(std::mt19937& rng)
+    {
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        const long geometries[2][5] = { { 3, 5, 8, 2, 2 }, { 48, 64, 128, 4, 32 } };
+        double worst_out = 0, worst_state = 0;
+        for (const auto& c : geometries)
+        {
+            mamba_layer L(c[0], c[1], c[2], c[3], c[4], rng);
+            dlib::resizable_tensor s1(1, L.state_floats()), s2;
+            s1 = 0;
+            s2 = s1;
+            dlib::resizable_tensor o1(1, L.H * L.P), o2(1, L.H * L.P), in(1, L.H * (2 * L.P + 3));
+            dlib::resizable_tensor dyn(1, 2 * L.R * L.N + L.S);
+            for (int t = 0; t < 6; ++t)
+            {
+                for (float& v : in) v = g(rng);
+                for (float& v : dyn) v = 1.5f * g(rng);
+                dlib::cpu::mamba3_step(o1, s1, in, dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f);
+                dlib::tt::mamba3_step(o2, s2, in, dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f);
+                double scale_out = 1, scale_state = 1;
+                for (size_t i = 0; i < o1.size(); ++i) scale_out = std::max<double>(scale_out, std::fabs(o1.host()[i]));
+                for (size_t i = 0; i < s1.size(); ++i)
+                    scale_state = std::max<double>(scale_state, std::fabs(s1.host()[i]));
+                for (size_t i = 0; i < o1.size(); ++i)
+                    worst_out = std::max(worst_out, std::fabs(o1.host()[i] - o2.host()[i]) / scale_out);
+                for (size_t i = 0; i < s1.size(); ++i)
+                    worst_state = std::max(worst_state, std::fabs(s1.host()[i] - s2.host()[i]) / scale_state);
+            }
+        }
+        expect(worst_out <= 1e-3 && worst_state <= 1e-3, "mamba3_step against the processor (outputs "
+            + std::to_string(worst_out) + ", states " + std::to_string(worst_state) + ")");
+        dlib::resizable_tensor x(3, 1, 1, 1536), y, turn(3, 1, 1, 1536);
+        for (float& v : x) v = g(rng);
+        for (float& v : turn) v = 3 * g(rng);
+        y = x;
+        dlib::cpu::geodesic_update(x, turn, 1.2f, 0.01f, 2);
+        dlib::tt::geodesic_update(y, turn, 1.2f, 0.01f, 2);
+        double worst_turn = 0;
+        for (size_t i = 0; i < x.size(); ++i)
+            worst_turn = std::max<double>(worst_turn, std::fabs(x.host()[i] - y.host()[i]));
+        expect(worst_turn <= 1e-5, "geodesic_update against the processor (error " + std::to_string(worst_turn) + ")");
+        std::printf("  mamba3_step within %.2g of the processor, its states %.2g, geodesic_update %.2g\n", worst_out,
+            worst_state, worst_turn);
+    }
+
+    /*
         The products of one generated token, and of the eight tokens of a pass that checks a
         draft, with the matrices of a layer of a model of 2 billion parameters in Q4_K and Q6_K,
         and with its output matrix: the time of each and the rate at which they read the
@@ -722,6 +955,128 @@ namespace
             }
         }
     }
+
+    // A matrix of rows rows and cols columns of random weights in a format, on the device.
+    void random_matrix(dlib::resizable_tensor& w, int type, long rows, long cols, std::mt19937& rng)
+    {
+        const format* f = nullptr;
+        for (const format& c : formats())
+            if (c.type == type) f = &c;
+        const size_t rb = gb::row_bytes(type, cols);
+        std::vector<uint8_t> bytes(static_cast<size_t>(rows) * rb);
+        // The rows repeat a few random ones: the time of a product does not depend on their values.
+        const long distinct = std::min<long>(rows, 64);
+        for (long r = 0; r < distinct; ++r) random_row(*f, bytes.data() + static_cast<size_t>(r) * rb, cols, rng);
+        for (long r = distinct; r < rows; ++r)
+            std::memcpy(bytes.data() + static_cast<size_t>(r) * rb,
+                bytes.data() + static_cast<size_t>(r % distinct) * rb, rb);
+        load_weights(w, bytes);
+    }
+
+    /*
+        One token in a block of a hybrid decoder of the size of those of Olala 1.0 mini (a width
+        of 1,536, a Mamba-3 layer of 48 heads of 64 channels, 256 experts of 768 in a latent
+        space of 384, 6 a token, beside a shared expert of 1,536), with the formats of its Q6_K
+        file: the time of each operation alone, the device waited for after each, then the time
+        of the block as the hybrid pass chains its operations, the device waited for once.
+    */
+    void measure_hybrid(std::mt19937& rng)
+    {
+#ifdef DLIB_USE_CUDA
+        const int repeats = 50;
+#else
+        const int repeats = 1;
+#endif
+        const long d = 1536, E = 256, K = 6, dl = 384, df = 768, ds = 1536;
+        mamba_layer L(48, 64, 128, 4, 32, rng);
+        const long in_w = L.H * (2 * L.P + 3), dyn_w = 2 * L.R * L.N + L.S, inner = L.H * L.P;
+        dlib::resizable_tensor ssm_in, ssm_dyn, wo, router, latent_down, shared_up, experts_up, experts_down, latent_up;
+        dlib::resizable_tensor shared_down;
+        random_matrix(ssm_in, gb::q6_K, in_w, d, rng);
+        random_matrix(ssm_dyn, gb::q6_K, dyn_w, d, rng);
+        random_matrix(wo, gb::q6_K, d, inner, rng);
+        random_matrix(router, gb::f32, E, d, rng);
+        random_matrix(latent_down, gb::q6_K, dl, d, rng);
+        random_matrix(shared_up, gb::q6_K, ds, d, rng);
+        random_matrix(experts_up, gb::q8_0, E * df, dl, rng);
+        random_matrix(experts_down, gb::q6_K, E * dl, df, rng);
+        random_matrix(latent_up, gb::bf16, d, dl, rng);
+        random_matrix(shared_down, gb::q6_K, d, ds, rng);
+        const size_t rb_q6 = gb::row_bytes(gb::q6_K, d);
+        dlib::resizable_tensor x(1, 1, 1, d), g(1, 1, 1, d), up(1, 1, 1, d);
+        dlib::resizable_tensor proj(1, in_w), dyn(1, dyn_w), mixed(1, inner);
+        dlib::resizable_tensor state(1, L.state_floats()), scores(1, E), bias(1, E), picks(1, K), weights(1, K);
+        dlib::resizable_tensor latent(1, dl), raised(K, df), lowered(K, dl), routed(1, dl), shared(1, ds);
+        random_floats(x.host_write_only(), x.size(), 0.03f, rng);
+        random_floats(bias.host_write_only(), bias.size(), 0.1f, rng);
+        state = 0;
+
+        struct step
+        {
+            const char* name;
+            std::function<void()> run;
+            const dlib::tensor* result;
+        };
+        const std::vector<step> steps = {
+            { "ssm_in      Q6_K 6288x1536", [&]() {
+                dlib::tt::gguf_matvec(proj, x, ssm_in, gb::q6_K, in_w, d, rb_q6); }, &proj },
+            { "ssm_in_dyn  Q6_K 1056x1536", [&]() {
+                dlib::tt::gguf_matvec(dyn, x, ssm_dyn, gb::q6_K, dyn_w, d, rb_q6); }, &dyn },
+            { "step of the Mamba-3 layer ", [&]() {
+                dlib::tt::mamba3_step(mixed, state, proj, dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f); },
+                &mixed },
+            { "attn_output Q6_K 1536x3072", [&]() {
+                dlib::tt::gguf_matvec(g, mixed, wo, gb::q6_K, d, inner, gb::row_bytes(gb::q6_K, inner)); }, &g },
+            { "geodesic update           ", [&]() { dlib::tt::geodesic_update(x, g, 1.0f, 0.02f, 3); }, &x },
+            { "router      F32  256x1536 ", [&]() {
+                dlib::tt::gguf_matvec(scores, x, router, gb::f32, E, d, gb::row_bytes(gb::f32, d)); }, &scores },
+            { "experts of the token      ", [&]() {
+                dlib::tt::expert_routes(picks, weights, scores, bias, K, true, 2.45f); }, &weights },
+            { "latent_down Q6_K 384x1536 ", [&]() {
+                dlib::tt::gguf_matvec(latent, x, latent_down, gb::q6_K, dl, d, rb_q6); }, &latent },
+            { "shared_up   Q6_K 1536x1536", [&]() {
+                dlib::tt::gguf_matvec(shared, x, shared_up, gb::q6_K, ds, d, rb_q6); }, &shared },
+            { "experts up  Q8_0 6x768x384", [&]() {
+                dlib::tt::gguf_matvec_picked(raised, latent, experts_up, gb::q8_0, df, dl, gb::row_bytes(gb::q8_0, dl),
+                    picks, K); }, &raised },
+            { "squares of the experts    ", [&]() { dlib::tt::squared_relu(raised); }, &raised },
+            { "experts down Q6_K 6x384x768", [&]() {
+                dlib::tt::gguf_matvec_picked(lowered, raised, experts_down, gb::q6_K, dl, df,
+                    gb::row_bytes(gb::q6_K, df), picks, 1); }, &lowered },
+            { "weighted sum of the experts", [&]() { dlib::tt::mix_rows(routed, lowered, weights, K); }, &routed },
+            { "latent_up   BF16 1536x384 ", [&]() {
+                dlib::tt::gguf_matvec(g, routed, latent_up, gb::bf16, d, dl, gb::row_bytes(gb::bf16, dl)); }, &g },
+            { "squares of the shared expert", [&]() { dlib::tt::squared_relu(shared); }, &shared },
+            { "shared_down Q6_K 1536x1536", [&]() {
+                dlib::tt::gguf_matvec(up, shared, shared_down, gb::q6_K, d, ds, gb::row_bytes(gb::q6_K, ds)); }, &up },
+            { "sum of the two outputs    ", [&]() { dlib::tt::add(1, g, 1, up); }, &g },
+            { "geodesic update           ", [&]() { dlib::tt::geodesic_update(x, g, 1.0f, 0.02f, 3); }, &x }
+        };
+        // Once through, so that the weights are on the device and every buffer holds values.
+        for (const step& s : steps) s.run();
+        x.host();
+        double sum = 0;
+        for (const step& s : steps)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < repeats; ++i)
+            {
+                s.run();
+                s.result->host();
+            }
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                / repeats;
+            sum += seconds;
+            std::printf("  hybrid block, %s: %8.1f us\n", s.name, seconds * 1e6);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i)
+            for (const step& s : steps) s.run();
+        x.host();
+        const double chained = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / repeats;
+        std::printf("  hybrid block, one token: %8.1f us with the device waited for once (%.1f us operation by "
+            "operation); 36 such blocks, %.1f ms\n", chained * 1e6, sum * 1e6, chained * 36e3);
+    }
 }
 
 static int run_checks(int argc, char** argv)
@@ -770,8 +1125,11 @@ static int run_checks(int argc, char** argv)
     check_rope(rng);
     check_kv_store(rng);
     check_attention(rng);
+    check_experts(rng);
+    check_mamba(rng);
     measure(rng);
     measure_attention(rng);
+    measure_hybrid(rng);
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

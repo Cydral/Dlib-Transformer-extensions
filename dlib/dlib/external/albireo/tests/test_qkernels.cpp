@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -441,6 +442,7 @@ namespace
                     return false;
             return true;
         };
+        std::vector<std::vector<float>> first;
         for (int threads : { 1, 2, 4, 12 })
         {
             thread_pool pool(threads);
@@ -451,6 +453,9 @@ namespace
                 qk_matmul(*p.W, p.X, p.n_tokens, p.x_stride, alone[static_cast<size_t>(i)].data(), p.y_stride, pool,
                     scratch, false, qk_path::integer);
             }
+            // The tasks follow the threads; the products do not.
+            if (first.empty()) first = alone;
+            check(first == alone, "products the same on any number of threads");
             for (long i = 0; i < count; ++i) items[static_cast<size_t>(i)].Y = together[static_cast<size_t>(i)].data();
             qk_matmul_group(items.data(), count, pool, scratch);
             check(same(), "products of a group as computed one by one");
@@ -831,15 +836,144 @@ namespace
             check(count.load() == 64, "pool after sleeping");
         }
         pool.set_spin_time(std::chrono::microseconds(2000));
+
+        // Every task of a section runs once, whatever the number of tasks and their lengths.
+        std::vector<std::atomic<int>> runs(5000);
+        bool once = true;
+        for (long n : { 2L, 3L, 7L, 64L, 257L, 5000L })
+        {
+            for (auto& r : runs) r.store(0);
+            pool.parallel_for(n, [&](long t, int) {
+                runs[static_cast<size_t>(t)].fetch_add(1);
+                if (t % 97 == 0) std::this_thread::yield();
+            });
+            for (long t = 0; t < 5000; ++t)
+                if (runs[static_cast<size_t>(t)].load() != (t < n ? 1 : 0)) once = false;
+        }
+        check(once, "every task of a section runs once");
+
+        /*
+            A task that throws: the caller receives its exception once the tasks under way are
+            done, the tasks not yet handed out are skipped, and the pool serves the sections
+            that follow.
+        */
+        for (int rep = 0; rep < 200; ++rep)
+        {
+            const long n = 2 + rep % 40;
+            const long thrower = rep % n;
+            std::atomic<long> ran{0};
+            std::atomic<long> running{0};
+            bool caught = false;
+            try
+            {
+                pool.parallel_for(n, [&](long t, int) {
+                    running.fetch_add(1);
+                    if (t == thrower || (rep % 5 == 0 && t == n - 1))
+                    {
+                        running.fetch_sub(1);
+                        throw std::runtime_error("task");
+                    }
+                    ran.fetch_add(1);
+                    running.fetch_sub(1);
+                });
+            }
+            catch (const std::runtime_error& e)
+            {
+                caught = std::string(e.what()) == "task";
+            }
+            check(caught, "exception of a task reaches the caller");
+            check(running.load() == 0, "no task runs after its section");
+            check(ran.load() < n, "tasks of a failed section", static_cast<double>(ran.load()), static_cast<double>(n));
+            std::atomic<long> count{0};
+            pool.parallel_for(n, [&](long, int) { count.fetch_add(1); });
+            check(count.load() == n, "section after a failed one", static_cast<double>(count.load()),
+                static_cast<double>(n));
+        }
+
+        // Two threads open sections of the same pool: each section runs alone, with all its tasks.
+        {
+            std::atomic<long> inside{0};
+            std::atomic<long> overlaps{0};
+            std::atomic<long> done{0};
+            auto caller = [&](int id) {
+                for (int rep = 0; rep < 300; ++rep)
+                {
+                    const long n = 2 + (rep + id) % 9;
+                    std::atomic<long> mine{0};
+                    std::atomic<int> owner{id};
+                    pool.parallel_for(n, [&](long, int) {
+                        if (inside.fetch_add(1) == 0) owner.store(id);
+                        if (owner.load() != id) overlaps.fetch_add(1);
+                        mine.fetch_add(1);
+                        inside.fetch_sub(1);
+                    });
+                    if (mine.load() == n) done.fetch_add(1);
+                }
+            };
+            std::thread other([&]() { caller(1); });
+            caller(0);
+            other.join();
+            check(done.load() == 600, "sections of two callers", static_cast<double>(done.load()), 600);
+            check(overlaps.load() == 0, "sections of two callers run one at a time");
+        }
         std::printf("  thread pool: %d threads\n", pool.size());
+    }
+
+    /*
+        More threads than the machine may have cores, sections of every size that follow one
+        another or wait long enough for the workers to sleep, and workers that the system
+        keeps away from their sections: every task still runs once, and a section never
+        waits for a worker that holds none of its tasks.
+    */
+    void test_crowded_pool()
+    {
+        std::atomic<bool> finished{false};
+        std::thread watchdog([&]() {
+            for (int i = 0; i < 2400 && !finished.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (!finished.load())
+            {
+                std::printf("FAILED: a section of a crowded pool never ended\n");
+                std::fflush(stdout);
+                std::_Exit(1);
+            }
+        });
+        std::mt19937 sizes(77);
+        for (int threads : { 3, 8, 16 })
+        {
+            thread_pool crowded(threads);
+            crowded.set_spin_time(std::chrono::microseconds(threads == 8 ? 30 : 400));
+            std::vector<std::atomic<int>> runs(512);
+            long wrong = 0;
+            for (int rep = 0; rep < 3000; ++rep)
+            {
+                const long n = 2 + static_cast<long>(sizes() % (rep % 50 == 0 ? 510 : 12));
+                for (long t = 0; t < n; ++t) runs[static_cast<size_t>(t)].store(0, std::memory_order_relaxed);
+                std::atomic<long> sum{0};
+                crowded.parallel_for(n, [&](long t, int thread) {
+                    if (thread < 0 || thread >= crowded.size()) sum.fetch_add(1000000);
+                    runs[static_cast<size_t>(t)].fetch_add(1);
+                    sum.fetch_add(t);
+                    if ((t + rep) % 61 == 0) std::this_thread::yield();
+                });
+                if (sum.load() != n * (n - 1) / 2) ++wrong;
+                for (long t = 0; t < n; ++t)
+                    if (runs[static_cast<size_t>(t)].load() != 1) ++wrong;
+                if (rep % 400 == 399) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            check(wrong == 0, "sections of a crowded pool", static_cast<double>(wrong), threads);
+        }
+        finished = true;
+        watchdog.join();
+        std::printf("  crowded pools: 3, 8 and 16 threads, 3000 sections each\n");
     }
 
     void test_new_pools()
     {
         /*
             A section opened as soon as the pool exists, before the system has run its
-            workers, in which every worker takes part.  A worker that missed it would leave
-            the section waiting for ever, which the watchdog reports.
+            workers: it ends with its tasks, whichever threads took them.  A section left
+            waiting would wait for ever, which the watchdog reports.
         */
         std::atomic<bool> finished{false};
         std::thread watchdog([&]() {
@@ -886,6 +1020,7 @@ int main()
     test_attention_q8(rng);
     test_pool(pool);
     test_new_pools();
+    test_crowded_pool();
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

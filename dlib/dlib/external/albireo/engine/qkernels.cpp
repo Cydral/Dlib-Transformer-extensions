@@ -2732,6 +2732,20 @@ namespace albireo
         std::atomic<bool> grouped_products{true};
 
         /*
+            The rows of a task of a product over cols columns and n_tokens tokens, from the
+            rows that would balance the threads: 128 at most, 32 with several tokens, whose
+            tiles then stay in the caches, and the rows of qk_task_weights weights at least.
+        */
+        long task_rows(long balanced, long cols, long n_tokens)
+        {
+            const size_t row_work = static_cast<size_t>(std::max<long>(1, cols))
+                * static_cast<size_t>(std::max<long>(1, n_tokens));
+            const long least = static_cast<long>((static_cast<size_t>(qk_task_weights) + row_work - 1) / row_work);
+            const long most = n_tokens > 1 ? 32 : 128;
+            return std::max(least, std::min(most, std::max<long>(1, balanced)));
+        }
+
+        /*
             The rows [r0, r1) of a product on the integer kernels, with the activations of its
             tokens as these kernels read them.  With several tokens, the tokens go by tiles:
             the rows and the activations of a tile then stay in the caches while every pair is
@@ -2829,13 +2843,12 @@ namespace albireo
             act = dst;
         }
 
-        // Groups of output rows, enough of them to balance the threads, few enough for
-        // each group to amortize its hand-over.
+        /*
+            Groups of output rows, enough of them to balance the threads, each one of
+            qk_task_weights weights at least: a small product runs on the calling thread.
+        */
         const long rows = W.rows;
-        const long threads = pool.size();
-        long group = std::max<long>(1, rows / (threads * 8));
-        group = std::min<long>(group, 128);
-        if (n_tokens > 1) group = std::max<long>(1, std::min<long>(group, 32));
+        const long group = task_rows(rows / (static_cast<long>(pool.size()) * 8), n, n_tokens);
         const long n_groups = (rows + group - 1) / group;
         pool.parallel_for(n_groups, [&](long g, int) {
             const long r0 = g * group;
@@ -2859,8 +2872,10 @@ namespace albireo
 
         /*
             The activations of each product, quantized once for all the rows of its matrix: the
-            rows given when the kernels read them as they are, a place in the buffer otherwise.
-            A null pointer stands for a place until the buffer has its size.
+            rows given when the kernels read them as they are, a place in the buffer otherwise,
+            which the products that read the same rows in the same form share, as the queries,
+            keys and values of a layer do.  A null pointer stands for a place until the buffer
+            has its size.
         */
         std::vector<qk_scratch::group_item>& prepared = scratch.items;
         prepared.resize(static_cast<size_t>(count));
@@ -2872,14 +2887,25 @@ namespace albireo
             qk_scratch::group_item& a = prepared[static_cast<size_t>(i)];
             a.act = nullptr;
             a.act_bytes = 0;
+            a.same = -1;
             if (!p.W->valid() || p.n_tokens <= 0) continue;
             const act_format f = qk_activation_format(p.W->type);
             a.act_bytes = qk_activation_row_bytes(f, p.W->cols);
-            if (f == act_format::f32 && p.x_stride == p.W->cols)
-                a.act = reinterpret_cast<const uint8_t*>(p.X);
-            else
-                bytes += a.act_bytes * static_cast<size_t>(p.n_tokens);
             work += static_cast<size_t>(p.W->rows) * static_cast<size_t>(p.W->cols) * static_cast<size_t>(p.n_tokens);
+            if (f == act_format::f32 && p.x_stride == p.W->cols)
+            {
+                a.act = reinterpret_cast<const uint8_t*>(p.X);
+                continue;
+            }
+            for (long j = 0; j < i && a.same < 0; ++j)
+            {
+                const qk_product& q = items[j];
+                const qk_scratch::group_item& b = prepared[static_cast<size_t>(j)];
+                if (b.act_bytes != 0 && !b.act && b.same < 0 && q.X == p.X && q.n_tokens == p.n_tokens
+                    && q.x_stride == p.x_stride && q.W->cols == p.W->cols && qk_activation_format(q.W->type) == f)
+                    a.same = j;
+            }
+            if (a.same < 0) bytes += a.act_bytes * static_cast<size_t>(p.n_tokens);
         }
         scratch.act.resize(bytes);
         uint8_t* place = scratch.act.data();
@@ -2888,6 +2914,12 @@ namespace albireo
             const qk_product& p = items[i];
             qk_scratch::group_item& a = prepared[static_cast<size_t>(i)];
             if (a.act || a.act_bytes == 0) continue;
+            if (a.same >= 0)
+            {
+                // The product it shares its activations with comes before it, and has its place.
+                a.act = prepared[static_cast<size_t>(a.same)].act;
+                continue;
+            }
             for (long t = 0; t < p.n_tokens; ++t)
                 qk_quantize_row(qk_activation_format(p.W->type), p.X + t * p.x_stride,
                     place + static_cast<size_t>(t) * a.act_bytes, p.W->cols);
@@ -2895,7 +2927,7 @@ namespace albireo
             place += a.act_bytes * static_cast<size_t>(p.n_tokens);
         }
 
-        // The rows of every matrix by tasks of about the same number of weights, eight a thread.
+        // The rows of every matrix by tasks of about the same number of weights, eight a thread at most.
         const size_t share = std::max<size_t>(1, work / (static_cast<size_t>(pool.size()) * 8));
         std::vector<qk_scratch::group_task>& tasks = scratch.tasks;
         tasks.clear();
@@ -2904,8 +2936,8 @@ namespace albireo
             const qk_product& p = items[i];
             if (prepared[static_cast<size_t>(i)].act_bytes == 0) continue;
             const size_t row_work = static_cast<size_t>(p.W->cols) * static_cast<size_t>(p.n_tokens);
-            long group = static_cast<long>(std::min<size_t>(128, std::max<size_t>(1, share / row_work)));
-            if (p.n_tokens > 1) group = std::min<long>(group, 32);
+            const long group = task_rows(static_cast<long>(std::min<size_t>(128, share / row_work)), p.W->cols,
+                p.n_tokens);
             for (long r = 0; r < p.W->rows; r += group)
             {
                 qk_scratch::group_task task;

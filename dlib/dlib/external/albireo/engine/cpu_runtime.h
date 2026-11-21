@@ -73,6 +73,17 @@ namespace albireo
                 tokens of a sequence, the chunks of a prompt, and a sequence goes back to these
                 lengths only (restorable_length()), saved_states of them at most.
 
+                When the offload computes the layers of a hybrid decoder (hybrid_pass), the
+                runtime hands it the passes once logits of the device agreed with those of the
+                processor alone, as for a dense decoder: the hidden states, the Mamba-3 layers,
+                the experts and the geodesic updates then stay on the device, and the processor
+                keeps the attention proper of the attention layers.  The states of the Mamba-3
+                layers of a sequence the device computes live on the device; the runtime brings
+                them back to save them at the end of a chunk of a prompt, to copy the sequence,
+                to compute a pass itself and before its model rests.  A pass the device fails
+                returns to the processor with the states its sequences had before it; a
+                sequence whose states were lost with the device goes back to its saved states.
+
                 A batch that gives the rotary positions of its tokens (forward_batch::
                 positions) rotates each pair of a head by the position component its
                 section names (model_config::rope_sections), and the rows it gives as
@@ -105,11 +116,8 @@ namespace albireo
         kv_format kv_type() const { return kv_.format(); }
         // The check of the memory of the system before each new block of keys and values (kv_pool::set_guard).
         void set_kv_guard(std::function<bool(size_t, size_t)> guard) { kv_.set_guard(std::move(guard)); }
-        void trim_memory() override { kv_.trim(); }
-        void set_busy(bool busy) override
-        {
-            if (offload_) offload_->set_busy(busy);
-        }
+        void trim_memory() override;
+        void set_busy(bool busy) override;
         size_t weight_bytes() const override { return static_cast<size_t>(file_->size()); }
 
         std::string description() const override;
@@ -182,6 +190,10 @@ namespace albireo
             // Whether the last saved state is one of the chunks of that prompt, which its next
             // chunk replaces.
             bool own = false;
+            // Whether live holds the states of the Mamba-3 layers; the device alone holds them otherwise.
+            bool on_host = true;
+            // Whether these states were lost with the device: the sequence goes back to a saved state.
+            bool lost = false;
         };
 
         // The states a sequence of a hybrid decoder keeps saved, at most.
@@ -262,9 +274,32 @@ namespace albireo
         // The forward pass of a hybrid decoder, and its blocks: each writes in tmp_ the output
         // that geodesic_update() then turns the hidden states towards.
         void load_hybrid_layer(const model_file& f, long layer);
-        void run_hybrid(const forward_batch& batch, std::vector<float>& logits);
+        /*
+            The forward pass of a hybrid decoder, with the layers on the device through
+            hybrid_pass_ when on_device is true; false when the device did not take the pass,
+            which then did nothing.  A pass the device fails leaves the states of its sequences
+            as they were before it and throws device_failure.
+        */
+        bool run_hybrid(const forward_batch& batch, std::vector<float>& logits, bool on_device);
         void mamba3_mixer(long layer, const forward_batch& batch);
-        void differential_attention(long layer, const forward_batch& batch);
+        // With on_device, the device computes the products of the layer around the attention.
+        void differential_attention(long layer, const forward_batch& batch, bool on_device);
+        // The description of the model for the device, or false when its experts do not lie one after the other.
+        bool describe_hybrid(hybrid_model& m) const;
+        /*
+            Brings the states of the Mamba-3 layers of a sequence back from the device when it
+            alone holds them; false when the device failed, the states then being lost.
+        */
+        bool fetch_states(int seq);
+        // The same for every sequence, as before the device may lose them.
+        void fetch_all_states();
+        // What the attention layers keep of the last token of each sequence of a pass, saved and brought back.
+        void save_attention_states(const forward_batch& batch);
+        void restore_states(const forward_batch& batch);
+        // The probes of the layers of the device for a hybrid decoder, as probe_layer_pass() and check_layer_pass().
+        int probe_hybrid_pass(long n, int attempt, std::string& detail);
+        void check_hybrid_pass();
+        void drop_hybrid_pass(const std::string& why);
         void latent_experts(const layer& L, long n_tokens);
         void geodesic_update(const float* g, float scale, float bias, long layer, long n_tokens);
         // The state of a sequence of a hybrid decoder at one of the lengths it holds, or null.
@@ -309,8 +344,9 @@ namespace albireo
         model_config cfg_;
         thread_pool& pool_;
         std::unique_ptr<matmul_offload> offload_;
-        // Destroyed before offload_, which it uses.
+        // Destroyed before offload_, which they use: the layers of a dense decoder, or of a hybrid one.
         std::unique_ptr<layer_pass> layer_pass_;
+        std::unique_ptr<hybrid_pass> hybrid_pass_;
         bool layer_pass_checked_ = false;
         int layer_pass_memory_failures_ = 0;
         int layer_pass_wait_ = 0;
@@ -347,6 +383,9 @@ namespace albireo
         std::vector<mixer_work> mixer_work_;
         aligned_floats proj_, dyn_, factor_a_, factor_b_, shift_, noise_, latent_, routed_latent_;
         std::vector<float> last_keys_;
+        // The segments of a pass of the device, and what its attention layers kept before it.
+        std::vector<hybrid_pass::segment> device_segments_;
+        std::vector<float> attention_states_;
         std::vector<double> turns_;
         weight_matrix token_embd_, output_;
         std::vector<float> output_norm_;

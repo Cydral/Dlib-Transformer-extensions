@@ -362,6 +362,279 @@ namespace dlib
             }
 
             /*
+                gguf_matvec_kernel for the rows of one matrix among several that lie one after
+                the other (tt::gguf_matvec_picked()), a token at a time.  The blocks of pick
+                blockIdx.x / blocks_per_pick compute the rows of the matrix of index picks[pick]
+                with row (first_pick + pick) / per_row of x, a warp per row, as the blocks of
+                gguf_matvec_kernel compute the rows of their matrix with one row of x.
+            */
+            template <int TYPE>
+            __global__ void __launch_bounds__(32 * warps_per_block) gguf_matvec_picked_kernel(
+                const uint8_t* __restrict__ w,
+                size_t row_bytes,
+                int rows,
+                int cols,
+                const float* __restrict__ x,
+                const int32_t* __restrict__ picks,
+                int first_pick,
+                int per_row,
+                int blocks_per_pick,
+                bool aligned,
+                float* __restrict__ y
+            )
+            {
+                __shared__ __align__(16) float xs[matvec_chunk * matvec_stride];
+                const int lane = threadIdx.x;
+                const int thread = threadIdx.y * 32 + lane;
+                const int pick = blockIdx.x / blocks_per_pick;
+                const int row = (blockIdx.x - pick * blocks_per_pick) * warps_per_block + threadIdx.y;
+                // A warp past the matrix copies its share of x and computes nothing.
+                const bool computes = row < rows;
+                const uint8_t* wr = w + (static_cast<size_t>(picks[pick]) * static_cast<size_t>(rows)
+                    + static_cast<size_t>(computes ? row : 0)) * row_bytes;
+                const float* xr = x + static_cast<size_t>((first_pick + pick) / per_row) * static_cast<size_t>(cols);
+                const int groups = cols / 32;
+                float acc = 0;
+                for (int first = 0; first < groups; first += matvec_chunk)
+                {
+                    const int count = groups - first < matvec_chunk ? groups - first : matvec_chunk;
+                    const float* xc = xr + static_cast<size_t>(first) * 32;
+                    // The warps have read the previous chunk.
+                    __syncthreads();
+                    if (aligned)
+                    {
+                        const int quads = count * 8;
+                        for (int q = thread; q < quads; q += 32 * warps_per_block)
+                            *reinterpret_cast<float4*>(xs + (q >> 3) * matvec_stride + (q & 7) * 4)
+                                = reinterpret_cast<const float4*>(xc)[q];
+                    }
+                    else
+                    {
+                        const int values = count * 32;
+                        for (int j = thread; j < values; j += 32 * warps_per_block)
+                            xs[(j >> 5) * matvec_stride + (j & 31)] = xc[j];
+                    }
+                    __syncthreads();
+                    if (computes && lane < count)
+                    {
+                        float v[32];
+                        gguf_blocks::decode_group<TYPE>(wr, first + lane, v);
+                        const float4* x4 = reinterpret_cast<const float4*>(xs + lane * matvec_stride);
+                        float s = 0;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                        {
+                            const float4 a = x4[i];
+                            s += v[4 * i] * a.x + v[4 * i + 1] * a.y + v[4 * i + 2] * a.z + v[4 * i + 3] * a.w;
+                        }
+                        acc += s;
+                    }
+                }
+                // A warp past the matrix leaves once the last barrier is behind it.
+                if (!computes) return;
+                const float s = warp_sum(acc);
+                if (lane == 0) y[static_cast<size_t>(pick) * static_cast<size_t>(rows) + row] = s;
+            }
+
+            // gguf_matvec_picked_kernel for the matrices in Q4_K and Q6_K, as gguf_matvec_k_kernel reads them.
+            template <int TYPE>
+            __global__ void __launch_bounds__(32 * warps_per_block) gguf_matvec_picked_k_kernel(
+                const uint8_t* __restrict__ w,
+                size_t row_bytes,
+                int rows,
+                int cols,
+                const float* __restrict__ x,
+                const int32_t* __restrict__ picks,
+                int first_pick,
+                int per_row,
+                int blocks_per_pick,
+                bool aligned,
+                float* __restrict__ y
+            )
+            {
+                const int span = matvec_supers * 256;
+                __shared__ __align__(16) float xs[matvec_supers * 256];
+                const int lane = threadIdx.x;
+                const int thread = threadIdx.y * 32 + lane;
+                const int pick = blockIdx.x / blocks_per_pick;
+                const int row = (blockIdx.x - pick * blocks_per_pick) * warps_per_block + threadIdx.y;
+                // A warp past the matrix copies its share of x and computes nothing.
+                const bool computes = row < rows;
+                const uint8_t* wr = w + (static_cast<size_t>(picks[pick]) * static_cast<size_t>(rows)
+                    + static_cast<size_t>(computes ? row : 0)) * row_bytes;
+                const float* xr = x + static_cast<size_t>((first_pick + pick) / per_row) * static_cast<size_t>(cols);
+                const size_t block_bytes = TYPE == gguf_blocks::q4_K ? 144 : 210;
+                const int supers = cols / 256;
+                float acc[1];
+                acc[0] = 0;
+                for (int first = 0; first < supers; first += matvec_supers)
+                {
+                    const int count = supers - first < matvec_supers ? supers - first : matvec_supers;
+                    const float* xc = xr + static_cast<size_t>(first) * 256;
+                    // The warps have read the previous chunk.
+                    __syncthreads();
+                    if (aligned)
+                    {
+                        const int quads = count * 64;
+                        for (int q = thread; q < quads; q += 32 * warps_per_block)
+                            reinterpret_cast<float4*>(xs)[q] = reinterpret_cast<const float4*>(xc)[q];
+                    }
+                    else
+                    {
+                        const int values = count * 256;
+                        for (int j = thread; j < values; j += 32 * warps_per_block) xs[j] = xc[j];
+                    }
+                    __syncthreads();
+                    if (computes)
+                    {
+#pragma unroll
+                        for (int s = 0; s < matvec_supers; ++s)
+                            if (s < count)
+                                gguf_blocks::lane_products<TYPE, 1>(wr + static_cast<size_t>(first + s) * block_bytes,
+                                    xs + s * 256, span, 1, lane, acc);
+                    }
+                }
+                // A warp past the matrix leaves once the last barrier is behind it.
+                if (!computes) return;
+                const float s = warp_sum(acc[0]);
+                if (lane == 0) y[static_cast<size_t>(pick) * static_cast<size_t>(rows) + row] = s;
+            }
+
+            // The blocks of a launch of the kernels above, at most.
+            const long max_picked_blocks = 1L << 22;
+
+            void launch_matvec_picked(
+                int type,
+                const uint8_t* w,
+                size_t row_bytes,
+                int rows,
+                int cols,
+                const float* x,
+                const int32_t* picks,
+                int first_pick,
+                int count,
+                int per_row,
+                float* y
+            )
+            {
+                // The rows of x start on 16 bytes when x does: cols is a multiple of 32.
+                const bool aligned = reinterpret_cast<uintptr_t>(x) % 16 == 0;
+                const dim3 threads(32, warps_per_block);
+                const int blocks_per_pick = (rows + warps_per_block - 1) / warps_per_block;
+                const dim3 blocks(static_cast<unsigned>(count) * static_cast<unsigned>(blocks_per_pick));
+                // The matrices start on 4 bytes when the first one does and each holds a multiple of 4 bytes.
+                if (type == gguf_blocks::q4_K && reinterpret_cast<uintptr_t>(w) % 4 == 0)
+                {
+                    gguf_matvec_picked_k_kernel<gguf_blocks::q4_K><<<blocks, threads>>>(w, row_bytes, rows, cols, x,
+                        picks, first_pick, per_row, blocks_per_pick, aligned, y);
+                    return;
+                }
+                if (type == gguf_blocks::q6_K)
+                {
+                    gguf_matvec_picked_k_kernel<gguf_blocks::q6_K><<<blocks, threads>>>(w, row_bytes, rows, cols, x,
+                        picks, first_pick, per_row, blocks_per_pick, aligned, y);
+                    return;
+                }
+                with_format(type, [&](auto format) {
+                    gguf_matvec_picked_kernel<decltype(format)::value><<<blocks, threads>>>(w, row_bytes, rows, cols,
+                        x, picks, first_pick, per_row, blocks_per_pick, aligned, y);
+                });
+            }
+
+            // The experts of a router and the experts a token takes, at most (tt::expert_routes()).
+            const int max_route_experts = 1024;
+            const int max_route_picks = 64;
+
+            /*
+                The experts of the token of each block (tt::expert_routes()): the threads share the
+                scores of the experts, each thread counts the experts ranked before its own, and
+                the first top_k threads write the experts of the first ranks with their weights.
+                Two experts never share a rank; scores that are not numbers may leave a rank
+                without an expert, which then keeps expert 0.
+            */
+            __global__ void expert_routes_kernel(
+                const float* __restrict__ logits,
+                const float* __restrict__ bias,
+                int experts,
+                int top_k,
+                bool normalize,
+                float scale,
+                int32_t* __restrict__ picks,
+                float* __restrict__ weights
+            )
+            {
+                __shared__ float scores[max_route_experts];
+                __shared__ float ranked[max_route_experts];
+                __shared__ int chosen[max_route_picks];
+                const float* row = logits + static_cast<size_t>(blockIdx.x) * static_cast<size_t>(experts);
+                for (int e = threadIdx.x; e < experts; e += blockDim.x)
+                {
+                    const float s = static_cast<float>(1.0 / (1.0 + ::exp(-static_cast<double>(row[e]))));
+                    scores[e] = s;
+                    ranked[e] = s + bias[e];
+                }
+                if (static_cast<int>(threadIdx.x) < top_k) chosen[threadIdx.x] = 0;
+                __syncthreads();
+                for (int e = threadIdx.x; e < experts; e += blockDim.x)
+                {
+                    const float mine = ranked[e];
+                    int rank = 0;
+                    for (int o = 0; o < experts; ++o)
+                    {
+                        const float other = ranked[o];
+                        if (other > mine || (other == mine && o < e)) ++rank;
+                    }
+                    if (rank < top_k) chosen[rank] = e;
+                }
+                __syncthreads();
+                if (static_cast<int>(threadIdx.x) < top_k)
+                {
+                    float selected = 0;
+                    for (int k = 0; k < top_k; ++k) selected += scores[chosen[k]];
+                    const int e = chosen[threadIdx.x];
+                    float share = scores[e];
+                    if (normalize) share /= selected + 1e-20f;
+                    const size_t at = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(top_k) + threadIdx.x;
+                    picks[at] = e;
+                    weights[at] = share * scale;
+                }
+            }
+
+            // x[i] = max(x[i], 0)^2, the activation of the experts of a hybrid decoder.
+            __global__ void squared_relu_kernel(float* x, size_t n)
+            {
+                for (auto i : grid_stride_range(0, n))
+                {
+                    const float r = x[i] > 0.0f ? x[i] : 0.0f;
+                    x[i] = r * r;
+                }
+            }
+
+            // d[t * width + i] = sum over j < per_row of w[t * per_row + j] * s[(t * per_row + j) * width + i].
+            __global__ void mix_rows_kernel(
+                const float* __restrict__ s,
+                const float* __restrict__ w,
+                int per_row,
+                size_t width,
+                float* __restrict__ d,
+                size_t n
+            )
+            {
+                for (auto k : grid_stride_range(0, n))
+                {
+                    const size_t t = k / width;
+                    const size_t i = k - t * width;
+                    float sum = 0;
+                    for (int j = 0; j < per_row; ++j)
+                    {
+                        const size_t row = t * static_cast<size_t>(per_row) + static_cast<size_t>(j);
+                        sum += w[row] * s[row * width + i];
+                    }
+                    d[k] = sum;
+                }
+            }
+
+            /*
                 dst[r][i] = src[r][i] / sqrt(mean over j of src[r][j]^2 + eps) * gamma[i]: a block
                 per row, which sums the squares of its row before it scales it.  dst may be src.
             */
@@ -1083,6 +1356,117 @@ namespace dlib
                     np, static_cast<int>(hd), o);
                 CHECK_CUDA(cudaGetLastError());
             }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        void expert_routes (
+            tensor& picks,
+            tensor& weights,
+            const tensor& logits,
+            const tensor& bias,
+            long top_k,
+            bool normalize,
+            float scale
+        )
+        {
+            const long experts = static_cast<long>(bias.size());
+            DLIB_CASSERT(experts > 0 && experts <= max_route_experts);
+            DLIB_CASSERT(logits.size() % static_cast<size_t>(experts) == 0);
+            DLIB_CASSERT(top_k > 0 && top_k <= experts && top_k <= max_route_picks);
+            const size_t n = logits.size() / static_cast<size_t>(experts);
+            DLIB_CASSERT(picks.size() == n * static_cast<size_t>(top_k) && weights.size() == picks.size());
+            DLIB_CASSERT(!is_same_object(picks, weights) && !is_same_object(picks, logits)
+                && !is_same_object(weights, logits) && !is_same_object(picks, bias)
+                && !is_same_object(weights, bias));
+            if (n == 0) return;
+            DLIB_CASSERT(n <= static_cast<size_t>(std::numeric_limits<int>::max()));
+            // A block per token, of 256 threads: the first top_k of them write its experts.
+            expert_routes_kernel<<<static_cast<unsigned>(n), 256>>>(logits.device(), bias.device(),
+                static_cast<int>(experts), static_cast<int>(top_k), normalize, scale,
+                reinterpret_cast<int32_t*>(picks.device_write_only()), weights.device_write_only());
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void gguf_matvec_picked (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            int type,
+            long rows,
+            long cols,
+            size_t row_bytes,
+            const tensor& picks,
+            long per_row
+        )
+        {
+            DLIB_CASSERT(gguf_blocks::known_format(type) && rows > 0 && cols > 0 && per_row > 0);
+            DLIB_CASSERT(static_cast<long long>(rows) <= std::numeric_limits<int>::max()
+                && static_cast<long long>(cols) <= std::numeric_limits<int>::max()
+                && static_cast<long long>(per_row) <= std::numeric_limits<int>::max());
+            DLIB_CASSERT(row_bytes != 0 && row_bytes == gguf_blocks::row_bytes(type, cols));
+            DLIB_CASSERT(!is_same_object(dest, src) && !is_same_object(dest, weights) && !is_same_object(dest, picks));
+            const size_t count = picks.size();
+            DLIB_CASSERT(count % static_cast<size_t>(per_row) == 0);
+            DLIB_CASSERT(count <= static_cast<size_t>(std::numeric_limits<int>::max()));
+            DLIB_CASSERT(src.size() == count / static_cast<size_t>(per_row) * static_cast<size_t>(cols));
+            DLIB_CASSERT(dest.size() == count * static_cast<size_t>(rows));
+            DLIB_CASSERT(weights.size() * sizeof(float) >= static_cast<size_t>(rows) * row_bytes);
+            // Words of four bytes hold the nibbles of Q4_K (gguf_blocks::lane_products()).
+            DLIB_CASSERT(type != gguf_blocks::q4_K || (static_cast<size_t>(rows) * row_bytes) % 4 == 0);
+            if (count == 0) return;
+            const uint8_t* w = reinterpret_cast<const uint8_t*>(weights.device());
+            const float* x = src.device();
+            const int32_t* pk = reinterpret_cast<const int32_t*>(picks.device());
+            float* y = dest.device_write_only();
+            const long blocks_per_pick = (rows + warps_per_block - 1) / warps_per_block;
+            const long step = std::max(1L, max_picked_blocks / blocks_per_pick);
+            const long total = static_cast<long>(count);
+            for (long first = 0; first < total; first += step)
+            {
+                const long k = std::min(step, total - first);
+                launch_matvec_picked(type, w, row_bytes, static_cast<int>(rows), static_cast<int>(cols), x,
+                    pk + first, static_cast<int>(first), static_cast<int>(k), static_cast<int>(per_row),
+                    y + static_cast<size_t>(first) * static_cast<size_t>(rows));
+                CHECK_CUDA(cudaGetLastError());
+            }
+        }
+
+        void squared_relu (
+            tensor& x
+        )
+        {
+            if (x.size() == 0) return;
+            // Every layer of a step calls it: no occupancy query of launch_kernel().
+            const unsigned blocks = static_cast<unsigned>(std::min<size_t>((x.size() + 255) / 256, 4096));
+            squared_relu_kernel<<<blocks, 256>>>(x.device(), x.size());
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void mix_rows (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            long per_row
+        )
+        {
+            DLIB_CASSERT(per_row > 0 && static_cast<long long>(per_row) <= std::numeric_limits<int>::max());
+            DLIB_CASSERT(weights.size() % static_cast<size_t>(per_row) == 0);
+            const size_t n = weights.size() / static_cast<size_t>(per_row);
+            DLIB_CASSERT(!is_same_object(dest, src) && !is_same_object(dest, weights));
+            if (n == 0)
+            {
+                DLIB_CASSERT(dest.size() == 0 && src.size() == 0);
+                return;
+            }
+            DLIB_CASSERT(dest.size() % n == 0);
+            const size_t width = dest.size() / n;
+            DLIB_CASSERT(src.size() == weights.size() * width);
+            if (width == 0) return;
+            const unsigned blocks = static_cast<unsigned>(std::min<size_t>((dest.size() + 255) / 256, 4096));
+            mix_rows_kernel<<<blocks, 256>>>(src.device(), weights.device(), static_cast<int>(per_row), width,
+                dest.device_write_only(), dest.size());
+            CHECK_CUDA(cudaGetLastError());
         }
 
     // ----------------------------------------------------------------------------------------
