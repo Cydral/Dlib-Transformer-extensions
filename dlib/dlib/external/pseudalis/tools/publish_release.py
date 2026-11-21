@@ -32,6 +32,9 @@ the sources, which the programs embed, and puts the installer, then the signatur
 in place of the former ones.  A failure before that leaves the folder as it is, and the files
 being written bear names that start with a dot, which the chain does not publish.
 
+The chain must be of version 1.0.5 at least (its file VERSION): an earlier one takes the files of
+a product elsewhere, and the program stops before it writes anything.
+
 The website alone carries the files to its hosting.  The program runs tools/site.sh status and
 tools/site.sh publish from <site>, on the terminal of the publisher, where the chain may ask
 for the password of the hosting, and stops when one of the two ends with an error.  The program
@@ -54,9 +57,10 @@ committed before the installer is built.  The copies installed before trust the 
 alone: they ignore the feeds of the new one until they are installed again.
 
 notes.json holds the release notes by language,
-{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}.  --dry-run checks the
-installer, the version, the notes and the folder of the website, and prints what would be done:
-it writes nothing and publishes nothing.  pseudalis-sign is searched in build-pseudalis/bin and
+{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}.  The website prints them on
+its downloads page, where it writes no e-mail address: notes that hold one are refused.
+--dry-run checks the installer, the version, the notes and the folder of the website, and prints
+what would be done: it writes nothing and publishes nothing.  pseudalis-sign is searched in build-pseudalis/bin and
 build-pseudalis-linux/bin of the repository, then in the PATH.
 """
 import argparse
@@ -85,6 +89,8 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", ".."))
 # the publication: the chain serves releases/files/<path> as files/<path> of the website.
 SITE = os.path.join("~", "work", "cydral-website")
 PUBLICATION = ("releases", "files", "pseudalis", "dist")
+# The first version of the chain of the website that takes the files of a product in that folder.
+SITE_VERSION = (1, 0, 5)
 # The public key of the feed, which the programs embed when it is there at their configuration.
 PUBLIC_KEY = os.path.join(HERE, "..", "resources", "feed-public-key.pem")
 # The address of the feed that the programs read, in host/settings.cpp.
@@ -238,12 +244,33 @@ def create_key(signer, key):
         shutil.rmtree(temp, ignore_errors=True)
 
 
+def site_version(site):
+    """The version of the chain of the website, the first line of its file VERSION, as a tuple of
+    numbers; None when the file is missing or holds no version."""
+    try:
+        with open(os.path.join(site, "VERSION"), encoding="utf-8") as f:
+            text = f.readline().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not re.match(r"^[0-9]+(\.[0-9]+){1,3}$", text):
+        return None
+    return tuple(int(n) for n in text.split("."))
+
+
 def check_site(site):
     """The folder of the chain of the website and, in it, the folder of the publication; raises
-    RuntimeError unless site holds the chain and the folder where it takes the files it publishes."""
+    RuntimeError unless site holds the chain, of a version that takes the files of a product in
+    that folder, and the folder where it takes the files it publishes."""
     site = os.path.realpath(os.path.expanduser(site))
     if not os.path.isfile(os.path.join(site, "tools", "site.sh")):
         raise RuntimeError("no chain of the website in %s (tools/site.sh): give its folder with --site" % site)
+    # An earlier chain would report the files written here as unknown and publish none of them.
+    found = site_version(site)
+    if found is None or found < SITE_VERSION:
+        raise RuntimeError("the chain of the website in %s is version %s: it takes the files of a product in %s "
+                           "from version %s on; update it (tools/site.sh update <package>) before publishing" %
+                           (site, ".".join(str(n) for n in found) if found else "unknown (no file VERSION)",
+                            "/".join(PUBLICATION), ".".join(str(n) for n in SITE_VERSION)))
     if not os.path.isdir(os.path.join(site, *PUBLICATION[:2])):
         raise RuntimeError("the chain of the website has no folder %s in %s: tools/site.sh setup makes it" %
                            ("/".join(PUBLICATION[:2]), site))

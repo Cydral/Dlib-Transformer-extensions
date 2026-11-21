@@ -27,6 +27,7 @@
 #include "date_formats.h"
 #include "unicode_text.h"
 #include "id_checks.h"
+#include "secret_formats.h"
 #include "pseudonymizer.h"
 #include "../crypto/sha256.h"
 
@@ -119,6 +120,7 @@ namespace dlib
                 case pii_type::title: return 58;
                 case pii_type::gender: return 72;
                 case pii_type::nationality: return 72;
+                case pii_type::secret: return 96;
                 case pii_type::none: break;
             }
             return 0;
@@ -296,6 +298,8 @@ namespace dlib
             if (normalized.empty() || normalized.size() > 48) return pii_type::none;
             pii_type t = find(normalized);
             if (t != pii_type::none) return t;
+            // "Mot de passe", "Nouveau mot de passe", "Password for the VPN", "PIN".
+            if (secret_label_strength(normalized) != 0) return pii_type::secret;
             if (normalized.compare(0, 7, "numero ") == 0)
             {
                 std::string rest = normalized.substr(7);
@@ -397,6 +401,8 @@ namespace dlib
             doc_acronyms_.clear();
             doc_versions_.clear();
             email_domains_.clear();
+            doc_secrets_.clear();
+            key_block_open_ = false;
             std::lock_guard<std::mutex> lock(cache_->m);
             cache_->spans.clear();
         }
@@ -462,6 +468,54 @@ namespace dlib
                         doc_versions_.insert(privacy_impl::cp_substr(t, text, b, e));
                 }
             remember(text, t, found);
+            if (enabled(pii_type::secret)) learn_key_block(text);
+        }
+
+        /* A private key written over several texts, each line a paragraph of its own: the lines read
+           after the one that opens the key are its parts until the line that closes it, and detect()
+           finds them alone. */
+        void learn_key_block(const std::string& text)
+        {
+            using namespace privacy_impl;
+            std::size_t ls = 0;
+            while (ls < text.size())
+            {
+                std::size_t le = text.find_first_of("\r\n", ls);
+                if (le == std::string::npos) le = text.size();
+                std::size_t b = ls, e = le;
+                while (b < e && secret_space(static_cast<unsigned char>(text[b]))) ++b;
+                while (e > b && secret_space(static_cast<unsigned char>(text[e - 1]))) --e;
+                ls = le + 1;
+                if (b == e) continue;
+                const std::string line = text.substr(b, e - b);
+                if (line.compare(0, 11, "-----BEGIN ") == 0)
+                {
+                    key_block_open_ = line.find("PRIVATE KEY") != std::string::npos &&
+                                      line.find("-----END ") == std::string::npos;
+                    continue;
+                }
+                if (!key_block_open_) continue;
+                if (line.compare(0, 9, "-----END ") == 0)
+                {
+                    key_block_open_ = false;
+                    continue;
+                }
+                bool base64 = line.size() >= 16;
+                for (std::size_t k = 0; k < line.size() && base64; ++k)
+                {
+                    const unsigned char c = static_cast<unsigned char>(line[k]);
+                    base64 = secret_alnum(c) || c == '+' || c == '/' || c == '=';
+                }
+                if (base64)
+                {
+                    if (doc_secrets_.size() < max_doc_secrets) doc_secrets_.insert(line);
+                }
+                // The lines that name the key and its cipher hold a colon; any other line ends the key.
+                else if (line.find(':') == std::string::npos)
+                {
+                    key_block_open_ = false;
+                }
+            }
         }
 
         // Keeps the values found in a text that the rest of the document repeats bare.
@@ -473,6 +527,16 @@ namespace dlib
                 const std::string value = privacy_impl::cp_substr(t, text, c.b, c.e);
                 // "ministère de la Pêche et des Eaux intérieures (MPEI)": "MPEI" anywhere.
                 if (c.type == pii_type::organization && c.defined) doc_acronyms_.insert(value);
+                /* A secret established by its form or by its key is found again wherever the document
+                   writes it, when it has the look of one: a short code of digits would be found in
+                   every number that holds it. */
+                if (c.type == pii_type::secret)
+                {
+                    if (c.strong && value.size() >= 6 && value.size() <= 256 &&
+                        secret_like(secret_stats(value, 0, value.size())) && doc_secrets_.size() < max_doc_secrets)
+                        doc_secrets_.insert(value);
+                    continue;
+                }
                 if (c.type == pii_type::person && c.strong)
                 {
                     doc_names_full_.insert(privacy_impl::fold_key(value));
@@ -532,9 +596,9 @@ namespace dlib
     public:
         void learn_value(const std::string& value, pii_type type)
         {
-            // Only the names, the places, the organisations and the e-mail addresses teach the document.
+            // Only the names, the places, the organisations, the e-mail addresses and the secrets teach the document.
             if (type != pii_type::person && type != pii_type::location && type != pii_type::organization &&
-                type != pii_type::email)
+                type != pii_type::email && type != pii_type::secret)
                 return;
             if (!enabled(type) || value.find("[[") != std::string::npos) return;
             const privacy_impl::utf8_text t(value, true);
@@ -757,8 +821,9 @@ namespace dlib
                 while (b < e && privacy_impl::is_space(t.cps[b])) ++b;
                 while (e > b && privacy_impl::is_space(t.cps[e - 1])) --e;
                 // A column headed "Titre" or "Genre" holds a civility or a sex only when its
-                // cell says so: closed vocabularies are checked like any labelled value.
-                if (attribute_type(context.forced))
+                // cell says so: closed vocabularies are checked like any labelled value, and so is
+                // the cell of a column of secrets, which a placeholder may fill.
+                if (attribute_type(context.forced) || context.forced == pii_type::secret)
                     type_value(text, t, b, e, context.forced, c);
                 else if (e > b && masked.empty())
                     add(c, b, e, context.forced, 1.0, 200, true);
@@ -766,6 +831,8 @@ namespace dlib
             }
 
             scan_emails(t, c);
+            // The secrets come before the web addresses, which keep those of their queries apart.
+            scan_secrets(text, t, words, c);
             // Web addresses that are not personal data are protected too: a date in their path stays.
             scan_urls(text, t, c, masked);
             scan_hosts(text, t, c);
@@ -797,6 +864,11 @@ namespace dlib
                     // "1-29-17 Gion, Tokyo": the numbers of a Japanese address before its district.
                     if (m.format.layout <= 1 && m.format.separator == 1 && m.format.two_digit_year &&
                         t.at(e) == ' ' && privacy_impl::is_upper(t.at(e + 1)))
+                        continue;
+                    /* Dotted numbers with a year of two digits that are a date in the other order of
+                       day and month only are the version of a program: "7.25.31". */
+                    if (m.format.separator == 2 && m.format.two_digit_year && m.format.layout <= 1 &&
+                        (m.format.layout == 1) != (options_.date_order == numeric_date_order::month_day_year))
                         continue;
                     // The version of a program, here or anywhere else in the document: "Tomcat 6.1.24".
                     if (software_version(text, t, b, e, m.format) ||
@@ -2923,6 +2995,556 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
 
+    // ------------------------------------------------------------------------------------
+    // Secrets: passwords, keys of programming interfaces, access tokens, private keys.
+
+        /* The value of a secret written at b, before e: between its quotes or its guillemets, or to
+           the first space, the punctuation of the sentence left out. Returns false when nothing is
+           written there; alone tells that nothing but a bracket follows the value before e. */
+        static bool read_secret(const utf8_text& t, std::size_t b, std::size_t e, std::size_t& vb, std::size_t& ve,
+                                bool& quoted, bool& alone)
+        {
+            using namespace privacy_impl;
+            while (b < e && is_space(t.cps[b])) ++b;
+            if (b >= e) return false;
+            const char32_t open = t.cps[b];
+            char32_t close = 0;
+            if (open == '"' || open == '\'' || open == '`') close = open;
+            else if (open == 0xAB) close = 0xBB;
+            else if (open == 0x201C || open == 0x201E) close = 0x201D;
+            else if (open == 0x2018) close = 0x2019;
+            quoted = false;
+            std::size_t after = e;
+            if (close != 0)
+            {
+                std::size_t q = b + 1;
+                while (q < e && t.cps[q] != close && !(open == 0x201E && t.cps[q] == 0x201C) &&
+                       !is_line_break(t.cps[q]))
+                    ++q;
+                if (q < e && !is_line_break(t.cps[q]))
+                {
+                    vb = b + 1;
+                    ve = q;
+                    while (vb < ve && is_space(t.cps[vb])) ++vb;
+                    while (ve > vb && is_space(t.cps[ve - 1])) --ve;
+                    quoted = true;
+                    after = q + 1;
+                }
+                else
+                {
+                    ++b;
+                }
+            }
+            if (!quoted)
+            {
+                vb = b;
+                ve = b;
+                /* A field left to fill and a remark between parentheses are read whole, their spaces
+                   included: "<mot de passe>", "[à définir]", "(communiqué à part)". */
+                const char32_t closer = t.cps[b] == '<' ? U'>' : t.cps[b] == '[' ? U']' : t.cps[b] == '{' ? U'}' :
+                                        t.cps[b] == '(' ? U')' : 0;
+                if (closer != 0)
+                {
+                    std::size_t q = b + 1;
+                    while (q < e && t.cps[q] != closer && !is_line_break(t.cps[q])) ++q;
+                    if (q < e && t.cps[q] == closer) ve = q + 1;
+                }
+                while (ve < e && !is_space(t.cps[ve]) && t.cps[ve] != 0xBB && t.cps[ve] != 0x201D) ++ve;
+                after = ve;
+
+                while (ve > vb && (t.cps[ve - 1] == '.' || t.cps[ve - 1] == ',' || t.cps[ve - 1] == ';' ||
+                                   t.cps[ve - 1] == ':' || t.cps[ve - 1] == '"' || t.cps[ve - 1] == '\'' ||
+                                   (t.cps[ve - 1] == ')' &&
+                                    std::find(t.cps.begin() + vb, t.cps.begin() + ve, U'(') == t.cps.begin() + ve)))
+                    --ve;
+            }
+            while (after < e && is_space(t.cps[after]) && !is_line_break(t.cps[after])) ++after;
+            alone = after >= e || is_line_break(t.cps[after]) || t.cps[after] == '(' || t.cps[after] == '[';
+            return ve > vb;
+        }
+
+        /* Whether the value read after a cue of the given strength (secret_cues()) is its secret:
+           no placeholder; between quotes, three characters at least; otherwise a value with the look
+           of a secret, a code of digits, or after a separator a word alone on what is left of its
+           line. */
+        static bool plausible_secret(const std::string& value, int strength, bool quoted, bool separator, bool alone)
+        {
+            using namespace privacy_impl;
+            if (value.size() < 3 || value.size() > 512) return false;
+            if (secret_placeholder(value) || secret_placeholder(fold_key(value))) return false;
+            const secret_statistics st = secret_stats(value, 0, value.size());
+            // Between quotes, a letter or a digit at least: "] =" between the quotes of a key and of its value is none.
+            if (quoted) return st.digits + st.letters() > 0;
+            if (secret_like(st)) return true;
+            if (st.digits == st.length) return st.length <= 12 && (separator || strength == 3);
+            return separator && alone && value.size() >= 4;
+        }
+
+        void scan_secrets(const std::string& text, const utf8_text& t, const std::vector<word_token>& words,
+                          std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            if (!enabled(pii_type::secret)) return;
+            auto index_of = [&](std::size_t byte) {
+                return static_cast<std::size_t>(std::lower_bound(t.offsets.begin(), t.offsets.end(), byte) -
+                                                t.offsets.begin());
+            };
+            const std::size_t first = out.size();
+            for (const secret_match& m : find_secrets(text))
+            {
+                // The password of a web address leaves with the address, which is reported whole.
+                if (m.web_credentials && enabled(pii_type::url)) continue;
+                // "auth: user=j.martin src=...": what a key names is itself the setting of a plain key.
+                if (m.evidence != secret_evidence::format)
+                {
+                    const std::size_t equal = text.find('=', m.begin);
+                    if (equal != std::string::npos && equal < m.end && equal - m.begin <= 16)
+                    {
+                        std::string key = text.substr(m.begin, equal - m.begin);
+                        for (char& ch : key)
+                            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+                        if (plain_secret_keys().count(key)) continue;
+                    }
+                }
+                add(out, index_of(m.begin), index_of(m.end), pii_type::secret, m.confidence,
+                    m.evidence == secret_evidence::format ? 6 : (m.confidence >= 0.9 ? 5 : 0), m.confidence >= 0.9);
+            }
+            scan_secret_cues(text, t, words, out);
+            scan_doc_secrets(text, t, out);
+            // What a format, a key or a cue tells is never read as generic words.
+            for (std::size_t k = first; k < out.size(); ++k) out[k].kept = true;
+        }
+
+        /* The secrets that the words of a sentence announce: a cue (secret_cues()), the words that
+           tell which secret, then a separator, a verb or nothing, and the value: "le mot de passe du
+           wifi est Tournesol2024!", "Passwort lautet: Sommer2024", "PIN 4821", "mot de passe
+           « Tournesol2024 »". A cue of strength 1 announces nothing here. */
+        void scan_secret_cues(const std::string& text, const utf8_text& t, const std::vector<word_token>& words,
+                              std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> openers = []() {
+                std::unordered_set<std::string> s;
+                for (const auto& kv : secret_cues())
+                    if (kv.second >= 2) s.insert(kv.first.substr(0, kv.first.find_first_of(" '-")));
+                return s;
+            }();
+            static const std::unordered_set<std::string> verbs = make_word_set(
+                "est etait sera is was lautet ist war es era e sara");
+            static const std::unordered_set<std::string> blocking = make_word_set(
+                "policy politique richtlinie politica length longueur lange lunghezza longitud expiration expiry "
+                "expires expire expired ablauf scadenza caducidad complexity complexite hint indice rules regles "
+                "strength force reset reinitialisation oublie forgotten forgot vergessen dimenticata olvidada "
+                "manager gestionnaire required requis obligatoire minimum maximum doit must should muss deve debe "
+                "ne not non nicht no pas");
+            static const std::unordered_set<std::string> bare_codes = make_word_set("pin puk cvv cvc cvv2 digicode");
+            const std::size_t n = t.size();
+            for (std::size_t i = 0; i < words.size(); ++i)
+            {
+                if (!openers.count(words[i].key)) continue;
+                // The longest cue that the words from here spell.
+                int strength = 0;
+                std::size_t last = i;
+                for (std::size_t len = std::min<std::size_t>(5, words.size() - i); len >= 1 && strength == 0; --len)
+                {
+                    const word_token& w = words[i + len - 1];
+                    if (w.e - words[i].b > 40 || !same_line(t, words[i].b, w.e)) continue;
+                    const auto it = secret_cues().find(fold_key(cp_substr(t, text, words[i].b, w.e)));
+                    if (it == secret_cues().end() || it->second < 2) continue;
+                    strength = it->second;
+                    last = i + len - 1;
+                }
+                if (strength == 0) continue;
+                // The words that tell which secret, five at most, to a verb, a separator or the value.
+                std::size_t k = last + 1, q = words[last].e;
+                bool blocked = false, verb = false;
+                for (int skipped = 0; k < words.size() && skipped < 5; ++skipped, ++k)
+                {
+                    bool joined = words[k].b > q && words[k].b - q <= 2;
+                    for (std::size_t g = q; g < words[k].b && joined; ++g)
+                        joined = t.cps[g] == ' ' || t.cps[g] == 0xA0 || is_apostrophe(t.cps[g]) || is_hyphen(t.cps[g]);
+                    if (!joined) break;
+                    if (blocking.count(words[k].key)) { blocked = true; break; }
+                    // A word with a digit or a capital inside is the value, not a word of the sentence.
+                    const std::string raw = cp_substr(t, text, words[k].b, words[k].e);
+                    const secret_statistics st = secret_stats(raw, 0, raw.size());
+                    if (st.digits > 0 || (st.upper > 0 && words[k].shape != 1 && words[k].shape != 2)) break;
+                    q = words[k].e;
+                    if (verbs.count(words[k].key)) { verb = true; ++k; break; }
+                }
+                if (blocked) { i = last; continue; }
+                std::size_t p = q;
+                while (p < n && (t.cps[p] == ' ' || t.cps[p] == 0xA0)) ++p;
+                // "Mot de passe (provisoire) : ..."
+                if (p < n && t.cps[p] == '(')
+                {
+                    std::size_t r = p + 1;
+                    while (r < n && r - p <= 32 && t.cps[r] != ')' && !is_line_break(t.cps[r])) ++r;
+                    if (r < n && t.cps[r] == ')')
+                    {
+                        p = r + 1;
+                        while (p < n && (t.cps[p] == ' ' || t.cps[p] == 0xA0)) ++p;
+                    }
+                }
+                bool separator = false;
+                if (p < n && (t.cps[p] == ':' || t.cps[p] == '=' || t.cps[p] == 0xFF1A || t.cps[p] == 0x2192))
+                {
+                    // A scheme, "://", is no separator.
+                    if (t.cps[p] == ':' && t.at(p + 1) == '/') { i = last; continue; }
+                    separator = true;
+                    ++p;
+                }
+                std::size_t line_end = p;
+                while (line_end < n && !is_line_break(t.cps[line_end]) && t.cps[line_end] != '\t') ++line_end;
+                std::size_t vb = 0, ve = 0;
+                bool quoted = false, alone = false;
+                if (!read_secret(t, p, line_end, vb, ve, quoted, alone)) { i = last; continue; }
+                /* Without a separator and without a verb, the value follows the cue itself: between
+                   quotes, or the digits of a code after the name of that code. */
+                if (!separator && !verb)
+                {
+                    const bool bare = k == last + 1 && strength == 3 && bare_codes.count(words[last].key) != 0;
+                    if (!quoted && !bare) { i = last; continue; }
+                }
+                const std::string value = cp_substr(t, text, vb, ve);
+                if (!plausible_secret(value, strength, quoted, separator, alone)) { i = last; continue; }
+                // After a verb alone, a code of digits is a secret only for the cues of codes.
+                add(out, vb, ve, pii_type::secret, separator ? 0.9 : 0.85, 5, separator || quoted);
+                i = last;
+            }
+        }
+
+        // The secrets that learn() established, wherever the text writes them whole.
+        void scan_doc_secrets(const std::string& text, const utf8_text& t, std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            if (doc_secrets_.empty()) return;
+            auto edge = [](unsigned char c) { return !(secret_alnum(c) || c == '_' || c >= 0x80); };
+            for (const std::string& secret : doc_secrets_)
+            {
+                for (std::size_t at = text.find(secret); at != std::string::npos; at = text.find(secret, at + 1))
+                {
+                    const std::size_t end = at + secret.size();
+                    if ((at > 0 && !edge(static_cast<unsigned char>(text[at - 1]))) ||
+                        (end < text.size() && !edge(static_cast<unsigned char>(text[end]))))
+                        continue;
+                    const std::size_t b = static_cast<std::size_t>(
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), at) - t.offsets.begin());
+                    const std::size_t e = static_cast<std::size_t>(
+                        std::lower_bound(t.offsets.begin(), t.offsets.end(), end) - t.offsets.begin());
+                    add(out, b, e, pii_type::secret, 0.9, 4);
+                }
+            }
+        }
+
+        /* The quotes or brackets that a reader took with a secret stay out of it: the closing one
+           whose opening one comes just before the value ("(T=7Hq2mW0Zk)"), and the pair around it. */
+        static void trim_secret_wrapping(const std::string& text, std::size_t& begin, std::size_t& end)
+        {
+            static const std::vector<std::pair<std::string, std::string>> pairs = {
+                { "(", ")" }, { "[", "]" }, { "{", "}" }, { "<", ">" }, { "\"", "\"" }, { "'", "'" }, { "`", "`" },
+                { "\xC2\xAB", "\xC2\xBB" }, { "\xE2\x80\x9C", "\xE2\x80\x9D" }, { "\xE2\x80\x9E", "\xE2\x80\x9C" },
+                { "\xE2\x80\x9E", "\xE2\x80\x9D" }, { "\xE2\x80\x98", "\xE2\x80\x99" } };
+            for (const auto& pair : pairs)
+            {
+                const std::size_t lo = pair.first.size(), lc = pair.second.size();
+                if (end - begin <= lc || text.compare(end - lc, lc, pair.second) != 0) continue;
+                if (end - begin > lo + lc && text.compare(begin, lo, pair.first) == 0)
+                {
+                    begin += lo;
+                    end -= lc;
+                    return;
+                }
+                if (begin >= lo && text.compare(begin - lo, lo, pair.first) == 0)
+                {
+                    end -= lc;
+                    return;
+                }
+            }
+        }
+
+        // The keys whose value is no secret, whatever it looks like: "host=", "checksum:", "client_id=".
+        static const std::unordered_set<std::string>& plain_secret_keys()
+        {
+            static const std::unordered_set<std::string> s = privacy_impl::make_word_set(
+                "host hostname server port user username login region zone version url uri endpoint database "
+                "dbname checksum sha256 sha1 sha512 md5 digest public_key publickey pubkey client_id clientid "
+                "tenant_id tenantid commit revision network ssid src dst name type id "
+                // The keywords of the tags, before the body of a tag that the lines of a PDF cut.
+                "person org location address email phone iban card nir siret ipv4 ipv6 mac date plate geo title "
+                "gender nationality");
+            return s;
+        }
+
+        /* Whether value names a program, an algorithm, a protocol or a technique, written with its
+           number: a name that the lexicon of products knows before the digits of its version
+           ("Python3", "Debian12"), an algorithm, a protocol or an encoding and its number ("SHA256",
+           "TLSv1.2", "Base64", "IPv6"), a suite of such names ("TLS_AES_128_GCM_SHA256",
+           "ECDHE-RSA-AES128-GCM-SHA256"), a name known with a digit inside ("Web2py", "Log4j2",
+           "x86_64") and the identifier of a technique or of a tactic of a public matrix ("T1566",
+           "T1059.001", "TA0001"). A value that holds any other sign is none of them, and neither is
+           a product named by an everyday word, which passwords are built on as well ("Falcon1987"). */
+        static bool numbered_name(const std::string& value)
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> whole = make_word_set(
+                "fail2ban log4j log4j2 web2py k8s k3s s3 ec2 x86 x64 x86_64 x86-64 amd64 arm64 aarch64 i386 i686 "
+                "x509 o365 m365 db2 h2 3des e2e p2p b2b b2c i18n l10n a11y");
+            static const std::unordered_set<std::string> names = make_word_set(
+                "tls tlsv ssl sslv ssh sshv http https smb smbv nfsv ntlm ntlmv ipv snmpv wpa pkcs fips iso iec rfc "
+                "ieee utf sha md crc pbkdf argon blake aes des rc rsa ecdsa chacha poly secp base win oauth uuidv "
+                "cvss cvssv");
+            // The products that an everyday word names.
+            static const std::unordered_set<std::string> everyday = make_word_set(
+                "falcon citadel sentinel defender cortex prisma nexus safari edge word excel teams zoom helm yarn twig "
+                "zap pip burp cron envoy elastic varnish axiom copilot outlook composer doctrine volatility caddy "
+                "snort squid samba flask rails");
+            // The words that only a suite of names holds: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".
+            static const std::unordered_set<std::string> parts = make_word_set(
+                "with gcm cbc ccm ctr ecb cfb ofb xts oaep pss hkdf hmac cmac dh dhe ecdh ecdhe dsa eddsa ed null "
+                "export anon psk srp kem id camellia aria seed idea salsa curve prime keccak ripemd scrypt bcrypt");
+            if (value.size() < 2 || value.size() > 64) return false;
+            std::string lower;
+            bool digits = false, letters = false;
+            for (const char ch : value)
+            {
+                char c = ch;
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                if (c >= 'a' && c <= 'z') letters = true;
+                else if (c >= '0' && c <= '9') digits = true;
+                else if (c != '-' && c != '_' && c != '.' && c != '/') return false;
+                lower.push_back(c);
+            }
+            if (!digits || !letters) return false;
+            if (whole.count(lower)) return true;
+            // "T1566", "T1059.001", "TA0001": one or two capitals, four digits, three more after a dot.
+            {
+                const std::size_t k = value.compare(0, 2, "TA") == 0 ? 2 : (value[0] == 'T' ? 1 : 0);
+                std::size_t d = k;
+                while (d < value.size() && value[d] >= '0' && value[d] <= '9') ++d;
+                if (k > 0 && d - k == 4 &&
+                    (d == value.size() || (k == 1 && value[d] == '.' && value.size() == d + 4 &&
+                                           value.find_first_not_of("0123456789", d + 1) == std::string::npos)))
+                    return true;
+            }
+            // Every run of letters is a known name, a word of suites or a single letter ("v", "b").
+            bool known = false;
+            for (std::size_t i = 0; i < lower.size();)
+            {
+                if (lower[i] < 'a' || lower[i] > 'z') { ++i; continue; }
+                std::size_t j = i;
+                while (j < lower.size() && lower[j] >= 'a' && lower[j] <= 'z') ++j;
+                const std::string run = lower.substr(i, j - i);
+                if (names.count(run) || (product_names().count(run) && !everyday.count(run))) known = true;
+                else if (run.size() > 1 && !parts.count(run)) return false;
+                i = j;
+            }
+            return known;
+        }
+
+        /* Whether the value [begin, end) that a recognizer reads as a secret is plainly something
+           else: the login at a machine of a command ("ssh root@srv-01"), the body of a public key
+           ("ssh-ed25519 AAAA..."), the short name of a commit, the host of a log line, written after
+           its date and time, the reference of an object as programs print it, a name and the
+           digits of its address ("Image@a1b2c3d4e5f60718", "Object@1b6d3586"), the name of a file
+           ("Agent12_Journal.log"), a symbol of code ("SessionManager::OpenChannel"), a code of
+           capitals and digits joined by underscores ("REQ_SEC_B2"), the setting
+           of a plain key ("name=POSTE0042"), the value of a key that names no secret ("host=",
+           "checksum:", "client_id=", "Wifi network:") or the name of a program, of an algorithm or of
+           a technique with its number (numbered_name()). */
+        static bool plain_value(const std::string& text, std::size_t begin, std::size_t end)
+        {
+            const std::unordered_set<std::string>& plain_keys = plain_secret_keys();
+            static const std::unordered_set<std::string> commands = privacy_impl::make_word_set(
+                "ssh scp sftp rsync telnet ftp");
+            auto name_char = [](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                       c == '-' || c == '.';
+            };
+            // The name that ends at q, in lower case.
+            auto name_before = [&](std::size_t q) {
+                std::size_t b = q;
+                while (b > 0 && q - b < 40 && name_char(text[b - 1])) --b;
+                std::string name = text.substr(b, q - b);
+                for (char& c : name)
+                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                return name;
+            };
+            std::size_t q = begin;
+            while (q > 0 && text[q - 1] == ' ') --q;
+            const std::string before = q < begin ? name_before(q) : std::string();
+            if (before.compare(0, 4, "ssh-") == 0 || before.compare(0, 11, "ecdsa-sha2-") == 0) return true;
+            const std::string value = text.substr(begin, end - begin);
+            if (before == "commit" && value.size() >= 7 && value.size() <= 40 &&
+                value.find_first_not_of("0123456789abcdef") == std::string::npos)
+                return true;
+            if (value.find("::") != std::string::npos) return true;
+            if (numbered_name(value)) return true;
+            // The marker of a picture of a document protected before, whole, cut short or glued to what follows.
+            if (value.compare(0, 6, "Image@") == 0 && value.size() >= 9 &&
+                value.find_first_not_of("0123456789abcdef", 6) >= 9)
+                return true;
+            // A code of capitals and digits joined by underscores, each part of three at most: "REQ_SEC_B2".
+            {
+                bool code = false, parts = true;
+                std::size_t part = 0;
+                for (std::size_t z = 0; z <= value.size() && parts; ++z)
+                {
+                    if (z < value.size() && value[z] != '_') continue;
+                    if (z < value.size()) code = true;
+                    parts = z > part && z - part <= 3;
+                    for (std::size_t r = part; r < z && parts; ++r)
+                        parts = (value[r] >= 'A' && value[r] <= 'Z') || (value[r] >= '0' && value[r] <= '9');
+                    part = z + 1;
+                }
+                if (code && parts) return true;
+            }
+            // The reference of an object: a name, "@", and 7 to 16 digits of base 16 that hold a digit and a letter.
+            {
+                const std::size_t at = value.find('@');
+                if (at != std::string::npos && at > 0 && value.size() - at - 1 >= 7 && value.size() - at - 1 <= 16 &&
+                    value.find_first_not_of("0123456789abcdef", at + 1) == std::string::npos &&
+                    value.find_first_of("0123456789", at + 1) != std::string::npos &&
+                    value.find_first_of("abcdef", at + 1) != std::string::npos)
+                {
+                    bool name = (value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z');
+                    for (std::size_t z = 0; z < at && name; ++z) name = name_char(value[z]) || value[z] == '$';
+                    if (name) return true;
+                }
+            }
+            // The name of a file, by its extension, and the setting of a plain key.
+            {
+                const std::size_t dot = value.rfind('.');
+                if (dot != std::string::npos && dot > 0 && value.size() - dot - 1 <= 5 &&
+                    value.find_first_of("=:/@ ") == std::string::npos)
+                {
+                    std::string extension = value.substr(dot + 1);
+                    for (char& c : extension)
+                        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                    if (privacy_impl::file_extensions().count(extension)) return true;
+                }
+                const std::size_t equal = value.find('=');
+                if (equal != std::string::npos && equal > 0 && equal <= 16 &&
+                    plain_keys.count(name_before(begin + equal)))
+                    return true;
+            }
+            // The login at a machine, on the line of a command that connects to it.
+            {
+                const std::size_t space = value.rfind(' ');
+                const std::string last = space == std::string::npos ? value : value.substr(space + 1);
+                const std::size_t at = last.find('@');
+                if (at != std::string::npos && at > 0 && at + 1 < last.size() &&
+                    last.find_first_of(":/") == std::string::npos)
+                {
+                    std::size_t line = begin;
+                    while (line > 0 && begin - line < 200 && text[line - 1] != '\n' && text[line - 1] != '\r') --line;
+                    std::size_t w = line;
+                    const std::size_t stop = space == std::string::npos ? begin : begin + space;
+                    while (w < stop)
+                    {
+                        std::size_t e = w;
+                        while (e < stop && name_char(text[e])) ++e;
+                        if (e > w && commands.count(name_before(e)) && e - w <= 6) return true;
+                        w = e + 1;
+                    }
+                }
+            }
+            // The first word of a log line after its date and time: "2026-03-09 06:41:27 fw-edge02 sshd[2211]:".
+            {
+                std::size_t line = begin;
+                while (line > 0 && begin - line < 48 && text[line - 1] != '\n' && text[line - 1] != '\r') --line;
+                bool stamp = begin > line && (line == 0 || text[line - 1] == '\n' || text[line - 1] == '\r');
+                bool time = false;
+                int letters = 0;
+                auto digit = [&](std::size_t z) { return text[z] >= '0' && text[z] <= '9'; };
+                for (std::size_t z = line; z < begin && stamp; ++z)
+                {
+                    const char c = text[z];
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+                        stamp = ++letters <= 3;
+                    else
+                    {
+                        letters = 0;
+                        stamp = digit(z) || c == ':' || c == '-' || c == '.' || c == '+' || c == ' ' || c == '/' ||
+                                c == ',' || c == '[' || c == ']';
+                    }
+                    if (c == ':' && z > line && z + 1 < begin && digit(z - 1) && digit(z + 1)) time = true;
+                }
+                if (stamp && time) return true;
+            }
+            // The value of an assignment: its key.
+            q = begin;
+            if (q > 0 && (text[q - 1] == '"' || text[q - 1] == '\'')) --q;
+            while (q > 0 && text[q - 1] == ' ') --q;
+            if (q == 0 || (text[q - 1] != '=' && text[q - 1] != ':')) return false;
+            --q;
+            while (q > 0 && text[q - 1] == ' ') --q;
+            if (q > 0 && (text[q - 1] == '"' || text[q - 1] == '\'')) --q;
+            return plain_keys.count(name_before(q)) != 0;
+        }
+
+        /* The secrets that the recognizers read: the pieces of one value that meet are joined, the
+           value grows to the limits a secret is written between (secret_chunk()), leaves the quotes
+           or brackets around it, and is kept when it is no placeholder, is not plainly something
+           else (plain_value()), is not, case aside, a value that the rules type otherwise in the
+           text, and has the look of a secret or was read with a confidence of 0.85 at least. */
+        void add_recognized_secrets(const std::string& text, const utf8_text& t, std::vector<pii_span> spans,
+                                    std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            if (spans.empty()) return;
+            const std::size_t read_before = out.size();
+            std::sort(spans.begin(), spans.end(),
+                      [](const pii_span& a, const pii_span& b) { return a.begin < b.begin; });
+            std::vector<pii_span> joined;
+            for (pii_span s : spans)
+            {
+                secret_chunk(text, s.begin, s.end);
+                if (!joined.empty() && s.begin <= joined.back().end)
+                {
+                    joined.back().end = std::max(joined.back().end, s.end);
+                    joined.back().confidence = std::max(joined.back().confidence, s.confidence);
+                    continue;
+                }
+                joined.push_back(s);
+            }
+            for (pii_span s : joined)
+            {
+                trim_secret_wrapping(text, s.begin, s.end);
+                const std::string value = text.substr(s.begin, s.end - s.begin);
+                if (value.size() < 4 || value.size() > 512 || value.find_first_of("\r\n\t") != std::string::npos)
+                    continue;
+                if (secret_placeholder(value) || secret_placeholder(fold_key(value))) continue;
+                if (!secret_like(secret_stats(value, 0, value.size())) && s.confidence < 0.85) continue;
+                if (plain_value(text, s.begin, s.end)) continue;
+                const std::size_t b = static_cast<std::size_t>(
+                    std::lower_bound(t.offsets.begin(), t.offsets.end(), s.begin) - t.offsets.begin());
+                const std::size_t e = static_cast<std::size_t>(
+                    std::lower_bound(t.offsets.begin(), t.offsets.end(), s.end) - t.offsets.begin());
+                // The characters, case aside, of a value that the rules type otherwise in this text: "kx-77"
+                // beside the reference "KX-77".
+                bool twin = false;
+                for (std::size_t k = 0; k < read_before && !twin; ++k)
+                {
+                    const candidate& c = out[k];
+                    if (c.type == pii_type::secret || c.learned || c.e - c.b != e - b || c.b == b) continue;
+                    twin = true;
+                    for (std::size_t z = 0; z < e - b && twin; ++z)
+                        twin = to_lower(t.cps[c.b + z]) == to_lower(t.cps[b + z]);
+                }
+                if (twin) continue;
+                const std::size_t before = out.size();
+                add(out, b, e, pii_type::secret, s.confidence, s.confidence >= 0.7 ? 2 : 0);
+                if (out.size() > before)
+                {
+                    out.back().learned = true;
+                    out.back().kept = true;
+                }
+            }
+        }
+
+    // ------------------------------------------------------------------------------------
+
         static bool boundary_before(const utf8_text& t, std::size_t i)
         {
             return i == 0 || !privacy_impl::is_word_char(t.cps[i - 1]);
@@ -3078,10 +3700,30 @@ namespace dlib
                         frag.clear();
                     }
                 }
+                /* The secrets read inside the address, the token of its query for instance: an address
+                   that is personal data takes them with it, and any other address stays readable
+                   around them, protected as it would be without them. */
+                std::vector<std::pair<std::size_t, std::size_t>> secrets;
+                for (const candidate& x : out)
+                    if (x.type == pii_type::secret && x.b >= i && x.e <= j) secrets.push_back(std::make_pair(x.b, x.e));
                 if (flag && enabled(pii_type::url))
-                    add(out, i, j, pii_type::url, 0.9);
+                {
+                    /* An address written with credentials is reported whole: what follows its password
+                       reads as an e-mail address ("password@host"), which would leave the user readable. */
+                    add(out, i, j, pii_type::url, 0.9, credentials || !secrets.empty() ? 8 : 0);
+                }
+
                 else if (!flag)
-                    protect.push_back(std::make_pair(i, j));
+                {
+                    std::sort(secrets.begin(), secrets.end());
+                    std::size_t from = i;
+                    for (const auto& s : secrets)
+                    {
+                        if (s.first > from) protect.push_back(std::make_pair(from, s.first));
+                        from = std::max(from, s.second);
+                    }
+                    if (from < j) protect.push_back(std::make_pair(from, j));
+                }
                 i = j;
             }
         }
@@ -4755,6 +5397,20 @@ namespace dlib
             }
         }
 
+        /* Whether the capitals [b, e) before a hyphen name a public catalogue of vulnerabilities or
+           weaknesses, or a public series of security advisories: "CVE-2014-0160", "CERTFR-2024-AVI-0123",
+           "RHSA-2024:1234". */
+        static bool public_catalogue(const utf8_text& t, std::size_t b, std::size_t e)
+        {
+            static const std::unordered_set<std::string> catalogues = privacy_impl::make_word_set(
+                "cve cwe capec ghsa euvd cnvd jvndb certfr certa vmsa talos zdi icsa icsma rhsa rhba rhea usn apsb "
+                "mfsa xsa snyk pysec rustsec glsa");
+            std::string prefix;
+            for (std::size_t q = b; q < e && q - b < 8; ++q)
+                prefix.push_back(static_cast<char>(privacy_impl::to_lower(t.cps[q])));
+            return t.at(e) == '-' && catalogues.count(prefix) != 0;
+        }
+
         /* A reference that carries a year, without a cue: "INC-2026-0147", "LF-2026-0331". Two to
            six capitals, a year from 1990 to 2099 and three to six digits, joined by hyphens: the
            shape of a file, ticket or incident number, whose year would also tell how far the
@@ -4772,15 +5428,10 @@ namespace dlib
                 while (j < n && t.cps[j] >= 'A' && t.cps[j] <= 'Z') ++j;
                 if (j - i < 2 || j - i > 6 || t.at(j) != '-') continue;
                 // The public catalogues of vulnerabilities and weaknesses: "CVE-2014-0160" names no file.
+                if (public_catalogue(t, i, j))
                 {
-                    std::string prefix;
-                    for (std::size_t q = i; q < j; ++q) prefix.push_back(static_cast<char>(t.cps[q]));
-                    if (prefix == "CVE" || prefix == "CWE" || prefix == "CAPEC" || prefix == "GHSA" ||
-                        prefix == "EUVD" || prefix == "CNVD" || prefix == "JVNDB")
-                    {
-                        i = j;
-                        continue;
-                    }
+                    i = j;
+                    continue;
                 }
                 std::size_t y = j + 1, d = y;
                 while (d < n && is_ascii_digit(t.cps[d]) && d - y < 5) ++d;
@@ -4879,6 +5530,10 @@ namespace dlib
             for (std::size_t k = 0; k < words.size(); ++k)
             {
                 if (!cues.count(words[k].key)) continue;
+                // A piece of the name of a machine or of a file is no noun: "FILE-SRV-12", "log-file-03".
+                if ((t.at(words[k].e) == '-' && is_letter(t.at(words[k].e + 1))) ||
+                    (words[k].b > 1 && t.cps[words[k].b - 1] == '-' && is_word_char(t.cps[words[k].b - 2])))
+                    continue;
                 std::size_t p = words[k].e;
                 std::size_t w = k + 1;
                 int skipped = 0;
@@ -4913,6 +5568,12 @@ namespace dlib
                 }
                 if (alnum < 4 || alnum > 32 || digits < 2 || is_word_char(t.at(e))) continue;
                 if (alnum == 4 && digits == 4 && (t.cps[p] == '1' || t.cps[p] == '2') && e == p + 4) continue;   // a year
+                // "Reference CVE-2014-0160": the entry of a public catalogue.
+                {
+                    std::size_t h = p;
+                    while (h < e && is_letter(t.cps[h])) ++h;
+                    if (h > p && public_catalogue(t, p, h)) continue;
+                }
                 // "the file export_2010.csv": a file name.
                 {
                     std::size_t dot = e;
@@ -5232,29 +5893,137 @@ namespace dlib
             return q - 1 - r > 2 && !person_titles().count(word) && !civility_words().count(word);
         }
 
+        // The words that name the version of a program, and those that name a date.
+        static const std::unordered_set<std::string>& version_words()
+        {
+            static const std::unordered_set<std::string> s = privacy_impl::make_word_set(
+                "version versions release releases build branche branches branch patch correctif "
+                "versione versioni versiones versionen");
+            return s;
+        }
+
+        static const std::unordered_set<std::string>& date_words()
+        {
+            static const std::unordered_set<std::string> s = privacy_impl::make_word_set(
+                "date datum data fecha dated geboren naissance nascita nacimiento birth dob");
+            return s;
+        }
+
+        /* Whether the table cell that begins after the separator at position sep lies in a column
+           that a word of versions heads, with no word of dates: "Produit;Version installee;Version
+           corrigee" over its rows, "| Product | Fixed version |". The header is the first of the
+           lines written above with as many separators, among the 200 nearest, a rule of hyphens
+           passed, and its cells are short, as labels are and the clauses of a sentence are not. */
+        static bool version_column(const std::string& text, const utf8_text& t, std::size_t sep)
+        {
+            using namespace privacy_impl;
+            const char32_t mark = t.cps[sep];
+            const std::size_t longest = 600;
+            auto line_start = [&](std::size_t p) {
+                while (p > 0 && !is_line_break(t.cps[p - 1])) --p;
+                return p;
+            };
+            auto marks_in = [&](std::size_t from, std::size_t to) {
+                std::size_t k = 0;
+                for (std::size_t q = from; q < to; ++q)
+                    if (t.cps[q] == mark) ++k;
+                return k;
+            };
+            const std::size_t ls = line_start(sep);
+            std::size_t le = sep;
+            while (le < t.size() && !is_line_break(t.cps[le])) ++le;
+            if (le - ls > longest) return false;
+            const std::size_t marks = marks_in(ls, le), column = marks_in(ls, sep + 1);
+            std::size_t header = ls, header_end = ls;
+            std::size_t current = ls;
+            for (int lines = 0; lines < 200 && current > 0; ++lines)
+            {
+                std::size_t pe = current - 1;
+                if (pe > 0 && t.cps[pe] == '\n' && t.cps[pe - 1] == '\r') --pe;
+                const std::size_t ps = line_start(pe);
+                if (pe == ps || pe - ps > longest) break;
+                bool rule = false, other = false;
+                for (std::size_t q = ps; q < pe; ++q)
+                {
+                    if (t.cps[q] == '-') rule = true;
+                    else if (t.cps[q] != ':' && t.cps[q] != ' ' && t.cps[q] != mark) other = true;
+                }
+                rule = rule && !other;
+                if (!rule)
+                {
+                    if (marks_in(ps, pe) != marks) break;
+                    header = ps;
+                    header_end = pe;
+                }
+                current = ps;
+            }
+            if (header_end == header) return false;
+            // The cell of the header in the column of the separator, every cell of the header being short.
+            std::size_t cb = header, ce = header, seen = 0;
+            for (std::size_t q = header, start = header; q <= header_end; ++q)
+            {
+                if (q < header_end && t.cps[q] != mark) continue;
+                if (q - start > 40) return false;
+                if (seen == column) { cb = start; ce = q; }
+                ++seen;
+                start = q + 1;
+            }
+            if (seen <= column) return false;
+            bool versions = false;
+            for (std::size_t q = cb; q < ce;)
+            {
+                if (!is_letter(t.cps[q])) { ++q; continue; }
+                std::size_t r = q;
+                while (r < ce && is_letter(t.cps[r])) ++r;
+                const std::string word = fold_key(cp_substr(t, text, q, r));
+                if (date_words().count(word)) return false;
+                if (version_words().count(word)) versions = true;
+                q = r;
+            }
+            return versions;
+        }
+
         /* Whether the dotted numbers [b, e), read as a date with a year of two digits ("6.1.24"),
            are the version of a program: after a sign ("< 5.4.18", "tomcat@6.1.24", "v6.1.24"), a
            product ("Tomcat 6.1.24", "IIS 7.5.19"), a word of versions ("version", "release",
            "branche"), possibly with a qualifier between ("versions publiées 6.1.25", "Tomcat détecté
            6.1.24"), a word of comparison and its preposition ("antérieure à 6.1.25", "prior to
            6.1.25"); in a list after such a version ("6.1.24, 6.2.19 et 6.3.11", "4.0.17-3, 4.1.18");
-           and at the start of a table cell after a cell that ends with such a word ("| Tomcat |
-           7.1.24", "| OpenSearch (moteur) | 1.1.19"). A preposition of dates keeps a date ("version
+           and at the start of a table cell after a cell that ends with such a word or holds such a
+           version ("| Tomcat | 7.1.24 | 7.1.26", "| OpenSearch (moteur) | 1.1.19", "Django;4.2.17").
+           So are they glued to the name of a package ("requests:2.31.19"), on the line of a port
+           scan ("22/tcp open ssh OpenSSH 8.9.13"), and, when the day or the month has one digit,
+           after a name written as programs are, a capital inside or a digit ("GitLab 9.4.12",
+           "urllib3 1.26.18"). So are the value of a field that a word of versions or a product
+           names ("version: 4.7.20", "\"version\": \"4.7.20\""), the numbers that follow a comparison
+           through its articles ("anteriores a la 6.1.25", "precedenti alla 10.1.33") or a word of
+           versions through a preposition ("versions before 5.8.29", "Versionen vor 5.8.29"; "ab",
+           "since", "depuis" when the day or the month has one digit), and the cell of a column that
+           a word of versions heads (version_column()). A preposition of dates keeps a date ("version
            du 08.03.30", "Fassung vom 01.02.24"), and so do the words that date a document or its
-           issue ("Stand", "rilascio"). */
+           issue ("Stand", "rilascio") and a field of dates ("date de version : 12.03.24"). */
         static bool software_version(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
                                      const date_format& f, int depth = 0)
         {
             using namespace privacy_impl;
             if (f.separator != 2 || !f.two_digit_year || f.layout > 1 || depth > 16 || e <= b) return false;
-            static const std::unordered_set<std::string> versions = make_word_set(
-                "version versions release releases build branche branches branch patch correctif "
-                "versione versioni versiones versionen");
+            const std::unordered_set<std::string>& versions = version_words();
             static const std::unordered_set<std::string> comparisons = make_word_set(
-                "anterieur anterieure anterieurs anterieures posterieur posterieure superieur superieure "
-                "inferieur inferieure prior earlier older later newer below above precedente successiva "
-                "anterior posterior inferior superior");
-            static const std::unordered_set<std::string> links = make_word_set("a to than que di del de als");
+                "anterieur anterieure anterieurs anterieures posterieur posterieure posterieurs posterieures "
+                "superieur superieure superieurs superieures inferieur inferieure inferieurs inferieures prior "
+                "earlier older later newer below above precedente precedenti successiva successive successivo "
+                "successivi anterior anteriores posterior posteriores inferior inferiores superior superiores "
+                "anteriore anteriori posteriore posteriori inferiore inferiori superiore superiori previa previas "
+                "previo previos alter altere alteren neuer neuere neueren fruher fruhere fruheren");
+            // The prepositions and the articles between a comparison, or a preposition, and the numbers.
+            static const std::unordered_set<std::string> links = make_word_set(
+                "a to than que di del de als al alla alle ai della delle dei la le les el los las il lo der die das "
+                "dem den the");
+            // After a word of versions or a product: the prepositions of an order, then those of a range.
+            static const std::unordered_set<std::string> order_links = make_word_set(
+                "before after avant apres vor nach prima dopo antes despues");
+            static const std::unordered_set<std::string> range_links = make_word_set(
+                "bis ab seit since until till through thru depuis desde hasta fino");
             static const std::unordered_set<std::string> list_links = make_word_set("et ou and or e o y oder und");
             static const std::unordered_set<std::string> date_links = make_word_set(
                 "vom von am bis ab seit zum zur dal dall al alla dalla desde hasta depuis jusqu since until till");
@@ -5264,55 +6033,140 @@ namespace dlib
             const char32_t c = t.cps[q - 1];
             if (c == '<' || c == '>' || c == '=' || c == '@' || c == '~' || c == 0x2264 || c == 0x2265) return true;
             if (q == b && (c == 'v' || c == 'V') && (q < 2 || !is_letter(t.cps[q - 2]))) return true;
-            // The word before q on its line, and its start.
+            // The line of a port scan names services and their versions.
+            {
+                std::size_t ls = b;
+                while (ls > 0 && b - ls < 200 && !is_line_break(t.cps[ls - 1])) --ls;
+                std::size_t d = ls;
+                while (d < b && is_ascii_digit(t.cps[d])) ++d;
+                if (d > ls && d - ls <= 5 && t.at(d) == '/' && (t.at(d + 1) == 't' || t.at(d + 1) == 'u') &&
+                    (t.at(d + 2) == 'c' || t.at(d + 2) == 'd') && t.at(d + 3) == 'p' && !is_word_char(t.at(d + 4)))
+                    return true;
+            }
+            // The word before q on its line, a dot inside it kept ("Node.js"), and its start.
             auto word_at = [&](std::size_t end, std::size_t& start) {
                 std::size_t r = end;
-                while (r > 0 && (is_letter(t.cps[r - 1]) || is_ascii_digit(t.cps[r - 1]) || t.cps[r - 1] == '-'))
+                while (r > 0 && (is_letter(t.cps[r - 1]) || is_ascii_digit(t.cps[r - 1]) || t.cps[r - 1] == '-' ||
+                                 (t.cps[r - 1] == '.' && r > 1 && r < end && is_letter(t.cps[r - 2]) &&
+                                  is_letter(t.cps[r]))))
                     --r;
                 start = r;
                 return cp_substr(t, text, r, end);
             };
+            const std::unordered_set<std::string>& dated = date_words();
+            // The name of a package glued to its version by a colon, in lower case as packages are named.
+            if (c == ':' && q == b)
+            {
+                std::size_t first = 0;
+                const std::string name = word_at(q - 1, first);
+                bool lower = name.size() >= 2;
+                for (std::size_t z = first; z + 1 < q && lower; ++z) lower = !is_upper(t.cps[z]);
+                if (lower && !dated.count(fold_key(name))) return true;
+            }
+            // The value of a field that a word of versions or a product names, quoted or not.
+            {
+                auto spaces_back = [&](std::size_t r) {
+                    while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+                    return r;
+                };
+                auto quote_back = [&](std::size_t r) {
+                    return r > 0 && (t.cps[r - 1] == '"' || t.cps[r - 1] == '\'') ? r - 1 : r;
+                };
+                std::size_t r = spaces_back(quote_back(q));
+                if (r > 0 && (t.cps[r - 1] == ':' || t.cps[r - 1] == '='))
+                {
+                    r = quote_back(spaces_back(r - 1));
+                    std::size_t first = 0;
+                    const std::string label = fold_key(word_at(r, first));
+                    if (versions.count(label) || product_names().count(label))
+                    {
+                        // "date de version : 12.03.24": the field of a date.
+                        bool date_field = false;
+                        for (int k = 0; k < 3 && first > 0 && !date_field; ++k)
+                        {
+                            const std::string word = fold_key(word_at(spaces_back(first), first));
+                            if (word.empty()) break;
+                            date_field = dated.count(word) != 0;
+                        }
+                        if (!date_field) return true;
+                    }
+                }
+            }
             std::size_t start = 0;
             const std::string raw = word_at(q, start);
             const std::string key = fold_key(raw);
             if (!key.empty())
             {
                 if (product_names().count(key) || versions.count(key)) return true;
-                // One word back: a qualifier after a word of versions, a preposition after a comparison.
+                /* A name written as programs are, a capital after a small letter or a digit among
+                   three letters at least, before numbers whose day or month has one digit. */
+                if (q < b && (f.day_style == 0 || f.month_style == 0))
+                {
+                    std::size_t letters = 0;
+                    bool digit = false, inner_capital = false;
+                    for (std::size_t z = start; z < q; ++z)
+                    {
+                        if (is_letter(t.cps[z])) ++letters;
+                        if (is_ascii_digit(t.cps[z])) digit = true;
+                        if (z > start && is_upper(t.cps[z]) && is_lower(t.cps[z - 1])) inner_capital = true;
+                    }
+                    static const std::unordered_set<std::string> particles = make_word_set("mc mac de du di le la");
+                    const std::string head = fold_key(cp_substr(t, text, start, std::min(q, start + 2)));
+                    const std::string head3 = fold_key(cp_substr(t, text, start, std::min(q, start + 3)));
+                    if (letters >= 3 && (digit || (inner_capital && !particles.count(head) && !particles.count(head3))))
+                        return true;
+                }
+                // One word back: a qualifier after a word of versions.
                 std::size_t p = start;
                 while (p > 0 && (t.cps[p - 1] == ' ' || t.cps[p - 1] == 0xA0)) --p;
                 std::size_t start2 = 0;
                 const std::string key2 = p < start ? fold_key(word_at(p, start2)) : std::string();
-                if (!key2.empty() && links.count(key) && comparisons.count(key2)) return true;
                 if (!key2.empty() && (versions.count(key2) || product_names().count(key2)) &&
                     !function_words().count(key) && !date_links.count(key))
                     return true;
-                if (comparisons.count(key)) return true;
-            }
-            // A cell after a cell that ends with a product or a word of versions, its comment between
-            // parentheses passed.
-            if (c == '|' || c == '\t')
-            {
-                std::size_t r = q - 1;
-                while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
-                if (r > 0 && t.cps[r - 1] == ')')
+                /* A comparison, its preposition and its article passed; a preposition of an order or
+                   of a range after a word of versions or a product. */
+                std::string word = key;
+                std::size_t from = start;
+                auto step_back = [&]() {
+                    std::size_t z = from;
+                    while (z > 0 && (t.cps[z - 1] == ' ' || t.cps[z - 1] == 0xA0)) --z;
+                    word = z < from ? fold_key(word_at(z, from)) : std::string();
+                };
+                for (int passed = 0; passed < 2 && links.count(word); ++passed) step_back();
+                if (comparisons.count(word)) return true;
+                if (order_links.count(word) ||
+                    (range_links.count(word) && (f.day_style == 0 || f.month_style == 0)))
                 {
-                    std::size_t open = r - 1;
-                    while (open > 0 && t.cps[open] != '(' && t.cps[open] != '|' && t.cps[open] != '\n') --open;
-                    if (t.cps[open] != '(') return false;
-                    r = open;
-                    while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+                    step_back();
+                    if (versions.count(word) || product_names().count(word)) return true;
                 }
-                std::size_t cell = 0;
-                const std::string last = fold_key(word_at(r, cell));
-                return !last.empty() && (product_names().count(last) || versions.count(last));
             }
-            // A list: the item before, a version, across a comma, a semicolon, a slash or a conjunction.
+            /* A cell after a cell that ends with a product or a word of versions, its comment between
+               parentheses passed, or that holds a version; a list: the item before, a version, across
+               a comma, a semicolon, a slash or a conjunction. */
+            // The cell of a column that a word of versions heads.
+            if ((c == '|' || c == '\t' || c == ';' || c == ',') && version_column(text, t, q - 1)) return true;
+            const bool border = c == '|' || c == '\t';
             std::size_t r = q;
-            if (c == ',' || c == ';' || c == '/') --r;
+            if (border || c == ',' || c == ';' || c == '/') --r;
             else if (list_links.count(key)) r = start;
             else return false;
             while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+            if (border && r > 0 && t.cps[r - 1] == ')')
+            {
+                std::size_t open = r - 1;
+                while (open > 0 && t.cps[open] != '(' && t.cps[open] != '|' && t.cps[open] != '\n') --open;
+                if (t.cps[open] != '(') return false;
+                r = open;
+                while (r > 0 && (t.cps[r - 1] == ' ' || t.cps[r - 1] == 0xA0)) --r;
+            }
+            if (border || c == ';')
+            {
+                std::size_t cell = 0;
+                const std::string last = fold_key(word_at(r, cell));
+                if (!last.empty() && (product_names().count(last) || versions.count(last))) return true;
+            }
             // The revision of a package after its version: "5.0.11-6".
             {
                 std::size_t d = r;
@@ -5323,9 +6177,17 @@ namespace dlib
             while (s0 > 0 && (is_ascii_digit(t.cps[s0 - 1]) || t.cps[s0 - 1] == '.')) --s0;
             if (s0 == r || (s0 > 0 && is_word_char(t.cps[s0 - 1]))) return false;
             const std::string item = cp_substr(t, text, s0, r);
-            int groups = 1;
-            for (char ch : item) groups += ch == '.';
-            if (groups != 3 || item.front() == '.' || item.back() == '.') return false;
+            int groups = 1, largest = 0, value = 0;
+            for (char ch : item)
+            {
+                if (ch == '.') { ++groups; value = 0; continue; }
+                value = std::min(value * 10 + (ch - '0'), 100000);
+                largest = std::max(largest, value);
+            }
+            if (item.front() == '.' || item.back() == '.') return false;
+            // Four numbers, one of them too large for an address: "11.4.5127.80".
+            if (groups == 4 && largest > 255) return true;
+            if (groups != 3) return false;
             return software_version(text, t, s0, r, f, depth + 1);
         }
 
@@ -7368,12 +8230,18 @@ namespace dlib
             using namespace privacy_impl;
             typedef learned_piece piece;
             std::vector<piece> found;
+            std::vector<pii_span> secrets;
             const std::size_t bytes = t.offsets.back();
             for (const pii_span& s : spans)
             {
                 if (s.end <= s.begin || s.end > bytes || s.confidence < min_confidence) continue;
                 const pii_type type = s.type != pii_type::none ? s.type : pii_type_from_label(s.label);
                 if (type == pii_type::none || !enabled(type)) continue;
+                if (type == pii_type::secret)
+                {
+                    secrets.push_back(s);
+                    continue;
+                }
                 // A byte offset inside a code point takes the whole code point.
                 const std::size_t b = static_cast<std::size_t>(
                     std::upper_bound(t.offsets.begin(), t.offsets.end(), s.begin) - t.offsets.begin()) - 1;
@@ -7383,7 +8251,20 @@ namespace dlib
                 // "au sens du RGPD", "Gemäß DSGVO": a law, a regulation or a standard names nobody.
                 std::size_t pb = b, pe = e;
                 if (type == pii_type::person || type == pii_type::organization || type == pii_type::location)
+                {
                     trim_regulations(text, t, pb, pe);
+                    // "Nginx1", "TLS13", "T1566": a program, a protocol or a technique with its number.
+                    if (pe > pb && numbered_name(cp_substr(t, text, pb, pe))) continue;
+                    // "Jeton : ...", "Kennwort=...": the name of a secret before its value is a label.
+                    std::size_t after = pe;
+                    while (after < t.size() && (t.cps[after] == ' ' || t.cps[after] == 0xA0)) ++after;
+                    if (pe > pb && (t.at(after) == ':' || t.at(after) == '=' || t.at(after) == 0xFF1A))
+                    {
+                        const std::string words = cp_substr(t, text, pb, pe);
+                        if (secret_cues().count(fold_key(words)) || secret_label_strength(normalize_label(words)) != 0)
+                            continue;
+                    }
+                }
                 // "Calle Asunción, 51, 1.º -": a dash or a comma after a street is no part of it.
                 if (type == pii_type::address)
                     while (pe > pb && (t.cps[pe - 1] == ' ' || t.cps[pe - 1] == 0xA0 || t.cps[pe - 1] == ',' ||
@@ -7393,6 +8274,7 @@ namespace dlib
                 if (pe <= pb) continue;
                 found.push_back(piece{ pb, pe, type, s.confidence, 1 });
             }
+            add_recognized_secrets(text, t, secrets, out);
             std::sort(found.begin(), found.end(), [](const piece& x, const piece& y) { return x.b < y.b; });
             /* The gap between two pieces of one name: spaces and hyphens, at most two; the
                pieces of a login, and those of an address cut inside a word, meet ("v" and
@@ -7915,6 +8797,16 @@ namespace dlib
                     }
                     if (phone_chars && digits >= 8 && digits <= 17)
                         add(out, b, stop, pii_type::phone, 0.9, 2);
+                    return;
+                }
+                case pii_type::secret:
+                {
+                    // "Mot de passe : Tournesol2024! (provisoire)": the value alone, when it is no placeholder.
+                    std::size_t vb = 0, ve = 0;
+                    bool quoted = false, alone = false;
+                    if (!read_secret(t, b, e, vb, ve, quoted, alone)) return;
+                    if (plausible_secret(cp_substr(t, text, vb, ve), 2, quoted, true, alone))
+                        add(out, vb, ve, pii_type::secret, 0.9, 5, true);
                     return;
                 }
                 case pii_type::title:
@@ -9921,6 +10813,9 @@ namespace dlib
         std::unordered_set<std::string> doc_acronyms_;   // acronyms of organisations defined in the document
         std::unordered_set<std::string> doc_versions_;   // versions of programs written in the document ("6.1.24")
         std::unordered_set<std::string> email_domains_;  // domains of the e-mail addresses, webmail left out
+        std::unordered_set<std::string> doc_secrets_;    // secrets established in the document, as written
+        bool key_block_open_ = false;                    // learn() is between the lines of a private key
+        static const std::size_t max_doc_secrets = 1024;
         std::vector<std::pair<std::vector<std::string>, pii_type>> terms_;
         std::unordered_map<std::string, std::vector<std::size_t>> term_index_;       // first key to terms_
         std::unordered_set<std::string> allowed_;

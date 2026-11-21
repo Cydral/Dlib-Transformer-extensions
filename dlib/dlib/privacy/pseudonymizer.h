@@ -632,7 +632,8 @@ namespace dlib
             }
             /* The tags of the short values are kept, at most max_cache_bytes of them: a long
                value is rare, and would hold memory and its clear text there. */
-            const bool cached = value.size() <= max_cached_value;
+            // A secret is coded each time: none stays in clear in the cache.
+            const bool cached = value.size() <= max_cached_value && type != pii_type::secret;
             const std::string cache_key = cached ? std::string(pii_type_keyword(type)) + '\x1F' + value
                                                  : std::string();
             if (cached)
@@ -681,6 +682,10 @@ namespace dlib
                 case pii_type::date:
                     if (options_.dates == date_policy::shift)
                         ok = date_forward(value, body);
+                    break;
+                case pii_type::secret:
+                    body = encode_padded(type, value);
+                    ok = true;
                     break;
                 case pii_type::title:
                 case pii_type::gender:
@@ -1237,7 +1242,29 @@ namespace dlib
             return encode_letters(value + '\x01', std::string("opaque.") + pii_type_keyword(type)) + "!";
         }
 
-        bool decode_opaque(const std::string& letters, const std::string& keyword, std::string& value) const
+        /* The code of a secret, whose length and whose kinds of characters would tell how to guess
+           it: the value, a byte 1 and zero bytes to a multiple of 16 bytes, coded as an opaque value
+           by blocks of padded_block bytes. FF1 costs the square of what it codes: by blocks, a long
+           secret costs what its length costs. A secret of one block has the opaque code of its
+           padded value; the blocks after the first take their rank in their tweak, so that two equal
+           blocks of a secret give two codes. */
+        std::string encode_padded(pii_type type, const std::string& value) const
+        {
+            std::string plain = value + '\x01';
+            plain.resize((plain.size() + 15) / 16 * 16, '\0');
+            std::string code;
+            for (std::size_t at = 0, block = 0; at < plain.size(); at += padded_block, ++block)
+                code += encode_letters(plain.substr(at, padded_block), padded_tweak(pii_type_keyword(type), block));
+            return code + "!";
+        }
+
+        static std::string padded_tweak(const std::string& keyword, std::size_t block)
+        {
+            return "opaque." + keyword + (block == 0 ? std::string() : "." + std::to_string(block));
+        }
+
+        // The bytes that a code of letters holds, their padding included: the inverse of encode_letters().
+        bool decode_bytes(const std::string& letters, const std::string& tweak, std::string& plain) const
         {
             const std::size_t m = letters.size();
             if (m > max_decoded_letters) return false;
@@ -1252,18 +1279,47 @@ namespace dlib
             }
             if (n == 0) return false;
             std::vector<std::uint32_t> y;
+            y.reserve(m);
             for (char c : letters)
             {
                 if (c < 'a' || c > 'z') return false;
                 y.push_back(static_cast<std::uint32_t>(c - 'a'));
             }
-            std::string plain;
-            if (!numerals_to_bytes(word_ff1_.decrypt(y, std::string("opaque.") + keyword), 26, n, plain)) return false;
+            return numerals_to_bytes(word_ff1_.decrypt(y, tweak), 26, n, plain);
+        }
+
+        // The value of a padded plaintext: what precedes its byte 1 and the zero bytes after it.
+        static bool unpad(std::string plain, std::string& value)
+        {
             while (!plain.empty() && plain.back() == '\0') plain.pop_back();
             if (plain.empty() || plain.back() != '\x01') return false;
             plain.pop_back();
-            value = plain;
+            value.swap(plain);
             return true;
+        }
+
+        bool decode_opaque(const std::string& letters, const std::string& keyword, std::string& value) const
+        {
+            std::string plain;
+            return decode_bytes(letters, "opaque." + keyword, plain) && unpad(plain, value);
+        }
+
+        /* Reads back the code of a secret of several blocks (encode_padded()): each block before the
+           last has the length of the code of padded_block bytes, which no shorter block has. A code of
+           one block is an opaque code, which decode_opaque() reads. */
+        bool decode_padded(const std::string& letters, const std::string& keyword, std::string& value) const
+        {
+            const std::size_t full = letters_for_bytes(padded_block);
+            std::string plain, part;
+            std::size_t block = 0;
+            for (std::size_t at = 0; at < letters.size(); ++block)
+            {
+                const std::size_t length = std::min(full, letters.size() - at);
+                if (!decode_bytes(letters.substr(at, length), padded_tweak(keyword, block), part)) return false;
+                plain += part;
+                at += length;
+            }
+            return unpad(plain, value);
         }
 
     // ------------------------------------------------------------------------------------
@@ -1846,7 +1902,10 @@ namespace dlib
             if (body.size() >= 2 && body.back() == '!')
             {
                 std::string v;
-                if (decode_opaque(body.substr(0, body.size() - 1), keyword, v))
+                const std::string letters = body.substr(0, body.size() - 1);
+                // The code of a secret of several blocks is read by blocks, and is no opaque code.
+                const bool blocks = type == pii_type::secret && letters.size() > letters_for_bytes(padded_block);
+                if (blocks ? decode_padded(letters, keyword, v) : decode_opaque(letters, keyword, v))
                     candidates.push_back(v);
             }
             std::string v;
@@ -1881,6 +1940,7 @@ namespace dlib
                 case pii_type::ipv4: if (code_ipv4(body, v, false)) candidates.push_back(v); break;
                 case pii_type::ipv6: if (code_ipv6(body, v, false)) candidates.push_back(v); break;
                 case pii_type::date: if (date_backward(body, v)) candidates.push_back(v); break;
+                case pii_type::secret:
                 case pii_type::title:
                 case pii_type::gender:
                 case pii_type::nationality:
@@ -2022,6 +2082,8 @@ namespace dlib
         static const std::size_t max_cache_entries = 1 << 16;
         static const std::size_t max_cache_bytes = 16u << 20;
         static const std::size_t max_cached_value = 256;
+        // The bytes that one block of the code of a secret holds: a multiple of 16.
+        static const std::size_t padded_block = 240;
         /* The longest code of letters decoded: FF1 costs the square of its length, and a tag
            written by hand could be as long as a document. */
         static const std::size_t max_decoded_letters = 16384;

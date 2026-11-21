@@ -224,6 +224,14 @@ namespace pseudalis
         void request_cleanup();
         // The space the originals kept take, in bytes, and the one they may take.
         void history_space(unsigned long long& used, unsigned long long& limit);
+        /*
+            The space the originals may take now: limit, the space of the setting, or less when the
+            disk of the data folder holds less, the free space make_room() keeps left out; never less
+            than used, what they take.
+        */
+        unsigned long long history_room(unsigned long long used, unsigned long long limit) const;
+        // The free space the disk of the data folder keeps beyond the originals.
+        static const unsigned long long history_reserve = 256ull << 20;
 
         /*!
             The imposed terms (common/imposed_terms.h), kept in the database and given to the
@@ -308,7 +316,7 @@ namespace pseudalis
         std::mutex counts_m_;
         std::chrono::steady_clock::time_point counts_at_;
         long long records_count_ = 0;
-        unsigned long long history_bytes_ = 0, history_limit_ = 0;
+        unsigned long long history_bytes_ = 0, history_limit_ = 0, history_setting_ = 0;
         json drive_status_ = json::object();
 
         friend class drive_host;

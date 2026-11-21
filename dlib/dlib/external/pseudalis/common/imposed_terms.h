@@ -38,7 +38,7 @@ namespace pseudalis
     inline const std::vector<std::string>& imposed_term_types()
     {
         static const std::vector<std::string> types = { "ORG", "PERSON", "LOCATION", "ADDRESS", "ID", "EMAIL",
-                                                        "PHONE", "URL" };
+                                                        "PHONE", "URL", "SECRET" };
         return types;
     }
 

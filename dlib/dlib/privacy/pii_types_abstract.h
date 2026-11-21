@@ -21,6 +21,11 @@ namespace dlib
                 also the keyword of the tags that replace the data, so a reader of a
                 protected document sees [[PERSON:...]], [[IBAN:...]] or [[DATE:...]] and
                 knows what was there.
+
+                secret is no personal data: it covers the values that open an access, a
+                password, a passphrase, a PIN, the key of a programming interface, an
+                access token, a private key, which a document, a log or a configuration
+                file must not carry outside its organisation any more than a name.
         !*/
         none,
         person,         // natural person names
@@ -44,7 +49,8 @@ namespace dlib
         geolocation,    // GPS coordinates
         title,          // civility before a name or after its label: M., Mme, Mrs, Ms
         gender,         // the value of a sex or gender field
-        nationality     // a nationality written after its label or cue
+        nationality,    // a nationality written after its label or cue
+        secret          // passwords, keys of programming interfaces, access tokens, private keys
     };
 
     struct pii_entity
@@ -93,7 +99,7 @@ namespace dlib
         ensures
             - Returns the tag keyword of t: PERSON, ORG, LOCATION, ADDRESS, EMAIL, PHONE,
               IBAN, CARD, NIR, SIRET, ID, IPV4, IPV6, MAC, URL, DATE, PLATE, GEO, TITLE,
-              GENDER or NATIONALITY, and "NONE" for pii_type::none.
+              GENDER, NATIONALITY or SECRET, and "NONE" for pii_type::none.
     !*/
 
     pii_type pii_type_from_keyword(
@@ -105,7 +111,8 @@ namespace dlib
               '-' reading as '_'. Command line names are accepted too: ORGANIZATION,
               ORGANISATION, PAYMENT_CARD, CREDIT_CARD, IDENTIFIER, MAC_ADDRESS,
               LICENSE_PLATE, LICENCE_PLATE, SIREN, GEOLOCATION, GPS, COORDINATES,
-              CIVILITY, HONORIFIC, SEX and CITIZENSHIP.
+              CIVILITY, HONORIFIC, SEX, CITIZENSHIP, PASSWORD, CREDENTIAL, API_KEY and
+              TOKEN.
             - Returns pii_type::none for any other string.
     !*/
 
@@ -115,8 +122,10 @@ namespace dlib
         ensures
             - Returns the labels of the learned recognizers, in the order of their class
               indices: GIVEN_NAME, FAMILY_NAME, USERNAME, STREET_ADDRESS, POSTAL_CODE,
-              CITY and ORGANIZATION. They split the categories that rules find hardest
-              (names, places, addresses, organisations) into the parts a model can learn.
+              CITY, ORGANIZATION and SECRET. They split the categories that rules find
+              hardest (names, places, addresses, organisations) into the parts a model can
+              learn, and add the secrets written in plain text, which no format tells.
+
     !*/
 
     pii_type pii_type_from_label(

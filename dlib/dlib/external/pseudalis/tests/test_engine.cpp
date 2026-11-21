@@ -876,6 +876,52 @@ int main()
         psd_free(&err);
     }
 
+    // Secrets: told by their label, their key and their format, replaced by tags that give them back.
+    {
+        const std::string token = std::string("gh") + "p_16C7e42F292c6912E7710c838347Ae178B4a";
+        const std::string text = "Mot de passe : Tournesol2024!\nDB_PASSWORD=Tr0ub4dor&3\nJeton " + token + "\n"
+                                 "Mot de passe : <à définir>\npassword: ${DB_PASSWORD}\n";
+        CHECK(process(e, "anonymize", "acces.txt", text, res, out));
+        CHECK(out.find("Tournesol2024") == std::string::npos && out.find("Tr0ub4dor") == std::string::npos &&
+              out.find(token) == std::string::npos && out.find("[[SECRET:") != std::string::npos);
+        // A value left to fill and a reference to a secret kept elsewhere stay as they are.
+        CHECK(out.find("<à définir>") != std::string::npos && out.find("${DB_PASSWORD}") != std::string::npos);
+        CHECK(res["report"]["values"]["SECRET"].as_int() >= 3);
+        std::string restored;
+        CHECK(process(e, "restore", "acces.txt", out, res, restored) && restored == text);
+        // The marker of a picture of a protected document is no secret: protected again, it stays as it is.
+        std::string marked;
+        CHECK(process(e, "anonymize_text", "prompt",
+                      "Schéma : [Image@a1b2c3d4e5f60718]\n[Image@0f1e2d3c4b5a6978]\nMot de passe : Kerlys#77", res,
+                      marked));
+        CHECK(marked.find("[Image@a1b2c3d4e5f60718]") != std::string::npos &&
+              marked.find("[Image@0f1e2d3c4b5a6978]") != std::string::npos &&
+              marked.find("Kerlys#77") == std::string::npos);
+        // The code of a secret tells neither its length nor its characters.
+        std::string four, long_one;
+        CHECK(process(e, "anonymize_text", "prompt", "PIN : 4821", res, four) &&
+              process(e, "anonymize_text", "prompt", "PIN : 48215973", res, long_one));
+        CHECK(four.find("4821") == std::string::npos && four.size() == long_one.size());
+        // An imposed term and an imposed column of the type.
+        const std::string terms = "[{\"term\": \"Sésame-42\", \"type\": \"SECRET\", \"case_sensitive\": true}]";
+        CHECK(psd_set_terms(e, terms.data(), terms.size(), &err) == 1);
+        psd_free(&err);
+        CHECK(process(e, "anonymize_text", "prompt", "le code Sésame-42 ouvre la salle", res, out) &&
+              out.find("Sésame-42") == std::string::npos && out.find("[[SECRET:") != std::string::npos);
+        CHECK(psd_set_terms(e, "[]", 2, &err) == 1);
+        psd_free(&err);
+        const std::string columns = "[{\"column\": \"mdp\", \"type\": \"SECRET\"}]";
+        CHECK(psd_set_columns(e, columns.data(), columns.size(), &err) == 1);
+        psd_free(&err);
+        const std::string csv = "compte;mdp\nsvc-batch;bleu\nsvc-web;Zx9!kk\n";
+        std::string bare;
+        CHECK(process(e, "anonymize", "comptes.csv", csv, res, bare));
+        CHECK(bare.find("bleu") == std::string::npos && bare.find("Zx9!kk") == std::string::npos &&
+              res["report"]["values"]["SECRET"].as_int() == 2);
+        CHECK(psd_set_columns(e, "[]", 2, &err) == 1);
+        psd_free(&err);
+    }
+
     psd_buffer fp = { nullptr, 0 };
     CHECK(psd_key_fingerprint(e, &fp) == 1 && fp.size > 0);
     psd_free(&fp);

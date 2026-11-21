@@ -177,6 +177,16 @@ def main():
         # The chain of the website must be there, with the folder where it takes the files it publishes.
         code, out = run(common[:-1] + [os.path.join(work, "nowhere")])
         check(code == 1 and "no chain of the website" in out, "a folder without the chain stops the publication")
+        # A chain that takes the files of a product elsewhere, or that tells no version, stops it too.
+        code, out = run(common)
+        check(code == 1 and "version unknown (no file VERSION)" in out and "tools/site.sh update" in out,
+              "a chain without version stops the publication: %s" % out)
+        write(os.path.join(site, "VERSION"), b"1.0.4\n")
+        code, out = run(common)
+        check(code == 1 and "is version 1.0.4" in out and "from version 1.0.5 on" in out,
+              "an earlier chain stops the publication: %s" % out)
+        check(publish_release.site_version(site) == (1, 0, 4), "the version of the chain is read")
+        write(os.path.join(site, "VERSION"), b"1.0.10\n")
         code, out = run(common)
         check(code == 1 and "no folder releases/files" in out and "tools/site.sh setup" in out,
               "a chain without its folder of files stops the publication: %s" % out)
@@ -193,6 +203,24 @@ def main():
         code, out = run(common + ["--dry-run"])
         check(code == 0 and "dry run: nothing written, nothing published" in out, "the dry run ends well: %s" % out)
         check(not os.path.exists(dist) and called() == [], "the dry run writes nothing and runs no chain")
+
+        # Notes that hold an e-mail address are refused: the website prints the notes in its pages.
+        addressed = os.path.join(work, "addressed.json")
+        write(addressed, json.dumps({"en": "Notes of the test",
+                                     "fr": "Contact : quelqu.un@example.org"}).encode("utf-8"))
+        code, out = run([addressed if x == notes else x for x in common])
+        check(code == 1 and 'the notes of "fr" hold an e-mail address' in out,
+              "notes with an address stop the publication: %s" % out)
+        check(not os.path.exists(dist) and called() == [], "refused notes write nothing")
+        for refused, said in (({"fr": "Notes du test"}, "need an English text"),
+                              ({"en": "Notes", "fr": 3}, "not a text"),
+                              ({"en": "Write to someone@example.org"}, "e-mail address")):
+            try:
+                make_feed.check_notes(refused)
+                check(False, "notes refused: %s" % said)
+            except ValueError as e:
+                check(said in str(e), "notes refused for the right reason: %s" % e)
+        make_feed.check_notes({"en": "Version 1.2.3 @ home, a@b without a domain", "de": "Notizen"})
 
         # An installer of another version is refused.
         other = os.path.join(work, "other.exe")

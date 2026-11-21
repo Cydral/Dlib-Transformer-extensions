@@ -43,7 +43,8 @@ namespace pseudalis
     {
         static const std::vector<std::string> types = { "PERSON", "ORG", "LOCATION", "ADDRESS", "EMAIL", "PHONE",
                                                         "ID", "DATE", "IBAN", "CARD", "NIR", "SIRET", "URL", "IP",
-                                                        "MAC", "PLATE", "GEO", "TITLE", "GENDER", "NATIONALITY" };
+                                                        "MAC", "PLATE", "GEO", "TITLE", "GENDER", "NATIONALITY",
+                                                        "SECRET" };
         return types;
     }
 

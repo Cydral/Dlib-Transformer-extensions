@@ -788,6 +788,28 @@ namespace dlib
                   previously set number of outputs.
         !*/
 
+        void widen_outputs(
+            long num,
+            float new_bias = 0
+        );
+        /*!
+            requires
+                - get_layer_params().size() != 0
+                - num >= get_num_outputs()
+                - the layer holds no active adapter
+            ensures
+                - #get_num_outputs() == num
+                - The outputs the layer had keep their weights and their biases: for any
+                  input, the first get_num_outputs() values of each output vector are
+                  those the layer gave before the call.
+                - The new outputs take weights of zero and, when get_bias_mode() ==
+                  LINEAR_HAS_BIAS, the bias new_bias: each gives new_bias for any input,
+                  and 0 for a layer without biases.
+                - This is how a classifier learns classes added after its training: with
+                  new_bias far below zero the network keeps its answers until training
+                  moves the new outputs.
+        !*/
+
         linear_bias_mode get_bias_mode(
         ) const;
         /*!

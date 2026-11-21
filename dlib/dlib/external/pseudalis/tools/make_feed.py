@@ -10,7 +10,8 @@ version resource; the name is the one it takes beside the feed, in the folder of
 publication: pseudalis-setup-<version>.exe.
 
 notes.json holds the release notes by language, {"en": "...", "fr": "...", ...}; the service
-shows the notes of the language of the user, else the English ones.  Without it, the notes of
+shows the notes of the language of the user, else the English ones, and the website prints them
+on its downloads page: notes that hold an e-mail address are refused.  Without it, the notes of
 the output feed are kept when that feed already describes the version, and the notes otherwise
 read "Pseudalis <version>".
 
@@ -113,15 +114,31 @@ def check_installer(path, version):
         raise ValueError("%s installs version %s, not %s" % (path, built, version))
 
 
+# An e-mail address, wherever a text holds one.
+ADDRESS = re.compile(r"[\w.%+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def check_notes(notes):
+    """Raises ValueError for notes without an English text, for notes that are not texts by
+    language and for a text that holds an e-mail address: the website prints the notes of the
+    feed in the HTML of its downloads page, where it writes no address."""
+    if not isinstance(notes, dict) or not notes.get("en"):
+        raise ValueError("the notes need an English text (\"en\")")
+    for language in sorted(notes):
+        if not isinstance(notes[language], str):
+            raise ValueError("the notes of \"%s\" are not a text" % language)
+        if ADDRESS.search(notes[language]):
+            raise ValueError("the notes of \"%s\" hold an e-mail address, which the website would print in its "
+                             "pages: name the contact page or the About window instead" % language)
+
+
 def read_notes(notes_path, output, version):
     """The notes of notes_path, else those the feed at output gives the same version, else
-    a default text.  Raises ValueError for notes without an English text."""
+    a default text.  Raises ValueError for notes that check_notes() refuses."""
     notes = None
     if notes_path:
         with open(notes_path, encoding="utf-8") as f:
             notes = json.load(f)
-        if not isinstance(notes, dict) or "en" not in notes:
-            raise ValueError("the notes need an English text (\"en\")")
     else:
         try:
             with open(output, encoding="utf-8") as f:
@@ -130,7 +147,10 @@ def read_notes(notes_path, output, version):
                 notes = current["notes"]
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
-    return notes or {"en": "Pseudalis " + version}
+        if notes is None:
+            return {"en": "Pseudalis " + version}
+    check_notes(notes)
+    return notes
 
 
 def make_feed(version, installer, url, notes, size=None, sha256=None, file=None):

@@ -20,6 +20,7 @@
 #include "../serialize.h"
 #include "pii_types.h"
 #include "pii_dataset.h"
+#include "secret_formats.h"
 #include "unicode_text.h"
 
 namespace dlib
@@ -280,6 +281,15 @@ namespace dlib
                 pii_span& s = spans[k];
                 const std::size_t lowest = k > 0 ? spans[k - 1].end : 0;
                 const std::size_t highest = k + 1 < spans.size() ? spans[k + 1].begin : text.size();
+                // A secret is written whole between its spaces or the signs of its assignment.
+                if (s.label == "SECRET")
+                {
+                    std::size_t sb = s.begin, se = s.end;
+                    secret_chunk(text, sb, se);
+                    s.begin = std::max(sb, lowest);
+                    s.end = std::min(se, highest);
+                    continue;
+                }
                 std::size_t b = index_of(s.begin), e = index_of(s.end);
                 while (inside_word(e) && t.offsets[e + 1] <= highest) ++e;
                 while (inside_word(b) && t.offsets[b - 1] >= lowest) --b;
@@ -297,7 +307,7 @@ namespace dlib
         static_assert(EMBEDDING_DIM % NUM_HEADS == 0 && (EMBEDDING_DIM / NUM_HEADS) % 2 == 0,
                       "the head dimension must be an even divisor of the embedding dimension");
     public:
-        static constexpr long num_classes = 15;
+        static constexpr long num_classes = 17;
         static constexpr long vocabulary = 260;
 
         typedef loss_cross_entropy_per_token<linear<num_classes, rms_norm<
@@ -432,8 +442,65 @@ namespace dlib
         friend void serialize(const pii_span_model<D, L, H>& item, std::ostream& out);
         template <long D, long L, long H>
         friend void deserialize(pii_span_model<D, L, H>& item, std::istream& in);
+        template <long D, long L, long H>
+        friend long deserialize_widened(pii_span_model<D, L, H>& item, std::istream& in);
 
     private:
+        /* Reads a model; widen accepts one trained for the first labels only, whose output layer
+           grows. Returns the number of classes the stream held. */
+        long read(std::istream& in, bool widen)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::string name;
+            deserialize(name, in);
+            if (name != "pii_span_model")
+                throw serialization_error("Unexpected version found while deserializing dlib::pii_span_model.");
+            long d = 0, l = 0, h = 0;
+            deserialize(d, in);
+            deserialize(l, in);
+            deserialize(h, in);
+            if (d != EMBEDDING_DIM || l != NUM_LAYERS || h != NUM_HEADS)
+                throw serialization_error("This pii_span_model was trained with embedding dimension " +
+                                          std::to_string(d) + ", " + std::to_string(l) + " layers and " +
+                                          std::to_string(h) + " heads, not " + std::to_string(EMBEDDING_DIM) + ", " +
+                                          std::to_string(NUM_LAYERS) + " and " + std::to_string(NUM_HEADS) + ".");
+            bool trained = false;
+            long window = 0;
+            deserialize(trained, in);
+            deserialize(window, in);
+            if (window < 16 || window > max_window)
+                throw serialization_error("Invalid window length found while deserializing dlib::pii_span_model.");
+            net_type net;
+            long stored = num_classes;
+            if (trained)
+            {
+                deserialize(net, in);
+                /* The output layer reads its size from the stream: a model trained for other labels
+                   would give scores for other classes than those of pii_fine_labels(). */
+                auto& head = net.subnet().layer_details();
+                const long classes = static_cast<long>(head.get_num_outputs());
+                stored = classes;
+                if (classes != num_classes)
+                {
+                    if (!widen || classes > num_classes || classes < 3 || classes % 2 == 0)
+                        throw serialization_error("This pii_span_model was trained for " + std::to_string(classes) +
+                                                  " classes, not the " + std::to_string(num_classes) +
+                                                  " of the labels of pii_fine_labels(): train it again, or go on " +
+                                                  "with its training from deserialize_widened().");
+                    head.widen_outputs(num_classes, new_class_bias);
+                }
+            }
+            net_ = std::move(net);
+            window_ = window;
+            trained_ = trained;
+            spares_.clear();
+            ++generation_;
+            return stored;
+        }
+
+        // The bias of the classes added to a model: far below the scores of the classes it knows.
+        static constexpr float new_class_bias = -8.0f;
+
         template <typename trainer_type>
         void run_training(
             trainer_type& trainer,
@@ -669,36 +736,17 @@ namespace dlib
     template <long D, long L, long H>
     void deserialize(pii_span_model<D, L, H>& item, std::istream& in)
     {
-        std::lock_guard<std::mutex> lock(item.mutex_);
-        std::string name;
-        deserialize(name, in);
-        if (name != "pii_span_model")
-            throw serialization_error("Unexpected version found while deserializing dlib::pii_span_model.");
-        long d = 0, l = 0, h = 0;
-        deserialize(d, in);
-        deserialize(l, in);
-        deserialize(h, in);
-        if (d != D || l != L || h != H)
-            throw serialization_error("This pii_span_model was trained with embedding dimension " + std::to_string(d) +
-                                      ", " + std::to_string(l) + " layers and " + std::to_string(h) +
-                                      " heads, not " + std::to_string(D) + ", " + std::to_string(L) + " and " +
-                                      std::to_string(H) + ".");
-        bool trained = false;
-        long window = 0;
-        deserialize(trained, in);
-        deserialize(window, in);
-        if (window < 16 || window > pii_span_model<D, L, H>::max_window)
-            throw serialization_error("Invalid window length found while deserializing dlib::pii_span_model.");
-        typename pii_span_model<D, L, H>::net_type net;
-        if (trained) deserialize(net, in);
-        item.net_ = std::move(net);
-        item.window_ = window;
-        item.trained_ = trained;
-        item.spares_.clear();
-        ++item.generation_;
+        item.read(in, false);
+    }
+
+    template <long D, long L, long H>
+    long deserialize_widened(pii_span_model<D, L, H>& item, std::istream& in)
+    {
+        return item.read(in, true);
     }
 
     template <long D, long L, long H> constexpr long pii_span_model<D, L, H>::num_classes;
+    template <long D, long L, long H> constexpr float pii_span_model<D, L, H>::new_class_bias;
     template <long D, long L, long H> constexpr long pii_span_model<D, L, H>::vocabulary;
     template <long D, long L, long H> constexpr long pii_span_model<D, L, H>::max_window;
     template <long D, long L, long H> constexpr std::size_t pii_span_model<D, L, H>::max_spares;

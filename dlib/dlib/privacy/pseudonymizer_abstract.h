@@ -214,6 +214,17 @@ namespace dlib
                         YYYY-MM-DD, YYYY-MM for a month and its year, YYYY for a year
                         alone, followed by "~" and a format code when the original was not
                         ISO.
+                    Secrets (passwords, keys, tokens): the exact encryption of the value
+                        padded with zero bytes to a multiple of 16 bytes, rendered as lower
+                        case letters followed by '!'. The code tells neither the length of
+                        the secret nor the kinds of its characters, which would tell how to
+                        guess it: "1234" and "Tournesol2024!" give codes of the same
+                        length. The same secret gives the same code, so that a document
+                        still shows where one value is used twice. A secret is coded each
+                        time it is met: none is kept in the memoization cache. A secret of
+                        more than 239 bytes is coded by blocks of 240 bytes, so that the
+                        time of its code grows with its length and no longer with its
+                        square.
                     Anything a dedicated code cannot represent, and every value whose tag
                         would not decode back to it, takes an exact FF1 encryption of the
                         whole value, rendered as lower case letters followed by '!'.

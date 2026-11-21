@@ -77,6 +77,7 @@ textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; paddi
 .k-contact { --mark: #fde3c8; --line-mark: #d9731a; }
 .k-id { --mark: #fbd6dc; --line-mark: #c8334f; }
 .k-date { --mark: #d2f2f0; --line-mark: #138f86; }
+.k-secret { --mark: #e1e1ea; --line-mark: #55556e; }
 .marks mark { background: var(--mark); }
 .marks mark.restored { border-bottom-color: var(--line-mark); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 0; font-size: 13px; color: var(--faint); }

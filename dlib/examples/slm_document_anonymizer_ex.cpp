@@ -812,6 +812,8 @@ namespace
     {
         std::shared_ptr<pii_sequence_tagger> tagger;
         std::shared_ptr<span_model> model;
+        // With both: the one whose reading counts more where they overlap.
+        pii_leading_recognizer leading = pii_leading_recognizer::tagger;
     };
 
     /* The models of the detector: those given with --tagger and --model, each read from its
@@ -844,18 +846,28 @@ namespace
             istringstream in(decode_model(embedded_span_model()));
             r.model = std::make_shared<span_model>(read_span_model(in, "the embedded span model"));
         }
+        if (r.model) r.leading = default_leading_recognizer(*r.model);
+#if !ANONYMIZER_ESSENTIALS_ONLY
+        const string leading = get_option(parser, "leading", "");
+        if (leading == "tagger")
+            r.leading = pii_leading_recognizer::tagger;
+        else if (leading == "model")
+            r.leading = pii_leading_recognizer::span_model;
+        else if (!leading.empty())
+            throw std::runtime_error("--leading takes tagger or model");
+#endif
         return r;
     }
 
-    /* Alone, either recognizer joins the detector with min_confidence. With both, the span
-       model leads and the tagger fills its gaps (attach_pii_recognizers() of
-       dlib/privacy/pii_recognizers.h): its confident spans where the span model kept nothing,
-       the less confident name parts that complete a name already found, and the name it reads
-       where the span model reads an organisation with little confidence, or a single word as a
-       town or an organisation before a family name the tagger reads. */
-    void attach(const recognizers& r, pii_detector& detector, double min_confidence, double tagger_min_confidence)
+    /* Alone, either recognizer joins the detector with min_confidence. With both
+       (attach_pii_recognizers() of dlib/privacy/pii_recognizers.h), where their spans overlap
+       the more confident one is kept, a span of the leading recognizer counting a tenth more
+       than its confidence; the other recognizer needs second_min_confidence, or only
+       min_confidence for a name part that completes a name already found. The recognizer that
+       scores higher alone leads: the tagger beside a tiny span model, a small span model. */
+    void attach(const recognizers& r, pii_detector& detector, double min_confidence, double second_min_confidence)
     {
-        attach_pii_recognizers(detector, r.tagger, r.model, min_confidence, tagger_min_confidence);
+        attach_pii_recognizers(detector, r.tagger, r.model, r.leading, min_confidence, second_min_confidence);
     }
 
 #if !ANONYMIZER_ESSENTIALS_ONLY
@@ -989,11 +1001,17 @@ namespace
         model_type model;
         if (!init_bytes.empty())
         {
+            /* A model trained before a label joined pii_fine_labels() goes on too: its output layer
+               grows, the classes it knows keeping their weights. */
             istringstream in(init_bytes);
-            deserialize(model, in);
+            const long classes = deserialize_widened(model, in);
             options.continue_training = true;
             cout << "Continuing the training of the " << size << " span model from "
                  << parser.option("init").argument() << "\n";
+            if (classes != model_type::num_classes)
+                cout << "That model was trained for " << (classes - 1) / 2 << " labels: its output layer takes the "
+                     << pii_fine_labels().size() << " labels of this program\n";
+
         }
         cout << "Training the " << size << " span model on " << train.size() << " examples, " << options.steps
              << " steps of " << options.batch_size << " windows\n";
@@ -1127,7 +1145,7 @@ namespace
        they learn; every system is also scored at the level at which values are replaced,
        where a given name and a family name side by side form one PERSON. */
     int evaluate(const command_line_parser& parser, const recognizers& r, const pii_detector_options& dopt,
-                 double min_confidence, double tagger_min_confidence)
+                 double min_confidence, double second_min_confidence)
     {
         if (parser.number_of_arguments() != 2)
         {
@@ -1149,7 +1167,7 @@ namespace
             print_evaluation(title, evaluate_pii_spans(coarse_truth, predicted, span_match::exact, labels),
                              evaluate_pii_spans(coarse_truth, predicted, span_match::overlap, labels));
         };
-        const std::vector<string> learned = { "PERSON", "LOCATION", "ADDRESS", "ORG" };
+        const std::vector<string> learned = { "PERSON", "LOCATION", "ADDRESS", "ORG", "SECRET" };
 
         pii_detector rules(dopt);
         configure(parser, rules);
@@ -1183,7 +1201,7 @@ namespace
         {
             pii_detector combined(dopt);
             configure(parser, combined);
-            attach(r, combined, min_confidence, tagger_min_confidence);
+            attach(r, combined, min_confidence, second_min_confidence);
             predicted.clear();
             start = chrono::steady_clock::now();
             for (const pii_example& ex : test) predicted.push_back(detector_spans(combined, ex.text));
@@ -1221,7 +1239,7 @@ namespace
        log goes on from the trials it holds, with either objective since the log keeps both
        scores. */
     int tune_tagger(const command_line_parser& parser, const recognizers& r, const pii_detector_options& dopt,
-                    double min_confidence, double tagger_min_confidence)
+                    double min_confidence, double second_min_confidence)
     {
         if (parser.number_of_arguments() != 2 || !parser.option("dev"))
         {
@@ -1294,7 +1312,8 @@ namespace
         ostringstream header;
         header << "# tune-tagger: " << train.size() << " examples of " << parser[1] << ", " << dev.size() << " of "
                << dev_name << ", seed " << seed << ", epsilon " << base.epsilon << ", " << base.max_iterations
-               << " iterations, confidences " << min_confidence << " and " << tagger_min_confidence
+               << " iterations, confidences " << min_confidence << " and " << second_min_confidence << ", "
+               << (r.leading == pii_leading_recognizer::tagger ? "tagger" : "span model") << " leading"
                << "; C, entity loss, hash bits, then true positives, false positives and false negatives of the "
                << "tagger alone and of the detector, seconds";
         const string log_name = get_option(parser, "log", "");
@@ -1353,7 +1372,7 @@ namespace
             with.tagger = tagger;
             pii_detector combined(dopt);
             configure(parser, combined);
-            attach(with, combined, min_confidence, tagger_min_confidence);
+            attach(with, combined, min_confidence, second_min_confidence);
             predicted.clear();
             for (const pii_example& ex : dev) predicted.push_back(detector_spans(combined, ex.text));
             t.detector = evaluate_pii_spans(coarse_truth, predicted, span_match::exact, std::vector<string>()).overall;
@@ -1494,7 +1513,8 @@ int main(int argc, char** argv)
         parser.add_option("types",
                           "Comma separated keywords of the types to replace, among PERSON ORG LOCATION ADDRESS "
                           "EMAIL PHONE IBAN CARD NIR SIRET ID IPV4 IPV6 MAC URL DATE PLATE GEO TITLE GENDER "
-                          "NATIONALITY. Default: all.",
+                          "NATIONALITY SECRET. Default: all.",
+
                           1);
         parser.add_option("except", "Comma separated keywords of types left readable, such as TITLE,GENDER.", 1);
         parser.add_option("no-public-bodies",
@@ -1516,9 +1536,12 @@ int main(int argc, char** argv)
         parser.add_option("no-model", "Use no span model.");
         parser.add_option("min-confidence", "Smallest confidence of a span kept from the recognizers. Default: 0.5.",
                           1);
-        parser.add_option("tagger-min-confidence", "With --model: smallest confidence of a tagger span kept where the "
-                          "span model found nothing; a name part that completes a name found needs only "
+        parser.add_option("second-min-confidence", "With both recognizers: smallest confidence of a span kept from "
+                          "the one that does not lead; a name part that completes a name found needs only "
                           "--min-confidence. Default: 0.9.", 1);
+        parser.add_option("leading", "With both recognizers: tagger or model, the one whose reading counts more "
+                          "where their spans overlap. Default: the tagger beside a tiny span model, the span model "
+                          "otherwise.", 1);
 #endif
         parser.add_option("dates", "Date policy: shift (default) moves every date into the past by the same secret "
                           "number of weeks, a month with its year or a year alone by whole months or years; "
@@ -1590,7 +1613,8 @@ int main(int argc, char** argv)
 #else
         const char* single[] = { "key", "passphrase-env", "context", "types", "except", "names", "terms", "keep",
                                  "patterns",
-                                 "tagger", "model", "min-confidence", "tagger-min-confidence", "dates", "date-order",
+                                 "tagger", "model", "min-confidence", "second-min-confidence", "leading", "dates",
+                                 "date-order",
                                  "out-dir", "out", "dev",
                                  "examples", "seed", "c", "loss", "bits", "epsilon", "iterations", "threads", "cache",
                                  "trials", "minutes", "dev-examples", "c-range", "loss-range", "bits-range",
@@ -1692,10 +1716,10 @@ int main(int argc, char** argv)
         if (date_policy_name == "keep")
             dopt.types.erase(std::remove(dopt.types.begin(), dopt.types.end(), pii_type::date), dopt.types.end());
 #if ANONYMIZER_ESSENTIALS_ONLY
-        const double min_confidence = 0.5, tagger_min_confidence = 0.9;
+        const double min_confidence = 0.5, second_min_confidence = 0.9;
 #else
         const double min_confidence = get_option(parser, "min-confidence", 0.5);
-        const double tagger_min_confidence = get_option(parser, "tagger-min-confidence", 0.9);
+        const double second_min_confidence = get_option(parser, "second-min-confidence", 0.9);
 #endif
         // Restoring and creating a key detect nothing, and load no model; the search of the
         // settings of the tagger trains the taggers it scores.
@@ -1704,14 +1728,14 @@ int main(int argc, char** argv)
         const recognizers learned =
             restoring_only ? recognizers() : load_recognizers(parser, cmd != command::tune_tagger);
 #if !ANONYMIZER_ESSENTIALS_ONLY
-        if (cmd == command::evaluate) return evaluate(parser, learned, dopt, min_confidence, tagger_min_confidence);
+        if (cmd == command::evaluate) return evaluate(parser, learned, dopt, min_confidence, second_min_confidence);
         if (cmd == command::tune_tagger)
-            return tune_tagger(parser, learned, dopt, min_confidence, tagger_min_confidence);
+            return tune_tagger(parser, learned, dopt, min_confidence, second_min_confidence);
 #endif
 
         pii_detector detector(dopt);
         configure(parser, detector);
-        attach(learned, detector, min_confidence, tagger_min_confidence);
+        attach(learned, detector, min_confidence, second_min_confidence);
         if ((cmd == command::detect || cmd == command::text || cmd == command::keygen) &&
             parser.number_of_arguments() > 1)
         {

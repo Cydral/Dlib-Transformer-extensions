@@ -17,6 +17,7 @@
     collides with a common word, a role or a heading.
 */
 
+#include <algorithm>
 #include <map>
 #include <sstream>
 #include <string>
@@ -491,6 +492,106 @@ namespace dlib
             return s;
         }
 
+        /* The words that name a secret before its value, in the five languages, each with what it
+           tells of that value, as secret_key_strength() does for the keys of settings: 2 a secret, 3 a
+           secret that may be a short code of digits, 1 a secret or another value, which the look of
+           the value decides. */
+        inline const std::map<std::string, int>& secret_cues()
+        {
+            static const std::map<std::string, int> m = []() {
+                std::map<std::string, int> x;
+                auto add = [&x](const char* phrases, int strength) {
+                    for (const std::string& p : make_phrase_set(phrases)) x[p] = strength;
+                };
+                add("mot de passe|mdp|password|passwd|pwd|passphrase|pass phrase|phrase de passe|phrase secrete|"
+                    "passcode|passwort|kennwort|contrasena|clave de acceso|parola d'ordine|frase segreta|"
+                    "frase de contrasena|codice segreto|code secret|code confidentiel|codigo secreto|geheimzahl|"
+                    "cle api|cle d'api|cle secrete|cle privee|api key|apikey|api secret|api token|secret key|"
+                    "private key|access key|secret access key|client secret|access token|auth token|"
+                    "authentication token|bearer token|refresh token|jeton d'acces|jeton d'authentification|"
+                    "chiave api|chiave segreta|chiave privata|token di accesso|clave api|clave de api|clave secreta|"
+                    "clave privada|token de acceso|api-schlussel|api schlussel|geheimer schlussel|"
+                    "privater schlussel|zugriffstoken|cle wifi|cle wi-fi|cle wpa|cle de securite reseau|wifi key|"
+                    "wpa key|network key|network security key|chiave wifi|chiave di rete|clave wifi|"
+                    "wlan-schlussel|wlan schlussel|netzwerkschlussel|preshared key|pre-shared key|psk|"
+                    "shared secret|secret partage|encryption key|cle de chiffrement|master key|master password|"
+                    "recovery key|cle de recuperation|wiederherstellungsschlussel|chiave di recupero|"
+                    "clave de recuperacion", 2);
+                add("pin|code pin|pin code|codice pin|codigo pin|pin-code|puk|code puk|puk code|codice puk|"
+                    "codigo puk|cvv|cvc|cvv2|cryptogramme|cryptogramme visuel|code de securite|security code|"
+                    "codice di sicurezza|codigo de seguridad|sicherheitscode|kartenprufnummer|code de verification|"
+                    "verification code|codice di verifica|codigo de verificacion|bestatigungscode|code d'acces|"
+                    "access code|codice di accesso|codice d'accesso|codigo de acceso|zugangscode|otp|"
+                    "one-time password|mot de passe a usage unique|einmalpasswort|recovery code|backup code|"
+                    "code de recuperation|code de secours|codice di recupero|codigo de recuperacion|"
+                    "wiederherstellungscode|digicode|code porte|code d'entree|door code|gate code|"
+                    "codice portone|codigo del portal|turcode", 3);
+                add("secret|token|jeton|clave|pass", 1);
+                return x;
+            }();
+            return m;
+        }
+
+        /* What the label of a field tells of a secret, 0 for another label: a cue of strength 2 or 3
+           alone ("Mot de passe", "PIN"), followed by three words at most that tell which secret
+           ("Mot de passe provisoire", "Password for the VPN"), or after two words at most that do
+           ("Nouveau mot de passe", "Root password"). The words that tell a property of the secret
+           make another label: "Longueur du mot de passe", "Password policy". The cues of strength 1
+           make no label: the keys of settings read them (find_secret_assignments()). */
+        inline int secret_label_strength(const std::string& normalized)
+        {
+            static const std::unordered_set<std::string> blocking = make_word_set(
+                "policy politique richtlinie politica length longueur lange lunghezza longitud expiration expiry "
+                "expires expire expired ablauf scadenza caducidad complexity complexite komplexitat complessita "
+                "complejidad hint indice hinweis rules regles regeln regole reglas strength force robustesse starke "
+                "reset reinitialisation oublie forgotten forgot vergessen dimenticata olvidada change changement "
+                "history historique manager gestionnaire field champ required requis obligatoire minimum maximum "
+                "min max age duree validity validite type format status statut etat hash generator generateur "
+                "rotation renouvellement renewal protected protege");
+
+            static const std::unordered_set<std::string> qualifiers = make_word_set(
+                "nouveau nouvel nouvelle ancien ancienne votre vos ton ta mon ma son sa notre le la l les un une "
+                "new old current temporary temp initial default admin administrator root user your my the neues "
+                "neuer altes alter aktuelles ihr dein das der nuova nuovo vecchia vecchio il tua sua nueva nuevo "
+                "antigua antiguo actual tu su el wifi wi-fi wlan vpn database db ftp sftp ssh smtp imap ldap sql "
+                "windows session compte account konto cuenta master administrateur utilisateur");
+            if (normalized.empty() || normalized.size() > 48) return 0;
+            const auto& cues = secret_cues();
+            const auto exact = cues.find(normalized);
+            if (exact != cues.end()) return exact->second >= 2 ? exact->second : 0;
+            std::vector<std::string> words;
+            {
+                std::istringstream in(normalized);
+                std::string w;
+                while (in >> w) words.push_back(w);
+            }
+            if (words.size() < 2 || words.size() > 7) return 0;
+            auto join = [&](std::size_t b, std::size_t e) {
+                std::string out;
+                for (std::size_t k = b; k < e; ++k) out += (k > b ? " " : "") + words[k];
+                return out;
+            };
+            for (const std::string& w : words)
+                if (blocking.count(w)) return 0;
+            // The cue first, then what tells which secret.
+            for (std::size_t len = std::min<std::size_t>(4, words.size() - 1); len >= 1; --len)
+            {
+                const auto it = cues.find(join(0, len));
+                if (it != cues.end() && it->second >= 2 && words.size() - len <= 3) return it->second;
+            }
+            // The cue last, after the words that tell which secret.
+            for (std::size_t len = std::min<std::size_t>(4, words.size() - 1); len >= 1; --len)
+            {
+                const auto it = cues.find(join(words.size() - len, words.size()));
+                if (it == cues.end() || it->second < 2 || words.size() - len > 2) continue;
+                bool known = true;
+                for (std::size_t k = 0; k + len < words.size(); ++k)
+                    if (!qualifiers.count(words[k])) known = false;
+                if (known) return it->second;
+            }
+            return 0;
+        }
+
         inline const std::map<std::string, pii_type>& field_labels()
         {
             /* Labels that type the value written after them ("Nom : DUPONT") or in the next
@@ -894,7 +995,15 @@ namespace dlib
                 {"emailaddress", pii_type::email}, {"companyname", pii_type::organization},
                 {"streetaddress", pii_type::address}, {"user name", pii_type::identifier},
                 {"userid", pii_type::identifier}, {"customerid", pii_type::identifier},
-                {"employeeid", pii_type::identifier}
+                {"employeeid", pii_type::identifier},
+                // The name of an account, which the forms and the tables that give a password write beside it.
+                {"benutzername", pii_type::identifier}, {"anmeldename", pii_type::identifier},
+                {"nutzername", pii_type::identifier}, {"benutzerkennung", pii_type::identifier},
+                {"nome utente", pii_type::identifier}, {"id utente", pii_type::identifier},
+                {"nombre de usuario", pii_type::identifier}, {"nombre usuario", pii_type::identifier},
+                {"id de usuario", pii_type::identifier}, {"nom utilisateur", pii_type::identifier},
+                {"identifiant de connexion", pii_type::identifier},
+                {"identifiant utilisateur", pii_type::identifier}, {"login name", pii_type::identifier}
             };
             return m;
         }

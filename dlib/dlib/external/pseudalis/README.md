@@ -34,6 +34,16 @@ sexes of one usage (`M` and `F`, `m`, `w` and `d`) takes them as sexes, as a hea
 a column whose cells are mostly names or towns found whole gives that type to its other cells of the form
 of a name.
 
+Secrets are protected with the personal values: a password, a PIN, the key of a programming interface, an
+access token, the lines of a private key and the password of a connection string take the tag `SECRET`,
+since a document, a log or a prompt must carry them outside their organisation no more than a name. Their
+formats, the keys and the labels that name them, the sentences that announce them in the five languages
+and the two models of the detector find them, and a secret found once is found again wherever its
+document writes it (see [`dlib/privacy/secret_formats.h`](../../privacy/secret_formats_abstract.h)). A
+value left to fill and a reference to a secret kept elsewhere stay as they are (`********`, `<password>`,
+`${DB_PASSWORD}`, the path of a key file). The code of the tag hides the length of the secret and the
+kinds of its characters, and the key of the computer gives the secret back as it gives any other value.
+
 The places that a tag would spoil take the value in its protected form without the tag, its
 substitute: `Xoydoeh Nuggwdfsorn` for `Jean Dupont`, a date shifted in the form of the original. They
 are the name of the file (`Contrat Jean Dupont.docx` becomes `Contrat Xoydoeh Nuggwdfsorn.docx`), the
@@ -131,8 +141,10 @@ reads the tags of a text under any name.
 
 The installer gives the drive a letter chosen among the free ones, `A:` when it is free. It is the
 folder `drive` of the data folder, which the service shows under its letter for every session of the
-computer, as the command `subst` would, and watches: it works as any folder, from the Explorer and from
-the prompt (`dir`, `copy`, `xcopy`, `move`, `del`, `ren`, `md`, `rd /s`, `type`, any editor), with one
+computer, as the command `subst` would, and watches. The letter names a folder of the disk of the data
+folder: the Explorer shows for it the size and the free space of that disk, and the web application shows
+the space of the originals, which the settings bound. The drive works as any folder, from the Explorer and
+from the prompt (`dir`, `copy`, `xcopy`, `move`, `del`, `ren`, `md`, `rd /s`, `type`, any editor), with one
 difference: a file is anonymized once its writer closed it and it rested two seconds, its name
 included. The anonymized file takes its place, the original goes to the encrypted vault, and the file
 written is deleted.
@@ -166,7 +178,10 @@ written is deleted.
   forgotten to make room, the oldest first, before a new one is written, every hour and at once when the
   settings lower the days or the space. A new original also leaves 256 MB free on the disk of the data
   folder: the oldest make room for it when forgetting them gives that room, and stay when other files
-  fill the disk. An installation updated from version 1.0.1 keeps every original: its settings, without
+  fill the disk. `GET /v1/info` gives this space (`history`): `bytes`, the size of the originals kept,
+  `setting`, the space of the settings, and `limit`, the room the originals have, the space of the
+  settings or less when the disk holds less; the web application shows what is left of it, in GB. An
+  installation updated from version 1.0.1 keeps every original: its settings, without
   `history_mb`, take the largest space (1048576 MB) and the 30 days of its default become 45, until an
   administrator sets them; a damaged `settings.json` keeps them the same way.
 - A file extracted on the drive from an anonymized archive that the service recorded stays as it is, and
@@ -279,8 +294,8 @@ computer starts again, its start with the system unchanged, or until a user star
 
 The administrators give up to 100 terms that Pseudalis replaces in every file, text and name before
 anything else is read: the name of a client, of a project, of a contract or of an organisation that the
-detector does not know, each with the tag of its type (ORG, PERSON, LOCATION, ADDRESS, ID, EMAIL, PHONE
-or URL) and, when asked, its case. A term is found as whole words, its words and numbers in the same
+detector does not know, each with the tag of its type (ORG, PERSON, LOCATION, ADDRESS, ID, EMAIL, PHONE,
+URL or SECRET) and, when asked, its case. A term is found as whole words, its words and numbers in the same
 order, separated by at most two characters of one line ("Projet Alpha", "PROJET-ALPHA"); without case
 sensitivity, its case and its accents are ignored. Its occurrences outrank every other value found: a
 name or an organisation read over a term keeps its parts outside it, while a term inside an e-mail
@@ -294,7 +309,7 @@ once, to the files processed afterwards.
 A CSV file with a header holds its values in columns, the names of the clients or their e-mail addresses
 in an export for instance. The administrators name up to 100 such columns, each with the type of all its
 values (PERSON, ORG, LOCATION, ADDRESS, EMAIL, PHONE, ID, DATE, IBAN, CARD, NIR, SIRET, URL, IP, MAC,
-PLATE, GEO, TITLE, GENDER or NATIONALITY). Every value below the name of such a column takes its
+PLATE, GEO, TITLE, GENDER, NATIONALITY or SECRET). Every value below the name of such a column takes its
 substitute, without detection and without tag, whatever the tags of the rest of the file; an empty cell
 stays empty, and the spaces around a value stay in place. Such files are typically the exports of a
 production database (PostgreSQL, Oracle, MySQL), protected before they are imported into a program under
@@ -614,14 +629,18 @@ refuses an installer of another folder unless `--any-folder` is given.
 `publish_release.py` checks that the installer carries the version of
 [`common/version.h`](common/version.h), that the feed announces no later one, that the key is the one of
 the public key of the sources, and that the chain of the website is there (`--site`,
-`~/work/cydral-website` by default) with its folder `releases/files`, which `tools/site.sh setup` makes.
+`~/work/cydral-website` by default), in version 1.0.5 at least, the first that takes the files of a
+product in `dist` (its file `VERSION`; `tools/site.sh update` installs a later package), with its folder
+`releases/files`, which `tools/site.sh setup` makes.
 It then copies the installer into `releases/files/pseudalis/dist` as
 `pseudalis-setup-<version>.exe`, writes the feed with its name, its size, its SHA-256 and the notes of
 each language (`{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`), with LF ends of line,
 signs it, checks the signature with the public key of the sources, and puts the installer, the signature
-and the feed in place of the former ones; the installers of the earlier versions leave the folder. A
-failure before the writing leaves the folder as it is, and the files being written bear names that start
-with a dot, which the chain of the website does not publish.
+and the feed in place of the former ones; the installers of the earlier versions leave the folder. The
+downloads page of the website prints the notes of the feed, and the website writes no e-mail address in
+its pages: notes that hold one are refused before anything is written. A failure before the writing
+leaves the folder as it is, and the files being written bear names that start with a dot, which the chain
+of the website does not publish.
 
 The program then runs `tools/site.sh status` and `tools/site.sh publish` from the folder of the website,
 on the terminal of the publisher, where the chain asks for the password of the hosting when it needs it:
@@ -639,11 +658,9 @@ chain of the website.
 The services read the feed and its signature on the website five minutes after their start, then every
 day, check the signature, download the installer beside the feed in the background, check its size and
 its SHA-256, and install it at the next start of the service, or at once from the menu of the icon. Their
-messages and logs never name the places they read. The copies of a version before 1.0.13 read the
-repository, where the feed no longer lies: they are updated once by hand, with the installer of the
-website. Those of 1.0.13 read `files/pseudalis/` of the website, one folder above, which the website
-answers with the files of `dist/` themselves, without a redirection: they receive the later versions as
-the others do.
+messages and logs never name the places they read. The copies of a version before 1.0.16 read places
+where the feed no longer lies, the repository until 1.0.12 and `files/pseudalis/` of the website, one
+folder above, from 1.0.13 to 1.0.15: they are updated once by hand, with the installer of the website.
 
 ## Editions and licenses
 

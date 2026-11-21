@@ -98,7 +98,7 @@ namespace dlib
                 other members are serialized.
         !*/
     public:
-        static constexpr long num_classes = 15;  // pii_bio_class_count()
+        static constexpr long num_classes = 17;  // pii_bio_class_count()
         static constexpr long vocabulary = 260;  // the 256 byte values and a few reserved ids
 
         typedef ... net_type;
@@ -193,7 +193,8 @@ namespace dlib
                   character boundaries, carry no surrounding space or separator and are
                   extended to the limits of the words they cut, except where a change of
                   case marks a word glued to another ("DupontMarie"), and never across a
-                  neighbouring span.
+                  neighbouring span. A span labelled SECRET grows to the limits a secret
+                  is written between instead (secret_chunk()).
                 - An empty result means that nothing was found.
         !*/
 
@@ -212,8 +213,28 @@ namespace dlib
     /*!
         The stream records the three template arguments, the window and the network.
         deserialize() throws serialization_error when the arguments differ from those of
-        item, naming the size the model was trained with, or when the window lies outside
-        [16, max_window]; item is left unchanged when it throws.
+        item, naming the size the model was trained with, when the window lies outside
+        [16, max_window], or when the network was trained for another number of classes
+        than num_classes, the labels of pii_fine_labels() having changed since; item is
+        left unchanged when it throws.
+    !*/
+
+    template <long D, long L, long H>
+    long deserialize_widened(pii_span_model<D, L, H>& item, std::istream& in);
+    /*!
+        ensures
+            - Reads a model as deserialize() does, and also a model trained for the first
+              labels of pii_fine_labels() only, saved before labels joined the end of
+              that list: its output layer grows to num_classes, the classes it knew
+              keeping their weights and the new ones starting far below them, so that
+              find() gives the spans the model gave. Training it further, with
+              pii_span_model_training_options::continue_training, teaches it the new
+              labels without losing what it learned.
+            - Returns the number of classes the stream held, num_classes when nothing
+              changed.
+        throws
+            - serialization_error as deserialize() does, and when the stream holds more
+              classes than num_classes or a number of classes no list of labels gives.
     !*/
 
     typedef pii_span_model<64, 2, 2>   pii_span_model_tiny;

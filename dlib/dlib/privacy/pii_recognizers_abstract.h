@@ -76,30 +76,80 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    enum class pii_leading_recognizer
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Which of a span model and a sequence tagger leads where both read the same
+                text (see combine_pii_recognizers()).
+        !*/
+        span_model,
+        tagger
+    };
+
     std::vector<pii_span> combine_pii_recognizers(
         const std::string& text,
         const std::vector<pii_span>& model_spans,
         const std::vector<pii_span>& tagger_spans,
+        pii_leading_recognizer leading,
         double min_confidence = 0.5,
-        double tagger_min_confidence = 0.9
+        double second_min_confidence = 0.9
     );
     /*!
         ensures
             - Combines the spans of a span model and of a sequence tagger over the same
-              text, the span model leading: its spans of at least min_confidence are kept,
-              and the tagger, whose word features also fire on capitalized words that are
-              not personal data, only fills their gaps, with its spans of at least
-              tagger_min_confidence where the span model kept nothing, and with its less
-              confident name parts (at least min_confidence) that complete a name already
-              found, so that the parts of a name are replaced together.
-            - A span the model reads as an organisation with a confidence below 0.9 gives
-              way to the name parts the tagger reads over all its words with more
-              confidence ("Lucie Rey" alone on its line), and a single word the model
-              reads as a town or an organisation gives way to the given name the tagger
-              reads there, with a confidence of 0.9 at least and close to that of the
-              model or above, when the tagger also reads the family name that follows it
-              ("Malo Cozic", "Nolwenn Le Floc'h").
-            - Returns the spans sorted by their beginning.
+              text. A span of the leading recognizer needs min_confidence and counts a
+              tenth more than its confidence; a span of the other recognizer needs
+              second_min_confidence and counts its confidence. The spans are taken from
+              the one that counts most to the one that counts least, each kept when it
+              overlaps none kept before; at equal counts the leading recognizer comes
+              first.
+            - On the spans labelled "SECRET" the span model leads whatever leading is: a
+              secret is a run of characters, which the span model reads byte by byte and
+              the tagger word by word. The secrets that the span model reads with
+              min_confidence at least are kept before every other span, since a secret
+              left readable costs more than a value given another type.
+            - A town that a leading tagger reads with less than second_min_confidence is
+              kept only where the span model reads a town or a postal code too, with a
+              confidence of 0.2 at least: its context alone tells a town from any other
+              capitalized word.
+            - The less confident name parts of the other recognizer (at least
+              min_confidence) that complete a name kept, separated from it by spaces or a
+              hyphen only, are kept too, so that the parts of a name are replaced
+              together.
+            - Returns the spans sorted by their beginning; no two of them overlap when
+              neither input holds overlapping spans.
+    !*/
+
+    pii_leading_recognizer default_leading_recognizer(
+        const pii_span_recognizer& model
+    );
+    /*!
+        ensures
+            - Returns the recognizer that leads beside model in attach_pii_recognizers(),
+              the one that scores higher alone on the evaluation sets of the anonymizers:
+              the tagger beside a tiny span model, the span model when it is a small one.
+    !*/
+
+    void attach_pii_recognizers(
+        pii_detector& detector,
+        std::shared_ptr<const pii_sequence_tagger> tagger,
+        std::shared_ptr<const pii_span_recognizer> model,
+        pii_leading_recognizer leading,
+        double min_confidence = 0.5,
+        double second_min_confidence = 0.9
+    );
+    /*!
+        ensures
+            - Adds to detector the recognizers given, either of which may be null or
+              empty: both through combine_pii_recognizers() with leading, or the one given
+              alone with min_confidence.
+            - The parts of a name and the organisations that the span model reads with a
+              confidence of 0.2 at least, below the confidence it needs to be kept and
+              where no span kept lies, also reach the detector, under the label "WEAK": no
+              values themselves, they are the weak evidence that a capitalized word joined
+              by a conjunction to a person found is another person ("Martin and Dupont").
+            - The detector keeps shared ownership of the models.
     !*/
 
     void attach_pii_recognizers(
@@ -107,19 +157,12 @@ namespace dlib
         std::shared_ptr<const pii_sequence_tagger> tagger,
         std::shared_ptr<const pii_span_recognizer> model,
         double min_confidence = 0.5,
-        double tagger_min_confidence = 0.9
+        double second_min_confidence = 0.9
     );
     /*!
         ensures
-            - Adds to detector the recognizers given, either of which may be null or
-              empty: both through combine_pii_recognizers(), or the one given alone with
-              min_confidence.
-            - The parts of a name and the organisations that the span model reads below
-              min_confidence, down to 0.2, where no value lies, also reach the detector,
-              under the label "WEAK": no values themselves, they are the weak evidence
-              that a capitalized word joined by a conjunction to a person found is
-              another person ("Martin and Dupont").
-            - The detector keeps shared ownership of the models.
+            - Same as above, with default_leading_recognizer(*model) as the leading
+              recognizer.
     !*/
 
 // ----------------------------------------------------------------------------------------

@@ -39,7 +39,8 @@ namespace dlib
         geolocation,    // GPS coordinates
         title,          // civility before a name or after its label: M., Mme, Mrs, Ms
         gender,         // the value of a sex or gender field
-        nationality     // a nationality written after its label or cue
+        nationality,    // a nationality written after its label or cue
+        secret          // passwords, keys of programming interfaces, access tokens, private keys
     };
 
     struct pii_entity
@@ -69,7 +70,7 @@ namespace dlib
             pii_type::nir, pii_type::siret, pii_type::identifier, pii_type::ipv4,
             pii_type::ipv6, pii_type::mac_address, pii_type::url, pii_type::date,
             pii_type::license_plate, pii_type::geolocation, pii_type::title, pii_type::gender,
-            pii_type::nationality };
+            pii_type::nationality, pii_type::secret };
         return types;
     }
 
@@ -98,6 +99,7 @@ namespace dlib
             case pii_type::title: return "TITLE";
             case pii_type::gender: return "GENDER";
             case pii_type::nationality: return "NATIONALITY";
+            case pii_type::secret: return "SECRET";
             case pii_type::none: break;
         }
         return "NONE";
@@ -121,13 +123,15 @@ namespace dlib
         if (k == "CIVILITY" || k == "HONORIFIC") return pii_type::title;
         if (k == "SEX") return pii_type::gender;
         if (k == "CITIZENSHIP") return pii_type::nationality;
+        if (k == "PASSWORD" || k == "CREDENTIAL" || k == "API_KEY" || k == "TOKEN") return pii_type::secret;
         return pii_type::none;
     }
 
     inline const std::vector<std::string>& pii_fine_labels()
     {
         static const std::vector<std::string> labels = {
-            "GIVEN_NAME", "FAMILY_NAME", "USERNAME", "STREET_ADDRESS", "POSTAL_CODE", "CITY", "ORGANIZATION" };
+            "GIVEN_NAME", "FAMILY_NAME", "USERNAME", "STREET_ADDRESS", "POSTAL_CODE", "CITY", "ORGANIZATION",
+            "SECRET" };
         return labels;
     }
 

@@ -481,7 +481,8 @@ namespace pseudalis
                 unsigned long long used = 0, limit = 0;
                 if (db_) history_space(used, limit);
                 history_bytes_ = used;
-                history_limit_ = limit;
+                history_setting_ = limit;
+                history_limit_ = history_room(used, limit);
                 counts_at_ = now;
             }
             j["records"] = records_count_;
@@ -489,6 +490,7 @@ namespace pseudalis
             json history = json::object();
             history["bytes"] = history_bytes_;
             history["limit"] = history_limit_;
+            history["setting"] = history_setting_;
             j["history"] = history;
         }
         j["albireo"] = albireo_.status();
@@ -1165,13 +1167,20 @@ namespace pseudalis
         limit = static_cast<unsigned long long>(settings_->get().history_mb) << 20;
     }
 
+    unsigned long long service::history_room(unsigned long long used, unsigned long long limit) const
+    {
+        uint64_t free = 0;
+        if (!free_disk_space(data_dir_, free)) return std::max(limit, used);
+        const unsigned long long reach = used + (free > history_reserve ? free - history_reserve : 0);
+        return std::max(std::min(limit, reach), used);
+    }
+
     bool service::make_room(unsigned long long needed)
     {
         std::lock_guard<std::mutex> lock(room_m_);
         const host_settings st = settings_->get();
         const unsigned long long limit = static_cast<unsigned long long>(st.history_mb) << 20;
-        // The free space the disk of the data folder keeps beyond a new original.
-        const unsigned long long reserve = 256ull << 20;
+        const unsigned long long reserve = history_reserve;
         unsigned long long used = 0, ignored = 0;
         history_space(used, ignored);
         // An original larger than the space of all of them: forgetting the others would not make it fit.

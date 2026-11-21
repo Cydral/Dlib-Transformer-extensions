@@ -9,6 +9,7 @@
 #include <istream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include "pii_detector.h"
 #include "pii_sequence_tagger.h"
@@ -111,97 +112,85 @@ namespace dlib
             return false;
         }
 
-        /* The spans of the model, where the tagger reads a name with more confidence. A span
-           read as an organisation with a confidence below doubt is replaced by the name parts
-           the tagger reads over its words, when they cover all of it: "Lucie Rey" alone on its
-           line. A single word read as a town or an organisation is replaced by the given name
-           the tagger reads there with a confidence of doubt at least, and close to that of the
-           model or above, when the tagger also reads the family name that follows it: "Malo
-           Cozic", "Nolwenn Le Floc'h". */
-        inline std::vector<pii_span> prefer_names(const std::string& text, const std::vector<pii_span>& model_spans,
-                                                  const std::vector<pii_span>& tagger_spans, double doubt)
-        {
-            std::vector<pii_span> out;
-            for (const pii_span& m : model_spans)
-            {
-                std::vector<pii_span> parts;
-                if (m.label == "ORGANIZATION" && m.confidence < doubt)
-                    for (const pii_span& s : tagger_spans)
-                        if (name_part(s) && s.begin < m.end && m.begin < s.end && s.confidence > m.confidence)
-                            parts.push_back(s);
-                bool covered = !parts.empty();
-                for (const pii_span& s : parts)
-                    if (s.begin < m.begin || s.end > m.end) covered = false;
-                for (std::size_t k = m.begin; k < m.end && covered; ++k)
-                {
-                    if (text[k] == ' ' || text[k] == '-') continue;
-                    bool inside = false;
-                    for (const pii_span& s : parts)
-                        if (s.begin <= k && k < s.end) inside = true;
-                    covered = inside;
-                }
-                if (!covered && (m.label == "ORGANIZATION" || m.label == "CITY") && text.find(' ', m.begin) >= m.end)
-                {
-                    const pii_span* given = nullptr;
-                    const pii_span* family = nullptr;
-                    for (const pii_span& s : tagger_spans)
-                    {
-                        if (s.label == "GIVEN_NAME" && s.begin == m.begin && s.end == m.end && s.confidence >= doubt &&
-                            s.confidence + 0.02 >= m.confidence)
-                            given = &s;
-                        if (s.label == "FAMILY_NAME" && s.begin > m.end && s.begin - m.end <= 2 &&
-                            text.find_first_not_of(" -", m.end) == s.begin)
-                            family = &s;
-                    }
-                    if (given && family)
-                    {
-                        out.push_back(*given);
-                        bool free = true;
-                        for (const pii_span& o : model_spans)
-                            if (o.begin < family->end && family->begin < o.end) free = false;
-                        if (free) out.push_back(*family);
-                        continue;
-                    }
-                }
-                if (covered) out.insert(out.end(), parts.begin(), parts.end());
-                else out.push_back(m);
-            }
-            std::sort(out.begin(), out.end(), [](const pii_span& a, const pii_span& b) { return a.begin < b.begin; });
-            return out;
-        }
+        inline bool spans_overlap(const pii_span& a, const pii_span& b) { return a.begin < b.end && b.begin < a.end; }
     }
 
 // ----------------------------------------------------------------------------------------
+
+    enum class pii_leading_recognizer
+    {
+        span_model,
+        tagger
+    };
 
     inline std::vector<pii_span> combine_pii_recognizers(
         const std::string& text,
         const std::vector<pii_span>& model_spans,
         const std::vector<pii_span>& tagger_spans,
+        pii_leading_recognizer leading,
         double min_confidence = 0.5,
-        double tagger_min_confidence = 0.9
+        double second_min_confidence = 0.9
     )
     {
         using namespace privacy_impl;
-        std::vector<pii_span> kept, spans, pending;
+        const bool tagger_leads = leading == pii_leading_recognizer::tagger;
+        const std::vector<pii_span>& second = tagger_leads ? model_spans : tagger_spans;
+        /* What a span counts: its confidence, and a tenth more when its recognizer leads. A secret
+           is no word: the span model, which reads bytes, leads on it beside any tagger, and the
+           secrets it reads come before every other span, a secret left readable costing more than
+           a value given another type. */
+        const double lead = 0.1;
+        std::vector<std::pair<double, const pii_span*>> candidates;
         for (const pii_span& s : model_spans)
-            if (s.confidence >= min_confidence) kept.push_back(s);
-        kept = prefer_names(text, kept, tagger_spans, 0.9);
-        spans = kept;
+        {
+            const bool secret = s.label == "SECRET";
+            if (s.confidence >= (secret || !tagger_leads ? min_confidence : second_min_confidence))
+                candidates.emplace_back(s.confidence + (secret ? 1 : (tagger_leads ? 0 : lead)), &s);
+        }
+        const std::size_t from_model = candidates.size();
+        /* A town is a word that its context alone tells from any other capitalized word, a heading
+           or a product: below second_min_confidence, a leading tagger keeps one where the span
+           model reads a town or a postal code too, even weakly. */
+        auto town_confirmed = [&model_spans](const pii_span& s) {
+            for (const pii_span& m : model_spans)
+                if ((m.label == "CITY" || m.label == "POSTAL_CODE") && m.confidence >= 0.2 && spans_overlap(s, m))
+                    return true;
+            return false;
+        };
         for (const pii_span& s : tagger_spans)
         {
-            bool free = true;
-            for (const pii_span& m : kept)
-                if (s.begin < m.end && m.begin < s.end) free = false;
-            if (!free) continue;
-            if (s.confidence >= tagger_min_confidence) spans.push_back(s);
-            else if (s.confidence >= min_confidence && name_part(s)) pending.push_back(s);
+            const bool leads = tagger_leads && s.label != "SECRET";
+            const bool sure =
+                leads && (s.label != "CITY" || s.confidence >= second_min_confidence || town_confirmed(s));
+            if (s.confidence >= (sure ? min_confidence : second_min_confidence))
+                candidates.emplace_back(s.confidence + (leads ? lead : 0), &s);
         }
+        // At equal counts, the spans of the leading recognizer come first.
+        if (tagger_leads)
+            std::rotate(candidates.begin(), candidates.begin() + static_cast<long>(from_model), candidates.end());
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const std::pair<double, const pii_span*>& a, const std::pair<double, const pii_span*>& b) {
+                             return a.first > b.first;
+                         });
+        std::vector<pii_span> spans;
+        auto is_free = [&spans](const pii_span& s) {
+            for (const pii_span& o : spans)
+                if (spans_overlap(s, o)) return false;
+            return true;
+        };
+        for (const std::pair<double, const pii_span*>& c : candidates)
+            if (is_free(*c.second)) spans.push_back(*c.second);
+        // The less confident name parts of the second recognizer that complete a name already kept.
+        std::vector<pii_span> pending;
+        for (const pii_span& s : second)
+            if (s.confidence >= min_confidence && s.confidence < second_min_confidence && name_part(s) && is_free(s))
+                pending.push_back(s);
         for (bool grown = true; grown;)
         {
             grown = false;
             for (std::size_t k = 0; k < pending.size(); ++k)
             {
-                if (!next_to_name(text, pending[k], spans)) continue;
+                if (!is_free(pending[k]) || !next_to_name(text, pending[k], spans)) continue;
                 spans.push_back(pending[k]);
                 pending.erase(pending.begin() + static_cast<long>(k));
                 grown = true;
@@ -214,25 +203,24 @@ namespace dlib
 
     namespace privacy_impl
     {
-        /* The parts of a name and the organisations that the span model reads below
-           min_confidence, down to 0.2, where no span kept lies: no value by themselves, they are
-           the weak evidence that a capitalized word joined by a conjunction to a person found is
-           another person ("Martin and Dupont"), which the detector reads under the label "WEAK". */
+        /* The parts of a name and the organisations that the span model reads below limit, down
+           to 0.2, where no span kept lies: no value by themselves, they are the weak evidence
+           that a capitalized word joined by a conjunction to a person found is another person
+           ("Martin and Dupont"), which the detector reads under the label "WEAK". */
         inline void append_weak_names(
             const std::vector<pii_span>& model_spans,
-            double min_confidence,
+            double limit,
             std::vector<pii_span>& out
         )
         {
             const std::size_t count = out.size();
             for (const pii_span& s : model_spans)
             {
-                if (s.confidence >= min_confidence || s.confidence < 0.2 ||
-                    !(name_part(s) || s.label == "ORGANIZATION"))
+                if (s.confidence >= limit || s.confidence < 0.2 || !(name_part(s) || s.label == "ORGANIZATION"))
                     continue;
                 bool free = true;
                 for (std::size_t k = 0; k < count && free; ++k)
-                    if (s.begin < out[k].end && out[k].begin < s.end) free = false;
+                    if (spans_overlap(s, out[k])) free = false;
                 if (!free) continue;
                 pii_span w = s;
                 w.label = "WEAK";
@@ -242,22 +230,31 @@ namespace dlib
         }
     }
 
+    inline pii_leading_recognizer default_leading_recognizer(const pii_span_recognizer& model)
+    {
+        return model.size() == "tiny" ? pii_leading_recognizer::tagger : pii_leading_recognizer::span_model;
+    }
+
     inline void attach_pii_recognizers(
         pii_detector& detector,
         std::shared_ptr<const pii_sequence_tagger> tagger,
         std::shared_ptr<const pii_span_recognizer> model,
+        pii_leading_recognizer leading,
         double min_confidence = 0.5,
-        double tagger_min_confidence = 0.9
+        double second_min_confidence = 0.9
     )
     {
         if (model && model->empty()) model.reset();
         if (model && tagger)
         {
-            detector.add_recognizer([model, tagger, min_confidence, tagger_min_confidence](const std::string& t) {
+            // A span of the model that the combination keeps out below this confidence is weak evidence at most.
+            const double weak = leading == pii_leading_recognizer::tagger ? second_min_confidence : min_confidence;
+            detector.add_recognizer([model, tagger, leading, weak, min_confidence, second_min_confidence](
+                                        const std::string& t) {
                 const std::vector<pii_span> read = model->find(t);
-                std::vector<pii_span> out = combine_pii_recognizers(t, read, tagger->find(t), min_confidence,
-                                                                    tagger_min_confidence);
-                privacy_impl::append_weak_names(read, min_confidence, out);
+                std::vector<pii_span> out = combine_pii_recognizers(t, read, tagger->find(t), leading, min_confidence,
+                                                                    second_min_confidence);
+                privacy_impl::append_weak_names(read, weak, out);
                 return out;
             }, 0);
         }
@@ -272,6 +269,20 @@ namespace dlib
             }, 0);
         else if (tagger)
             detector.add_recognizer([tagger](const std::string& t) { return tagger->find(t); }, min_confidence);
+    }
+
+    inline void attach_pii_recognizers(
+        pii_detector& detector,
+        std::shared_ptr<const pii_sequence_tagger> tagger,
+        std::shared_ptr<const pii_span_recognizer> model,
+        double min_confidence = 0.5,
+        double second_min_confidence = 0.9
+    )
+    {
+        const pii_leading_recognizer leading =
+            model && !model->empty() ? default_leading_recognizer(*model) : pii_leading_recognizer::tagger;
+        attach_pii_recognizers(detector, std::move(tagger), std::move(model), leading, min_confidence,
+                               second_min_confidence);
     }
 
 // ----------------------------------------------------------------------------------------

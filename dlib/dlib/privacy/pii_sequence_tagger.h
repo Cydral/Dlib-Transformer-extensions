@@ -5,10 +5,12 @@
 
 #include "pii_sequence_tagger_abstract.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include "../serialize.h"
 #include "../svm/sequence_labeler.h"
@@ -168,6 +170,23 @@ namespace dlib
             if (location_triggers().count(key)) flags.push_back("place_trigger");
             if (common_words().count(key)) flags.push_back("common");
             if (acronym_words().count(key)) flags.push_back("acronym");
+            // The tables of the words that name nobody in the documents of an organisation, and of what they name.
+            if (role_words().count(key)) flags.push_back("role");
+            if (business_words().count(key)) flags.push_back("business");
+            if (technical_terms().count(key)) flags.push_back("technical");
+            if (function_words().count(key)) flags.push_back("function");
+            if (greeting_words().count(key)) flags.push_back("greeting");
+            if (civility_words().count(key)) flags.push_back("civility");
+            if (nationality_words().count(key)) flags.push_back("nationality");
+            if (country_names().count(key)) flags.push_back("country");
+            if (region_names().count(key)) flags.push_back("region");
+            if (public_body_acronyms().count(key)) flags.push_back("public_acronym");
+            if (public_body_heads().count(key)) flags.push_back("public_head");
+            if (known_organizations().count(key)) flags.push_back("known_org");
+            if (product_names().count(key)) flags.push_back("product");
+            if (regulation_terms().count(key)) flags.push_back("regulation");
+            if (organization_sectors().count(key)) flags.push_back("sector");
+            if (organization_trade_words().count(key)) flags.push_back("trade");
             return flags;
         }
     }
@@ -306,8 +325,130 @@ namespace dlib
                 }
             }
 
+            /* What tells a secret. A secret is written whole between two spaces, and its tokens are cut
+               wherever its case or its signs change: each token takes the look of the whole value it
+               belongs to (its length, the kinds of its characters, how little they repeat), the key
+               that an equals sign or a colon joins to it ("DB_PASSWORD=...") and its place in the
+               value. A cue read before a token on its line ("mot de passe", "PIN", "client_secret")
+               reaches the tokens after it. */
+            std::vector<std::string> chunk_look(n), chunk_place(n), chunk_mark(n);
+            for (std::size_t i = 0; i < n;)
+            {
+                std::size_t j = i + 1;
+                while (j < n && tokens[j].begin == tokens[j - 1].end) ++j;
+                // The key of an assignment, when the value follows it without a space.
+                std::size_t value = i;
+                int assigned = -1;
+                for (std::size_t k = i + 1; k + 1 < j && assigned < 0; ++k)
+                {
+                    if (raw[k] != "=" && raw[k] != ":") continue;
+                    std::size_t kb = tokens[i].begin, ke = tokens[k].begin;
+                    while (kb < ke && (text[kb] == '"' || text[kb] == '\'' || text[kb] == '-' || text[kb] == '?' ||
+                                       text[kb] == '&'))
+                        ++kb;
+                    while (ke > kb && (text[ke - 1] == '"' || text[ke - 1] == '\'')) --ke;
+                    bool name = ke > kb;
+                    for (std::size_t q = kb; q < ke && name; ++q)
+                    {
+                        const unsigned char c = static_cast<unsigned char>(text[q]);
+                        name = secret_alnum(c) || c == '_' || c == '-' || c == '.';
+                    }
+                    if (!name) break;
+                    assigned = secret_key_candidate(text, kb, ke) ? secret_key_strength(text.substr(kb, ke - kb)) : 0;
+                    value = k + 1;
+                }
+                std::size_t vb = tokens[value].begin, ve = tokens[j - 1].end;
+                while (vb < ve && (text[vb] == '"' || text[vb] == '\'' || text[vb] == '(' || text[vb] == '[' ||
+                                   text[vb] == '<'))
+                    ++vb;
+                while (ve > vb && (text[ve - 1] == '"' || text[ve - 1] == '\'' || text[ve - 1] == ',' ||
+                                   text[ve - 1] == ';' || text[ve - 1] == '.' || text[ve - 1] == ')' ||
+                                   text[ve - 1] == ']' || text[ve - 1] == '>'))
+                    --ve;
+                const secret_statistics st = secret_stats(text, vb, ve);
+                std::string look;
+                if (st.lower > 0) look += 'l';
+                if (st.upper > 0) look += 'u';
+                if (st.digits > 0) look += 'd';
+                if (st.joiners > 0) look += 'j';
+                if (st.symbols > 0) look += 's';
+                if (st.other > 0) look += 'o';
+                look += st.length <= 3 ? "|1-3" : st.length <= 5 ? "|4-5" : st.length <= 7 ? "|6-7" :
+                        st.length <= 11 ? "|8-11" : st.length <= 19 ? "|12-19" : st.length <= 39 ? "|20-39" : "|40+";
+                look += st.entropy < 2 ? "|e0" : st.entropy < 2.75 ? "|e1" : st.entropy < 3.5 ? "|e2" :
+                        st.entropy < 4.25 ? "|e3" : "|e4";
+                std::string mark;
+                if (secret_like(st)) mark += 'k';
+                if (ve > vb && secret_placeholder(text.substr(vb, ve - vb))) mark += 'p';
+                if (ve > vb && (secret_prefixed_end(text, vb) != 0 || secret_jwt_end(text, vb) != 0 ||
+                                secret_hash_end(text, vb) != 0))
+                    mark += 'f';
+                const std::size_t count = j - value;
+                for (std::size_t k = i; k < j; ++k)
+                {
+                    chunk_look[k] = look;
+                    chunk_mark[k] = mark;
+                    std::string place = k < value ? "key" : count == 1 ? "only" : k == value ? "first" :
+                                        k + 1 == j ? "last" : "in";
+                    if (assigned >= 0) place += "|" + std::to_string(assigned);
+                    chunk_place[k] = place;
+                }
+                i = j;
+            }
+            std::vector<std::string> cue(n);
+            {
+                static const std::unordered_set<std::string> openers = []() {
+                    std::unordered_set<std::string> s;
+                    for (const auto& kv : secret_cues()) s.insert(kv.first.substr(0, kv.first.find_first_of(" '-")));
+                    return s;
+                }();
+                // The strength of the cue that ends at each token, 0 for none.
+                std::vector<int> ends(n, 0);
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    if (secret_key_candidate(text, tokens[i].begin, tokens[i].end))
+                        ends[i] = std::max(ends[i], secret_key_strength(raw[i]));
+                    if (!openers.count(key[i])) continue;
+                    for (std::size_t len = std::min<std::size_t>(7, n - i); len >= 1; --len)
+                    {
+                        const std::size_t last = i + len - 1;
+                        if (tokens[last].end - tokens[i].begin > 48) continue;
+                        bool same = true;
+                        for (std::size_t k = i + 1; k <= last && same; ++k) same = !line_start[k] && !after_tab[k];
+                        if (!same) continue;
+                        const auto it = secret_cues().find(
+                            fold_key(text.substr(tokens[i].begin, tokens[last].end - tokens[i].begin)));
+                        if (it == secret_cues().end()) continue;
+                        ends[last] = std::max(ends[last], it->second);
+                        break;
+                    }
+                }
+                int strength = 0;
+                std::size_t distance = 0;
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    if (line_start[i]) strength = 0;
+                    if (strength != 0)
+                    {
+                        ++distance;
+                        if (distance > 8) strength = 0;
+                    }
+                    if (strength != 0)
+                        cue[i] = std::to_string(strength) + (distance == 1 ? "|1" : distance == 2 ? "|2" :
+                                                             distance <= 4 ? "|3-4" : "|5-8");
+                    if (ends[i] != 0)
+                    {
+                        strength = ends[i];
+                        distance = 0;
+                    }
+                }
+            }
+
             sequence_type seq(n);
             for (std::size_t i = 0; i < n; ++i) seq[i].opens_segment = line_start[i] || after_tab[i];
+            // The tables each word belongs to, read once for the word and for its two neighbours.
+            std::vector<std::vector<const char*>> flags(n);
+            for (std::size_t i = 0; i < n; ++i) flags[i] = lexicon_flags(key[i]);
             auto word = [&](long k) -> const std::string& {
                 static const std::string bos = "<s>", eos = "</s>";
                 if (k < 0) return bos;
@@ -339,7 +480,7 @@ namespace dlib
                     add("p", w.substr(0, p));
                     add("x", w.substr(w.size() - p));
                 }
-                for (const char* flag : lexicon_flags(w)) add("lex", flag);
+                for (const char* flag : flags[i]) add("lex", flag);
                 for (long d : { -2L, -1L, 1L, 2L })
                 {
                     const std::string tag = "w" + std::to_string(d);
@@ -348,13 +489,17 @@ namespace dlib
                     add(stag.c_str(), sh(k + d));
                 }
                 if (i > 0)
-                    for (const char* flag : lexicon_flags(key[i - 1])) add("lex-1", flag);
+                    for (const char* flag : flags[i - 1]) add("lex-1", flag);
                 if (i + 1 < n)
-                    for (const char* flag : lexicon_flags(key[i + 1])) add("lex+1", flag);
+                    for (const char* flag : flags[i + 1]) add("lex+1", flag);
                 add("bg-1", word(k - 1) + "|" + w);
                 add("bg+1", w + "|" + word(k + 1));
                 add("sh3", sh(k - 1) + "|" + short_shape[i] + "|" + sh(k + 1));
                 if (line_start[i]) add("pos", "bol");
+                // The word that opens a sentence takes a capital whatever it names.
+                if (line_start[i] || (i > 0 && (raw[i - 1] == "." || raw[i - 1] == "!" || raw[i - 1] == "?" ||
+                                                raw[i - 1] == ":")))
+                    add("pos", "opens");
                 if (line_end[i]) add("pos", "eol");
                 if (after_tab[i]) add("pos", "tab");
                 if (i > 0 && raw[i - 1] == ":") add("pos", "colon");
@@ -363,14 +508,31 @@ namespace dlib
                 if (raw[i][0] == '@') add("has", "at_sign");
                 if (field[i] != pii_type::none) add("field", pii_type_keyword(field[i]));
                 if (field[i] != pii_type::none) add("field_s", std::string(pii_type_keyword(field[i])) + short_shape[i]);
+                add("ck", chunk_look[i]);
+                add("ck_p", chunk_place[i]);
+                if (!chunk_mark[i].empty()) add("ck_m", chunk_mark[i]);
+                if (!chunk_mark[i].empty()) add("ck_mp", chunk_mark[i] + "|" + chunk_place[i]);
+                if (!cue[i].empty())
+                {
+                    add("sc", cue[i]);
+                    add("sc_m", cue[i] + "|" + chunk_mark[i]);
+                    add("sc_ck", cue[i].substr(0, 1) + "|" + chunk_look[i]);
+                }
             }
             return seq;
         }
+
+        /* The generation of the features: it changes with what make_sequence() computes, so that the
+           weights trained for other features are refused when they are read. */
+        static const unsigned long generation = 2;
 
         friend void serialize(const pii_tagger_features& item, std::ostream& out)
         {
             serialize("pii_tagger_features", out);
             serialize(item.bits_, out);
+            const unsigned long features = generation;
+            serialize(features, out);
+
         }
 
         friend void deserialize(pii_tagger_features& item, std::istream& in)
@@ -383,6 +545,12 @@ namespace dlib
             deserialize(bits, in);
             if (bits < 10 || bits > 26)
                 throw serialization_error("Invalid hash size found while deserializing dlib::pii_tagger_features.");
+            unsigned long trained = 0;
+            deserialize(trained, in);
+            if (trained != generation)
+                throw serialization_error("This pii_sequence_tagger was trained with the features of generation " +
+                                          std::to_string(trained) + ", not " + std::to_string(generation) +
+                                          ": train it again.");
             item.bits_ = bits;
         }
 

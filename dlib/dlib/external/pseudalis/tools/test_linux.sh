@@ -9,7 +9,7 @@
 #
 # Default build folder: build-pseudalis-linux at the root of the repository.  The tests of the
 # engine, of the host and of the publication run first; the service then runs in a data folder of its own, on port
-# 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a CSV file,
+# 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a secret, a CSV file,
 # a name and the archive of a folder as the web application sends it, refuses a body sent in
 # chunks, then anonymizes and restores files and a folder through its drive, whose originals
 # come back through the interface, an archive extracted on the
@@ -82,6 +82,14 @@ if [ $ready -eq 1 ]; then
     python3 -c 'import json, sys; print(json.dumps({"text": json.load(sys.stdin)["text"]}))')
   step "text restored" "jean.dupont@exemple.fr" api -X POST -H "Content-Type: application/json" \
     --data "$PROTECTED" "$URL/v1/text/restore"
+  # A secret that its label tells takes its tag, and the value left to fill beside it stays.
+  HIDDEN=$(api -X POST -H "Content-Type: application/json" \
+    --data '{"text": "Mot de passe : Tournesol2024!\nMot de passe : <mot de passe>"}' "$URL/v1/text/anonymize")
+  if printf '%s' "$HIDDEN" | grep -q '\[\[SECRET:' && ! printf '%s' "$HIDDEN" | grep -q 'Tournesol' &&
+     printf '%s' "$HIDDEN" | grep -q '<mot de passe>'; then
+    record "secret anonymized" PASS "tag SECRET, the field to fill kept"
+  else record "secret anonymized" FAIL "$(printf '%s' "$HIDDEN" | head -c 200)"
+  fi
   # A body sent in chunks declares no length, which the limit of its route needs: it is refused.
   CHUNKED=$(api -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
     -H "Transfer-Encoding: chunked" --data "{\"text\": \"$TEXT\"}" "$URL/v1/text/anonymize")
@@ -388,7 +396,7 @@ sys.stdout.write(("Note %s de Jean Dupont, jean.dupont@exemple.fr\n" % sys.argv[
     "$URL/v1/restore?name=gros1.txt"
   api -X POST --data-binary @"$WORK/gros3.anon.txt" -o "$WORK/gros3.back.txt" "$URL/v1/restore?name=gros3.txt"
   SPACE=$(api "$URL/v1/info" | python3 -c 'import json, sys; h = json.load(sys.stdin)["history"]
-print(h["bytes"] <= h["limit"])')
+print(h["bytes"] <= h["limit"] and h["setting"] == 1048576)')
   admin_json PUT /v1/settings '{"history_mb": 10240, "max_file_mb": 150}' > /dev/null
   if cmp -s "$WORK/gros1.txt" "$WORK/gros1.back.txt" &&
      report_of "$WORK/gros1.back.headers" | grep -q '"reason":"space"' &&

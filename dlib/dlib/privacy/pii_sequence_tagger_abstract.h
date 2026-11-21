@@ -62,9 +62,25 @@ namespace dlib
                 and length; the folded forms and shapes of its two neighbours on each
                 side and the bigrams they form with it; its membership of the lexicons
                 of the detector (first names, titles, particles, street types, legal
-                forms, organisation heads, place triggers, common words); whether it
-                opens or closes a line, follows a tab or a colon; and, after a field
-                label such as "Nom :" or "Ville", the type that label announces.
+                forms, organisation heads, place triggers, common words, and the tables
+                of the words that name nobody in the documents of an organisation or of
+                what they name: roles, business and technical terms, function words,
+                greetings, civilities, nationalities, countries, regions, public bodies,
+                known organisations, products, regulations, sectors and trades), for
+                itself and for its two neighbours; whether it opens or closes a line or
+                a sentence, follows a tab or a colon; and, after a field label such as
+                "Nom :" or "Ville", the type that label announces.
+
+                A secret is written whole between two spaces, while its tokens are cut
+                wherever its case or its signs change. Each token therefore also takes
+                what tells the whole value it belongs to: the length of that value, the
+                kinds of its characters and the entropy of its bytes (secret_stats()),
+                whether it has the look of a secret, of a placeholder or of a format a
+                secret is issued in, the key that an equals sign or a colon joins to it
+                ("DB_PASSWORD=...", with secret_key_strength()), the place of the token in
+                the value, and the cue of a secret read before it on its line ("mot de
+                passe", "PIN", "client_secret"), with its distance.
+
 
                 Each feature is hashed from its name, a separator byte and its value into
                 32 bits, then mixed with the label into one of 2^hash_bits weights, which
@@ -169,8 +185,11 @@ namespace dlib
     void serialize(const pii_tagger_features& item, std::ostream& out);
     void deserialize(pii_tagger_features& item, std::istream& in);
     /*!
-        deserialize() throws serialization_error if the stream does not hold a
-        pii_tagger_features or if its hash size lies outside [10, 26].
+        The stream records the hash size and the generation of the features, a number
+        that changes with what make_sequence() computes. deserialize() throws
+        serialization_error if the stream does not hold a pii_tagger_features, if its
+        hash size lies outside [10, 26], or if it was written for another generation of
+        features: its weights would be read for features they were not trained for.
     !*/
 
 // ----------------------------------------------------------------------------------------

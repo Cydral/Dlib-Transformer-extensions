@@ -2,6 +2,7 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 
 #include <dlib/privacy.h>
+#include <dlib/privacy/pii_recognizers.h>
 #include <dlib/privacy/pii_sequence_tagger.h>
 #include <dlib/privacy/pii_span_model.h>
 #include <dlib/rand.h>
@@ -3643,6 +3644,74 @@ namespace
         DLIB_TEST_MSG(read_back.find("Raffaella Fiorini, fiole") != string::npos, read_back);
     }
 
+// ----------------------------------------------------------------------------------------
+
+    void test_versions_and_public_references()
+    {
+        /* The versions of programs that have the layout of a date with a year of two digits, and
+           the entries of public catalogues after a noun of references. */
+        const pii_detector detector;
+        auto dated = [&](const string& text) {
+            for (const pii_entity& e : detector.detect(text))
+                if (e.type == pii_type::date) return true;
+            return false;
+        };
+        for (const char* version : {
+                 "La banniere indique Roundcube 7.25.31 sur le port 443.",    // no date in the order of the document
+                 "pillow:6.3.18 (CVE-2021-44228)",                             // a package and its version
+                 "22/tcp  open  sftp  Bitvise 9.4.12",                         // the line of a port scan
+                 "Le serveur GitLab 9.4.12 est expose.",                       // a capital inside the name
+                 "La dependance urllib3 1.6.18 est a mettre a jour.",          // a digit in the name
+                 "Passer a Node.js 9.4.12 avant la fin du mois.",              // a dot in the name of a product
+                 "| Tomcat | 7.1.24 | 8.1.26 |",                               // a cell after a version
+                 "Django;4.2.17;5.1.21",                                       // cells that semicolons separate
+                 "Log4j;11.4.5127.80;4.9.25",                                  // after four numbers that are no address
+                 "services:\n  cache:\n    version: 4.7.20\n",                 // the value of a field of versions
+                 "{ \"name\": \"orbix\", \"version\": \"4.7.20\" }",
+                 "Version : 6.1.24 (stable)",
+                 "Produit;Version installee;Version corrigee\nAlphaServ;4.8.31;7.2.35",   // a column of versions
+                 "| Product | Installed version | Fixed version |\n|---|---|---|\n| AlphaServ | 4.8.31 | 7.2.35 |",
+                 "Host\tSoftware\tRelease\nsrv-01\tAlphaServ\t4.8.31",
+                 "Sistemi interessati: Orbix versioni precedenti alla 10.1.33.",   // a comparison and its article
+                 "Versiones anteriores a la 6.1.25 del servidor.",
+                 "Affected: Orbix versions before 5.8.29.",                    // a preposition after a word of versions
+                 "Betroffene Systeme: Orbix Versionen vor 5.8.29.",
+                 "Betroffen sind die Versionen ab 5.8.29." })
+            DLIB_TEST_MSG(!dated(version), version);
+        for (const char* date : {
+                 "Rendez-vous a Rennes le 6.3.10 a midi.", "date:12.03.20", "Courrier de McDonald 6.3.10 recu.",
+                 "Le serveur GitLab 09.04.12 est expose.", "srv-01;10.0.0.5;12.03.20", "Ne le 27.08.83 a Brest.",
+                 "Date de version : 12.03.24", "Die Versionen ab 01.02.24 gelten.",
+                 "Hote;Adresse;Date de version\nsrv-01;10.0.0.5;12.03.20",
+                 "Hote;Version;Mise en service\nsrv-01;AlphaServ;12.03.20",
+                 // The clauses of a sentence are no header.
+                 "La mise en production du portail de la region, version stable, reste prevue\n"
+                 "Reunion de suivi, 12.03.24, salle du conseil" })
+            DLIB_TEST_MSG(dated(date), date);
+        {
+            pii_detector_options options;
+            options.date_order = numeric_date_order::month_day_year;
+            const pii_detector american(options);
+            DLIB_TEST(american.detect("Roundcube 25.7.31 on port 443.").empty());
+            DLIB_TEST(!american.detect("Signed on 8.27.20 in Austin.").empty());
+        }
+
+        auto identified = [&](const string& text, const string& value) {
+            return found(detector.detect(text), text, pii_type::identifier, value);
+        };
+        DLIB_TEST(detector.detect("Reference : CVE-2014-0160 (score CVSS 9.1).").empty());
+        DLIB_TEST(detector.detect("Riferimento CWE-79, vedi GHSA-jfh8-c2jp-5v3q.").empty());
+        // The public series of security advisories.
+        DLIB_TEST(detector.detect("Avis CERTFR-2026-AVI-0412 et bulletin VMSA-2026-0007.").empty());
+        DLIB_TEST(detector.detect("Reference : TALOS-2026-2101, voir ZDI-2026-0318.").empty());
+        DLIB_TEST(identified("Reference : SIN-2024-0153", "SIN-2024-0153"));
+        DLIB_TEST(identified("Dossier AB48213377 ouvert hier.", "AB48213377"));
+        // A piece of the name of a machine is no noun of references.
+        DLIB_TEST(!covered(detector.detect("Sauvegarde de file-srv3.internal vers le NAS."),
+                           "Sauvegarde de file-srv3.internal vers le NAS.", "srv3"));
+        DLIB_TEST(identified("ticket-48213377 clos.", "48213377"));
+    }
+
     void test_imposed_terms()
     {
         pii_detector_options options;
@@ -4173,7 +4242,7 @@ namespace
         DLIB_TEST(back.size() == 4 && back[3].begin == 19 && back[3].end == 25 && back[3].label == "CITY");
         DLIB_TEST(!pii_bio_transition_allowed(0, pii_bio_class("CITY", true)));
         DLIB_TEST(pii_bio_transition_allowed(pii_bio_class("CITY", false), pii_bio_class("CITY", true)));
-        DLIB_TEST(pii_bio_class_count() == 15);
+        DLIB_TEST(pii_bio_class_count() == 17);
 
         const std::vector<pii_span> coarse = coarsen_pii_spans(ex.text, ex.spans);
         DLIB_TEST(coarse.size() == 2 && coarse[0].label == "PERSON" && coarse[1].label == "LOCATION");
@@ -4452,6 +4521,23 @@ namespace
         for (size_t i = 0; i < a.size() && i < b.size(); ++i)
             DLIB_TEST(a[i].begin == b[i].begin && a[i].end == b[i].end && a[i].label == b[i].label);
 
+        // A recognizer reads the model without knowing its size, and joins a detector alone.
+        {
+            std::istringstream sized(sout.str());
+            DLIB_TEST(pii_span_recognizer::serialized_size(sized) == "tiny");
+            const auto recognizer = std::make_shared<pii_span_recognizer>(sized);
+            DLIB_TEST(recognizer->size() == "tiny" && !recognizer->empty());
+            DLIB_TEST(recognizer->find(train[0].text).size() == a.size());
+            pii_detector alone;
+            attach_pii_recognizers(alone, nullptr, recognizer);
+            DLIB_TEST(alone.recognizer_count() == 1);
+            pii_detector none;
+            attach_pii_recognizers(none, nullptr, std::make_shared<pii_span_recognizer>());
+            DLIB_TEST(none.recognizer_count() == 0);
+            std::istringstream other("not a model");
+            DLIB_TEST(pii_span_recognizer::serialized_size(other).empty());
+        }
+
         // A complementary training starts from the current weights: a few steps at a low rate
         // keep what the model knows, which as few steps from new weights cannot reach.
         pii_span_model_training_options more = options;
@@ -4477,6 +4563,588 @@ namespace
         try { deserialize(other_size, sin2); }
         catch (serialization_error& err) { message = err.what(); }
         DLIB_TEST(message.find("embedding dimension 64") != string::npos);
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void test_recognizer_combination()
+    {
+        /* Two recognizers over the same text: a span of the leading one counts a tenth more than
+           its confidence, a span of the other one needs second_min_confidence, and where two
+           spans overlap the one that counts more is kept. */
+        auto span = [](size_t begin, size_t end, const char* label, double confidence) {
+            pii_span s;
+            s.begin = begin;
+            s.end = end;
+            s.label = label;
+            s.confidence = confidence;
+            return s;
+        };
+        auto read = [](const string& text, const std::vector<pii_span>& spans) {
+            string out;
+            for (const pii_span& s : spans) out += text.substr(s.begin, s.end - s.begin) + "=" + s.label + ";";
+            return out;
+        };
+        typedef std::vector<pii_span> spans;
+        const pii_leading_recognizer by_tagger = pii_leading_recognizer::tagger;
+        const pii_leading_recognizer by_model = pii_leading_recognizer::span_model;
+        const string text = "Lucie Rey, Rennes Services";
+
+        // An overlap goes to the leading recognizer at close confidences, to the other one well above.
+        const spans organisation = { span(11, 26, "ORGANIZATION", 0.93) };
+        DLIB_TEST(read(text, combine_pii_recognizers(text, organisation, { span(11, 17, "USERNAME", 0.88) },
+                                                     by_tagger)) == "Rennes=USERNAME;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, organisation, { span(11, 17, "USERNAME", 0.88) },
+                                                     by_model)) == "Rennes Services=ORGANIZATION;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, organisation, { span(11, 17, "CITY", 0.96) }, by_model)) ==
+                  "Rennes Services=ORGANIZATION;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, { span(11, 26, "ORGANIZATION", 0.97) },
+                                                     { span(11, 17, "CITY", 0.55) }, by_tagger)) ==
+                  "Rennes Services=ORGANIZATION;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, { span(11, 26, "ORGANIZATION", 0.6) },
+                                                     { span(11, 17, "CITY", 0.95) }, by_model)) == "Rennes=CITY;");
+
+        // Each recognizer has its smallest confidence: min_confidence when it leads, second_min_confidence else.
+        const spans none;
+        const spans a_name = { span(11, 17, "USERNAME", 0.89) };
+        DLIB_TEST(combine_pii_recognizers(text, none, { span(11, 17, "USERNAME", 0.49) }, by_tagger).empty());
+        DLIB_TEST(combine_pii_recognizers(text, a_name, none, by_tagger).empty());
+        DLIB_TEST(read(text, combine_pii_recognizers(text, a_name, none, by_model)) == "Rennes=USERNAME;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, none, a_name, by_tagger)) == "Rennes=USERNAME;");
+        DLIB_TEST(combine_pii_recognizers(text, none, a_name, by_model).empty());
+        DLIB_TEST(read(text, combine_pii_recognizers(text, a_name, none, by_tagger, 0.5, 0.8)) == "Rennes=USERNAME;");
+
+        /* A town that the leading tagger reads below second_min_confidence needs the span model to read
+           a town or a postal code there too, even weakly. */
+        const spans a_town = { span(11, 17, "CITY", 0.6) };
+        DLIB_TEST(combine_pii_recognizers(text, none, a_town, by_tagger).empty());
+        DLIB_TEST(combine_pii_recognizers(text, { span(11, 26, "ORGANIZATION", 0.3) }, a_town, by_tagger).empty());
+        DLIB_TEST(read(text, combine_pii_recognizers(text, { span(11, 17, "CITY", 0.25) }, a_town, by_tagger)) ==
+                  "Rennes=CITY;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, { span(9, 17, "POSTAL_CODE", 0.4) }, a_town, by_tagger)) ==
+                  "Rennes=CITY;");
+        DLIB_TEST(combine_pii_recognizers(text, { span(11, 17, "CITY", 0.1) }, a_town, by_tagger).empty());
+        DLIB_TEST(read(text, combine_pii_recognizers(text, none, { span(11, 17, "CITY", 0.92) }, by_tagger)) ==
+                  "Rennes=CITY;");
+
+        // A less confident name part of the second recognizer completes a name kept, and only a name.
+        const spans family = { span(6, 9, "FAMILY_NAME", 0.6) };
+        const spans given = { span(0, 5, "GIVEN_NAME", 0.95) };
+        DLIB_TEST(read(text, combine_pii_recognizers(text, family, given, by_tagger)) ==
+                  "Lucie=GIVEN_NAME;Rey=FAMILY_NAME;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, given, family, by_model)) ==
+                  "Lucie=GIVEN_NAME;Rey=FAMILY_NAME;");
+        DLIB_TEST(combine_pii_recognizers(text, family, none, by_tagger).empty());
+        DLIB_TEST(read(text, combine_pii_recognizers(text, family, { span(11, 17, "CITY", 0.95) }, by_tagger)) ==
+                  "Rennes=CITY;");
+        DLIB_TEST(read(text, combine_pii_recognizers(text, { span(6, 9, "CITY", 0.6) }, given, by_tagger)) ==
+                  "Lucie=GIVEN_NAME;");
+        // One part after the other, whatever their order.
+        const string three = "Marie Anne Rey";
+        DLIB_TEST(read(three, combine_pii_recognizers(three, { span(11, 14, "FAMILY_NAME", 0.55),
+                                                               span(6, 10, "GIVEN_NAME", 0.6) },
+                                                      { span(0, 5, "GIVEN_NAME", 0.95) }, by_tagger)) ==
+                  "Marie=GIVEN_NAME;Anne=GIVEN_NAME;Rey=FAMILY_NAME;");
+
+        // On a secret the span model leads beside a leading tagger too: it reads bytes, the tagger words.
+        const string line = "token: Xk9mP2vL7q";
+        const spans secret = { span(7, 17, "SECRET", 0.6) };
+        DLIB_TEST(read(line, combine_pii_recognizers(line, secret, none, by_tagger)) == "Xk9mP2vL7q=SECRET;");
+        DLIB_TEST(combine_pii_recognizers(line, none, secret, by_tagger).empty());
+        DLIB_TEST(read(line, combine_pii_recognizers(line, { span(7, 17, "SECRET", 0.95) },
+                                                     { span(7, 17, "USERNAME", 0.9) }, by_tagger)) ==
+                  "Xk9mP2vL7q=SECRET;");
+        // Its secrets come before every other span, whichever recognizer leads.
+        DLIB_TEST(read(line, combine_pii_recognizers(line, secret, { span(7, 17, "USERNAME", 0.99) }, by_tagger)) ==
+                  "Xk9mP2vL7q=SECRET;");
+        DLIB_TEST(read(line, combine_pii_recognizers(line, secret, { span(7, 17, "USERNAME", 0.99) }, by_model)) ==
+                  "Xk9mP2vL7q=SECRET;");
+        DLIB_TEST(read(line, combine_pii_recognizers(line, { span(7, 17, "USERNAME", 0.6) },
+                                                     { span(7, 17, "SECRET", 0.95) }, by_tagger)) ==
+                  "Xk9mP2vL7q=SECRET;");
+        DLIB_TEST(read(line, combine_pii_recognizers(line, { span(7, 17, "SECRET", 0.4) },
+                                                     { span(7, 17, "USERNAME", 0.6) }, by_tagger)) ==
+                  "Xk9mP2vL7q=USERNAME;");
+
+        // The spans come back sorted by their beginning, whichever was kept first.
+        DLIB_TEST(read(text, combine_pii_recognizers(text, none, { span(11, 17, "CITY", 0.95),
+                                                                   span(0, 5, "GIVEN_NAME", 0.6) }, by_tagger)) ==
+                  "Lucie=GIVEN_NAME;Rennes=CITY;");
+
+        // The weak name parts and organisations of the model, where nothing was kept, are hints.
+        spans kept = given;
+        privacy_impl::append_weak_names({ span(0, 5, "FAMILY_NAME", 0.4), span(6, 9, "FAMILY_NAME", 0.4),
+                                          span(11, 17, "CITY", 0.4), span(18, 26, "ORGANIZATION", 0.1) }, 0.5, kept);
+        DLIB_TEST(read(text, kept) == "Lucie=GIVEN_NAME;Rey=WEAK;");
+        DLIB_TEST(kept.back().type == pii_type::none);
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void test_secrets()
+    {
+        /* Passwords, codes, keys and tokens: what their form tells, what a key or a cue names, what
+           the document repeats, and what a recognizer reads. The tokens of real issuers are joined
+           from their pieces here, so that this file holds none. */
+        const string hub = string("gh") + "p_16C7e42F292c6912E7710c838347Ae178B4a";
+        const string cloud_id = string("AK") + "IAIOSFODNN7EXAMPLE";
+        const string cloud_key = string("wJalrXUtnFEMI/K7MDENG") + "/bPxRfiCYEXAMPLEKEY";
+        const string web_token = string("ey") + "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + "ey" +
+                                 "JzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        const string pay = string("sk_") + "live_4eC39HqLyjWDarjtT1zdp7dc";
+        const string key_open = string("-----BEGIN RSA PRIVATE ") + "KEY-----";
+        const string key_close = string("-----END RSA PRIVATE ") + "KEY-----";
+
+        // Statistics, placeholders and the names of keys.
+        {
+            const string v = "Tournesol2024!";
+            const secret_statistics st = secret_stats(v, 0, v.size());
+            DLIB_TEST(st.length == 14 && st.lower == 8 && st.upper == 1 && st.digits == 4 && st.symbols == 1);
+            DLIB_TEST(st.entropy > 3 && secret_like(st));
+            for (const char* word : { "bonjour", "voir-ci-dessous", "aujourd'hui", "abc" })
+                DLIB_TEST_MSG(!secret_like(secret_stats(word, 0, string(word).size())), word);
+            for (const char* value : { "", "********", "xxxxxxxx", "<password>", "[password]", "{{ db_password }}",
+                                       "${DB_PASSWORD}", "$DB_PASSWORD", "%PASSWORD%", "os.environ[",
+                                       "getpass.getpass()", "/run/secrets/db_password", "~/.ssh/id_rsa",
+                                       "C:\\keys\\service.pem", "null", "true", "required", "YOUR_API_KEY",
+                                       "my-secret-token", "password", "!vault",
+                                       "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" })
+                DLIB_TEST_MSG(secret_placeholder(value), value);
+            for (const char* value : { "Tournesol2024!", "hunter2", "soleil", "supersecret", "$ecret123!", "123456",
+                                       "correct horse battery staple" })
+                DLIB_TEST_MSG(!secret_placeholder(value), value);
+            const pair<const char*, int> keys[] = {
+                { "password", 2 }, { "PGPASSWORD", 2 }, { "db_pass", 2 }, { "pass", 1 }, { "apiKey", 2 },
+                { "X-Api-Key", 2 }, { "aws_secret_access_key", 2 }, { "aws_access_key_id", 0 }, { "public_key", 0 },
+                { "primary_key", 0 }, { "key", 0 }, { "secret", 1 }, { "client_secret", 2 }, { "secretName", 0 },
+                { "token", 1 }, { "access_token", 2 }, { "max_tokens", 0 }, { "pin", 3 }, { "access_code", 3 },
+                { "postal_code", 0 }, { "password_policy", 0 }, { "password_confirmation", 2 }, { "motDePasse", 2 },
+                { "OLDPWD", 0 }, { "MYSQL_PWD", 2 }, { "Authorization", 2 }, { "username", 0 }, { "kennwort", 2 } };
+            for (const auto& k : keys) DLIB_TEST_MSG(secret_key_strength(k.first) == k.second, k.first);
+        }
+
+        auto values = [](const string& text) {
+            std::vector<string> out;
+            for (const secret_match& m : find_secrets(text)) out.push_back(text.substr(m.begin, m.end - m.begin));
+            return out;
+        };
+        typedef std::vector<string> list;
+        // Formats.
+        DLIB_TEST(values("token " + hub + " ok") == list({ hub }));
+        DLIB_TEST(values("id " + cloud_id + " key " + cloud_key) == list({ cloud_id, cloud_key }));
+        DLIB_TEST(values("jwt " + web_token + ".") == list({ web_token }));
+        DLIB_TEST(values("root:$6$rounds=5000$saltsalt$Qm9vdCBwYXNzd29yZCBoYXNoIGV4YW1wbGUgZm9y:19000:0") ==
+                  list({ "$6$rounds=5000$saltsalt$Qm9vdCBwYXNzd29yZCBoYXNoIGV4YW1wbGUgZm9y" }));
+        DLIB_TEST(values("DATABASE_URL=postgres://app:S3cret%21@db.internal:5432/crm") == list({ "S3cret%21" }));
+        DLIB_TEST(values("see https://www.example.org:8080/a@b and postgres://app@db:5432/crm").empty());
+        DLIB_TEST(values(key_open + "\nMIIEowIBAAKCAQEAv1\nProc-Type: 4,ENCRYPTED\n"
+                         "qmB3x9LkT0aZ1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zA4bC5dE6fG7hI8\n" + key_close +
+                         "\nafter") ==
+                  list({ "MIIEowIBAAKCAQEAv1", "qmB3x9LkT0aZ1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zA4bC5dE6fG7hI8" }));
+        DLIB_TEST(values("-----BEGIN CERTIFICATE-----\n"
+                         "MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ\n"
+                         "-----END CERTIFICATE-----").empty());
+        /* The short line that ends a key is a part of it once its closing line is read; a key without
+           closing line ends at the first line of words; a key on one line gives its pieces; the two
+           marks of a key quoted in a sentence hold no key. */
+        const string key_line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        DLIB_TEST(values(key_open + "\n" + key_line + "\nXw==\n" + key_close + "\n") == list({ key_line, "Xw==" }));
+        DLIB_TEST(values(key_open + "\n" + key_line + "\nXw==\n\nCordialement,\nAnticonstitutionnellement\n") ==
+                  list({ key_line }));
+        DLIB_TEST(values(key_open + " " + key_line.substr(0, 32) + " " + key_line.substr(32) + " Xw== " + key_close +
+                         " puis " + hub) ==
+                  list({ key_line.substr(0, 32), key_line.substr(32), "Xw==", hub }));
+        DLIB_TEST(values("La clef se place entre " + key_open + " et " + key_close + " dans le fichier.").empty());
+        DLIB_TEST(values(key_open + "\nvotre\nclef\n" + key_close).empty());
+        DLIB_TEST(values(key_open + "\nLe contenu de la clef suit, puis " + hub + "\n") == list({ hub }));
+        // What is read again for a value is bounded: a long run without spaces is neither value nor token.
+        {
+            const string run(6000, 'a');
+            DLIB_TEST(values("password=" + run + " fin").empty());
+            DLIB_TEST(values("password=" + run + "&pin=4821&x=" + run + " puis password=Tr0ub4dor&3") ==
+                      list({ "4821", "Tr0ub4dor&3" }));
+            DLIB_TEST(values("SG." + run + "1 puis " + hub) == list({ hub }));
+            string address = "https://";
+            for (int k = 0; k < 300; ++k) address += "example.";
+            DLIB_TEST(values(address + "org:Zx9kk@host et postgres://app:S3cret@db:5432/crm") == list({ "S3cret" }));
+        }
+        DLIB_TEST(values("le sk-learn est un outil, comme la task-force et les pat-terns").empty());
+        // Assignments.
+        DLIB_TEST(values("DB_PASSWORD=Tr0ub4dor&3") == list({ "Tr0ub4dor&3" }));
+        DLIB_TEST(values("password = \"correct horse battery staple\"") == list({ "correct horse battery staple" }));
+        DLIB_TEST(values("{\"client_secret\": \"aB3$kLm9!xQ\", \"scope\": \"read\"}") == list({ "aB3$kLm9!xQ" }));
+        DLIB_TEST(values("Server=db;User Id=app;Password=Xy7#pQ2;Database=crm") == list({ "Xy7#pQ2" }));
+        DLIB_TEST(values("https://api.example.org/v1/items?page=2&api_key=9f8e7d6c5b4a39281706&sort=asc") ==
+                  list({ "9f8e7d6c5b4a39281706" }));
+        DLIB_TEST(values("mysql --user=root --password=S3cr3t! crm") == list({ "S3cr3t!" }));
+        DLIB_TEST(values("CREATE USER app IDENTIFIED BY 'Pl0uf-2024';") == list({ "Pl0uf-2024" }));
+        DLIB_TEST(values("<password>Kerlys#77</password>") == list({ "Kerlys#77" }));
+        DLIB_TEST(values("Authorization: Bearer abcDEF123456ghiJKL7890mnop") == list({ "abcDEF123456ghiJKL7890mnop" }));
+        DLIB_TEST(values("curl -u admin:S3cret-99 https://intranet.example.org/api") == list({ "S3cret-99" }));
+        DLIB_TEST(values("pin: 4821") == list({ "4821" }));
+        DLIB_TEST(values("token=" + pay) == list({ pay }));
+        for (const char* none : { "password: ********", "password=<password>", "password: ${DB_PASSWORD}",
+                                  "password = os.environ[\"DB_PASSWORD\"]", "password = getpass.getpass()",
+                                  "self.password = password", "api_key=YOUR_API_KEY", "\"password\": null",
+                                  "private_key: /etc/ssl/private/server.key", "passwd:         files systemd",
+                                  "password: see the vault", "max_tokens: 4096, token_type: Bearer", "key: value",
+                                  "pwd=/home/alice/project", "int ledPin = 13;", "token: 4096",
+                                  "secret: my-registry-secret", "The password policy: at least 12 characters." })
+            DLIB_TEST_MSG(values(none).empty(), none);
+
+        // The detector: labels, cues, tables, web addresses.
+        pii_detector detector;
+        auto read = [&](const string& text) { return detector.detect(text); };
+        DLIB_TEST(pii_type_from_keyword("secret") == pii_type::secret &&
+                  pii_type_from_label("SECRET") == pii_type::secret);
+        DLIB_TEST(string(pii_type_keyword(pii_type::secret)) == "SECRET");
+        // The name of an account beside its password, in a form and in the header of a table.
+        for (const char* form : { "Benutzername: mweber\nPasswort: Sommer2024",
+                                  "Nome utente: mrossi\nPassword: Estate2024",
+                                  "Nombre de usuario: mgarcia\nContrase\xC3\xB1" "a: Verano2024",
+                                  "Benutzername | Passwort\nmweber | Sommer2024\nkschmidt | Winter2023" })
+        {
+            const string written = form;
+            const std::vector<pii_entity> got = read(written);
+            std::size_t accounts = 0, secrets = 0;
+            for (const pii_entity& x : got)
+            {
+                accounts += x.type == pii_type::identifier;
+                secrets += x.type == pii_type::secret;
+            }
+            DLIB_TEST_MSG(accounts >= 1 && secrets == accounts, written);
+        }
+        // A remark between parentheses in place of the value is no secret.
+        for (const char* remark : { "Password: (comunicata a parte)", "Mot de passe : (voir le coffre)",
+                                    "Passwort: (folgt per SMS)" })
+            DLIB_TEST_MSG(read(remark).empty(), remark);
+        for (const char* label : { "Mot de passe", "Mot de passe :", "Nouveau mot de passe", "Mot de passe provisoire",
+                                   "Password for the VPN", "Root password", "Passwort", "Contraseña", "PIN", "Code PIN",
+                                   "Clé API", "Codice di sicurezza", "WLAN-Schlüssel" })
+            DLIB_TEST_MSG(detector.label_type(label) == pii_type::secret, label);
+        for (const char* label : { "Longueur du mot de passe", "Password policy", "Mot de passe oublié", "Token",
+                                   "Code", "Clé" })
+            DLIB_TEST_MSG(detector.label_type(label) != pii_type::secret, label);
+
+        string text = "Identifiant : jdupont\nMot de passe : Tournesol2024! (provisoire)\nCode PIN : 4821";
+        std::vector<pii_entity> e = read(text);
+        DLIB_TEST(found(e, text, pii_type::secret, "Tournesol2024!") && found(e, text, pii_type::secret, "4821"));
+        DLIB_TEST(found(e, text, pii_type::identifier, "jdupont"));
+        for (const char* none : { "Mot de passe : ********", "Mot de passe : <mot de passe>", "Mot de passe : oublié",
+                                  "Mot de passe : à définir par l'utilisateur", "Password: see below",
+                                  "Longueur du mot de passe : 12", "Le mot de passe est obligatoire.",
+                                  "The password is case-sensitive.", "Le mot de passe doit contenir 12 caractères.",
+                                  "Mot de passe oublié ?" })
+        {
+            bool any = false;
+            for (const pii_entity& x : read(none)) any = any || x.type == pii_type::secret;
+            DLIB_TEST_MSG(!any, none);
+        }
+        const pair<const char*, const char*> announced[] = {
+            { "Le mot de passe du wifi invité est Sol3il-Bleu.", "Sol3il-Bleu" },
+            { "Ihr Passwort lautet Sommer2024!", "Sommer2024!" },
+            { "La contraseña es Verano2024 y caduca mañana.", "Verano2024" },
+            { "The password for the staging server is hunter2.", "hunter2" },
+            { "La password è \xC2\xAB" "Estate2024" "\xC2\xBB.", "Estate2024" },
+            { "Votre code de vérification est 493817.", "493817" },
+            { "Code PIN 4821, à ne pas noter.", "4821" },
+            { "Mot de passe : soleil", "soleil" },
+            { "Mdp admin = Kerlys#77", "Kerlys#77" } };
+        for (const auto& a : announced)
+        {
+            text = a.first;
+            DLIB_TEST_MSG(found(read(text), text, pii_type::secret, a.second), a.first);
+        }
+        // A column headed by the label of a secret, in a table written as text and as a forced type.
+        text = "Titulaire;Identifiant;Mot de passe\nAnne Martin;amartin;Guitare31#\nLuc Morel;lmorel;********";
+        e = read(text);
+        DLIB_TEST(found(e, text, pii_type::secret, "Guitare31#") && !covered(e, text, "********"));
+        detection_context column;
+        column.forced = pii_type::secret;
+        DLIB_TEST(found(detector.detect("Guitare31#", column), "Guitare31#", pii_type::secret, "Guitare31#"));
+        DLIB_TEST(detector.detect("n/a", column).empty() && detector.detect("********", column).empty());
+        // The token of a query leaves alone, its address staying readable; credentials take the address.
+        text = "Voir https://api.example.org/v1/items?page=2&api_key=9f8e7d6c5b4a39281706&sort=asc pour le detail.";
+        e = read(text);
+        DLIB_TEST(found(e, text, pii_type::secret, "9f8e7d6c5b4a39281706"));
+        DLIB_TEST(!covered(e, text, "api.example.org") && !covered(e, text, "sort=asc"));
+        text = "Depot : https://jdoe:hunter2@intranet.example.org/wiki";
+        e = read(text);
+        DLIB_TEST(found(e, text, pii_type::url, "https://jdoe:hunter2@intranet.example.org/wiki"));
+        text = "DATABASE_URL=postgres://app:S3cret-99@db.internal:5432/crm";
+        DLIB_TEST(found(read(text), text, pii_type::secret, "S3cret-99"));
+        text = "Jeton : " + hub + "\nCle : " + cloud_id;
+        e = read(text);
+        DLIB_TEST(found(e, text, pii_type::secret, hub) && found(e, text, pii_type::secret, cloud_id));
+        // A type left out of the options is not reported.
+        {
+            pii_detector_options options;
+            options.types = { pii_type::person, pii_type::url };
+            const pii_detector names(options);
+            text = "Mot de passe : Tournesol2024!";
+            DLIB_TEST(names.detect(text).empty());
+        }
+
+        // A secret established once is found wherever the document writes it; a short code is not.
+        {
+            pii_detector doc;
+            doc.begin_document();
+            doc.learn("Compte de service\nMot de passe : Kerlys#77\nCode PIN : 4821");
+            text = "La sauvegarde utilise Kerlys#77 depuis mars ; 4821 fichiers ont ete copies.";
+            e = doc.detect(text);
+            DLIB_TEST(found(e, text, pii_type::secret, "Kerlys#77") && !covered(e, text, "4821"));
+            // The lines of a private key written as paragraphs of their own.
+            doc.begin_document();
+            const string line = "qmB3x9LkT0aZ1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zA4bC5dE6fG7hI8";
+            doc.learn(key_open);
+            doc.learn(line);
+            doc.learn(key_close);
+            doc.learn("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh");
+            DLIB_TEST(found(doc.detect(line), line, pii_type::secret, line));
+            DLIB_TEST(doc.detect("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh").empty());
+            doc.begin_document();
+            DLIB_TEST(doc.detect(line).empty());
+        }
+
+        // What a recognizer reads grows to the whole value, and a placeholder is left.
+        {
+            auto spans = std::make_shared<std::vector<pair<string, double>>>();
+            pii_detector learned;
+            learned.add_recognizer([spans](const string& t) {
+                std::vector<pii_span> out;
+                for (const auto& v : *spans)
+                {
+                    const size_t at = t.find(v.first);
+                    if (at == string::npos) continue;
+                    pii_span s;
+                    s.begin = at;
+                    s.end = at + v.first.size();
+                    s.label = "SECRET";
+                    s.confidence = v.second;
+                    out.push_back(s);
+                }
+                return out;
+            }, 0.5);
+            *spans = { { "Tournesol", 0.7 }, { "2024", 0.6 } };
+            text = "voici les acces : jdupont / Tournesol2024! et rien d'autre";
+            DLIB_TEST(found(learned.detect(text), text, pii_type::secret, "Tournesol2024!"));
+            *spans = { { "soleil", 0.6 } };
+            text = "utilise soleil pour te connecter";
+            DLIB_TEST(learned.detect(text).empty());
+            // The reads of a recognizer are kept for a document: a new one reads the text again.
+            *spans = { { "soleil", 0.95 } };
+            learned.begin_document();
+            DLIB_TEST(found(learned.detect(text), text, pii_type::secret, "soleil"));
+
+            *spans = { { "<password>", 0.99 } };
+            text = "saisir <password> puis valider";
+            DLIB_TEST(learned.detect(text).empty());
+
+            // The quotes or brackets that a reader took with the value stay out of it.
+            learned.begin_document();
+            *spans = { { "T=7Hq2mW0Zk)", 0.95 } };
+            text = "il a note son mot de passe (T=7Hq2mW0Zk) sur un papier";
+            DLIB_TEST(found(learned.detect(text), text, pii_type::secret, "T=7Hq2mW0Zk"));
+            learned.begin_document();
+            *spans = { { "\xC2\xABp&tKXLm418\xC2\xBB", 0.9 } };
+            text = "la clave inicial es \xC2\xABp&tKXLm418\xC2\xBB.";
+            DLIB_TEST(found(learned.detect(text), text, pii_type::secret, "p&tKXLm418"));
+            // What is plainly something else is no secret, whatever a recognizer reads.
+            auto secret_over = [](const std::vector<pii_entity>& entities, const string& t, const string& value) {
+                const size_t at = t.find(value);
+                for (const pii_entity& x : entities)
+                    if (x.type == pii_type::secret && x.begin < at + value.size() && at < x.end) return true;
+                return false;
+            };
+            const pair<const char*, const char*> plain[] = {
+                { "sshpass -p \"$PASS\" ssh root@SRV-ADM-03", "root@SRV-ADM-03" },
+                { "ssh -p 2222 mleroy27@fw-rec-05", "mleroy27@fw-rec-05" },
+                { "public_key = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJq7vKx2", "AAAAC3NzaC1lZDI1NTE5AAAAIJq7vKx2" },
+                { "\"checksum\": \"9d2f4a6c8e0b1d3f5a7c9e1b3d5f7a90\",", "9d2f4a6c8e0b1d3f5a7c9e1b3d5f7a90" },
+                { "Commit b4e19a7 par Michel", "b4e19a7" },
+                { "export host=LDAP-REC-04", "LDAP-REC-04" },
+                { "client_id: 7a1c3e5f9b2d4f6a8c0e1b3d", "7a1c3e5f9b2d4f6a8c0e1b3d" },
+                { "Wifi network: LIVEBOX-7Q2", "LIVEBOX-7Q2" },
+                { "voir [Image@a1b2c3d4e5f60718] ci-dessous", "Image@a1b2c3d4e5f60718" },
+                { "extrait [Image@5a6b7c8d9e0f1a2b]L'analyse suit", "Image@5a6b7c8d9e0f1a2b]L'analyse" },
+                { "zone [Image@d41f0", "Image@d41f0" },
+                { "selon [ LOCATION:Mnopqrstuvwx#7K2 ]", "Mnopqrstuvwx#7K2" },
+                { "leak of java.lang.Object@1b6d3586 in the pool", "java.lang.Object@1b6d3586" },
+                { "journal Agent12_Journal.log joint", "Agent12_Journal.log" },
+                { "l'unite d'oeuvre UO_SEC_B2 couvre le besoin", "UO_SEC_B2" },
+                { "appel de SessionManager::OpenChannel2 refuse", "SessionManager::OpenChannel2" },
+                { "session type=3 name=POSTE0042 ouverte", "name=POSTE0042" },
+                { "2026-03-09 06:41:27 fw-edge02 sshd[2211]: session opened", "fw-edge02" },
+                { "Mar  9 06:41:28 dns02 named: zone loaded", "dns02" },
+                { "Composants : Python3, Java17 et Debian12", "Debian12" },
+                { "le site tourne sous Web2py depuis mars", "Web2py" },
+                { "condensat SHA256 code en Base64", "Base64" },
+                { "suite TLS_AES_128_GCM_SHA256 acceptee", "TLS_AES_128_GCM_SHA256" },
+                { "suite ECDHE-RSA-AES128-GCM-SHA256 refusee", "ECDHE-RSA-AES128-GCM-SHA256" },
+                { "protocole TLSv1.2 et architecture x86_64", "TLSv1.2" },
+                { "technique T1059.001 observee", "T1059.001" } };
+            for (const auto& v : plain)
+            {
+                learned.begin_document();
+                *spans = { { v.second, 0.95 } };
+                text = v.first;
+                DLIB_TEST_MSG(!secret_over(learned.detect(text), text, v.second), v.first);
+            }
+            const pair<const char*, const char*> kept[] = {
+                { "api_token = Xk9mP2vL7qRt", "Xk9mP2vL7qRt" },
+                { "le compte de test : P@ssw0rd-Kerlys", "P@ssw0rd-Kerlys" },
+                { "valeur b4e19a7d02 a saisir", "b4e19a7d02" },
+                { "le compte de test : Summer@123456", "Summer@123456" },
+                { "le compte de test : Admin@2024", "Admin@2024" },
+                { "Releve de 07:58:12, la valeur Xk9mP2vL7qRt est a saisir", "Xk9mP2vL7qRt" },
+                // A word that names no program, a product among other signs and a product that an
+                // everyday word names stay secrets.
+                { "essayer avec Tournesol24 demain", "Tournesol24" },
+                { "puis avec Python3!x7 ensuite", "Python3!x7" },
+                { "ou encore avec Sentinel1987 ce soir", "Sentinel1987" } };
+            for (const auto& v : kept)
+            {
+                learned.begin_document();
+                *spans = { { v.second, 0.95 } };
+                text = v.first;
+                DLIB_TEST_MSG(found(learned.detect(text), text, pii_type::secret, v.second), v.first);
+            }
+        }
+
+        // What a key names is itself the setting of a plain key: the account of a log line is no secret.
+        text = "2026-03-09 06:42:10 fw-edge02 auth: user=a.durand src=198.51.100.7 result=ok";
+        for (const pii_entity& x : read(text)) DLIB_TEST_MSG(x.type != pii_type::secret, text);
+        // The characters, case aside, of a value that the rules type otherwise in the text are no secret.
+        {
+            pii_detector twin;
+            twin.add_recognizer([](const string& t) {
+                std::vector<pii_span> out;
+                const size_t at = t.find("kx-77");
+                if (at == string::npos) return out;
+                pii_span s;
+                s.begin = at;
+                s.end = at + 5;
+                s.label = "SECRET";
+                s.confidence = 0.9;
+                out.push_back(s);
+                return out;
+            }, 0.5);
+            text = "Le dossier porte la reference KX-77, pas kx-77.";
+            e = twin.detect(text);
+            DLIB_TEST(found(e, text, pii_type::identifier, "KX-77") && e.size() == 1);
+            text = "Le code a saisir est kx-77.";
+            DLIB_TEST(found(twin.detect(text), text, pii_type::secret, "kx-77"));
+        }
+        // Between the quotes of a key and of its value lies no secret; the value is read.
+        text = "$config['CACHE_PASSWORD'] = 'qT*4rmz_=WAKLpS';";
+        e = read(text);
+        DLIB_TEST(found(e, text, pii_type::secret, "qT*4rmz_=WAKLpS") && e.size() == 1);
+
+        // The name of a secret before its value is a label, whatever a recognizer reads there.
+        {
+            pii_detector named;
+            named.add_recognizer([](const string& t) {
+                std::vector<pii_span> out;
+                for (const char* word : { "Jeton", "Martin" })
+                {
+                    const size_t at = t.find(word);
+                    if (at == string::npos) continue;
+                    pii_span s;
+                    s.begin = at;
+                    s.end = at + string(word).size();
+                    s.label = "FAMILY_NAME";
+                    s.confidence = 0.97;
+                    out.push_back(s);
+                }
+                return out;
+            }, 0.5);
+            text = "Identifiant : jdupont / Jeton : Xk9mP2vL7q";
+            e = named.detect(text);
+            DLIB_TEST(!covered(e, text, "Jeton") && found(e, text, pii_type::secret, "Xk9mP2vL7q"));
+            text = "Le Jeton est arrive hier avec M. Martin : merci.";
+            DLIB_TEST(found(named.detect(text), text, pii_type::person, "Martin"));
+        }
+
+        // A program or a technique written with its number is no place, whatever a recognizer reads there.
+        {
+            pii_detector numbered;
+            numbered.add_recognizer([](const string& t) {
+                std::vector<pii_span> out;
+                for (const char* word : { "Nginx1", "T1566", "Quimper" })
+                {
+                    const size_t at = t.find(word);
+                    if (at == string::npos) continue;
+                    pii_span s;
+                    s.begin = at;
+                    s.end = at + string(word).size();
+                    s.label = "CITY";
+                    s.confidence = 0.97;
+                    out.push_back(s);
+                }
+                return out;
+            }, 0.5);
+            text = "Le serveur Nginx1 de Quimper est vise par la technique T1566.";
+            e = numbered.detect(text);
+            DLIB_TEST(found(e, text, pii_type::location, "Quimper") && e.size() == 1);
+        }
+
+        // The code of a secret tells neither its length nor its characters, and gives it back.
+        {
+            const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x42')));
+            const string a = p.tag(pii_type::secret, "1234"), b = p.tag(pii_type::secret, "Tournesol2024!");
+            DLIB_TEST(a.size() == b.size() && a != b && a.compare(0, 9, "[[SECRET:") == 0);
+            DLIB_TEST(a == p.tag(pii_type::secret, "1234"));
+            DLIB_TEST(p.tag(pii_type::secret, string(40, 'k')).size() > a.size());
+            for (const string& value : { string("1234"), string("Tournesol2024!"), string("p@ss word \xC3\xA9"),
+                                         hub, string(600, 'z') })
+            {
+                pii_type type = pii_type::none;
+                string original;
+                DLIB_TEST(p.decode(p.tag(pii_type::secret, value), type, original));
+                DLIB_TEST(type == pii_type::secret && original == value);
+            }
+            // A long secret is coded by blocks of 240 bytes, two equal blocks giving two codes.
+            for (const std::size_t length : { 238, 239, 240, 241, 479, 480, 481, 1000, 5000, 20000 })
+            {
+                string value;
+                for (std::size_t k = 0; k < length; ++k) value.push_back(static_cast<char>('!' + (k * 7 + k / 5) % 90));
+                pii_type type = pii_type::none;
+                string original;
+                DLIB_TEST_MSG(p.decode(p.tag(pii_type::secret, value), type, original), length);
+                DLIB_TEST_MSG(type == pii_type::secret && original == value, length);
+            }
+            const string once = p.tag(pii_type::secret, string(239, 'a'));
+            const string twice = p.tag(pii_type::secret, string(480, 'a'));
+            const std::size_t code = once.size() - string("[[SECRET:!#ABC]]").size();
+            DLIB_TEST(twice.size() > 9 + 2 * code && twice.substr(9, code) != twice.substr(9 + code, code));
+            DLIB_TEST(once.size() < p.tag(pii_type::secret, string(240, 'a')).size());
+            text = "Mot de passe : Tournesol2024!";
+            const string hidden = p.apply(text, detector.detect(text));
+            DLIB_TEST(hidden.find("Tournesol") == string::npos && hidden.find("[[SECRET:") != string::npos);
+            DLIB_TEST(p.restore(hidden) == text);
+            std::vector<pseudonymizer::substitution> made;
+            const string plain = p.apply_substitutes(text, detector.detect(text), &made);
+            DLIB_TEST(made.size() == 1 && plain.find("Tournesol") == string::npos && plain.find("[[") == string::npos);
+        }
+
+        // A layer grows new outputs without changing those it has.
+        {
+            typedef add_layer<linear_<3, LINEAR_HAS_BIAS>, input<matrix<float>>> small_net;
+            small_net net;
+            matrix<float> sample = matrix_cast<float>(randm(1, 6));
+            resizable_tensor x;
+            net.to_tensor(&sample, &sample + 1, x);
+            const tensor& before_out = net.forward(x);
+            const std::vector<float> before(before_out.host(), before_out.host() + before_out.size());
+            DLIB_TEST(before.size() == 3);
+            layer<0>(net).layer_details().widen_outputs(5, -8.0f);
+            DLIB_TEST(layer<0>(net).layer_details().get_num_outputs() == 5);
+            const tensor& after_out = net.forward(x);
+            DLIB_TEST(after_out.size() == 5);
+            const float* after = after_out.host();
+            for (size_t k = 0; k < 3; ++k) DLIB_TEST(std::abs(after[k] - before[k]) < 1e-6);
+            DLIB_TEST(std::abs(after[3] + 8.0f) < 1e-6 && std::abs(after[4] + 8.0f) < 1e-6);
+        }
     }
 
 // ----------------------------------------------------------------------------------------
@@ -4548,12 +5216,17 @@ namespace
             test_business_documents();
             print_spinner();
             test_technical_documents();
+            test_versions_and_public_references();
             print_spinner();
             test_imposed_terms();
             test_imposed_columns();
             test_ip_columns();
             test_ascii_windows_1252();
             test_health_and_exports();
+            print_spinner();
+            test_secrets();
+            print_spinner();
+            test_recognizer_combination();
             print_spinner();
             test_dataset();
             print_spinner();

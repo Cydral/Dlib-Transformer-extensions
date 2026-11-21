@@ -2747,6 +2747,38 @@ namespace dlib
         unsigned long get_num_inputs() const { return num_inputs; }
         linear_bias_mode get_bias_mode() const { return bias_mode; }
 
+        /* Grows an allocated layer to num outputs. The outputs it has keep their weights and their
+           biases; the new ones take weights of zero and, when the layer has biases, the bias
+           given. A classifier that learns new classes after its training gives the answers it gave
+           when that bias lies far below zero, until training moves the new outputs. */
+        void widen_outputs(long num, float new_bias = 0)
+        {
+            DLIB_CASSERT(params.size() > 0, "widen_outputs() requires an allocated layer");
+            DLIB_CASSERT(!adapter.active(), "merge the adapters of the layer before widening it");
+            DLIB_CASSERT(num >= static_cast<long>(num_outputs),
+                "widen_outputs() cannot remove outputs: the layer has " << num_outputs << ", num == " << num);
+            if (num == static_cast<long>(num_outputs)) return;
+
+            resizable_tensor previous;
+            previous.copy_size(params);
+            memcpy(previous, params);
+            // One row for each input, then the row of the biases: an output is a column.
+            const long rows = static_cast<long>(num_inputs) + (bias_mode == LINEAR_HAS_BIAS ? 1 : 0);
+            const long old_outputs = static_cast<long>(num_outputs);
+            params.set_size(rows, num);
+            const float* src = previous.host();
+            float* dst = params.host_write_only();
+            for (long r = 0; r < rows; ++r)
+                for (long c = 0; c < num; ++c)
+                    dst[r * num + c] = c < old_outputs ? src[r * old_outputs + c] :
+                                       (r == static_cast<long>(num_inputs) ? new_bias : 0.0f);
+            num_outputs = static_cast<unsigned long>(num);
+            weights = alias_tensor(num_inputs, num_outputs);
+            if (bias_mode == LINEAR_HAS_BIAS)
+                biases = alias_tensor(1, num_outputs);
+            adapter_offset = base_param_count();
+        }
+
         template <typename SUBNET>
         void setup(const SUBNET& sub)
         {

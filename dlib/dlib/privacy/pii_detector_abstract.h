@@ -140,8 +140,8 @@ namespace dlib
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                Finds personal data in UTF-8 text in French, English, Italian, Spanish and
-                German.
+                Finds personal data, and the secrets that open an access, in UTF-8 text in
+                French, English, Italian, Spanish and German.
 
                 Five channels contribute candidates. Each candidate takes the priority of
                 its type, the types of the validated scanners above names, places and
@@ -326,8 +326,16 @@ namespace dlib
                    of its own keeps an address. Pieces of codes joined by underscores
                    ("REQ_SEC_B2") or of words whose whole is generic ("Shell" in
                    "PowerShell"), page numbers of a table of contents and the identifiers
-                   of the public catalogues of vulnerabilities ("CVE-2014-0160") name
-                   nothing either.
+                   of the public catalogues of vulnerabilities and of the public series of
+                   security advisories ("CVE-2014-0160", "CERTFR-2024-AVI-0123"), after a
+                   noun of references too ("Reference: CVE-2014-0160"), name nothing
+                   either. A noun of references that is a piece of the name of a machine or
+                   of a file announces no reference ("FILE-SRV-12"). A program, an
+                   algorithm, a protocol or a technique written with its number is no
+                   person, organisation or place, whatever a recognizer reads there: a
+                   product of the lexicon before the digits of its version ("Debian12"),
+                   an algorithm or a suite of algorithms ("SHA256",
+                   "TLS_AES_128_GCM_SHA256"), a technique of a public matrix ("T1566").
 
                    Technical documents name programs, versions, ports and hosts. The
                    dotted numbers of a date with a year of two digits are the version of a
@@ -335,9 +343,19 @@ namespace dlib
                    its preposition, a sign ("<", "@"), another version of a list or the
                    table cell of a product ("Tomcat 6.1.24", "versions publiées 6.1.25",
                    "antérieure à 6.1.25", "6.1.24, 6.2.19 et 6.3.11",
-                   "| Tomcat | 7.1.24 |"), and wherever the document writes them alone once
-                   one of them was read so; a preposition of dates keeps a date ("Fassung
-                   vom 01.02.24"). The maker before its product ("Google" in "autour de
+                   "| Tomcat | 7.1.24 | 7.1.26 |", "Django;4.2.17"), glued to the name of a
+                   package ("requests:2.31.19"), on the line of a port scan ("22/tcp open
+                   ssh OpenSSH 8.9.13"), after a name written as programs are, a capital
+                   inside or a digit, when their day or month has one digit ("GitLab
+                   6.3.10", "urllib3 1.26.18"), whenever they are a date in the other
+                   order of day and month only ("7.25.31"), as the value of a field that
+                   a word of versions or a product names ("version: 4.7.20"), after a
+                   comparison and its articles or after a word of versions and a
+                   preposition ("precedenti alla 10.1.33", "versions before 5.8.29"), in
+                   a column that a word of versions heads ("Product;Fixed version" over
+                   its rows), and wherever the document
+                   writes them alone once one of them was read so; a preposition of dates
+                   keeps a date ("Fassung vom 01.02.24"). The maker before its product ("Google" in "autour de
                    Google Chrome"), a port after its protocol or its server ("LDAPS 636"), a
                    code of one or two capitals and digits ("W8"), a word repeated with
                    numbers read as
@@ -408,6 +426,66 @@ namespace dlib
                    given name of "cn: Ilario Venturi" where "Venturi" is a town elsewhere
                    in the document, the name of "Maelle Kerbrat Novexa" where "Novexa" is
                    an organisation; a common word left alone names nobody.
+
+                Secrets. The values that open an access (pii_type::secret: passwords,
+                passphrases, PIN and security codes, keys of programming interfaces,
+                access tokens, private keys) are no personal data, and are found by the
+                same channels, each for what it reads best:
+                  - their form (find_secret_formats()): the lines of a private key between
+                    its opening and closing lines, the tokens that a prefix of their
+                    issuer opens, JSON Web Tokens, the hashes of passwords, the password of
+                    an address written with its credentials
+                    ("postgres://app:S3cret@db:5432/crm") and the token "Bearer" presents;
+                  - the key that names them (find_secret_assignments()), in the settings of
+                    a program, the variables of an environment, a JSON or YAML document,
+                    the query of an address, the headers of a request, the options of a
+                    command and the elements of an XML document ("DB_PASSWORD=...",
+                    "\"client_secret\": \"...\"", "--password ...", "<password>...");
+                  - the label of their field or of their column, in French, English,
+                    Italian, Spanish and German ("Mot de passe :", "Nouveau mot de passe",
+                    "Password for the VPN", "Kennwort", "Code PIN", "Codice di sicurezza"),
+                    and the cue that announces them in a sentence, before a verb, a
+                    separator or quotes ("le mot de passe du wifi est Tournesol2024!",
+                    "Ihr Passwort lautet Sommer2024!", "Code PIN 4821"); the words that tell
+                    a property of the secret announce nothing ("Longueur du mot de passe",
+                    "Password policy");
+                  - the document: a secret established by its form, its key or its label,
+                    and that has the look of one (secret_like()), is found again wherever
+                    the document writes it, and the lines of a private key written as
+                    paragraphs of their own are found one by one between the lines that
+                    open and close the key;
+                  - the recognizers, under the label SECRET, for the secrets that a text
+                    writes without any of the above ("voici les accès : jdupont /
+                    Tournesol2024!"): what they read grows to the limits a secret is
+                    written between (secret_chunk()), leaves the quotes or brackets taken
+                    with it, and is kept when it has the look of a secret or was read with
+                    a confidence of 0.85 at least, unless it is plainly something else:
+                    the login at a machine of a command ("ssh root@srv-01"), the body of a
+                    public key, the short name of a commit, the host of a log line, the
+                    reference of an object as programs print it ("Image@a1b2c3d4e5f60718",
+                    "Object@1b6d3586"), the name of a file, a symbol of code, a code of
+                    capitals and digits joined by underscores ("REQ_SEC_B2"), the value of
+                    a key that names no secret ("host=", "checksum:", "client_id="), a
+                    program, an algorithm or a technique written with its number
+                    ("Debian12", "TLS_AES_128_GCM_SHA256", "T1566"; not a product that an
+                    everyday word names, which passwords are built on as well), or,
+                    case aside, a value that the rules type otherwise
+                    in the text ("kx-77" beside the reference "KX-77"). The name of a secret
+                    before its value is a label, whatever a recognizer reads there
+                    ("Jeton :");
+                  - the user: add_pattern(), add_term() and the imposed terms take the type
+                    secret as any other.
+                A placeholder is never a secret (secret_placeholder()): a masked value, a
+                field left to fill, a variable, a call, the path of a file, a word that
+                tells the state of the secret ("********", "<password>", "${DB_PASSWORD}",
+                "getpass.getpass()", "/run/secrets/db_password", "oublié", "required"). A
+                word alone is a secret after its label when nothing else follows it on
+                its line ("Mot de passe : soleil"); in a sentence, the value needs the
+                look of a secret, or quotes. The token of the query of a web address is
+                reported alone, the rest of the address staying readable and protected
+                as it would be without it ("https://api.example.org/items?api_key=..."),
+                while an address that is personal data, the credentials of a web address
+                included, is reported whole with what it holds.
 
                 The detector is a recall-oriented filter. Its output is meant to be
                 pseudonymized, and a residual-risk audit of the protected document is
@@ -611,7 +689,9 @@ namespace dlib
                 - Records value, without the spaces at its ends, as a value of type found with
                   strong evidence, as learn() records the values it finds, without reading it:
                   a person name, a place or an organisation that detect() then finds bare in
-                  the document, or the domain and the fragments of an e-mail address. A value
+                  the document, the domain and the fragments of an e-mail address, or a
+                  secret that has the look of one, found again as it is written. A value
+
                   of another type, of a type left out of the options, or holding a tag teaches
                   nothing. It serves the values whose type is known beforehand, the cells of an
                   imposed column (document_anonymizer::set_imposed_columns()).

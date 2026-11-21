@@ -160,8 +160,13 @@
       const a = info.albireo || {};
       box.appendChild(pill(t('s_albireo'), a.found ? a.model : t('s_albireo_off'), !!a.found));
       box.appendChild(pill(t('s_records'), String(info.records || 0)));
+      /* The space of the originals, as a drive shows its own: what is left of the space they may take,
+         which the setting gives and the disk of the data folder bounds. */
       const h = info.history || {};
-      if (h.limit) box.appendChild(pill(t('s_history'), size(h.bytes || 0) + ' / ' + size(h.limit)));
+      if (h.limit) {
+        const free = Math.max(0, h.limit - (h.bytes || 0));
+        box.appendChild(pill(t('s_history'), t('s_history_free', { free: size(free), total: size(h.limit) })));
+      }
     } catch (e) {
       box.textContent = '';
       box.appendChild(pill('', t('s_offline'), false));
@@ -476,7 +481,7 @@
   const textLegend = document.getElementById('text-legend');
   // The tags of the pseudonymizer: [[KEYWORD:body#CCC]].
   const tagPattern = new RegExp('\\[\\[(PERSON|ORG|LOCATION|ADDRESS|EMAIL|PHONE|IBAN|CARD|NIR|SIRET|ID|IPV4|IPV6|' +
-    'MAC|URL|DATE|PLATE|GEO|TITLE|GENDER|NATIONALITY):[^\\[\\]]{1,4096}?#[0-9A-Z]{3}\\]\\]', 'g');
+    'MAC|URL|DATE|PLATE|GEO|TITLE|GENDER|NATIONALITY|SECRET):[^\\[\\]]{1,16384}?#[0-9A-Z]{3}\\]\\]', 'g');
   // The values just restored, in UTF-16 units of the text, until the text changes.
   let restoredMarks = null;
   /* The substitutes of the texts protected without tags in this page, which alone gives their values back:
@@ -493,6 +498,7 @@
         type === 'MAC') return 'contact';
     if (type === 'ID' || type === 'IBAN' || type === 'CARD' || type === 'NIR' || type === 'SIRET') return 'id';
     if (type === 'DATE') return 'date';
+    if (type === 'SECRET') return 'secret';
     return 'person';
   }
 
@@ -624,13 +630,15 @@
   let recordsTotal = 0;
   let fingerprint = '';
 
+  // A size in the unit that reads best: gigabytes from one of them, megabytes below, kilobytes below one of those.
   function size(bytes) {
-    const mb = bytes >= 1048576;
+    const unit = bytes >= 1073741824 ? ['gigabyte', 1073741824, ' GB'] :
+      bytes >= 1048576 ? ['megabyte', 1048576, ' MB'] : ['kilobyte', 1024, ' KB'];
+    const value = bytes <= 0 ? 0 : unit[1] === 1024 ? Math.max(0.1, bytes / 1024) : bytes / unit[1];
     try {
-      return new Intl.NumberFormat(language, { style: 'unit', unit: mb ? 'megabyte' : 'kilobyte',
-        maximumFractionDigits: 1 }).format(mb ? bytes / 1048576 : Math.max(0.1, bytes / 1024));
+      return new Intl.NumberFormat(language, { style: 'unit', unit: unit[0], maximumFractionDigits: 1 }).format(value);
     } catch (e) {
-      return mb ? (bytes / 1048576).toFixed(1) + ' MB' : (bytes / 1024).toFixed(1) + ' KB';
+      return value.toFixed(1) + unit[2];
     }
   }
 
@@ -856,7 +864,7 @@
   // The imposed terms: replaced with the tag of their type before anything else of a text.
 
   let terms = [];
-  let termTypes = ['ORG', 'PERSON', 'LOCATION', 'ADDRESS', 'ID', 'EMAIL', 'PHONE', 'URL'];
+  let termTypes = ['ORG', 'PERSON', 'LOCATION', 'ADDRESS', 'ID', 'EMAIL', 'PHONE', 'URL', 'SECRET'];
   let termsMax = 100, termLength = 200;
 
   function renderTerms() {
@@ -977,7 +985,7 @@
 
   let columns = [];
   let columnTypes = ['PERSON', 'ORG', 'LOCATION', 'ADDRESS', 'EMAIL', 'PHONE', 'ID', 'DATE', 'IBAN', 'CARD', 'NIR',
-    'SIRET', 'URL', 'IP', 'MAC', 'PLATE', 'GEO', 'TITLE', 'GENDER', 'NATIONALITY'];
+    'SIRET', 'URL', 'IP', 'MAC', 'PLATE', 'GEO', 'TITLE', 'GENDER', 'NATIONALITY', 'SECRET'];
   let columnsMax = 100, columnLength = 200;
 
   function renderColumns() {
