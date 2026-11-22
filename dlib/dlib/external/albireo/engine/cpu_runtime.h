@@ -320,6 +320,23 @@ namespace albireo
         // The size of the probes of the layer pass.
         long probe_size() const;
         void drop_layer_pass(const std::string& why);
+        /*
+            The seconds of a pass of n tokens of a sequence of its own, with the layers on the
+            device (on_device) or as the processor computes them without it: the shortest of
+            timed passes that follow warm passes of the same sequence, each of n tokens.
+            Negative when the keys and values or the device found no room for the pass.
+        */
+        double time_pass(long n, int warm, int timed, bool on_device);
+        /*
+            Times the passes of the device against the processor, for the passes of a few tokens
+            (single tokens that follow one another, as a generation) and for the longer ones (a
+            pass of many tokens, when many > 1), and sets device_few_ and device_many_; a measure
+            that found no room leaves the device its passes.  detail describes the measures.
+            Returns false when the processor computes both kinds faster.
+        */
+        bool time_passes(long many, std::string& detail);
+        // Whether the device serves the passes of the size of batch (device_few_, device_many_).
+        bool device_serves(const forward_batch& batch) const;
         // Y = X W^T through the offload when there is one, with the kernels of qkernels.h
         // otherwise.
         void product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
@@ -357,6 +374,13 @@ namespace albireo
         */
         int attention_wait_ = 0;
         int attention_interval_ = 0;
+        /*
+            Whether the device serves the passes of at most attention_tokens tokens, those of a
+            generation, and the longer ones, those of the prompts: each kind stays on the device
+            only when the device computes it faster than the processor (time_passes()).
+        */
+        bool device_few_ = true;
+        bool device_many_ = true;
         // The products of the probe passes of the processor do not go to the offload.
         bool host_only_ = false;
         // Whether the device may attend the passes (false in a probe of the layers alone), and attended the last one.

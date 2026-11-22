@@ -4161,11 +4161,15 @@ namespace dlib
             const long R = static_cast<long>(bias.size()) / (2 * N * H);
             DLIB_CASSERT(R > 0);
             const long P = static_cast<long>(mo.size()) / (H * R);
-            const long S = static_cast<long>(dyn.size()) - 2 * R * N;
-            DLIB_CASSERT(P > 0 && S >= 0 && S <= N / 2);
+            DLIB_CASSERT(P > 0);
+            const long T = static_cast<long>(in.size()) / (H * (2 * P + 3));
+            DLIB_CASSERT(T > 0 && static_cast<long>(dyn.size()) % T == 0);
+            const long S = static_cast<long>(dyn.size()) / T - 2 * R * N;
+            DLIB_CASSERT(S >= 0 && S <= N / 2);
             DLIB_CASSERT(static_cast<long>(bias.size()) == 2 * H * R * N && static_cast<long>(mo.size()) == H * R * P);
             DLIB_CASSERT(static_cast<long>(mxz.size()) == 2 * H * R * P);
-            DLIB_CASSERT(static_cast<long>(in.size()) == H * (2 * P + 3) && static_cast<long>(out.size()) == H * P);
+            DLIB_CASSERT(static_cast<long>(in.size()) == T * H * (2 * P + 3));
+            DLIB_CASSERT(static_cast<long>(out.size()) == T * H * P);
             DLIB_CASSERT(static_cast<long>(state.size()) == H * S + H * P * N + H * R * N + H * P);
 
             const double pi = 3.14159265358979323846;
@@ -4180,110 +4184,122 @@ namespace dlib
             float* op = out.host_write_only();
             auto softplus = [](double x) { return x > 20.0 ? x : std::log1p(std::exp(x)); };
 
-            // The inputs and the outputs of the states, normalized, and the turn of each angle for a step of one.
-            std::vector<float> normed(static_cast<size_t>(2 * R * N));
-            for (long j = 0; j < 2 * R; ++j)
+            /* The inputs and the outputs of the states of each token, normalized, and the turn
+               of each of its angles for a step of one: the heads share them. */
+            const long row_values = 2 * R * N;
+            std::vector<float> normed(static_cast<size_t>(T * row_values));
+            std::vector<double> turn(static_cast<size_t>(T * S));
+            for (long t = 0; t < T; ++t)
             {
-                const float* row = dy + j * N;
-                const float* g = gam + (j < R ? 0 : N);
-                float ss = 0;
-                for (long n = 0; n < N; ++n) ss += row[n] * row[n];
-                const float scale = 1.0f / std::sqrt(ss / N + eps);
-                for (long n = 0; n < N; ++n) normed[static_cast<size_t>(j * N + n)] = row[n] * scale * g[n];
+                const float* token = dy + t * (row_values + S);
+                for (long j = 0; j < 2 * R; ++j)
+                {
+                    const float* row = token + j * N;
+                    const float* g = gam + (j < R ? 0 : N);
+                    float ss = 0;
+                    for (long n = 0; n < N; ++n) ss += row[n] * row[n];
+                    const float scale = 1.0f / std::sqrt(ss / N + eps);
+                    float* to = normed.data() + t * row_values + j * N;
+                    for (long n = 0; n < N; ++n) to[n] = row[n] * scale * g[n];
+                }
+                for (long i = 0; i < S; ++i)
+                    turn[static_cast<size_t>(t * S + i)] = std::tanh(static_cast<double>(token[row_values + i])) * pi;
             }
-            std::vector<double> turn(static_cast<size_t>(S));
-            for (long i = 0; i < S; ++i)
-                turn[static_cast<size_t>(i)] = std::tanh(static_cast<double>(dy[2 * R * N + i])) * pi;
 
-            // The heads are independent of one another.
+            // The heads are independent of one another; each takes the tokens in their order.
             parallel_for(0, H, [&](long h)
             {
-                const float* head = inp + h * (2 * P + 3);
-                const float* z = head;
-                const float* x = head + P;
-                const double step = softplus(static_cast<double>(head[2 * P]) + ms[h]);
-                const double decay = std::min(-softplus(static_cast<double>(head[2 * P + 1])), -1e-4);
-                const double trapezoid = 1.0 / (1.0 + std::exp(-static_cast<double>(head[2 * P + 2])));
-                const double kept = std::exp(decay * step);
-                const float alpha = static_cast<float>(kept);
-                const float beta = static_cast<float>((1.0 - trapezoid) * step * kept);
-                const float gamma = static_cast<float>(trapezoid * step);
-
                 float* angle = st + h * S;
                 float* channels = st + H * S + h * P * N;
                 float* k_before = st + H * S + H * P * N + h * R * N;
                 float* x_before = st + H * S + H * P * N + H * R * N + h * P;
-                std::vector<float> k(static_cast<size_t>(R * N)), q(static_cast<size_t>(R * N));
-                std::vector<float> cs(static_cast<size_t>(S)), sn(static_cast<size_t>(S));
-                // The angles of the head, kept within one turn; the rotations read them as the state holds them.
-                for (long i = 0; i < S; ++i)
-                {
-                    double sum = angle[i] + turn[static_cast<size_t>(i)] * step;
-                    sum -= 2 * pi * std::floor((sum + pi) / (2 * pi));
-                    angle[i] = static_cast<float>(sum);
-                    cs[static_cast<size_t>(i)] = std::cos(angle[i]);
-                    sn[static_cast<size_t>(i)] = std::sin(angle[i]);
-                }
-                // The inputs and the outputs of the states of the head: their biases, then the rotation.
                 const float* bias_k = bs + h * 2 * R * N;
                 const float* bias_q = bias_k + R * N;
-                for (long r = 0; r < R; ++r)
-                {
-                    float* kr = k.data() + r * N;
-                    float* qr = q.data() + r * N;
-                    for (long n = 0; n < N; ++n)
-                    {
-                        kr[n] = normed[static_cast<size_t>(r * N + n)] + bias_k[r * N + n];
-                        qr[n] = normed[static_cast<size_t>((R + r) * N + n)] + bias_q[r * N + n];
-                    }
-                    for (long i = 0; i < S; ++i)
-                    {
-                        const float c = cs[static_cast<size_t>(i)], s = sn[static_cast<size_t>(i)];
-                        const float a = kr[i], b = kr[i + N / 2];
-                        kr[i] = a * c - b * s;
-                        kr[i + N / 2] = a * s + b * c;
-                        const float u = qr[i], v = qr[i + N / 2];
-                        qr[i] = u * c - v * s;
-                        qr[i + N / 2] = u * s + v * c;
-                    }
-                }
                 const float* mx = mxzp + h * 2 * R * P;
                 const float* mz = mx + R * P;
                 const float* mout = mop + h * R * P;
                 const float skip = ms[H + h];
+                std::vector<float> k(static_cast<size_t>(R * N)), q(static_cast<size_t>(R * N));
+                std::vector<float> cs(static_cast<size_t>(S)), sn(static_cast<size_t>(S));
                 std::vector<float> now(static_cast<size_t>(R)), before(static_cast<size_t>(R));
                 std::vector<float> y(static_cast<size_t>(R));
-                for (long p = 0; p < P; ++p)
+                for (long t = 0; t < T; ++t)
                 {
+                    const float* head = inp + (t * H + h) * (2 * P + 3);
+                    const float* z = head;
+                    const float* x = head + P;
+                    const double step = softplus(static_cast<double>(head[2 * P]) + ms[h]);
+                    const double decay = std::min(-softplus(static_cast<double>(head[2 * P + 1])), -1e-4);
+                    const double trapezoid = 1.0 / (1.0 + std::exp(-static_cast<double>(head[2 * P + 2])));
+                    const double kept = std::exp(decay * step);
+                    const float alpha = static_cast<float>(kept);
+                    const float beta = static_cast<float>((1.0 - trapezoid) * step * kept);
+                    const float gamma = static_cast<float>(trapezoid * step);
+
+                    // The angles of the head, kept within one turn; the rotations read them as the state holds them.
+                    for (long i = 0; i < S; ++i)
+                    {
+                        double sum = angle[i] + turn[static_cast<size_t>(t * S + i)] * step;
+                        sum -= 2 * pi * std::floor((sum + pi) / (2 * pi));
+                        angle[i] = static_cast<float>(sum);
+                        cs[static_cast<size_t>(i)] = std::cos(angle[i]);
+                        sn[static_cast<size_t>(i)] = std::sin(angle[i]);
+                    }
+                    // The inputs and the outputs of the states of the head: their biases, then the rotation.
+                    const float* rows = normed.data() + t * row_values;
                     for (long r = 0; r < R; ++r)
                     {
-                        now[static_cast<size_t>(r)] = gamma * x[p] * mx[r * P + p];
-                        before[static_cast<size_t>(r)] = beta * x_before[p] * mx[r * P + p];
-                        y[static_cast<size_t>(r)] = 0;
+                        float* kr = k.data() + r * N;
+                        float* qr = q.data() + r * N;
+                        for (long n = 0; n < N; ++n)
+                        {
+                            kr[n] = rows[r * N + n] + bias_k[r * N + n];
+                            qr[n] = rows[(R + r) * N + n] + bias_q[r * N + n];
+                        }
+                        for (long i = 0; i < S; ++i)
+                        {
+                            const float c = cs[static_cast<size_t>(i)], s = sn[static_cast<size_t>(i)];
+                            const float a = kr[i], b = kr[i + N / 2];
+                            kr[i] = a * c - b * s;
+                            kr[i + N / 2] = a * s + b * c;
+                            const float u = qr[i], v = qr[i + N / 2];
+                            qr[i] = u * c - v * s;
+                            qr[i + N / 2] = u * s + v * c;
+                        }
                     }
-                    // The state of the channel takes its inputs by the trapezoid rule and gives its outputs.
-                    float* s = channels + p * N;
-                    for (long n = 0; n < N; ++n)
+                    for (long p = 0; p < P; ++p)
                     {
-                        float v = alpha * s[n];
                         for (long r = 0; r < R; ++r)
-                            v += before[static_cast<size_t>(r)] * k_before[r * N + n]
-                                + now[static_cast<size_t>(r)] * k[static_cast<size_t>(r * N + n)];
-                        s[n] = v;
-                        for (long r = 0; r < R; ++r) y[static_cast<size_t>(r)] += v * q[static_cast<size_t>(r * N + n)];
+                        {
+                            now[static_cast<size_t>(r)] = gamma * x[p] * mx[r * P + p];
+                            before[static_cast<size_t>(r)] = beta * x_before[p] * mx[r * P + p];
+                            y[static_cast<size_t>(r)] = 0;
+                        }
+                        // The state of the channel takes its inputs by the trapezoid rule and gives its outputs.
+                        float* s = channels + p * N;
+                        for (long n = 0; n < N; ++n)
+                        {
+                            float v = alpha * s[n];
+                            for (long r = 0; r < R; ++r)
+                                v += before[static_cast<size_t>(r)] * k_before[r * N + n]
+                                    + now[static_cast<size_t>(r)] * k[static_cast<size_t>(r * N + n)];
+                            s[n] = v;
+                            for (long r = 0; r < R; ++r)
+                                y[static_cast<size_t>(r)] += v * q[static_cast<size_t>(r * N + n)];
+                        }
+                        float sum = 0;
+                        for (long r = 0; r < R; ++r)
+                        {
+                            const float gate = z[p] * mz[r * P + p];
+                            const float o = y[static_cast<size_t>(r)] + skip * x[p] * mx[r * P + p];
+                            sum += gate / (1.0f + std::exp(-gate)) * o * mout[r * P + p];
+                        }
+                        op[(t * H + h) * P + p] = sum;
                     }
-                    float sum = 0;
-                    for (long r = 0; r < R; ++r)
-                    {
-                        const float gate = z[p] * mz[r * P + p];
-                        const float o = y[static_cast<size_t>(r)] + skip * x[p] * mx[r * P + p];
-                        sum += gate / (1.0f + std::exp(-gate)) * o * mout[r * P + p];
-                    }
-                    op[h * P + p] = sum;
+                    // What the next token reads of this one.
+                    std::memcpy(k_before, k.data(), sizeof(float) * static_cast<size_t>(R * N));
+                    std::memcpy(x_before, x, sizeof(float) * static_cast<size_t>(P));
                 }
-                // What the next token reads of this one.
-                std::memcpy(k_before, k.data(), sizeof(float) * static_cast<size_t>(R * N));
-                std::memcpy(x_before, x, sizeof(float) * static_cast<size_t>(P));
             });
         }
 

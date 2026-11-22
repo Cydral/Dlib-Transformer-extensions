@@ -88,6 +88,12 @@ namespace albireo
                     routing       "auto" (the default) measures where each shape runs
                                   faster, "device" sends every product to the device and
                                   "host" none, for tests and diagnostics.
+                    timed_passes  true (the default) for the runtime to time the layers of
+                                  the device against the processor, for the passes of a
+                                  generation and for those of the prompts, and to keep for
+                                  the device those it computes faster; false keeps every
+                                  pass the device computes right on the device.  The
+                                  routing "device" keeps them there too.
                     cache_dir     the folder of the compiled graphs (OpenVINO) and of the
                                   file of the extended memory.
                     benchmark     true when the engine is being measured: the graphs then

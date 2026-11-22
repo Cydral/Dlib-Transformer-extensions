@@ -186,6 +186,13 @@ namespace albireo
         */
         virtual long tiled_tokens() const { return 0; }
 
+        /*
+            Whether the runtime times the passes of this object against the processor and keeps
+            for the device those it computes faster; false when the configuration sends every
+            pass to the device.
+        */
+        virtual bool timed() const { return true; }
+
         /*!
             ensures
                 - Writes in the log of the device the outcome of the comparison that the
@@ -466,6 +473,9 @@ namespace albireo
 
         // As layer_pass::tiled_tokens().
         virtual long tiled_tokens() const { return 0; }
+
+        // As layer_pass::timed().
+        virtual bool timed() const { return true; }
 
         // As layer_pass::report().
         virtual void report(bool ok, const std::string& detail) = 0;

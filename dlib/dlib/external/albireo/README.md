@@ -555,6 +555,13 @@ image, keep the products; a model whose attention grows with the positions (`att
 keeps its attention on the processor. The layers of a hybrid decoder have a pass of their own on
 the card ([Hybrid decoders](#hybrid-decoders)).
 
+Once the probes agree, the runtime times the layers of the card against the processor, single
+tokens that follow one another then a pass of 64 tokens, and keeps for the card the passes of at
+most 8 tokens and the longer ones only where the card was the faster of the two
+([Hybrid decoders](#hybrid-decoders) gives the measure); a card that keeps the longer passes alone
+leaves the attention of the short ones to the processor with them and frees its copies of the
+keys and values.
+
 With OpenVINO, the products of a single token often stay on the processor, which serves them from
 the compact weights; the products of the prompts go to the device. The image encoder of a model sends its
 products to the device of the engine too, its copies leaving the device for the decoder between
@@ -755,14 +762,18 @@ at about half its speed of the day before, for a cause the measures do not tell:
 The answers held 522 tokens with the file made from Olala-v1.0-summarise under Linux and 300 with
 the file of the authors under Windows; the prompts kept their speeds, 80 to 117 tokens per second
 under Linux and 94 to 102 under Windows. These measures precede the sections that end with their
-tasks.
+tasks. With them, in version 1.0.27, the same laptop wrote on 21 November 2026 at 43.0 and 43.4
+tokens per second with `cpu-avx2` and at 44.6 and 45.2 with `cpu-avxvnni` under Windows, where the
+engines of the day before gave 39.8 to 41.3 in the same runs, and at 49.2 and 47.7 with `cpu-avx2`
+under Linux; 24 threads under Windows wrote faster than 16 (36.0) or 8 (28.6).
 
 The `cuda` engine computes the layers of a hybrid decoder on the card
 ([`engine/tensor_backend.cpp`](engine/tensor_backend.cpp), `tensor_hybrid_pass`) once the copies
 of all its matrices fit there in their GGUF formats, 6.3 GB for the Q6_K file of Olala mini. The
 hidden states of a pass stay on the card from the embeddings to the logits. A Mamba-3 layer runs
-there whole: its two projections, the step of its states token after token (`tt::mamba3_step()`),
-its output projection and the turn of the hidden states (`tt::geodesic_update()`). So do the
+there whole: its two projections, the step of its states over the tokens of each sequence of the
+pass, in their order and in one launch (`tt::mamba3_step()`), its output projection and the turn of
+the hidden states (`tt::geodesic_update()`). So do the
 experts of every layer: the router and the choice of the experts of each token
 (`tt::expert_routes()`), the two products of the chosen experts, read in place among the 256
 matrices of the layer (`tt::gguf_matvec_picked()`), their activation (`tt::squared_relu()`), their
@@ -792,7 +803,37 @@ then hands over one by one. On the host code of dlib, the tiny model of the test
 model of four layers with the sizes of Olala mini give through these layers the logits of the
 exact products within 2e-5. `test_device_ops` checks each of these operations on the card against
 the processor code of dlib, then prints the time of the 18 operations of a token in a block of
-Olala mini, one by one and chained.
+Olala mini, one by one and chained, and the time of the step of a Mamba-3 layer over 64 tokens.
+
+Version 1.0.27 kept these layers on the card once the probes agreed, whatever their speed. On the
+laptop above (Windows, file of the authors, answers of 300 tokens, 21 November 2026), its `cuda`
+engine wrote at 22.6 tokens per second with the layers on the card and at 43.2 with the layers on
+the processor, and read its prompts at 124 tokens per second against 270. `test_device_ops` gave
+the cause: of the 1,075 microseconds of the 18 chained operations of a token in a block, each of
+the two turns of the hidden states took 362 alone and the step of the Mamba-3 layer 250, the
+fifteen others 19 to 36 each. A turn ran as one thread of the card per row, over its 1,536 values
+in double precision; a step ran as four launches whose threads each computed the cosines of the
+angles and the scales of the rows of their head again. Since version 1.0.28 a block of 256 threads
+turns a row, its three sums added in the shared memory of the block, and one launch steps a layer:
+a block per head, a thread per channel, the rows of the head computed once per token in the shared
+memory of the block, and the tokens of a prompt taken one after the other in that launch.
+
+Since version 1.0.28 the runtime also times the layers of a device against the processor, after
+the probes and for every decoder, dense or hybrid
+([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp), `time_passes()`). Eight single tokens follow
+one another in a sequence of their own, as a generation, the shortest of the last six counting;
+then a pass of 64 tokens, as a part of a prompt, taken once more when the two times lie within 30 %
+of each other. The passes of at most 8 tokens and the longer ones each stay on the device only
+when the device computed its measure in less time than the processor; the processor serves the
+others, with the products its routing hands over one by one, and the log gives the four times. A
+device that loses both measures gives the layers up. The states of the Mamba-3 layers follow the
+passes: the processor takes them back before a pass of its own, and the device then drops its
+copy, which a later pass of the device would otherwise read as current; version 1.0.27 kept that
+copy, and a card that took the prompts while the processor wrote the answers, as when the copies
+of the weights exceed its memory, could continue a sequence from the states it held before those
+answers. The key
+`timed_passes` of the configuration of the device, false, and the routing `device` keep on the
+device every pass it computes right.
 
 The same computation exists in dlib for the programs that load a GGUF file without Albireo:
 `tt::geodesic_update()` and `tt::mamba3_step()`
@@ -1608,8 +1649,8 @@ cmake --build build-albireo-win -j
 | `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the products of the prompts on 8-bit panels against a reference in double precision over the activations rounded to 8 bits, each token as computed in another pass, the attention by tiles against a reference in double precision, the bound of the scores of an attention (`qk_softcap()`) and the step of the state of a Mamba-3 layer (`qk_state_step()`) against their definitions in double precision, the expansion of Q6_K bit for bit with dlib, and the products of a group (`qk_matmul_group()`) against the same products computed one by one, bit for bit, for every format, 1 to 7 tokens and 1 to 12 threads, the products whatever the number of threads that share them, bit for bit, and the thread pool: every task of a section run once for 2 to 5,000 tasks, the exception of a task, two threads that open sections at once, and pools of 3, 8 and 16 threads; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches; `synthetic` checks the attention on a tiny model, then a tiny hybrid decoder (Mamba-3 layers, differential attentions, experts in a latent space) against the logits of the reference for 24 tokens, which `tests/data/hybrid.golden` holds, on two threads and on twelve, with 8-bit keys, by passes and by steps, its sequences cut and copied at the lengths of their saved states, and the states saved along the prompts (a lone token of a prompt, the prompt after generated tokens), then a tiny mixture of experts (8 experts of which 3 answer a token) cut the same ways; both models give the same logits, bit for bit, in their passes of a few tokens whether the products of a layer share their parallel sections or take one each, as a model given on the command line does; also as `test_runtime_portable`, without the instructions of AVX2 in the kernels. `test_runtime hybrid-model file.gguf` writes that tiny decoder, from which `python3 tests/reference_forward.py file.gguf hybrid.golden 1 2 ... 24` computes the logits again |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
-| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise), come back, then leave it again within the period of that rise, which bounds the next rises and doubles their period; then the tiny mixture of experts and the tiny hybrid decoder, whose steps hand their products over by groups, with a device that routes to the processor (the logits of the runtime alone, bit for bit), with the measured routing and with every product on the device; then the layers of the tiny hybrid decoder on the device, its experts in single precision then in Q8_0 with a latent exit in BF16, through a script of prompts, steps of two sequences, copies and cuts, against the processor, with a pass the device fails (`ALBIREO_TEST_HYBRID_FAILURE` gives the operation that fails), a pass that lacks memory, and states the device loses, which send the sequence back to its saved state; with a model, the measured routing follows the usual kernels or, through the layers of the device, the exact products |
-| `test_device_ops` | on the processor, the lanes of the kernel of the card for Q4_K and Q6_K (`gguf_blocks::lane_products()`) against the processor kernels; then the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); the operations of the experts (`tt::expert_routes`, with scores that tie, `tt::gguf_matvec_picked`, `tt::squared_relu`, `tt::mix_rows`) and the step of a Mamba-3 layer (`tt::mamba3_step`, with the sizes of Olala mini among others) against the processor code of dlib; then the time of the products of one and of eight tokens on the matrices of a 2B model, of the attention of a generated token over 4,096 positions, and of the 18 operations of a token in a block of Olala mini, one by one and chained |
+| `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise), come back, then leave it again within the period of that rise, which bounds the next rises and doubles their period; then the tiny mixture of experts and the tiny hybrid decoder, whose steps hand their products over by groups, with a device that routes to the processor (the logits of the runtime alone, bit for bit), with the measured routing and with every product on the device; then the layers of the tiny hybrid decoder on the device, its experts in single precision then in Q8_0 with a latent exit in BF16, through a script of prompts, steps of two sequences, copies and cuts, against the processor, with a pass the device fails (`ALBIREO_TEST_HYBRID_FAILURE` gives the operation that fails), a pass that lacks memory, and states the device loses, which send the sequence back to its saved state; then the passes timed against the processor, for the dense and the hybrid decoder, the device keeping the passes of a few tokens, the longer ones, both or none (`ALBIREO_TEST_TIMED_PASSES` names them), with the logits of the processor and the count of the passes of the device in each case; with a model, the measured routing follows the usual kernels or, through the layers of the device, the exact products |
+| `test_device_ops` | on the processor, the lanes of the kernel of the card for Q4_K and Q6_K (`gguf_blocks::lane_products()`) against the processor kernels; then the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); the operations of the experts (`tt::expert_routes`, with scores that tie, `tt::gguf_matvec_picked`, `tt::squared_relu`, `tt::mix_rows`) and the step of a Mamba-3 layer (`tt::mamba3_step`, with the sizes of Olala mini among others, token by token then several tokens in one call) against the processor code of dlib; then the time of the products of one and of eight tokens on the matrices of a 2B model, of the attention of a generated token over 4,096 positions, of the 18 operations of a token in a block of Olala mini, one by one and chained, of the step of its Mamba-3 layer over 64 tokens, and of the 16 operations of a token in a block of a dense 4B model |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |

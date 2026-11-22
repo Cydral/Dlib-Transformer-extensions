@@ -4270,41 +4270,80 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        // The threads of a block of _cuda_geodesic_update(), a power of two: its sums halve their terms.
+        const int geodesic_threads = 256;
+
         __global__ void _cuda_geodesic_update(
-            float* x, const float* g, long rows, long nc, float scale, float bias, float depth)
+            float* x, const float* g, long nc, float scale, float bias, float depth)
         {
-            // One row per thread: its sums run in double precision, the rows being few.
-            for (auto r : grid_stride_range(0, rows))
+            /* One block per row.  Each thread adds its share of the sums of the row, in double
+               precision, the block adds the shares in an order that never changes, and each
+               thread then writes its values of the row. */
+            __shared__ double sum_a[geodesic_threads];
+            __shared__ double sum_b[geodesic_threads];
+            // The square of the length of the row, its part along g, then the cosine and the scaled sine of its turn.
+            __shared__ double turn[4];
+            const size_t first = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(nc);
+            float* xr = x + first;
+            const float* gr = g + first;
+            const int t = threadIdx.x;
+            double xx = 0, xg = 0;
+            for (long i = t; i < nc; i += geodesic_threads)
             {
-                float* xr = x + r * nc;
-                const float* gr = g + r * nc;
-                double xx = 0, xg = 0;
-                for (long i = 0; i < nc; ++i)
+                xx += (double)xr[i] * xr[i];
+                xg += (double)xr[i] * gr[i];
+            }
+            sum_a[t] = xx;
+            sum_b[t] = xg;
+            __syncthreads();
+            for (int width = geodesic_threads / 2; width > 0; width /= 2)
+            {
+                if (t < width)
                 {
-                    xx += (double)xr[i] * xr[i];
-                    xg += (double)xr[i] * gr[i];
+                    sum_a[t] += sum_a[t + width];
+                    sum_b[t] += sum_b[t + width];
                 }
-                const double along = xg / (xx > 1e-12 ? xx : 1e-12);
-                double tt = 0;
-                for (long i = 0; i < nc; ++i)
-                {
-                    const double v = gr[i] - along * xr[i];
-                    tt += v * v;
-                }
-                double norm = ::sqrt(tt);
+                __syncthreads();
+            }
+            if (t == 0)
+            {
+                turn[0] = sum_a[0];
+                turn[1] = sum_b[0] / (sum_a[0] > 1e-12 ? sum_a[0] : 1e-12);
+            }
+            __syncthreads();
+            const double along = turn[1];
+            double tt = 0;
+            for (long i = t; i < nc; i += geodesic_threads)
+            {
+                const double v = gr[i] - along * xr[i];
+                tt += v * v;
+            }
+            sum_a[t] = tt;
+            __syncthreads();
+            for (int width = geodesic_threads / 2; width > 0; width /= 2)
+            {
+                if (t < width) sum_a[t] += sum_a[t + width];
+                __syncthreads();
+            }
+            if (t == 0)
+            {
+                double norm = ::sqrt(sum_a[0]);
                 if (norm < 1e-8) norm = 1e-8;
-                double radius = ::sqrt(xx);
+                double radius = ::sqrt(turn[0]);
                 if (radius < 1e-6) radius = 1e-6;
                 const double quarter = 0.78539816339744830962;
                 double theta = norm / radius;
                 if (theta > quarter) theta = quarter;
                 theta = (theta * scale + bias) / depth;
                 if (theta > quarter) theta = quarter;
-                const double c = ::cos(theta);
-                const double s = ::sin(theta) * radius / norm;
-                for (long i = 0; i < nc; ++i)
-                    xr[i] = (float)(xr[i] * c + (gr[i] - along * xr[i]) * s);
+                turn[2] = ::cos(theta);
+                turn[3] = ::sin(theta) * radius / norm;
             }
+            __syncthreads();
+            const double c = turn[2];
+            const double s = turn[3];
+            for (long i = t; i < nc; i += geodesic_threads)
+                xr[i] = (float)(xr[i] * c + (gr[i] - along * xr[i]) * s);
         }
 
         void geodesic_update(
@@ -4319,172 +4358,172 @@ namespace dlib
             DLIB_CASSERT(depth > 0);
             DLIB_CASSERT(!is_same_object(x, g));
             if (x.size() == 0) return;
-            const long rows = static_cast<long>(x.size()) / x.nc();
-            launch_kernel(_cuda_geodesic_update, max_jobs(rows),
-                x.device(), g.device(), rows, x.nc(), scale, bias, static_cast<float>(depth));
+            const size_t rows = x.size() / static_cast<size_t>(x.nc());
+            _cuda_geodesic_update<<<static_cast<unsigned int>(rows), geodesic_threads>>>(
+                x.device(), g.device(), x.nc(), scale, bias, static_cast<float>(depth));
+            CHECK_CUDA(cudaGetLastError());
         }
 
     // ----------------------------------------------------------------------------------------
 
-        // The inputs and outputs of a state, and the rotated pairs of a row, that the kernels below hold.
+        /* What the kernel of the Mamba-3 layers holds: the inputs and outputs of a state, the
+           rotated pairs of a row, the channels of a head, and the values of the shared memory
+           of a block (45 KB of the 48 KB a block has without asking for more). */
         const long mamba3_max_rank = 8;
         const long mamba3_max_angles = 256;
-
-        /* The step of a Mamba-3 layer runs as four kernels, one after the other: the angles of
-           the heads, then the states of the channels with their outputs, then what the next
-           token reads of this one, the inputs of the states and the inputs of the channels.
-           Every thread computes what it needs of its head, a few sums and a few cosines. */
+        const long mamba3_max_channels = 1024;
+        const long mamba3_max_shared = 11264;
+        // The threads of a block, at least: the rows of a head with few channels still have threads to share.
+        const long mamba3_min_threads = 64;
 
         __device__ inline double cuda_mamba3_softplus(double x)
         {
             return x > 20.0 ? x : ::log1p(::exp(x));
         }
 
-        // 1/sqrt(mean of the squares of a row + eps)
-        __device__ inline float cuda_mamba3_row_scale(const float* row, long N, float eps)
-        {
-            float ss = 0;
-            for (long n = 0; n < N; ++n) ss += row[n] * row[n];
-            return 1.0f / std::sqrt(ss / N + eps);
-        }
-
-        /* Value n of row r of the inputs (which == 0) or of the outputs (which == 1) of the
-           states of head h: the row of dyn normalized, its bias added, its pairs (i, i + N/2),
-           i < S, turned by the angles of the head. */
-        __device__ inline float cuda_mamba3_value(
-            const float* dyn, const float* norms, const float* bias, float cs, float sn,
-            float row_scale, long which, long h, long r, long n, long N, long R, long S)
-        {
-            // cs and sn: the cosine and the sine of the angle of the pair of n, when n has one.
-            const float* row = dyn + (which * R + r) * N;
-            const float* gamma = norms + which * N;
-            const float* b = bias + ((h * 2 + which) * R + r) * N;
-            const long half = N / 2;
-            if (n < S)
-            {
-                const float u = row[n] * row_scale * gamma[n] + b[n];
-                const float v = row[n + half] * row_scale * gamma[n + half] + b[n + half];
-                return u * cs - v * sn;
-            }
-            if (n >= half && n < half + S)
-            {
-                const long i = n - half;
-                const float u = row[i] * row_scale * gamma[i] + b[i];
-                const float v = row[n] * row_scale * gamma[n] + b[n];
-                return u * sn + v * cs;
-            }
-            return row[n] * row_scale * gamma[n] + b[n];
-        }
-
-        __global__ void _cuda_mamba3_angles(
-            float* state, const float* in, const float* dyn, const float* misc,
-            long H, long P, long N, long R, long S)
-        {
-            for (auto i : grid_stride_range(0, H * S))
-            {
-                const long h = i / S;
-                const long a = i % S;
-                const double pi = 3.14159265358979323846;
-                const double step = cuda_mamba3_softplus((double)in[h * (2 * P + 3) + 2 * P] + misc[h]);
-                double sum = state[i] + ::tanh((double)dyn[2 * R * N + a]) * pi * step;
-                sum -= 2 * pi * ::floor((sum + pi) / (2 * pi));
-                state[i] = (float)sum;
-            }
-        }
-
-        __global__ void _cuda_mamba3_channels(
+        /* The tokens of a sequence through a Mamba-3 layer, in one launch: one block per head,
+           one thread per channel, the tokens one after the other.  For each token the block
+           computes the scales of the rows of dyn and the angles of its head, then the input and
+           output rows of its states, then its channels.  The rows stay in the shared memory of
+           the block: the input rows of a token are those the next token reads as the previous
+           ones, the two tables changing places at each token, and the state takes them back
+           once, after the last token. */
+        __global__ void _cuda_mamba3_steps(
             float* out, float* state, const float* in, const float* dyn, const float* norms,
             const float* bias, const float* misc, const float* mxz, const float* mo,
-            long H, long P, long N, long R, long S, float eps)
+            long T, long H, long P, long N, long R, long S, float eps)
         {
-            for (auto i : grid_stride_range(0, H * P))
+            extern __shared__ float shared[];
+            float* scale = shared;
+            float* cs = scale + 2 * R;
+            float* sn = cs + S;
+            float* q = sn + S;
+            float* k = q + R * N;
+            float* k_before = k + R * N;
+
+            const long h = blockIdx.x;
+            const long tid = threadIdx.x;
+            const long threads = blockDim.x;
+            const long half = N / 2;
+            const double pi = 3.14159265358979323846;
+            float* angle = state + h * S;
+            float* channels = state + H * S + h * P * N;
+            float* kept_rows = state + H * S + H * P * N + h * R * N;
+            float* kept_inputs = state + H * S + H * P * N + H * R * N + h * P;
+            const float* bias_k = bias + h * 2 * R * N;
+            const float* bias_q = bias_k + R * N;
+            const float* mx = mxz + h * 2 * R * P;
+            const float* mz = mx + R * P;
+            const float* mout = mo + h * R * P;
+            const float skip = misc[H + h];
+
+            for (long i = tid; i < R * N; i += threads) k_before[i] = kept_rows[i];
+            float x_before = tid < P ? kept_inputs[tid] : 0.0f;
+
+            for (long t = 0; t < T; ++t)
             {
-                const long h = i / P;
-                const long p = i % P;
-                const float* head = in + h * (2 * P + 3);
-                const float z = head[p];
-                const float x = head[P + p];
+                const float* head = in + (t * H + h) * (2 * P + 3);
+                const float* d = dyn + t * (2 * R * N + S);
                 const double step = cuda_mamba3_softplus((double)head[2 * P] + misc[h]);
-                double decay = -cuda_mamba3_softplus((double)head[2 * P + 1]);
-                if (decay > -1e-4) decay = -1e-4;
-                const double trapezoid = 1.0 / (1.0 + ::exp(-(double)head[2 * P + 2]));
-                const double kept = ::exp(decay * step);
-                const float alpha = (float)kept;
-                const float beta = (float)((1.0 - trapezoid) * step * kept);
-                const float gamma = (float)(trapezoid * step);
 
-                const float* angle = state + h * S;
-                float* s = state + H * S + (h * P + p) * N;
-                const float* kb = state + H * S + H * P * N + h * R * N;
-                const float xb = state[H * S + H * P * N + H * R * N + h * P + p];
-                const float* mx = mxz + h * 2 * R * P;
-                const float* mz = mx + R * P;
+                // The scales of the rows of dyn, 1/sqrt(mean of the squares + eps), and the angles of the head.
+                for (long j = tid; j < 2 * R; j += threads)
+                {
+                    const float* row = d + j * N;
+                    float ss = 0;
+                    for (long n = 0; n < N; ++n) ss += row[n] * row[n];
+                    scale[j] = 1.0f / std::sqrt(ss / N + eps);
+                }
+                for (long a = tid; a < S; a += threads)
+                {
+                    double sum = angle[a] + ::tanh((double)d[2 * R * N + a]) * pi * step;
+                    sum -= 2 * pi * ::floor((sum + pi) / (2 * pi));
+                    const float turned = (float)sum;
+                    angle[a] = turned;
+                    cs[a] = ::cosf(turned);
+                    sn[a] = ::sinf(turned);
+                }
+                // The previous token has left the table that k names, which this token writes.
+                __syncthreads();
 
-                float cs[mamba3_max_angles], sn[mamba3_max_angles];
-                for (long a = 0; a < S; ++a)
+                /* The input and output rows of the states of the head: each row of dyn
+                   normalized, its bias added, its pairs (i, i + N/2), i < S, turned by the
+                   angles of the head. */
+                for (long i = tid; i < R * N; i += threads)
                 {
-                    cs[a] = ::cos(angle[a]);
-                    sn[a] = ::sin(angle[a]);
-                }
-                float in_scale[mamba3_max_rank], out_scale[mamba3_max_rank];
-                float now[mamba3_max_rank], before[mamba3_max_rank], y[mamba3_max_rank];
-                for (long r = 0; r < R; ++r)
-                {
-                    in_scale[r] = cuda_mamba3_row_scale(dyn + r * N, N, eps);
-                    out_scale[r] = cuda_mamba3_row_scale(dyn + (R + r) * N, N, eps);
-                    now[r] = gamma * x * mx[r * P + p];
-                    before[r] = beta * xb * mx[r * P + p];
-                    y[r] = 0;
-                }
-                const long half = N / 2;
-                for (long n = 0; n < N; ++n)
-                {
+                    const long r = i / N;
+                    const long n = i % N;
+                    const float* row_k = d + r * N;
+                    const float* row_q = d + (R + r) * N;
+                    const float* bk = bias_k + r * N;
+                    const float* bq = bias_q + r * N;
+                    const float scale_k = scale[r];
+                    const float scale_q = scale[R + r];
                     const long a = n < S ? n : (n >= half && n < half + S ? n - half : -1);
-                    const float c = a >= 0 ? cs[a] : 1.0f;
-                    const float t = a >= 0 ? sn[a] : 0.0f;
-                    float v = alpha * s[n];
-                    for (long r = 0; r < R; ++r)
-                        v += before[r] * kb[r * N + n] + now[r] * cuda_mamba3_value(dyn, norms, bias, c, t,
-                            in_scale[r], 0, h, r, n, N, R, S);
-                    s[n] = v;
-                    for (long r = 0; r < R; ++r)
-                        y[r] += v * cuda_mamba3_value(dyn, norms, bias, c, t, out_scale[r], 1, h, r, n, N, R, S);
+                    if (a < 0)
+                    {
+                        k[i] = row_k[n] * scale_k * norms[n] + bk[n];
+                        q[i] = row_q[n] * scale_q * norms[N + n] + bq[n];
+                    }
+                    else
+                    {
+                        const long b = a + half;
+                        const float ku = row_k[a] * scale_k * norms[a] + bk[a];
+                        const float kv = row_k[b] * scale_k * norms[b] + bk[b];
+                        const float qu = row_q[a] * scale_q * norms[N + a] + bq[a];
+                        const float qv = row_q[b] * scale_q * norms[N + b] + bq[b];
+                        k[i] = n < half ? ku * cs[a] - kv * sn[a] : ku * sn[a] + kv * cs[a];
+                        q[i] = n < half ? qu * cs[a] - qv * sn[a] : qu * sn[a] + qv * cs[a];
+                    }
                 }
-                float sum = 0;
-                for (long r = 0; r < R; ++r)
+                __syncthreads();
+
+                // The channel of the thread: its state takes its inputs by the trapezoid rule and gives its outputs.
+                if (tid < P)
                 {
-                    const float gate = z * mz[r * P + p];
-                    const float o = y[r] + misc[H + h] * x * mx[r * P + p];
-                    sum += gate / (1.0f + std::exp(-gate)) * o * mo[(h * R + r) * P + p];
+                    const long p = tid;
+                    const float z = head[p];
+                    const float x = head[P + p];
+                    double decay = -cuda_mamba3_softplus((double)head[2 * P + 1]);
+                    if (decay > -1e-4) decay = -1e-4;
+                    const double trapezoid = 1.0 / (1.0 + ::exp(-(double)head[2 * P + 2]));
+                    const double kept = ::exp(decay * step);
+                    const float alpha = (float)kept;
+                    const float beta = (float)((1.0 - trapezoid) * step * kept);
+                    const float gamma = (float)(trapezoid * step);
+                    float now[mamba3_max_rank], before[mamba3_max_rank], y[mamba3_max_rank];
+                    for (long r = 0; r < R; ++r)
+                    {
+                        now[r] = gamma * x * mx[r * P + p];
+                        before[r] = beta * x_before * mx[r * P + p];
+                        y[r] = 0;
+                    }
+                    float* s = channels + p * N;
+                    for (long n = 0; n < N; ++n)
+                    {
+                        float v = alpha * s[n];
+                        for (long r = 0; r < R; ++r) v += before[r] * k_before[r * N + n] + now[r] * k[r * N + n];
+                        s[n] = v;
+                        for (long r = 0; r < R; ++r) y[r] += v * q[r * N + n];
+                    }
+                    float sum = 0;
+                    for (long r = 0; r < R; ++r)
+                    {
+                        const float gate = z * mz[r * P + p];
+                        const float o = y[r] + skip * x * mx[r * P + p];
+                        sum += gate / (1.0f + std::exp(-gate)) * o * mout[r * P + p];
+                    }
+                    out[(t * H + h) * P + p] = sum;
+                    x_before = x;
                 }
-                out[i] = sum;
+                float* rows = k;
+                k = k_before;
+                k_before = rows;
             }
-        }
 
-        __global__ void _cuda_mamba3_keep_inputs(
-            float* state, const float* dyn, const float* norms, const float* bias,
-            long H, long P, long N, long R, long S, float eps)
-        {
-            for (auto i : grid_stride_range(0, H * R * N))
-            {
-                const long n = i % N;
-                const long r = (i / N) % R;
-                const long h = i / (N * R);
-                const float* angle = state + h * S;
-                const long half = N / 2;
-                const long a = n < S ? n : (n >= half && n < half + S ? n - half : -1);
-                const float c = a >= 0 ? ::cos(angle[a]) : 1.0f;
-                const float t = a >= 0 ? ::sin(angle[a]) : 0.0f;
-                const float scale = cuda_mamba3_row_scale(dyn + r * N, N, eps);
-                state[H * S + H * P * N + i] = cuda_mamba3_value(dyn, norms, bias, c, t, scale, 0, h, r, n, N, R, S);
-            }
-        }
-
-        __global__ void _cuda_mamba3_keep_channels(
-            float* state, const float* in, long H, long P, long N, long R, long S)
-        {
-            for (auto i : grid_stride_range(0, H * P))
-                state[H * S + H * P * N + H * R * N + i] = in[(i / P) * (2 * P + 3) + P + i % P];
+            // What the next token of the sequence reads of the last one.
+            for (long i = tid; i < R * N; i += threads) kept_rows[i] = k_before[i];
+            if (tid < P) kept_inputs[tid] = x_before;
         }
 
         void mamba3_step(
@@ -4506,23 +4545,25 @@ namespace dlib
             const long R = static_cast<long>(bias.size()) / (2 * N * H);
             DLIB_CASSERT(R > 0 && R <= mamba3_max_rank);
             const long P = static_cast<long>(mo.size()) / (H * R);
-            const long S = static_cast<long>(dyn.size()) - 2 * R * N;
-            DLIB_CASSERT(P > 0 && S >= 0 && S <= N / 2 && S <= mamba3_max_angles);
+            DLIB_CASSERT(P > 0 && P <= mamba3_max_channels);
+            const long T = static_cast<long>(in.size()) / (H * (2 * P + 3));
+            DLIB_CASSERT(T > 0 && static_cast<long>(dyn.size()) % T == 0);
+            const long S = static_cast<long>(dyn.size()) / T - 2 * R * N;
+            DLIB_CASSERT(S >= 0 && S <= N / 2 && S <= mamba3_max_angles);
             DLIB_CASSERT(static_cast<long>(bias.size()) == 2 * H * R * N && static_cast<long>(mo.size()) == H * R * P);
             DLIB_CASSERT(static_cast<long>(mxz.size()) == 2 * H * R * P);
-            DLIB_CASSERT(static_cast<long>(in.size()) == H * (2 * P + 3) && static_cast<long>(out.size()) == H * P);
+            DLIB_CASSERT(static_cast<long>(in.size()) == T * H * (2 * P + 3));
+            DLIB_CASSERT(static_cast<long>(out.size()) == T * H * P);
             DLIB_CASSERT(static_cast<long>(state.size()) == H * S + H * P * N + H * R * N + H * P);
+            const long values = 2 * R + 2 * S + 3 * R * N;
+            DLIB_CASSERT(values <= mamba3_max_shared);
 
-            if (S > 0)
-                launch_kernel(_cuda_mamba3_angles, max_jobs(H * S),
-                    state.device(), in.device(), dyn.device(), misc.device(), H, P, N, R, S);
-            launch_kernel(_cuda_mamba3_channels, max_jobs(H * P),
+            const long threads = P < mamba3_min_threads ? mamba3_min_threads : P;
+            _cuda_mamba3_steps<<<static_cast<unsigned int>(H), static_cast<unsigned int>(threads),
+                static_cast<size_t>(values) * sizeof(float)>>>(
                 out.device(), state.device(), in.device(), dyn.device(), norms.device(), bias.device(),
-                misc.device(), mxz.device(), mo.device(), H, P, N, R, S, eps);
-            launch_kernel(_cuda_mamba3_keep_inputs, max_jobs(H * R * N),
-                state.device(), dyn.device(), norms.device(), bias.device(), H, P, N, R, S, eps);
-            launch_kernel(_cuda_mamba3_keep_channels, max_jobs(H * P),
-                state.device(), in.device(), H, P, N, R, S);
+                misc.device(), mxz.device(), mo.device(), T, H, P, N, R, S, eps);
+            CHECK_CUDA(cudaGetLastError());
         }
 
     // ----------------------------------------------------------------------------------------

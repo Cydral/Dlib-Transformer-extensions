@@ -4,8 +4,10 @@
 #include "cpu_runtime.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -279,6 +281,8 @@ namespace albireo
         layer_pass_wait_ = 0;
         attention_wait_ = 0;
         attention_interval_ = 0;
+        device_few_ = true;
+        device_many_ = true;
         if (!offload_) return;
         if (cfg_.hybrid())
         {
@@ -1200,6 +1204,109 @@ namespace albireo
         layer_pass_.reset();
     }
 
+    double cpu_runtime::time_pass(long n, int warm, int timed, bool on_device)
+    {
+        const bool hybrid = cfg_.hybrid();
+        const long V = cfg_.vocab;
+        const long B = kv_.block_positions();
+        const long layers = hybrid ? cfg_.attention_layers() : cfg_.n_layers;
+        const long tokens = n * (warm + timed);
+        const size_t per_token = 2 * static_cast<size_t>(layers) * static_cast<size_t>(cfg_.n_kv_heads)
+            * kv_row_bytes(kv_.format(), cfg_.head_dim);
+        std::unique_ptr<kv_pool> own(new kv_pool(layers, cfg_.n_kv_heads, cfg_.head_dim, B,
+            per_token * static_cast<size_t>((tokens + B - 1) / B * B), kv_.format()));
+        const int seq = create_sequence();
+        sequence_pools_[static_cast<size_t>(seq)] = own.get();
+        struct release
+        {
+            cpu_runtime& rt;
+            int seq;
+            ~release() { rt.release_sequence(seq); }
+        } guard{ *this, seq };
+        if (!reserve_sequence(seq, tokens)) return -1;
+        forward_batch b;
+        b.segments.push_back({ seq, 0, n });
+        b.logit_rows.push_back(n - 1);
+        std::vector<float> logits;
+        double best = -1;
+        for (int pass = 0; pass < warm + timed; ++pass)
+        {
+            b.tokens.clear();
+            for (long i = 0; i < n; ++i)
+                b.tokens.push_back(static_cast<int>((2003 + 7919 * (static_cast<long>(pass) * n + i)) % V));
+            const auto start = std::chrono::steady_clock::now();
+            if (!(hybrid ? run_hybrid(b, logits, on_device) : run(b, logits, on_device))) return -1;
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            if (pass >= warm && (best < 0 || seconds < best)) best = seconds;
+        }
+        return best;
+    }
+
+    bool cpu_runtime::time_passes(long many, std::string& detail)
+    {
+        device_few_ = true;
+        device_many_ = true;
+        std::ostringstream o;
+        o.setf(std::ios::fixed);
+        o.precision(1);
+        // Two passes settle the routes of the products of the processor, then the shortest of six counts.
+        int warm = 2, timed = 6;
+        if (cfg_.ctx_train > 0 && cfg_.ctx_train < warm + timed)
+        {
+            warm = cfg_.ctx_train > 1 ? 1 : 0;
+            timed = static_cast<int>(std::max(1L, cfg_.ctx_train - warm));
+        }
+        const double few_device = time_pass(1, warm, timed, true);
+        const double few_host = few_device < 0 ? -1 : time_pass(1, warm, timed, false);
+        const bool few = few_device >= 0 && few_host >= 0;
+        if (few)
+        {
+            device_few_ = few_device <= few_host;
+            o << "a token in " << few_device * 1e3 << " ms on the device and " << few_host * 1e3
+                << " ms on the processor";
+        }
+        double many_device = many > 1 ? time_pass(many, 0, 1, true) : -1;
+        double many_host = many_device < 0 ? -1 : time_pass(many, 0, 1, false);
+        const bool both = many_device >= 0 && many_host >= 0;
+        if (both)
+        {
+            // Measures close to each other are taken once more, each kept at its shortest.
+            if (many_device < 1.3 * many_host && many_host < 1.3 * many_device)
+            {
+                const double device_again = time_pass(many, 0, 1, true);
+                const double host_again = time_pass(many, 0, 1, false);
+                if (device_again >= 0) many_device = std::min(many_device, device_again);
+                if (host_again >= 0) many_host = std::min(many_host, host_again);
+            }
+            device_many_ = many_device <= many_host;
+            o << (few ? ", " : "") << many << " tokens in " << many_device * 1e3 << " ms and " << many_host * 1e3
+                << " ms";
+        }
+        // A test names the passes the device keeps whatever the measures.
+        if (const char* test = std::getenv("ALBIREO_TEST_TIMED_PASSES"))
+        {
+            const std::string kept(test);
+            device_few_ = kept == "few" || kept == "both";
+            device_many_ = kept == "many" || kept == "both";
+            o << ", a test keeping for the device the passes named '" << kept << "'";
+        }
+        if (!device_few_ && !device_many_)
+            o << ", the processor computing its passes faster";
+        else if (!device_few_)
+            o << ", the processor serving the passes of at most " << attention_tokens << " tokens, which it computes "
+                "faster";
+        else if (!device_many_)
+            o << ", the processor serving the passes of more than " << attention_tokens << " tokens, which it "
+                "computes faster";
+        detail = o.str();
+        return device_few_ || device_many_;
+    }
+
+    bool cpu_runtime::device_serves(const forward_batch& batch) const
+    {
+        return static_cast<long>(batch.tokens.size()) <= attention_tokens ? device_few_ : device_many_;
+    }
+
     /*
         Runs n tokens in a sequence of their own through the layers of the device, then through
         the processor alone, and compares their logits: 1 when they agree, the relative distance
@@ -1387,6 +1494,23 @@ namespace albireo
                 note(detail);
             }
         }
+        if (layer_pass_->timed())
+        {
+            const long many = tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train) ? tiled : 0;
+            const bool kept = time_passes(many, detail);
+            if (!detail.empty()) note(detail);
+            if (!kept)
+            {
+                drop_layer_pass(details);
+                return;
+            }
+            if (!device_few_)
+            {
+                // The device attends the passes of a few tokens alone, which it leaves to the processor.
+                layer_pass_->allow_attention(false);
+                attention_wait_ = 0;
+            }
+        }
         layer_pass_checked_ = true;
         layer_pass_->report(true, details);
     }
@@ -1443,7 +1567,7 @@ namespace albireo
                         check_hybrid_pass();
                         if (hybrid_pass_ && !layer_pass_checked_) layer_pass_wait_ = layer_pass_check_interval;
                     }
-                    if (hybrid_pass_ && layer_pass_checked_ && run_hybrid(batch, logits, true))
+                    if (hybrid_pass_ && layer_pass_checked_ && device_serves(batch) && run_hybrid(batch, logits, true))
                     {
                         layer_pass_memory_failures_ = 0;
                         return;
@@ -1477,7 +1601,7 @@ namespace albireo
                 {
                     check_attention();
                 }
-                if (layer_pass_ && layer_pass_checked_ && run(batch, logits, true))
+                if (layer_pass_ && layer_pass_checked_ && device_serves(batch) && run(batch, logits, true))
                 {
                     layer_pass_memory_failures_ = 0;
                     return;
@@ -2331,6 +2455,17 @@ namespace albireo
                 return;
             }
         }
+        if (hybrid_pass_->timed())
+        {
+            const long many = tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train) ? tiled : 0;
+            const bool kept = time_passes(many, detail);
+            if (!detail.empty()) note(detail);
+            if (!kept)
+            {
+                drop_hybrid_pass(details);
+                return;
+            }
+        }
         layer_pass_checked_ = true;
         hybrid_pass_->report(true, details);
     }
@@ -2361,11 +2496,18 @@ namespace albireo
                 throw std::logic_error("cpu_runtime: the states of a sequence stand at another length than its keys");
             for (long j = 0; j < s.count; ++j) positions_[static_cast<size_t>(s.start + j)] = seq.length + j;
         }
-        // The processor reads the states of the sequences of its passes from the host.
+        /*
+            The processor reads the states of the sequences of its passes from the host and moves
+            them ahead: the device drops the copies it kept, which a later pass of its own
+            would otherwise take for the states of the sequences.
+        */
         if (!on_device)
             for (const auto& s : batch.segments)
+            {
                 if (!fetch_states(s.sequence))
                     throw std::runtime_error("cpu_runtime: the states of a sequence were lost with the device");
+                if (hybrid_pass_ && s.count > 0) hybrid_pass_->forget(s.sequence);
+            }
 
         // The embeddings enter the sphere the blocks keep them on.
         embed(batch.tokens);

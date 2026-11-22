@@ -26,12 +26,14 @@
     equal rank included; tt::gguf_matvec_picked() for every format against products in
     double precision with the rows of the matrices its picks name; tt::squared_relu() and
     tt::mix_rows() against their definitions; tt::mamba3_step() and tt::geodesic_update()
-    against the processor code of dlib, with the geometry of the layers of Olala 1.0 mini.
+    against the processor code of dlib, with the geometry of the layers of Olala 1.0 mini,
+    token by token and several tokens in one call.
     The program ends with the time of the products of one and of eight tokens with the
     matrices of a model of 2 billion parameters, and the rate at which they read the
     weights, with the time of the attention of a generated token over 4,096 positions, and
     with the time of one token in a block of a hybrid decoder of the size of those of
-    Olala 1.0 mini, operation by operation and as the hybrid pass chains them.
+    Olala 1.0 mini and in a block of a dense decoder of 4 billion parameters, operation by
+    operation and as the passes of the layers chain them.
 */
 
 #include <algorithm>
@@ -882,6 +884,21 @@ namespace
                 for (size_t i = 0; i < s1.size(); ++i)
                     worst_state = std::max(worst_state, std::fabs(s1.host()[i] - s2.host()[i]) / scale_state);
             }
+            // Then several tokens in one call, as the tokens of a prompt.
+            const long T = 5;
+            dlib::resizable_tensor many_in(T, L.H * (2 * L.P + 3)), many_dyn(T, 2 * L.R * L.N + L.S);
+            dlib::resizable_tensor m1(T, L.H * L.P), m2(T, L.H * L.P);
+            for (float& v : many_in) v = g(rng);
+            for (float& v : many_dyn) v = 1.5f * g(rng);
+            dlib::cpu::mamba3_step(m1, s1, many_in, many_dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f);
+            dlib::tt::mamba3_step(m2, s2, many_in, many_dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f);
+            double scale_out = 1, scale_state = 1;
+            for (size_t i = 0; i < m1.size(); ++i) scale_out = std::max<double>(scale_out, std::fabs(m1.host()[i]));
+            for (size_t i = 0; i < s1.size(); ++i) scale_state = std::max<double>(scale_state, std::fabs(s1.host()[i]));
+            for (size_t i = 0; i < m1.size(); ++i)
+                worst_out = std::max(worst_out, std::fabs(m1.host()[i] - m2.host()[i]) / scale_out);
+            for (size_t i = 0; i < s1.size(); ++i)
+                worst_state = std::max(worst_state, std::fabs(s1.host()[i] - s2.host()[i]) / scale_state);
         }
         expect(worst_out <= 1e-3 && worst_state <= 1e-3, "mamba3_step against the processor (outputs "
             + std::to_string(worst_out) + ", states " + std::to_string(worst_state) + ")");
@@ -1076,6 +1093,130 @@ namespace
         const double chained = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / repeats;
         std::printf("  hybrid block, one token: %8.1f us with the device waited for once (%.1f us operation by "
             "operation); 36 such blocks, %.1f ms\n", chained * 1e6, sum * 1e6, chained * 36e3);
+
+        // The step of the Mamba-3 layer over the 64 tokens of a part of a prompt, in one call.
+        const long T = 64;
+        dlib::resizable_tensor many_in(T, in_w), many_dyn(T, dyn_w), many_out(T, inner);
+        random_floats(many_in.host_write_only(), many_in.size(), 1.0f, rng);
+        random_floats(many_dyn.host_write_only(), many_dyn.size(), 1.5f, rng);
+        dlib::tt::mamba3_step(many_out, state, many_in, many_dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f);
+        many_out.host();
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i)
+        {
+            dlib::tt::mamba3_step(many_out, state, many_in, many_dyn, L.norms, L.bias, L.misc, L.mxz, L.mo, 1e-6f);
+            many_out.host();
+        }
+        const double many = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / repeats;
+        std::printf("  hybrid block, step of the Mamba-3 layer over %ld tokens in one call: %8.1f us, %.1f us a "
+            "token\n", T, many * 1e6, many * 1e6 / T);
+    }
+
+    /*
+        One token in a block of a dense decoder of the size of those of a model of 4 billion
+        parameters (a width of 2,560, 32 query heads and 8 key/value heads of 128 values, a
+        feed-forward block of 9,728), its matrices in Q4_K, the token attending 1,024 positions
+        in half precision: the time of each operation alone, the device waited for after each,
+        then the time of the block as the layer pass chains its operations.
+    */
+    void measure_dense(std::mt19937& rng)
+    {
+#ifdef DLIB_USE_CUDA
+        const int repeats = 50;
+#else
+        const int repeats = 1;
+#endif
+        const long d = 2560, H = 32, KVH = 8, hd = 128, qd = H * hd, kvd = KVH * hd, df = 9728, positions = 1024;
+        dlib::resizable_tensor wq, wk, wv, wo, w_gate, w_up, w_down;
+        random_matrix(wq, gb::q4_K, qd, d, rng);
+        random_matrix(wk, gb::q4_K, kvd, d, rng);
+        random_matrix(wv, gb::q4_K, kvd, d, rng);
+        random_matrix(wo, gb::q4_K, d, qd, rng);
+        random_matrix(w_gate, gb::q4_K, df, d, rng);
+        random_matrix(w_up, gb::q4_K, df, d, rng);
+        random_matrix(w_down, gb::q4_K, d, df, rng);
+        const size_t rb_d = gb::row_bytes(gb::q4_K, d);
+        dlib::kv_page_layout L;
+        L.layers = 1;
+        L.heads = KVH;
+        L.head_dim = hd;
+        L.block_positions = 256;
+        L.q8 = false;
+        const long pages = positions / L.block_positions;
+        std::vector<uint8_t> bytes(static_cast<size_t>(pages) * L.page_bytes());
+        for (auto& b : bytes) b = static_cast<uint8_t>(rng() & 0x3F);
+        dlib::resizable_tensor p, slots, tk, tb;
+        load_weights(p, bytes);
+        std::vector<int32_t> tables;
+        for (long i = 0; i < pages; ++i) tables.push_back(static_cast<int32_t>(i));
+        // The token writes the last row of the pages and attends every position.
+        put_integers(slots, { static_cast<int32_t>(positions - 1) });
+        put_integers(tk, { static_cast<int32_t>(positions - 1), 0 });
+        put_integers(tb, tables);
+        dlib::resizable_tensor x(1, d), xn(1, d), tmp(1, d), gamma(1, d), q(1, qd), k(1, kvd), v(1, kvd), ctx(1, qd);
+        dlib::resizable_tensor gate(1, df), up(1, df), angles(1, hd);
+        random_floats(x.host_write_only(), x.size(), 1.0f, rng);
+        gamma = 1;
+        float* a = angles.host_write_only();
+        for (long i = 0; i < hd / 2; ++i)
+        {
+            a[i] = std::cos(0.01f * static_cast<float>(i));
+            a[hd / 2 + i] = std::sin(0.01f * static_cast<float>(i));
+        }
+
+        struct step
+        {
+            const char* name;
+            std::function<void()> run;
+            const dlib::tensor* result;
+        };
+        const std::vector<step> steps = {
+            { "norm of the hidden state  ", [&]() { dlib::tt::rms_norm_rows(xn, x, gamma, 1e-6f); }, &xn },
+            { "attn_q      Q4_K 4096x2560", [&]() { dlib::tt::gguf_matvec(q, xn, wq, gb::q4_K, qd, d, rb_d); }, &q },
+            { "attn_k      Q4_K 1024x2560", [&]() { dlib::tt::gguf_matvec(k, xn, wk, gb::q4_K, kvd, d, rb_d); }, &k },
+            { "attn_v      Q4_K 1024x2560", [&]() { dlib::tt::gguf_matvec(v, xn, wv, gb::q4_K, kvd, d, rb_d); }, &v },
+            { "rotation of the queries   ", [&]() { dlib::tt::rope_rows(q, angles, H, hd, hd, true); }, &q },
+            { "rotation of the keys      ", [&]() { dlib::tt::rope_rows(k, angles, KVH, hd, hd, true); }, &k },
+            { "keys and values to pages  ", [&]() { dlib::tt::paged_kv_store(p, L, 0, k, v, slots); }, &k },
+            { "attention, 1,024 positions", [&]() {
+                dlib::tt::paged_attention(ctx, q, H, 0.088f, p, L, 0, tk, tb, positions); }, &ctx },
+            { "attn_output Q4_K 2560x4096", [&]() {
+                dlib::tt::gguf_matvec(tmp, ctx, wo, gb::q4_K, d, qd, gb::row_bytes(gb::q4_K, qd)); }, &tmp },
+            { "residual sum              ", [&]() { dlib::tt::add(1, x, 0.01f, tmp); }, &x },
+            { "norm of the hidden state  ", [&]() { dlib::tt::rms_norm_rows(xn, x, gamma, 1e-6f); }, &xn },
+            { "ffn_gate    Q4_K 9728x2560", [&]() {
+                dlib::tt::gguf_matvec(gate, xn, w_gate, gb::q4_K, df, d, rb_d); }, &gate },
+            { "ffn_up      Q4_K 9728x2560", [&]() {
+                dlib::tt::gguf_matvec(up, xn, w_up, gb::q4_K, df, d, rb_d); }, &up },
+            { "gate times the raised rows", [&]() { dlib::tt::silu_multiply(gate, up); }, &gate },
+            { "ffn_down    Q4_K 2560x9728", [&]() {
+                dlib::tt::gguf_matvec(tmp, gate, w_down, gb::q4_K, d, df, gb::row_bytes(gb::q4_K, df)); }, &tmp },
+            { "residual sum              ", [&]() { dlib::tt::add(1, x, 0.01f, tmp); }, &x }
+        };
+        // Once through, so that the weights are on the device and every buffer holds values.
+        for (const step& s : steps) s.run();
+        x.host();
+        double sum = 0;
+        for (const step& s : steps)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < repeats; ++i)
+            {
+                s.run();
+                s.result->host();
+            }
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                / repeats;
+            sum += seconds;
+            std::printf("  dense block, %s: %8.1f us\n", s.name, seconds * 1e6);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i)
+            for (const step& s : steps) s.run();
+        x.host();
+        const double chained = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / repeats;
+        std::printf("  dense block, one token: %8.1f us with the device waited for once (%.1f us operation by "
+            "operation); 36 such blocks, %.1f ms\n", chained * 1e6, sum * 1e6, chained * 36e3);
     }
 }
 
@@ -1130,6 +1271,7 @@ static int run_checks(int argc, char** argv)
     measure(rng);
     measure_attention(rng);
     measure_hybrid(rng);
+    measure_dense(rng);
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

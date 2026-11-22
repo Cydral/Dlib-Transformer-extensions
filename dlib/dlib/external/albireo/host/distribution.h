@@ -32,7 +32,7 @@ namespace albireo
 {
 
     // The address of the file name of the folder of the versions: "feed.json", "catalog.json.sig",
-    // "albireo-setup-online-1.0.27.exe".
+    // "albireo-setup-online-1.0.28.exe".
     std::string distribution_address(const std::string& name);
 
     /*!

@@ -460,6 +460,8 @@ namespace albireo
         size_t budget = 0;
         // 1: every product goes to the device, -1: none does, 0: measured.
         int forced = 0;
+        // Whether the runtime times the passes of the layers against the processor.
+        bool timed_passes = true;
 
         std::atomic<size_t> resident{0};
         /*
@@ -1996,6 +1998,11 @@ namespace albireo
             return expanded_product_tokens;
         }
 
+        bool timed() const override
+        {
+            return o_.d_.forced == 0 && o_.d_.timed_passes;
+        }
+
         void report(bool ok, const std::string& detail) override
         {
             if (ok && attends())
@@ -2630,7 +2637,9 @@ namespace albireo
                 why = "a mixture of experts beyond those the device chooses";
                 return false;
             }
-            if (m.ssm_rank > 8 || m.ssm_angles > 256 || m.ssm_state % 2 != 0)
+            // The bounds of tt::mamba3_step() on a device.
+            if (m.ssm_rank > 8 || m.ssm_angles > 256 || m.ssm_state % 2 != 0 || m.ssm_head_dim > 1024
+                || 2 * m.ssm_rank + 2 * m.ssm_angles + 3 * m.ssm_rank * m.ssm_state > 11264)
             {
                 why = "Mamba-3 layers beyond those the kernels of the device hold";
                 return false;
@@ -2766,21 +2775,18 @@ namespace albireo
                 dlib::alias_tensor_instance dyn = view(dyn_, n_, dyn_w);
                 o_.product_on_device(L.ssm_in, *c.a->t, c.a->quantized, x, proj);
                 o_.product_on_device(L.ssm_dyn, *c.b->t, c.b->quantized, x, dyn);
-                // The tokens of a sequence in order, each a step of the states of the layer.
+                // The tokens of a sequence in their order through the states of the layer, in one call.
                 for (const segment& s : segments_)
                 {
+                    if (s.count <= 0) continue;
                     device_state& st = states_.at(s.sequence);
                     dlib::device_scope pin_state({ &st.values });
                     dlib::alias_tensor_instance state = view(st.values, 1, layer_state_,
                         static_cast<long>(L.state_offset));
-                    for (long j = 0; j < s.count; ++j)
-                    {
-                        const long t = s.start + j;
-                        dlib::alias_tensor_instance in = view(proj_, 1, in_w, t * in_w);
-                        dlib::alias_tensor_instance turns = view(dyn_, 1, dyn_w, t * dyn_w);
-                        dlib::alias_tensor_instance out = view(inner_, 1, inner, t * inner);
-                        dlib::tt::mamba3_step(out, state, in, turns, k.norms, k.bias, k.misc, k.mxz, k.mo, m_.rms_eps);
-                    }
+                    dlib::alias_tensor_instance in = view(proj_, s.count, in_w, s.start * in_w);
+                    dlib::alias_tensor_instance turns = view(dyn_, s.count, dyn_w, s.start * dyn_w);
+                    dlib::alias_tensor_instance out = view(inner_, s.count, inner, s.start * inner);
+                    dlib::tt::mamba3_step(out, state, in, turns, k.norms, k.bias, k.misc, k.mxz, k.mo, m_.rms_eps);
                 }
                 dlib::alias_tensor_instance mixed = view(inner_, n_, inner);
                 dlib::alias_tensor_instance g = rows_of(g_, n_, d);
@@ -3018,6 +3024,11 @@ namespace albireo
         long tiled_tokens() const override
         {
             return expanded_product_tokens;
+        }
+
+        bool timed() const override
+        {
+            return o_.d_.forced == 0 && o_.d_.timed_passes;
         }
 
         void report(bool ok, const std::string& detail) override
@@ -3738,6 +3749,7 @@ namespace albireo
         d.min_tokens = std::max<long>(1, static_cast<long>(config["offload_min_tokens"].as_int(1)));
         const std::string routing = config["routing"].str("auto");
         d.forced = routing == "device" ? 1 : routing == "host" ? -1 : 0;
+        d.timed_passes = config["timed_passes"].as_bool(true);
 
 #if defined(DLIB_USE_CUDA)
         d.backend = "cuda";

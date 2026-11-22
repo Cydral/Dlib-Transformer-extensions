@@ -182,6 +182,8 @@ namespace
         c["offload_mb"] = budget_mb;
         c["routing"] = routing;
         c["v2ram"] = false;
+        // The checks below count the passes of the device, whatever the processor would do faster.
+        c["timed_passes"] = false;
         return c;
     }
 
@@ -469,6 +471,42 @@ namespace
             }
 
             /*
+                The passes timed against the processor.  A test names the passes the device keeps:
+                those of a few tokens, the longer ones, both or none.  The logits stay those of
+                the processor while the states move between the two, and the passes of the device
+                after the fifth step are those of the kind it keeps (23 of at most 8 tokens, 2
+                longer ones).
+            */
+            const char* kept_cases[4] = { "both", "few", "many", "none" };
+            const long long kept_passes[4] = { 25, 23, 2, 0 };
+            for (int i = 0; i < 4; ++i)
+            {
+                json timed = device_config(device, 0, "auto");
+                timed["timed_passes"] = true;
+                set_variable("ALBIREO_TEST_TIMED_PASSES", kept_cases[i]);
+                tensor_device dev(timed, pool, print_log);
+                std::vector<float> got;
+                json before;
+                {
+                    cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16);
+                    rt.set_offload(dev.make_offload());
+                    got = hybrid_script(rt, [&](int at) { if (at == 1) before = dev.stats(); });
+                }
+                set_variable("ALBIREO_TEST_TIMED_PASSES", nullptr);
+                const json st = dev.stats();
+                expect(got.size() == reference.size(), "the same rows with timed passes");
+                if (got.size() != reference.size()) continue;
+                const stats d = compare(reference.data(), got.data(), rows, V);
+                const std::string what = std::string("timed passes, the device keeping '") + kept_cases[i] + "'";
+                report(what.c_str(), d);
+                expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97, what.c_str());
+                const long long served = st["layer_passes"].as_int() - before["layer_passes"].as_int();
+                std::printf("  passes on the device after the fifth step: %lld\n", served);
+                expect(served == kept_passes[i], "the device serves the passes it keeps");
+                expect(st["weights_bytes"].as_int() == 0, "the copies and the states left with the model");
+            }
+
+            /*
                 A device that fails in a step without giving the states back: the pass ends with an
                 error, the sequence goes back to the 20 tokens of its saved state, and the processor
                 continues it as a runtime that never had a device.
@@ -593,6 +631,44 @@ namespace
                     expect(d.mean_kl < 1e-4 && d.top1 >= 0.97, "attention of the device, 8 bits");
                 else
                     expect(d.max_abs <= 1e-3 * std::max(1.0, d.scale) && d.top1 >= 0.99, "attention of the device");
+
+                /*
+                    The passes timed against the processor, the device keeping the kinds a test
+                    names: the keys and values the processor writes and those the device writes
+                    serve each other's passes.
+                */
+                const char* kept_cases[3] = { "few", "many", "none" };
+                for (const char* kept : kept_cases)
+                {
+                    json timed = device_config(device, 0, "auto");
+                    timed["timed_passes"] = true;
+                    set_variable("ALBIREO_TEST_TIMED_PASSES", kept);
+                    tensor_device timed_dev(timed, pool, print_log);
+                    std::vector<float> mixed;
+                    json after;
+                    qk_set_exact_products(true);
+                    {
+                        cpu_runtime rt(file, cfg, pool, size_t(64) << 20, 16, format);
+                        rt.set_offload(timed_dev.make_offload());
+                        mixed = script(rt);
+                        after = timed_dev.stats();
+                    }
+                    qk_set_exact_products(false);
+                    set_variable("ALBIREO_TEST_TIMED_PASSES", nullptr);
+                    expect(mixed.size() == reference.size(), "the same rows with timed passes");
+                    if (mixed.size() != reference.size()) continue;
+                    const stats m = compare(reference.data(), mixed.data(), rows, V);
+                    const std::string what = std::string("timed passes, the device keeping '") + kept + "'"
+                        + (q8 ? ", 8 bits" : "");
+                    report(what.c_str(), m);
+                    std::printf("  passes on the device %lld, attended there %lld\n", after["layer_passes"].as_int(),
+                        after["attention_passes"].as_int());
+                    if (q8)
+                        expect(m.mean_kl < 1e-4 && m.top1 >= 0.97, what.c_str());
+                    else
+                        expect(m.max_abs <= 1e-3 * std::max(1.0, m.scale) && m.top1 >= 0.99, what.c_str());
+                    expect(after["failures"].as_int() == 0, "no device failure with timed passes");
+                }
             }
             if (with_biases) continue;
 

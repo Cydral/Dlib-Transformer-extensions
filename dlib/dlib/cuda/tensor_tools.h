@@ -3171,24 +3171,28 @@ namespace dlib { namespace tt
             - The sizes of the tensors give the geometry of the layer: N == norms.size()/2
               values in the state of a channel, N even; H == misc.size()/2 heads;
               R == bias.size()/(2*N*H) inputs and outputs of a state; P == mo.size()/(H*R)
-              channels in a head; S == dyn.size() - 2*R*N rotated pairs, 0 <= S <= N/2.
+              channels in a head; T == in.size()/(H*(2*P + 3)) tokens, T > 0;
+              S == dyn.size()/T - 2*R*N rotated pairs, 0 <= S <= N/2.
             - bias.size() == 2*H*R*N, mxz.size() == 2*H*R*P, mo.size() == H*R*P
-            - in.size() == H*(2*P + 3) and out.size() == H*P
+            - in.size() == T*H*(2*P + 3), dyn.size() == T*(2*R*N + S) and out.size() == T*H*P
             - state.size() == H*S + H*P*N + H*R*N + H*P
-            - With CUDA, R <= 8 and S <= 256.
+            - With CUDA, R <= 8, S <= 256, P <= 1024 and 2*R + 2*S + 3*R*N <= 11264.
         ensures
-            - One token of a Mamba-3 layer with several inputs and outputs (Gu and Dao's
-              state space layers in their third version, as the olala family computes
-              them), between the two projections of the layer.  in holds, for each head, a
-              gate and an input for each of its P channels, then a step, a decay and a
-              trapezoid weight; dyn holds R input rows and R output rows of N values, shared
-              by the heads, then S turns.  The constants of the layer come packed as the
-              files of that family store them: norms holds the weights of the normalization
-              of the input rows then of the output rows (2 x N); bias the biases of the
-              input rows then of the output rows of each head (H x 2R x N); misc the bias
-              of the steps then the direct weights of the heads (2 x H); mxz the factors of
-              the inputs then of the gates (H x 2R x P); mo the factors of the outputs
-              (H x R x P).
+            - T tokens of a sequence, in their order, through a Mamba-3 layer with several
+              inputs and outputs (Gu and Dao's state space layers in their third version,
+              as the olala family computes them), between the two projections of the
+              layer.  A call with T tokens gives what T calls with one token each give; on
+              a device it is one launch, the tokens of a prompt costing no launch each.
+              For each token, in holds, for each head, a gate and an input for each of its
+              P channels, then a step, a decay and a trapezoid weight; dyn holds R input
+              rows and R output rows of N values, shared by the heads, then S turns; out
+              receives the P outputs of each head.  The constants of the layer come packed
+              as the files of that family store them: norms holds the weights of the
+              normalization of the input rows then of the output rows (2 x N); bias the
+              biases of the input rows then of the output rows of each head (H x 2R x N);
+              misc the bias of the steps then the direct weights of the heads (2 x H); mxz
+              the factors of the inputs then of the gates (H x 2R x P); mo the factors of
+              the outputs (H x R x P).
             - For head h, with dt = softplus(step + misc[0][h]), A = min(-softplus(decay),
               -1e-4), w = sigmoid(trapezoid weight), alpha = exp(A*dt), beta = (1-w)*dt*alpha
               and gamma = w*dt:

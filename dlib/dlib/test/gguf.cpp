@@ -933,16 +933,68 @@ namespace
                 DLIB_TEST_MSG(outputs < 1e-3 * (1 + max(abs(mat(o1)))), outputs);
                 DLIB_TEST_MSG(states < 1e-3 * (1 + max(abs(mat(s1)))), states);
             }
+            // Several tokens in one launch, after the tokens above.
+            const long T = 5;
+            resizable_tensor many_in(T, 1, 1, H * (2 * P + 3)), many_dyn(T, 1, 1, 2 * R * N + S);
+            resizable_tensor m1(T, 1, 1, H * P), m2(T, 1, 1, H * P);
+            for (float& v : many_in) v = rnd.get_random_gaussian();
+            for (float& v : many_dyn) v = 1.5f * rnd.get_random_gaussian();
+            cpu::mamba3_step(m1, s1, many_in, many_dyn, norms, bias, misc, mxz, mo, 1e-6f);
+            cuda::mamba3_step(m2, s2, many_in, many_dyn, norms, bias, misc, mxz, mo, 1e-6f);
+            const float outputs = max(abs(mat(m1) - mat(m2))), states = max(abs(mat(s1) - mat(s2)));
+            DLIB_TEST_MSG(outputs < 1e-3 * (1 + max(abs(mat(m1)))), outputs);
+            DLIB_TEST_MSG(states < 1e-3 * (1 + max(abs(mat(s1)))), states);
         }
-        resizable_tensor x(2, 1, 3, 40), g(2, 1, 3, 40);
-        for (float& v : x) v = rnd.get_random_gaussian();
-        for (float& v : g) v = 3 * rnd.get_random_gaussian();
-        resizable_tensor y(x);
-        cpu::geodesic_update(x, g, 1.2f, 0.01f, 2);
-        cuda::geodesic_update(y, g, 1.2f, 0.01f, 2);
-        DLIB_TEST_MSG(max(abs(mat(x) - mat(y))) < 1e-5, max(abs(mat(x) - mat(y))));
+        // Rows narrower and wider than a block of the device, the wider ones with outputs far beyond their rows.
+        const long widths[2] = { 40, 1000 };
+        for (const long width : widths)
+        {
+            resizable_tensor x(2, 1, 3, width), g(2, 1, 3, width);
+            for (float& v : x) v = rnd.get_random_gaussian();
+            for (float& v : g) v = (width > 256 ? 3e6f : 3.0f) * rnd.get_random_gaussian();
+            resizable_tensor y(x);
+            cpu::geodesic_update(x, g, 1.2f, 0.01f, 2);
+            cuda::geodesic_update(y, g, 1.2f, 0.01f, 2);
+            DLIB_TEST_MSG(max(abs(mat(x) - mat(y))) < 1e-5, max(abs(mat(x) - mat(y))));
+        }
     }
 #endif
+
+    // tt::mamba3_step() over several tokens in one call against one call per token.
+    void test_mamba3_step_tokens()
+    {
+        dlib::rand rnd;
+        const long geometries[3][5] = { { 3, 5, 8, 2, 2 }, { 2, 7, 12, 4, 0 }, { 6, 8, 32, 3, 16 } };
+        for (const auto& c : geometries)
+        {
+            const long H = c[0], P = c[1], N = c[2], R = c[3], S = c[4];
+            const long T = 6, in_w = H * (2 * P + 3), dyn_w = 2 * R * N + S;
+            resizable_tensor norms(2, N), bias(H, 2 * R, N), misc(2, H), mxz(H, 2 * R, P), mo(H, R, P);
+            for (float& v : norms) v = 1 + 0.2f * rnd.get_random_gaussian();
+            for (float& v : bias) v = 1 + 0.3f * rnd.get_random_gaussian();
+            for (float& v : misc) v = 0.5f * rnd.get_random_gaussian();
+            for (float& v : mxz) v = 0.7f + 0.3f * rnd.get_random_gaussian();
+            for (float& v : mo) v = 0.5f + 0.2f * rnd.get_random_gaussian();
+            resizable_tensor in(T, 1, 1, in_w), dyn(T, 1, 1, dyn_w), together(T, 1, 1, H * P), apart(T, 1, 1, H * P);
+            for (float& v : in) v = rnd.get_random_gaussian();
+            for (float& v : dyn) v = 1.5f * rnd.get_random_gaussian();
+            resizable_tensor s1(1, 1, 1, H * S + H * P * N + H * R * N + H * P), s2;
+            s1 = 0;
+            s2 = s1;
+            tt::mamba3_step(together, s1, in, dyn, norms, bias, misc, mxz, mo, 1e-6f);
+            resizable_tensor one_in(1, 1, 1, in_w), one_dyn(1, 1, 1, dyn_w), one_out(1, 1, 1, H * P);
+            for (long t = 0; t < T; ++t)
+            {
+                std::memcpy(one_in.host_write_only(), in.host() + t * in_w, sizeof(float) * in_w);
+                std::memcpy(one_dyn.host_write_only(), dyn.host() + t * dyn_w, sizeof(float) * dyn_w);
+                tt::mamba3_step(one_out, s2, one_in, one_dyn, norms, bias, misc, mxz, mo, 1e-6f);
+                std::memcpy(apart.host() + t * H * P, one_out.host(), sizeof(float) * H * P);
+            }
+            const float outputs = max(abs(mat(together) - mat(apart))), states = max(abs(mat(s1) - mat(s2)));
+            DLIB_TEST_MSG(outputs <= 1e-5 * (1 + max(abs(mat(apart)))), outputs);
+            DLIB_TEST_MSG(states <= 1e-5 * (1 + max(abs(mat(s2)))), states);
+        }
+    }
 
 // ----------------------------------------------------------------------------------------
 
@@ -967,6 +1019,7 @@ namespace
             test_bounded();
             print_spinner();
             test_geodesic_update();
+            test_mamba3_step_tokens();
             print_spinner();
             test_expert_operations();
             print_spinner();
