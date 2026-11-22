@@ -960,6 +960,161 @@ namespace
     }
 #endif
 
+    /*
+        The operations of the longer passes of a decoder, on the device of the build, against
+        the processor code and against the operations they stand for: tt::gguf_gemm() in every
+        arithmetic the device computes with, through tiles of one row to the whole matrix,
+        against cpu::gguf_matvec(); tt::add_rms_norm_rows() against the sum followed by
+        cpu::rms_norm_rows(); tt::rope_rows() of two sets of rows against a call each;
+        tt::paged_attention_rows() against cpu::paged_attention(), in half precision and in 8
+        bits, from the start of a sequence and from further on, in one run of the tokens and in
+        runs of five.
+    */
+    void test_long_pass_operations()
+    {
+        dlib::rand rnd;
+        const int types[5] = { gguf_blocks::f32, gguf_blocks::bf16, gguf_blocks::q8_0, gguf_blocks::q4_K,
+            gguf_blocks::q6_K };
+        const gguf_precision precisions[3] = { gguf_precision::single, gguf_precision::tf32, gguf_precision::half };
+        for (int type : types)
+        {
+            const bool k_quant = type == gguf_blocks::q4_K || type == gguf_blocks::q6_K;
+            const long rows = 21, cols = k_quant ? 512 : 160;
+            const size_t row_bytes = gguf_blocks::row_bytes(type, cols);
+            resizable_tensor w;
+            store_bytes(w, random_weight_rows(type, rows, cols, rnd));
+            for (long n : { 3L, 70L })
+            {
+                resizable_tensor x(n, cols), expected(n, rows), y(n, rows), saturated(1);
+                for (float& v : x) v = rnd.get_random_gaussian();
+                cpu::gguf_matvec(expected, x, w, type, rows, cols, row_bytes);
+                const float size = 1 + max(abs(mat(expected)));
+                for (gguf_precision p : precisions)
+                {
+                    if (!tt::gguf_gemm_computes(p)) continue;
+                    const bool half = p == gguf_precision::half;
+                    for (long tile : { 1L, 6L, rows })
+                    {
+                        const size_t activations = half ? (static_cast<size_t>(n) * cols * 2 + 15) / 16 * 16 : 0;
+                        resizable_tensor work;
+                        work.set_size(static_cast<long long>((activations + static_cast<size_t>(tile) * cols
+                            * (half ? 2 : 4) + 3) / 4));
+                        saturated = 0;
+                        y = 1e30f;
+                        tt::gguf_gemm(y, x, w, type, rows, cols, row_bytes, work, p, saturated);
+                        const float apart = max(abs(mat(expected) - mat(y)));
+                        // The floats agree within their rounding; the tensor cores and the halves keep 10 and 11 bits.
+                        DLIB_TEST_MSG(apart < (p == gguf_precision::single ? 2e-4f : 2e-2f) * size, "type " << type
+                            << ", " << n << " rows, tiles of " << tile << ", arithmetic " << static_cast<int>(p) << ": "
+                            << apart);
+                        DLIB_TEST_MSG(saturated.host()[0] == 0, "type " << type << ": no value beyond the halves");
+                    }
+                }
+            }
+        }
+        DLIB_TEST(tt::gguf_gemm_computes(gguf_precision::single));
+        if (tt::gguf_gemm_computes(gguf_precision::half))
+        {
+            // An activation beyond the halves is told.
+            const long rows = 5, cols = 64, n = 4;
+            resizable_tensor w, x(n, cols), y(n, rows), saturated(1), work;
+            store_bytes(w, random_weight_rows(gguf_blocks::f32, rows, cols, rnd));
+            for (float& v : x) v = rnd.get_random_gaussian();
+            x.host()[cols + 7] = -1e6f;
+            work.set_size(n * cols + rows * cols);
+            saturated = 0;
+            tt::gguf_gemm(y, x, w, gguf_blocks::f32, rows, cols, gguf_blocks::row_bytes(gguf_blocks::f32, cols), work,
+                gguf_precision::half, saturated);
+            DLIB_TEST(saturated.host()[0] != 0);
+        }
+
+        for (long width : { 48L, 256L, 700L })
+        {
+            const long rows = 4;
+            resizable_tensor x(rows, width), addend(rows, width), gamma(1, width), expected(rows, width);
+            resizable_tensor normalized(rows, width);
+            for (float& v : x) v = 3 * rnd.get_random_gaussian();
+            for (float& v : addend) v = 3 * rnd.get_random_gaussian();
+            for (float& v : gamma) v = 1 + 0.3f * rnd.get_random_gaussian();
+            resizable_tensor sum(x);
+            for (size_t i = 0; i < sum.size(); ++i) sum.host()[i] += 0.7f * addend.host()[i];
+            cpu::rms_norm_rows(expected, sum, gamma, 1e-6f);
+            tt::add_rms_norm_rows(normalized, x, addend, 0.7f, gamma, 1e-6f);
+            DLIB_TEST_MSG(max(abs(mat(sum) - mat(x))) < 1e-5, max(abs(mat(sum) - mat(x))));
+            DLIB_TEST_MSG(max(abs(mat(expected) - mat(normalized))) < 1e-4, max(abs(mat(expected) - mat(normalized))));
+        }
+
+        for (int neox = 0; neox < 2; ++neox)
+        {
+            const long n = 33, q_heads = 4, k_heads = 2, hd = 32, dims = 24;
+            resizable_tensor q(n, q_heads * hd), k(n, k_heads * hd), angles(n, dims);
+            for (float& v : q) v = rnd.get_random_gaussian();
+            for (float& v : k) v = rnd.get_random_gaussian();
+            for (float& v : angles) v = rnd.get_random_gaussian();
+            resizable_tensor q_alone(q), k_alone(k);
+            cpu::rope_rows(q_alone, angles, q_heads, hd, dims, neox != 0);
+            cpu::rope_rows(k_alone, angles, k_heads, hd, dims, neox != 0);
+            tt::rope_rows(q, q_heads, k, k_heads, angles, hd, dims, neox != 0);
+            DLIB_TEST_MSG(max(abs(mat(q) - mat(q_alone))) < 1e-5, max(abs(mat(q) - mat(q_alone))));
+            DLIB_TEST_MSG(max(abs(mat(k) - mat(k_alone))) < 1e-5, max(abs(mat(k) - mat(k_alone))));
+        }
+
+        for (int q8 = 0; q8 < 2; ++q8)
+            for (long rep : { 1L, 4L })
+            {
+                kv_page_layout layout;
+                layout.layers = 2;
+                layout.heads = 2;
+                layout.head_dim = 64;
+                layout.block_positions = 8;
+                layout.q8 = q8 != 0;
+                const long hd = layout.head_dim, q_heads = layout.heads * rep, kvd = layout.heads * hd;
+                const long layer = 1, page_count = 6, first_entry = 2;
+                // The blocks of the sequence lie in pages out of order, after other entries of the table.
+                const std::vector<int32_t> table = { 5, 5, 3, 0, 4, 1 };
+                resizable_tensor pages, tables;
+                pages.set_size(static_cast<long long>((static_cast<size_t>(page_count) * layout.page_bytes() + 3) / 4));
+                pages = 0;
+                store_integers(tables, table);
+                for (long first_position : { 0L, 11L })
+                {
+                    const long n = 13, span = first_position + n;
+                    resizable_tensor keys(span, kvd), values(span, kvd), slots, tokens;
+                    for (float& v : keys) v = rnd.get_random_gaussian();
+                    for (float& v : values) v = rnd.get_random_gaussian();
+                    std::vector<int32_t> where, plan;
+                    for (long p = 0; p < span; ++p)
+                        where.push_back(table[static_cast<size_t>(first_entry + p / layout.block_positions)]
+                            * static_cast<int32_t>(layout.block_positions)
+                            + static_cast<int32_t>(p % layout.block_positions));
+                    for (long t = 0; t < n; ++t)
+                    {
+                        plan.push_back(static_cast<int32_t>(first_position + t));
+                        plan.push_back(static_cast<int32_t>(first_entry));
+                    }
+                    store_integers(slots, where);
+                    store_integers(tokens, plan);
+                    cpu::paged_kv_store(pages, layout, layer, keys, values, slots);
+                    resizable_tensor q(n, q_heads * hd), expected(n, q_heads * hd), out(n, q_heads * hd);
+                    for (float& v : q) v = rnd.get_random_gaussian();
+                    cpu::paged_attention(expected, q, q_heads, 0.2f, pages, layout, layer, tokens, tables, span);
+                    for (long run : { n, 5L })
+                    {
+                        resizable_tensor work;
+                        work.set_size(static_cast<long long>(tt::paged_attention_rows_scratch(n, q_heads, layout,
+                            first_position, run)));
+                        out = 1e30f;
+                        tt::paged_attention_rows(out, q, q_heads, 0.2f, pages, layout, layer, tables, first_entry,
+                            first_position, work);
+                        const float apart = max(abs(mat(expected) - mat(out)));
+                        DLIB_TEST_MSG(apart < 1e-4, "attention of consecutive tokens, " << (q8 ? "8 bits" : "halves")
+                            << ", " << q_heads << " heads, from position " << first_position << ", runs of " << run
+                            << ": " << apart);
+                    }
+                }
+            }
+    }
+
     // tt::mamba3_step() over several tokens in one call against one call per token.
     void test_mamba3_step_tokens()
     {
@@ -1020,6 +1175,8 @@ namespace
             print_spinner();
             test_geodesic_update();
             test_mamba3_step_tokens();
+            print_spinner();
+            test_long_pass_operations();
             print_spinner();
             test_expert_operations();
             print_spinner();

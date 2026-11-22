@@ -86,6 +86,12 @@ namespace
             DLIB_TEST(avx2::gelu(a, src));
             cpu::gelu(b, src);
             DLIB_TEST_MSG(worst(b, a) <= 2e-6f, "gelu " << n << ": " << worst(b, a));
+            DLIB_TEST(avx2::mish(a, src));
+            cpu::mish(b, src);
+            DLIB_TEST_MSG(worst(b, a) <= 2e-6f, "mish " << n << ": " << worst(b, a));
+            DLIB_TEST(avx2::elu(a, src, 0.7f));
+            cpu::elu(b, src, 0.7f);
+            DLIB_TEST_MSG(worst(b, a) <= 2e-6f, "elu " << n << ": " << worst(b, a));
             // In place, as the layers call them.
             a = src;
             DLIB_TEST(avx2::tanh(a, a));

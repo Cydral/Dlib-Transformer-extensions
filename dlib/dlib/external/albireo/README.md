@@ -281,7 +281,7 @@ The engine takes every physical core by default (`threads`), the efficient cores
 performance cores: on that processor, the processor runtime reads and writes faster on its 24 cores
 than on 8 threads at each stage of the table (19.48 tokens per second against 15.25 for the steps).
 A processor whose efficient cores are slower may write faster on its performance cores alone, which
-`threads` sets and `bench_runtime model.gguf <threads>` measures.
+`threads` sets and `bench_runtime model.gguf --threads 8,24` measures.
 
 On 24 threads of that machine, Qwen3 0.6B Q4_K_M read its first pass at 1172 to 1290 tokens per
 second with the graph against 1304 to 1354, its later passes at 317 to 428 against 1063 to 1088, and
@@ -491,7 +491,15 @@ in a budget:
   precision for the other formats. The kernels of dlib
   ([`dlib/cuda/cuda_gguf.cu`](../../cuda/cuda_gguf.cu)) read the blocks in place for a product of
   fewer than 64 tokens, a warp per row decoding each group of 32 weights once for up to eight
-  tokens, and expand them from 64 tokens on by tiles of 64 MB that cuBLAS multiplies. A block of
+  tokens, and expand them from 64 tokens on by tiles of 64 MB that cuBLAS multiplies
+  (`tt::gguf_gemm()`), each tile writing its columns of the result in place. The card computes
+  these products in the arithmetic it runs fastest among those it has: single precision, the single
+  precision of the tensor cores (TF32, from the compute capability 8.0 on), or weights and
+  activations in half precision with sums in single precision (from 7.0 on). The first such product
+  times them on its matrix with 256 rows of zeros, a first run settling the kernels of cuBLAS, and
+  the log gives the times; `gemm_precision` imposes one (`single`, `tf32`, `half`). The halves serve
+  the layers of the dense models alone: a pass that holds a value beyond them (65504) is computed
+  again by the processor, and the passes that follow leave the halves. A block of
   eight warps copies the activations of up to eight tokens to its shared memory by chunks of 1,024
   columns, which its warps read 16 bytes at a time without conflicts of banks: each lane read its
   own group of 32 activations from the caches before, 128 bytes away from those of the next lanes,
@@ -523,42 +531,62 @@ in a budget:
 
 With CUDA, the layers of a dense model run on the card as a whole (`layer_pass`): the hidden states
 of a pass stay on the card from the first layer to the last, and the card computes the
-normalizations, the seven products, the SwiGLU gate and the residual sums of each layer. For a pass
-of up to 8 tokens, as a step of the generation, the card also computes the biases, the
-normalizations of queries and keys, the rotary positions and the attention
-([`dlib/cuda/kv_pages.h`](../../cuda/kv_pages.h), `tt::paged_kv_store()` and
-`tt::paged_attention()`): it keeps copies of the pages of keys and values in their format, writes
-the keys and values of the tokens of the pass into them, and attends them, the positions of a token
+normalizations, the seven products, the SwiGLU gate and the residual sums of each layer, the sum
+that ends a block in the same launch as the normalization that follows it
+(`tt::add_rms_norm_rows()`). The card also computes the biases, the normalizations of queries and
+keys, the rotary positions, those of the queries and of the keys in one launch, and the attention
+([`dlib/cuda/kv_pages.h`](../../cuda/kv_pages.h), `tt::paged_kv_store()`, `tt::paged_attention()`
+and `tt::paged_attention_rows()`): it keeps copies of the pages of keys and values in their format
+and writes the keys and values of the tokens of the pass into them. A layer of a generated token
+is 13 launches, where it was 16. For a pass of up to 8 tokens, as a step of the generation, a
+block of the card attends each token and key/value head, the positions of a token
 split among the blocks of the card when its heads alone would leave most of it idle, the partial
-sums being merged afterwards (the split of FlashDecoding). The layers of a step then exchange
-nothing with the processor: the tokens go to the card at the start of the step, and the hidden
-state of the next token comes back at its end with the keys and values of the step, which go into
+sums being merged afterwards (the split of FlashDecoding). For a longer pass, as a chunk of a
+prompt, the card attends all the tokens together, with matrix products: it expands the keys and
+the values of the positions the pass attends to floats, head after head, then takes the tokens by
+runs, the scores of a run being one batched product of its queries with the keys, their softmax
+one launch with a block per row, and the outputs one batched product of the weights with the
+values. The work of that attention keeps within 384 MB, the tokens of a pass going in as many runs
+as it takes; a pass whose keys and values alone exceed it, beyond some 46,000 positions for 8
+key/value heads of 128 values, and a pass that holds the tokens of several sequences leave their
+attention to the processor. The layers of a pass the card attends exchange
+nothing with the processor: the tokens go to the card at the start of the pass, and the hidden
+state of the next token comes back at its end with the keys and values of the pass, which go into
 the pages of the processor, where the layers of a step of a model of 36 layers crossed the bus 72
-times. A page that a step reads and the card lacks, or whose rows the processor wrote
-since, as after the prompt of a question, crosses whole before the step. The copies take room in
+times. A page that a pass reads and the card lacks, or whose rows the processor wrote
+since, crosses whole before the pass. The copies take room in
 the budget of the device and grow with the conversations; the page of the block least recently read
-goes to another block, an idle model gives its copies back with its matrices, and a step whose
-pages do not fit is attended by the processor. For the longer passes, as a prompt, the processor
+goes to another block, an idle model gives its copies back with its matrices, and a pass whose
+pages do not fit is attended by the processor. For a pass the processor attends, it
 keeps the attention over its pages, the biases, the normalizations of queries and keys and the
 rotary positions: a layer crosses the bus once each way, the queries, keys and values of its tokens
 to the processor and the outputs of their attention back, through pinned memory and asynchronous
-copies, where the products alone crossed it twice per product.
+copies, where the products alone crossed it twice per product. Until version 1.0.28 every pass of
+more than 8 tokens went that way.
 
 Before their first use, the layers of the card pass probes against the processor alone, with the
 keys and values of the probe tokens in half precision in a pool of their own: in 8 bits, the keys
 of the two passes would turn the small differences of their products into whole steps of their
 rounding. A pass over 8 probe tokens attended by the card, whose products read the blocks in place,
-and a pass over 64, whose products go through the tiles and whose attention stays on the processor,
-must give the logits of the processor within 1 %, the most likely token differing for one of the 8
-probe tokens and four of the 64 at most; with keys and values in 8 bits, a pass over 8 probe tokens
-attended by the card over keys and values in 8 bits must stay within 5 %, the most likely token
-differing for one of them at most. An attention of the card that differs leaves the attention to
-the processor and the layers to the card; one whose copies find no room is probed again 64 passes
-later, then twice as late each time; products that differ leave the layers with the products. The
+and a pass over 64, whose products go through the tiles and which the card attends over its tokens
+together, must give the logits of the processor within 1 %, the most likely token differing for
+one of the 8 probe tokens and four of the 64 at most; with keys and values in 8 bits, a pass over
+8 probe tokens and a pass over 16, each attended by the card its own way over keys and values in 8
+bits, must stay within 5 %, the most likely token differing for one of the 8 and two of the 16 at
+most. An attention of the card that differs leaves that attention to
+the processor and the layers to the card, the attention of the longer passes apart from that of
+the steps; one whose copies find no room is probed again 64 passes later, then twice as late each
+time. A pass over 64 tokens that still differs with the attention of the processor returns the
+products of the card to single precision when they ran in another arithmetic, and is compared
+once more, attended by the card again, since that arithmetic may have been alone to differ;
+products that differ in single precision leave the layers with the products. The
 copies of the keys and values keep within the memory of the card, beyond which the passes of a few
 tokens stay on the processor. A check that the keys and values or the card put off is made again
 64 passes later. A failure of the card brings the pass back to the processor, which computes
-it again. A model with a mixture of experts, and the passes that add the DeepStack slices of an
+it again; a check of dlib that fails in the code of the card (`DLIB_CASSERT`) is such a failure
+each time it happens, the trees of Albireo being compiled with `DLIB_NO_ABORT_ON_2ND_FATAL_ERROR`,
+without which dlib ends the process at the second one. A model with a mixture of experts, and the
+passes that add the DeepStack slices of an
 image, keep the products; a model whose attention grows with the positions (`attn_temp_scale`)
 keeps its attention on the processor. The layers of a hybrid decoder have a pass of their own on
 the card ([Hybrid decoders](#hybrid-decoders)).
@@ -841,7 +869,10 @@ copy, and a card that took the prompts while the processor wrote the answers, as
 of the weights exceed its memory, could continue a sequence from the states it held before those
 answers. The key
 `timed_passes` of the configuration of the device, false, and the routing `device` keep on the
-device every pass it computes right.
+device every pass it computes right. The first passes of a model on a device hold these probes and
+these measures, a second or more for a model of 4 billion parameters on the laptop above: a figure
+of a first prompt holds them, and `bench_offload` runs each of its tests once unmeasured for that
+reason.
 
 The same computation exists in dlib for the programs that load a GGUF file without Albireo:
 `tt::geodesic_update()` and `tt::mamba3_step()`
@@ -1611,7 +1642,7 @@ reported as unusable, with its compute capability, and the other engines serve t
 | `ALBIREO_PROGRAMS`        | ON      | service, tray, installer, processor engines                       |
 | `ALBIREO_ENGINE_OPENVINO` | OFF     | OpenVINO engines (dlib with `DLIB_USE_NPU`), one per family of kernels |
 | `ALBIREO_ENGINE_CUDA`     | OFF     | CUDA engine (dlib with `DLIB_USE_CUDA`)                           |
-| `ALBIREO_ENGINE_DLIB`     | OFF     | engine whose products go through the host code of dlib (tests)     |
+| `ALBIREO_ENGINE_DLIB`     | OFF     | engine whose products go through the host code of dlib, with `test_offload`, `test_device_ops` and `bench_offload` on it (tests) |
 | `ALBIREO_TESTS`           | ON      | test programs, in `<build>/tests`                                 |
 | `ALBIREO_EXTRA_ENGINE_DIRS` |       | folders of engines built in other trees, added to the installer   |
 | `ALBIREO_COPY_RUNTIME`    | ON on Windows | copy of the runtime libraries beside the device engines      |
@@ -1658,14 +1689,14 @@ cmake --build build-albireo-win -j
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches; `synthetic` checks the attention on a tiny model, then a tiny hybrid decoder (Mamba-3 layers, differential attentions, experts in a latent space) against the logits of the reference for 24 tokens, which `tests/data/hybrid.golden` holds, on two threads and on twelve, with 8-bit keys, by passes and by steps, its sequences cut and copied at the lengths of their saved states, and the states saved along the prompts (a lone token of a prompt, the prompt after generated tokens), then a tiny mixture of experts (8 experts of which 3 answer a token) cut the same ways; both models give the same logits, bit for bit, in their passes of a few tokens whether the products of a layer share their parallel sections or take one each, as a model given on the command line does; also as `test_runtime_portable`, without the instructions of AVX2 in the kernels. `test_runtime hybrid-model file.gguf` writes that tiny decoder, from which `python3 tests/reference_forward.py file.gguf hybrid.golden 1 2 ... 24` computes the logits again |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products and the layers of a device against the processor kernels, the small budget path and the measured routing; `synthetic` runs a script of passes through the attention of the device on the tiny model, against the processor, then on a card that runs out of memory and has room again (`ALBIREO_TEST_CARD_FREE_MB` gives the device a card of that many megabytes less its copies), whose copies leave it, wait for the ceiling the release left to rise (`ALBIREO_TEST_CARD_RAISE_MS` gives the period of the rise), come back, then leave it again within the period of that rise, which bounds the next rises and doubles their period; then the tiny mixture of experts and the tiny hybrid decoder, whose steps hand their products over by groups, with a device that routes to the processor (the logits of the runtime alone, bit for bit), with the measured routing and with every product on the device; then the layers of the tiny hybrid decoder on the device, its experts in single precision then in Q8_0 with a latent exit in BF16, through a script of prompts, steps of two sequences, copies and cuts, against the processor, with a pass the device fails (`ALBIREO_TEST_HYBRID_FAILURE` gives the operation that fails), a pass that lacks memory, and states the device loses, which send the sequence back to its saved state; then the passes timed against the processor, for the dense and the hybrid decoder, the device keeping the passes of a few tokens, the longer ones, both or none (`ALBIREO_TEST_TIMED_PASSES` names them), with the logits of the processor and the count of the passes of the device in each case; with a model, the measured routing follows the usual kernels or, through the layers of the device, the exact products |
-| `test_device_ops` | on the processor, the lanes of the kernel of the card for Q4_K and Q6_K (`gguf_blocks::lane_products()`) against the processor kernels; then the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); the operations of the experts (`tt::expert_routes`, with scores that tie, `tt::gguf_matvec_picked`, `tt::squared_relu`, `tt::mix_rows`) and the step of a Mamba-3 layer (`tt::mamba3_step`, with the sizes of Olala mini among others, token by token then several tokens in one call) against the processor code of dlib; then the time of the products of one and of eight tokens on the matrices of a 2B model, of the attention of a generated token over 4,096 positions, of the 18 operations of a token in a block of Olala mini, one by one and chained, of the step of its Mamba-3 layer over 64 tokens, and of the 16 operations of a token in a block of a dense 4B model |
+| `test_device_ops` | on the processor, the lanes of the kernel of the card for Q4_K and Q6_K (`gguf_blocks::lane_products()`) against the processor kernels; then the operations of dlib on the weights in their GGUF formats (`tt::gguf_matvec`, `tt::gguf_dequantize`, `tt::rms_norm_rows`, `tt::silu_multiply`, and `tt::add` of the biases of the attention without cuDNN) against the processor kernels, for every format, with activations on 16 bytes and off them; the operations of the attention (`tt::rope_rows`, `tt::paged_kv_store` and `tt::paged_kv_gather` against the rows the processor writes, in half precision and in 8 bits, `tt::paged_attention` against a reference in double precision over heads of 32 to 256 values); the operations of the experts (`tt::expert_routes`, with scores that tie, `tt::gguf_matvec_picked`, `tt::squared_relu`, `tt::mix_rows`) and the step of a Mamba-3 layer (`tt::mamba3_step`, with the sizes of Olala mini among others, token by token then several tokens in one call) against the processor code of dlib; then the time of the products of one and of eight tokens on the matrices of a 2B model, of the attention of a generated token over 4,096 positions, of the 18 operations of a token in a block of Olala mini, one by one and chained, of the step of its Mamba-3 layer over 64 tokens, and of the 16 operations of a token in a block of a dense 4B model; the operations of the longer passes: `tt::gguf_gemm` for 64 and 130 tokens in every arithmetic the device computes with, through tiles of one row to the whole matrix, against products in double precision, with the float the halves set for a value beyond them, `tt::add_rms_norm_rows` against its definition, `tt::rope_rows` of two sets of rows against a call each, and `tt::paged_attention_rows` against `tt::paged_attention` for 40 consecutive tokens, from the start of a sequence and from position 300, in one run and in runs of seven; then their measures: the time of a launch of a kernel, chained and with the device waited for, the expansion of a tile, the products of 64 and of 512 tokens with a matrix of 9,728 by 2,560 in each arithmetic, and the attention of 512 tokens token by token and together |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, the history of an answer read ahead of the next question, and the drafts of the answers that repeat, kept, the answers being those of the model without drafts |
 | `test_sampler`   | the draws with a draft against the distribution of the draws without one, a draft the filters leave out never returned, the most likely token at temperature 0, and the pending tokens of a verification counted by the penalties as the tokens accepted |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the prompts of Mistral Small 3.2 (default system prompt joined with the dates, tools before the last question, identifiers of 9 characters for the calls and their results), the calls whose code leaves its quotes unescaped, the calls of Mistral and Granite 3 read to their end with a `"}"` in such code, followed by a space or not, or a marker in a string, a call followed by text or by JSON, two calls with a text between them, the calls a call cut short writes as examples, two Granite 3 calls without a marker between them, the XML parameters without their closing marker, on their lines or on one, an XML value that writes a parameter, given or not, or names one within a line, and an XML call cut inside a value, the Llama 3 answers that are no call and an earlier answer holding `</think>`; the prompts of the format of Olala (the instructions of its template for each reasoning effort, with and without tools, the effort of a request among those the model learned, the tools of a developer turn, the analyses kept along a loop of tool calls and dropped by a new question, a call and its result) and its answers read channel by channel, whole or cut in pieces, with the tools channel of a request without tools dropped, a marker inside a channel, a channel without content, a name longer than those of the channels and what a model writes after a complete answer dropped |
 | `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads of the models from a local server of official addresses, and from nowhere else (the address of a message without its query; a file of another size or of other bytes, a web page in place of a file and a server that fails, each failing the download with the address and its failure, the progress kept; a model of eight parts, one compressed, resumed with the part it lacked; a download cancelled at once; an address that answers twice 404, 410 or 451, or 401 or 403 with the error headers of the hub, by itself or through another address of its own server and without a web page, ending the download with the code `download_unavailable`, its progress and its partial files dropped and its address kept seven days, the same statuses from a web page or from another server a redirection led to, and 401 or 403 without these headers, staying failures of the transfer), the catalog and the feed of the updates from a local folder of the versions alone (the signed catalog of the repository and the signed feed of `tests/data` read from it; a file it lacks, answered with a line of text or with the page of a website, another signature, with no request to an official address), the installer of an update written through a new partial file and named once it has the size and the hash the feed names, each failure of the folder of the versions with the bounds of the tests shortened (web pages with 200 and 403, a proxy that asks for its authentication, connections reset or refused, a server that stalls or answers byte by byte) failing with the address and the failure, without exception, the local server still answering, the settings of an earlier version written again without the link of that version and the search providers, the graph of OpenVINO `auto` of a document before version 2 read `off` unless its accelerator is `cpu`, the 8192 tokens of an answer of the relay of a document before version 3 read 16384, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider), and the relay (its secret kept out of `settings.json` for its provider, address and user, the substitutes of an answer cut anywhere restored at the boundaries of words, the memory of the pseudonymization served again, bounded and forgetting, the requests of an engine of OpenAI, of Ollama and of Claude to a local server that answers as each and as Pseudalis, the texts and the descriptions of the images sent pseudonymized, a refused key, an account without credit, the substitutes left in the answer for a check, an address without `/v1` or with the path of an operation reaching the interface at `/v1`, the codes, statuses and messages of the failures of the test, the refusals of the tools, of the offline mode and of a missing key, offline an engine of this computer answering with Pseudalis while the downloads are cancelled and the providers of the Internet and the public addresses refused before any connection, and a log that names no key and no value) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning and its budget (`--budget`), the sampling the authors of the model advise (`--temperature auto`) and a presence penalty (`--presence`), the drafts of the answers (`--draft N`, 0 for none) and the products of the prompts on floats (`--floats`), the threads (`--threads`) and the time they wait for the next parallel section before they sleep (`--spin`, in microseconds), the device of the OpenVINO engine over `DLIB_NPU_DEVICE` (`--device`, written to the environment block of the process, which dlib reads on Windows whatever the runtime of C of the program), its graph (`--graph off\|auto\|on`) and the cache of the engine where the graph writes its weights (`--cache-dir`), parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
-| `bench_runtime`  | tokens per second of the prompt and of the generation, the prompt on 8-bit integers or on floats (`floats`), also as `bench_runtime_avxvnni`; the sequences that advance together start from the first tokens of the prompt, 64 at most, and their number is the size of the passes their steps measure |
+| `bench_runtime`  | the tokens per second of the runtime as `llama-bench` of llama.cpp measures its own: a prompt of 512 tokens drawn at random, read in passes of the size of the engine with the logits of the last token of each (`pp512`), and 128 tokens written one pass each from an empty sequence (`tg128`), each test run once unmeasured then 5 times, with the mean and the standard deviation of its repetitions; neither a tokenization nor a sampling counts. `--threads 8,24` runs the tests for each number of threads, `--prompt`, `--generate`, `--repetitions`, `--batch` and `--depth` (positions the sequence holds before each test) set them, `--parallel` adds the steps of several sequences in one pass, each after the first tokens of a prompt, 64 at most, `--kv` gives the format of the keys and values, those of the engine by default, and `--floats` computes the prompts on floats; also as `bench_runtime_avxvnni`. A tree with a device engine builds it as `bench_offload`, which hands the layers to the device as the engine does (`--routing`, `--device`, `--offload-mb`, `--precision` for the arithmetic of the products of the longer passes): its unmeasured runs hold the probes and the measures of the first passes, and it prints the log and the statistics of the device |
 | `test_ov_graph`  | the graph of OpenVINO of a model against the processor runtime (OpenVINO tree): the logits of a prompt read by passes and of single steps, compared as distributions, with the hidden states; a sequence cut inside its positions and read further, against the processor runtime and against a new sequence of the same runtime that reads the same tokens, which the cut sequence of the graph has to match within a divergence of 0.01, a second sequence that copies the start of the first, both stepping in one batch, then again after `trim_memory()`; with Qwen3-VL, an image of 4 x 4 tokens with multimodal positions and DeepStack slices; the speeds of both runtimes and the memory the graph takes; `-mask` gives the processor the graph of the other devices, whose attention takes the causal mask as an input, `-f32` has the other devices compute in single precision rather than in half precision, and `-dq` leaves their plugin its default, which rounds the inputs of the products of the long passes of a prompt to 8 bits; a comparison whose largest divergence exceeds 0.1 names its pass or step and the most probable tokens of both runtimes with their probabilities. `test_ov_graph model.gguf [device] [threads] [f16\|u8][-mask][-f32][-dq] [prompt] [chunk] [steps]` |
 | `test_publish_release.py` | the publication of a version by `tools/publish_release.py`, with a chain of the website played by a script, which publishes the feed, the catalog and the installers of its folder of the publication, and a local hosting: the refusals before anything is written, each told in one line (a folder without the chain, an installer of another version or of another folder, a key of another pair, notes that are no texts by language, a catalog whose signature fails or that tells no time, the feed of a later version or a later catalog in the folder of the publication or on the website, a website that cannot be read or answers with a page), the release notes of the sources taken by default, the seven files written under hidden names, each copy compared with its source, a link at one of these names never written through and the names a run cut short left removed, a signature of the feed that fails or is the one of another key, a failure at the first name, which leaves the folder as it was, and one after it, told with what the folder holds and completed by the same command, the order of the names, another build of one version and of one size, the two commands of the chain on the terminal of the publisher, the check of what the hosting serves (another signed file, a signature that fails, another size, another installer by the list of the files, a later version, a redirection, a feed served after a moment), `--deposit`, `--dry-run`, the catalog alone with `--catalog` (a feed that is not the one served, an installer the folder lacks), the note on a catalog that Git does not hold yet, the offline bundle of `tools/make_offline_bundle.py` from the hosting and from a folder, and no name of a session, of a password file or of a setting of the website in the program; `test_linux.sh` runs it |
 
@@ -1688,7 +1719,12 @@ powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\test_w
 ```
 
 They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q8_0.gguf` by default
-and skip the steps whose model or build tree is missing. The Linux script runs a service offline in
+and skip the steps whose model or build tree is missing. The Linux script runs `test_offload` and
+`test_device_ops` through the host code of dlib when its tree holds the validation engine, that is
+once it was configured with `-DALBIREO_ENGINE_DLIB=ON`
+(`cmake -S dlib/dlib/external/albireo -B build-albireo -DALBIREO_ENGINE_DLIB=ON`, which the tree
+keeps); a tree without it skips these two steps and says so. The service ignores that engine, which
+serves the tests alone. The Linux script runs a service offline in
 a data folder of its own, on the port `ALBIREO_TEST_PORT` (18443 by default), sends it the model
 through the upload route, checks that the route of the paths refuses a plain file, runs the tests of
 the service (`test_host`), asks a question through the OpenAI interface, gives the code function to

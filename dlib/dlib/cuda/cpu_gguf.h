@@ -44,6 +44,15 @@ namespace dlib
             float eps
         );
 
+        void add_rms_norm_rows (
+            tensor& dest,
+            tensor& x,
+            const tensor& addend,
+            float factor,
+            const tensor& gamma,
+            float eps
+        );
+
         void silu_multiply (
             tensor& gate,
             const tensor& up
@@ -53,6 +62,17 @@ namespace dlib
             tensor& rows,
             const tensor& angles,
             long heads,
+            long head_dim,
+            long rope_dims,
+            bool neox
+        );
+
+        void rope_rows (
+            tensor& first_rows,
+            long first_heads,
+            tensor& second_rows,
+            long second_heads,
+            const tensor& angles,
             long head_dim,
             long rope_dims,
             bool neox
@@ -85,6 +105,19 @@ namespace dlib
             const tensor& tokens,
             const tensor& tables,
             long span
+        );
+
+        void paged_attention_rows (
+            tensor& out,
+            const tensor& queries,
+            long q_heads,
+            float scale,
+            const tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const tensor& tables,
+            long first_entry,
+            long first_position
         );
 
         void expert_routes (

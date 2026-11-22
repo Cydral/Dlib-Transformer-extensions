@@ -29,7 +29,7 @@ namespace albireo
                 A product runs on the device with a copy of its weight matrix: the blocks of
                 its GGUF format for the formats of dlib/cuda/gguf_blocks.h, which the kernels
                 of dlib read in place (tt::gguf_matvec()) or expand by tiles that cuBLAS
-                multiplies (tt::gguf_dequantize()), and single precision floats for the other
+                multiplies (tt::gguf_gemm()), and single precision floats for the other
                 formats and with OpenVINO.  A new copy in a GGUF format serves once its first
                 rows give, on probe activations, the products of the processor, and their
                 expansion its rows: a format the device would decode wrongly keeps its
@@ -54,9 +54,19 @@ namespace albireo
 
                 With CUDA and with the host code of dlib, the runtime of a dense model also
                 hands its layers to the device (matmul_offload::make_layer_pass()): the
-                hidden states of a pass stay on the device, which exchanges the inputs and
-                outputs of the attention with the processor once per layer, so that a token
-                waits for the bus once per layer instead of once per product.
+                hidden states of a pass stay on the device, which attends the tokens itself
+                from its copies of the keys and values, those of a generation one by one and
+                those of a chunk of a prompt together, with matrix products, so that a pass
+                crosses the bus at its start and at its end.  A pass the device cannot attend,
+                for lack of room or because it holds the tokens of several sequences, exchanges
+                the inputs and outputs of its attention with the processor once per layer.
+
+                The products of the longer passes expand the weights by tiles that cuBLAS
+                multiplies (dlib::tt::gguf_gemm()), in the arithmetic the card computes
+                fastest among those it has, which the first such product times: single
+                precision, the single precision of the tensor cores (TF32) or half precision
+                with sums in single precision.  A pass whose values exceed the halves is
+                computed again by the processor, and the passes that follow leave the halves.
 
                 On a CUDA device, the blocks of a copy cross the bus from the mapping of the
                 file, and a copy in single precision from a buffer of the host of bounded
@@ -94,6 +104,11 @@ namespace albireo
                                   the device those it computes faster; false keeps every
                                   pass the device computes right on the device.  The
                                   routing "device" keeps them there too.
+                    gemm_precision
+                                  "auto" (the default) for the arithmetic of the products of
+                                  the longer passes that the card computes fastest, or
+                                  "single", "tf32" or "half" to impose one (CUDA), which the
+                                  card must have.
                     cache_dir     the folder of the compiled graphs (OpenVINO) and of the
                                   file of the extended memory.
                     benchmark     true when the engine is being measured: the graphs then

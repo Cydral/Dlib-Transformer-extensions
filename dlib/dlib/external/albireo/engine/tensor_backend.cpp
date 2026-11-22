@@ -280,6 +280,15 @@ namespace albireo
         // The bytes of a tile of a matrix expanded to single precision for a product.
         const size_t expanded_tile_bytes = size_t(64) << 20;
 
+        /*
+            The rows of zeros with which a device times the arithmetics of the products of its
+            longer passes (tensor_offload::choose_precision()), and the bytes the work of the
+            attention of such a pass takes at most on the device, its keys and values expanded
+            and the scores of a run of its tokens (dlib::tt::paged_attention_rows()).
+        */
+        const long precision_probe_tokens = 256;
+        const size_t attention_work_bytes = size_t(384) << 20;
+
         // The pages of keys and values a first growth of the copies of a layer pass makes at least.
         const long min_kv_pages = 8;
 
@@ -462,6 +471,15 @@ namespace albireo
         int forced = 0;
         // Whether the runtime times the passes of the layers against the processor.
         bool timed_passes = true;
+        /*
+            The arithmetic of the products of the longer passes (dlib::gguf_precision), -1 until
+            the first of them times those the device computes with: the fastest one, and the
+            fastest one of floats for the products whose values may lie beyond the halves.
+            forced_precision is the arithmetic the configuration imposes, -1 for none.
+        */
+        std::atomic<int> precision{-1};
+        std::atomic<int> float_precision{-1};
+        int forced_precision = -1;
 
         std::atomic<size_t> resident{0};
         /*
@@ -710,6 +728,8 @@ namespace albireo
     public:
         tensor_offload(tensor_device::impl& d, const std::string& model) : d_(d), model_(model)
         {
+            saturated_.set_size(1);
+            saturated_ = 0;
             std::lock_guard<std::mutex> lock(d_.registry_m);
             d_.offloads.push_back(this);
         }
@@ -1292,32 +1312,17 @@ namespace albireo
         }
 
         /*
-            y[t][first + i] = part[t][i] on the device, for t < n and i < count, the rows of y
-            holding width floats.
-        */
-        static void place_columns(const dlib::tensor& part, dlib::tensor& y, long n, long width, long first,
-            long count)
-        {
-#if defined(DLIB_USE_CUDA)
-            cuda_check(cudaMemcpy2DAsync(y.device() + first, sizeof(float) * width, part.device(),
-                sizeof(float) * count, sizeof(float) * count, static_cast<size_t>(n), cudaMemcpyDeviceToDevice, 0),
-                "copy of products on the device");
-#else
-            const float* src = part.host();
-            float* dst = y.host();
-            for (long t = 0; t < n; ++t) std::memcpy(dst + t * width + first, src + t * count, sizeof(float) * count);
-#endif
-        }
-
-        /*
             y = x W^T on the device, x holding n rows of W.cols floats and y n rows of W.rows
             floats, w being the weights of W in their GGUF format (quantized) or in single
             precision.  A product of fewer than expanded_product_tokens tokens reads the blocks
-            in place; a larger one expands them by tiles of rows that cuBLAS multiplies, as it
-            does the weights in single precision.
+            in place; a larger one expands them by tiles of rows that cuBLAS multiplies
+            (dlib::tt::gguf_gemm()), in the arithmetic the device computes fastest
+            (choose_precision()).  halves tells whether the values of x are known to hold in
+            half precision or are checked after the pass (take_saturation()): the products of
+            the other passes keep to the arithmetics of floats.
         */
         void product_on_device(const weight_matrix& W, const dlib::tensor& w, bool quantized, const dlib::tensor& x,
-            dlib::tensor& y)
+            dlib::tensor& y, bool halves = false)
         {
             if (!quantized)
             {
@@ -1331,32 +1336,207 @@ namespace albireo
                 dlib::tt::gguf_matvec(y, x, w, type, W.rows, W.cols, W.row_bytes);
                 return;
             }
-            const long tile = tile_rows(W);
-            reserve_buffer(tile_, static_cast<size_t>(tile) * static_cast<size_t>(W.cols));
-            if (tile < W.rows) reserve_buffer(tile_out_, static_cast<size_t>(n) * static_cast<size_t>(tile));
-            for (long first = 0; first < W.rows; first += tile)
-            {
-                const long count = std::min(tile, W.rows - first);
-                dlib::alias_tensor wa(count, W.cols);
-                dlib::alias_tensor_instance expanded = wa(tile_);
-                dlib::tt::gguf_dequantize(expanded, w, type, first, count, W.cols, W.row_bytes);
-                if (count == W.rows)
-                {
-                    dlib::tt::gemm(0, y, 1, x, false, expanded, true);
-                    return;
-                }
-                dlib::alias_tensor pa(n, count);
-                dlib::alias_tensor_instance part = pa(tile_out_);
-                dlib::tt::gemm(0, part, 1, x, false, expanded, true);
-                place_columns(part, y, n, W.rows, first, count);
-            }
+            if (d_.precision.load(std::memory_order_relaxed) < 0) choose_precision(W, w);
+            const dlib::gguf_precision precision = static_cast<dlib::gguf_precision>(
+                (halves ? d_.precision : d_.float_precision).load(std::memory_order_relaxed));
+            reserve_buffer(tile_, tile_values(W, n, precision));
+            if (precision == dlib::gguf_precision::half) halves_used_ = true;
+            dlib::tt::gguf_gemm(y, x, w, type, W.rows, W.cols, W.row_bytes, tile_, precision, saturated_);
         }
 
-        // The rows of W that a tile of its expansion to single precision holds.
+        /*
+            Chooses the arithmetic of the products of the longer passes, the first of which calls
+            it with its matrix: the one the configuration imposes ("gemm_precision"), or the
+            fastest of those the device computes with, timed on rows of zeros.  A first product in
+            each arithmetic settles the kernels of cuBLAS, a second one is timed, the device waited
+            for; an arithmetic that fails is left out, and a failure of the measure itself leaves
+            the products in single precision.
+        */
+        void choose_precision(const weight_matrix& W, const dlib::tensor& w)
+        {
+            using dlib::gguf_precision;
+            const int single = static_cast<int>(gguf_precision::single);
+            const int half = static_cast<int>(gguf_precision::half);
+            auto computes = [](gguf_precision p) {
+                try
+                {
+                    return dlib::tt::gguf_gemm_computes(p);
+                }
+                catch (const std::exception&)
+                {
+                    return false;
+                }
+            };
+            if (d_.forced_precision >= 0)
+            {
+                const gguf_precision forced = static_cast<gguf_precision>(d_.forced_precision);
+                const int kept = computes(forced) ? d_.forced_precision : single;
+                d_.float_precision = kept == half ? single : kept;
+                d_.precision = kept;
+                d_.message(ALBIREO_LOG_INFO, std::string("device: the products of the longer passes run in ")
+                    + precision_name(static_cast<gguf_precision>(kept)) + ", which the configuration "
+                    + (kept == d_.forced_precision ? "asks for" : "leaves in place of the one it asks for, which the "
+                        "device lacks"));
+                return;
+            }
+            int best = single, best_floats = single;
+#if defined(DLIB_USE_CUDA)
+            if (computes(gguf_precision::tf32) || computes(gguf_precision::half))
+            {
+                std::string detail;
+                try
+                {
+                    const long n = precision_probe_tokens;
+                    const int type = static_cast<int>(W.type);
+                    dlib::resizable_tensor x, y, work, flag;
+                    x.set_size(n, W.cols);
+                    x = 0;
+                    y.set_size(n, W.rows);
+                    work.set_size(static_cast<long long>(tile_values(W, n)));
+                    flag.set_size(1);
+                    flag = 0;
+                    dlib::device_scope pin({ &x, &y, &work, &flag });
+                    double best_seconds = -1, best_floats_seconds = -1;
+                    for (gguf_precision p : { gguf_precision::single, gguf_precision::tf32, gguf_precision::half })
+                    {
+                        if (!computes(p)) continue;
+                        double seconds = -1;
+                        try
+                        {
+                            for (int run = 0; run < 2; ++run)
+                            {
+                                cuda_check(cudaStreamSynchronize(0), "wait for the device");
+                                const auto start = std::chrono::steady_clock::now();
+                                dlib::tt::gguf_gemm(y, x, w, type, W.rows, W.cols, W.row_bytes, work, p, flag);
+                                cuda_check(cudaStreamSynchronize(0), "product of the tiles of a matrix on the device");
+                                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                                    .count();
+                            }
+                        }
+                        catch (const std::exception&)
+                        {
+                            // Single precision served every pass so far: its failure is one of the device.
+                            cudaStreamSynchronize(0);
+                            if (p == gguf_precision::single) throw;
+                            seconds = -1;
+                        }
+                        char text[96];
+                        const char* separator = detail.empty() ? "" : ", ";
+                        if (seconds < 0)
+                            std::snprintf(text, sizeof(text), "%s%s failed", separator, precision_name(p));
+                        else
+                            std::snprintf(text, sizeof(text), "%s%s %.2f ms", separator, precision_name(p),
+                                seconds * 1e3);
+                        detail += text;
+                        if (seconds < 0) continue;
+                        if (best_seconds < 0 || seconds < best_seconds)
+                        {
+                            best_seconds = seconds;
+                            best = static_cast<int>(p);
+                        }
+                        if (p != gguf_precision::half && (best_floats_seconds < 0 || seconds < best_floats_seconds))
+                        {
+                            best_floats_seconds = seconds;
+                            best_floats = static_cast<int>(p);
+                        }
+                    }
+                    d_.message(ALBIREO_LOG_INFO, std::string("device: the products of the longer passes run in ")
+                        + precision_name(static_cast<gguf_precision>(best)) + ", the fastest for a matrix of "
+                        + std::to_string(W.rows) + " x " + std::to_string(W.cols) + " and " + std::to_string(n)
+                        + " tokens (" + detail + ")");
+                }
+                catch (const std::exception& e)
+                {
+                    cudaStreamSynchronize(0);
+                    best = single;
+                    best_floats = single;
+                    d_.message(ALBIREO_LOG_WARNING, std::string("device: the arithmetics of the products of the longer "
+                        "passes could not be timed (") + e.what() + "), which stay in single precision");
+                }
+            }
+#else
+            (void)W;
+            (void)w;
+#endif
+            d_.float_precision = best_floats;
+            d_.precision = best;
+        }
+
+        // The rows of W that a tile of its expansion holds.
         static long tile_rows(const weight_matrix& W)
         {
             const size_t row = sizeof(float) * static_cast<size_t>(std::max<long>(1, W.cols));
             return std::max<long>(1, std::min<long>(W.rows, static_cast<long>(expanded_tile_bytes / row)));
+        }
+
+        /*
+            The floats of the work of a product of n tokens with W in an arithmetic: a tile of
+            tile_rows() rows of floats, or, in half precision, the n rows of the activations
+            followed by such a tile, both in halves (dlib::tt::gguf_gemm()).
+        */
+        static size_t tile_values(const weight_matrix& W, long n, dlib::gguf_precision precision)
+        {
+            const size_t cols = static_cast<size_t>(W.cols);
+            const size_t rows = static_cast<size_t>(tile_rows(W));
+            if (precision != dlib::gguf_precision::half) return rows * cols;
+            const size_t activations = (static_cast<size_t>(n) * cols * sizeof(uint16_t) + 15) / 16 * 16;
+            return (activations + rows * cols * sizeof(uint16_t) + sizeof(float) - 1) / sizeof(float);
+        }
+
+        // The floats of the work of a product of n tokens with W in whichever arithmetic the device takes.
+        static size_t tile_values(const weight_matrix& W, long n)
+        {
+            return std::max(tile_values(W, n, dlib::gguf_precision::single),
+                tile_values(W, n, dlib::gguf_precision::half));
+        }
+
+        /*
+            Whether a product in half precision met a value beyond the halves since the last
+            call, which waits for the device when products ran in that arithmetic.
+        */
+        bool take_saturation()
+        {
+            if (!halves_used_) return false;
+            halves_used_ = false;
+            if (saturated_.host()[0] == 0.0f) return false;
+            saturated_ = 0;
+            return true;
+        }
+
+        /*
+            Gives up the arithmetics of lower precision for the products to come; false when the
+            device already computes them in single precision.
+        */
+        bool retreat_precision(const std::string& why)
+        {
+            const int single = static_cast<int>(dlib::gguf_precision::single);
+            if (d_.precision.load() == single && d_.float_precision.load() == single) return false;
+            if (d_.precision.load() < 0) return false;
+            d_.precision = single;
+            d_.float_precision = single;
+            d_.message(ALBIREO_LOG_WARNING, "device: the products of the longer passes return to single precision ("
+                + why + ")");
+            return true;
+        }
+
+        /*
+            Keeps the products in half precision out of the passes to come, a value of a pass
+            having exceeded the halves: they go on in the fastest arithmetic of floats.
+        */
+        void leave_halves()
+        {
+            if (d_.precision.load() != static_cast<int>(dlib::gguf_precision::half)) return;
+            d_.precision = d_.float_precision.load();
+            d_.message(ALBIREO_LOG_INFO, "device: a value of a pass of '" + model_ + "' lies beyond the half "
+                "precision: the products of the longer passes go on in "
+                + precision_name(static_cast<dlib::gguf_precision>(d_.precision.load())));
+        }
+
+        static const char* precision_name(dlib::gguf_precision p)
+        {
+            return p == dlib::gguf_precision::half ? "half precision"
+                : p == dlib::gguf_precision::tf32 ? "the single precision of the tensor cores (TF32)"
+                : "single precision";
         }
 
         // Copies n rows of cols floats of the host, x_stride floats apart, to the view x of the device.
@@ -1731,8 +1911,14 @@ namespace albireo
         std::unordered_map<const uint8_t*, unsigned long long> refused_;
         std::map<std::tuple<long, long, int>, route> routes_;
         dlib::resizable_tensor x_, y_, w_;
-        // A tile of a matrix expanded to single precision on the device, and its products.
-        dlib::resizable_tensor tile_, tile_out_;
+        /*
+            The work of the products of the longer passes on the device, the tiles of a matrix
+            expanded (dlib::tt::gguf_gemm()); the float such a product in half precision sets when
+            a value lies beyond the halves, and whether products ran in that arithmetic since
+            take_saturation().
+        */
+        dlib::resizable_tensor tile_, saturated_;
+        bool halves_used_ = false;
         // The matrix expanded on the host before it goes to w_ (CUDA).
         std::vector<float> expanded_;
         // The layer pass of the model, which keeps copies of its keys and values.
@@ -1813,19 +1999,15 @@ namespace albireo
                 // The tiles of the expansions of the larger passes, so that no layer allocates.
                 if (n >= expanded_product_tokens)
                 {
-                    long tile = 1;
                     size_t tile_values = 0;
                     for (const dense_layer& L : m_.layers)
                         for (const weight_matrix* W : { &L.wq, &L.wk, &L.wv, &L.wo, &L.w_gate, &L.w_up, &L.w_down })
-                        {
-                            const long t = tensor_offload::tile_rows(*W);
-                            if (t < W->rows) tile = std::max(tile, t);
-                            tile_values = std::max(tile_values, static_cast<size_t>(t) * W->cols);
-                        }
+                            tile_values = std::max(tile_values, tensor_offload::tile_values(*W, n));
                     tensor_offload::reserve_buffer(o_.tile_, tile_values);
-                    if (tile > 1) tensor_offload::reserve_buffer(o_.tile_out_, rows * tile);
                 }
                 n_ = n;
+                pending_ = false;
+                rows_ = false;
                 dlib::device_scope pin({ &x_ });
                 dlib::alias_tensor_instance states = view(x_, n_, d_model);
                 upload(states, x, rows * d_model);
@@ -1846,7 +2028,7 @@ namespace albireo
         {
             guarded([&]() {
                 const long qd = m_.q_dim, kvd = m_.kv_dim;
-                dlib::device_scope pin({ &x_, &xn_, &qkv_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin({ &x_, &xn_, &tmp_, &qkv_, &o_.tile_, &o_.saturated_ });
                 project(layer);
                 const size_t qn = static_cast<size_t>(n_ * qd), kn = static_cast<size_t>(n_ * kvd);
                 const float* all = download(view(qkv_, n_, qd + 2 * kvd), qn + 2 * kn);
@@ -1859,7 +2041,7 @@ namespace albireo
         void attention_output(long layer, const float* ctx) override
         {
             guarded([&]() {
-                dlib::device_scope pin({ &x_, &xn_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin({ &x_, &xn_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.saturated_ });
                 dlib::alias_tensor_instance attended = view(ctx_, n_, m_.q_dim);
                 upload(attended, ctx, static_cast<size_t>(n_ * m_.q_dim));
                 finish(layer);
@@ -1874,14 +2056,40 @@ namespace albireo
         void allow_attention(bool on) override
         {
             allowed_ = on;
+            if (on) long_allowed_ = true;
             // The copies of the keys and values serve the attention of the device alone.
             if (!on) release_pages();
+        }
+
+        bool attends_many() const override
+        {
+            return attends_ && allowed_ && long_allowed_;
+        }
+
+        void allow_long_attention(bool on) override
+        {
+            long_allowed_ = on;
+            if (!on)
+            {
+                // The work of that attention goes without waiting for the device, which no pass uses now.
+                dlib::resizable_tensor gone;
+                attention_work_.swap(gone);
+            }
+        }
+
+        bool retreat() override
+        {
+            return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor");
         }
 
         bool begin_attention(const attention_plan& plan) override
         {
             attending_ = false;
+            rows_ = false;
             if (!attends() || n_ <= 0 || !plan.pool) return false;
+            // A longer pass is attended over the consecutive tokens of one sequence.
+            const bool together = n_ > few_attention_tokens;
+            if (together && (!attends_many() || plan.segments.size() != 1)) return false;
             const kv_pool& pool = *plan.pool;
             if (pool.layers() != static_cast<long>(m_.layers.size()) || pool.kv_heads() != m_.n_kv_heads
                 || pool.head_dim() != m_.head_dim || static_cast<long>(plan.positions.size()) != n_)
@@ -1896,7 +2104,7 @@ namespace albireo
             bool taken = false;
             try
             {
-                taken = prepare(plan, layout);
+                taken = (!together || plan_rows(plan, layout)) && prepare(plan, layout);
             }
             catch (const std::exception& e)
             {
@@ -1906,6 +2114,7 @@ namespace albireo
             }
             if (!taken) return false;
             attending_ = true;
+            rows_ = together;
             ++o_.d_.attention_passes;
             return true;
         }
@@ -1915,8 +2124,8 @@ namespace albireo
             guarded([&]() {
                 const long qd = m_.q_dim, kvd = m_.kv_dim, H = m_.n_heads, KVH = m_.n_kv_heads, hd = m_.head_dim;
                 const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
-                dlib::device_scope pin({ &x_, &xn_, &qkv_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.tile_out_ });
-                dlib::device_scope pin_pages({ &pages_, &plan_ });
+                dlib::device_scope pin({ &x_, &xn_, &qkv_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.saturated_ });
+                dlib::device_scope pin_pages({ &pages_, &plan_, &attention_work_ });
                 project(layer);
                 dlib::alias_tensor_instance q = view(qkv_, n_, qd);
                 dlib::alias_tensor_instance k = view(qkv_, n_, kvd, n_ * qd);
@@ -1938,12 +2147,20 @@ namespace albireo
                 dlib::alias_tensor_instance tokens = view(plan_, 2 * T, 1, T);
                 dlib::alias_tensor_instance tables = view(plan_, table_entries_, 1, 3 * T);
                 dlib::alias_tensor_instance angles = view(plan_, T, m_.rope_dims, 3 * T + table_entries_);
-                dlib::tt::rope_rows(q, angles, H, hd, m_.rope_dims, m_.neox);
-                dlib::tt::rope_rows(k, angles, KVH, hd, m_.rope_dims, m_.neox);
+                dlib::tt::rope_rows(q, H, k, KVH, angles, hd, m_.rope_dims, m_.neox);
                 dlib::tt::paged_kv_store(pages_, layout_, layer, k, v, slots);
                 dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
-                dlib::tt::paged_attention(attended, q, H, m_.attention_scale, pages_, layout_, layer, tokens, tables,
-                    span_);
+                if (rows_)
+                {
+                    dlib::alias_tensor_instance work = view(attention_work_, static_cast<long>(work_values_), 1);
+                    dlib::tt::paged_attention_rows(attended, q, H, m_.attention_scale, pages_, layout_, layer, tables,
+                        first_entry_, first_position_, work);
+                }
+                else
+                {
+                    dlib::tt::paged_attention(attended, q, H, m_.attention_scale, pages_, layout_, layer, tokens,
+                        tables, span_);
+                }
                 finish(layer);
             });
         }
@@ -1959,7 +2176,15 @@ namespace albireo
         {
             guarded([&]() {
                 const long d = m_.d_model;
-                dlib::device_scope pin({ &x_, &pages_, &plan_, &gathered_ });
+                dlib::device_scope pin({ &x_, &tmp_, &pages_, &plan_, &gathered_ });
+                if (pending_)
+                {
+                    // The sum that ends the last layer, which no normalization follows on the device.
+                    dlib::alias_tensor_instance states = view(x_, n_, d);
+                    dlib::alias_tensor_instance last = view(tmp_, n_, d);
+                    dlib::tt::add(1, states, m_.residual_scale, last);
+                    pending_ = false;
+                }
                 const uint8_t* written = attending_ ? gather_written() : nullptr;
                 if (rows.size() == 1)
                 {
@@ -1981,6 +2206,16 @@ namespace albireo
                     cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
                 }
 #endif
+                /*
+                    A value beyond the halves leaves the products of the pass without meaning: the
+                    processor computes the pass again, and the passes to come leave the halves.
+                */
+                if (o_.take_saturation())
+                {
+                    o_.leave_halves();
+                    throw device_failure("a value of the pass lies beyond the half precision of its products", false,
+                        true);
+                }
                 // The copies of the rows crossed with the hidden states, which the device waited for.
                 if (written) scatter_written(written);
             });
@@ -2005,7 +2240,11 @@ namespace albireo
 
         void report(bool ok, const std::string& detail) override
         {
-            if (ok && attends())
+            if (ok && attends_many())
+                o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + o_.model() + "' run on the device, which "
+                    "attends the tokens of every pass itself, from its copies of the keys and values: those of the "
+                    "generation one by one, those of the longer passes together (" + detail + ")");
+            else if (ok && attends())
                 o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of '" + o_.model() + "' run on the device, which "
                     "attends the tokens of the generation itself, from its copies of the keys and values, and "
                     "exchanges the inputs and outputs of the attention of the longer passes with the processor once "
@@ -2106,16 +2345,31 @@ namespace albireo
             const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
             dlib::alias_tensor_instance x = view(x_, n_, d);
             dlib::alias_tensor_instance xn = view(xn_, n_, d);
-            dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer)], m_.rms_eps);
+            const dlib::tensor& norm = norms_[2 * static_cast<size_t>(layer)];
+            if (pending_)
+            {
+                // The sum that ends the previous layer, with the normalization that starts this one.
+                dlib::alias_tensor_instance last = view(tmp_, n_, d);
+                dlib::tt::add_rms_norm_rows(xn, x, last, m_.residual_scale, norm, m_.rms_eps);
+                pending_ = false;
+            }
+            else
+            {
+                dlib::tt::rms_norm_rows(xn, x, norm, m_.rms_eps);
+            }
             dlib::alias_tensor_instance qv = view(qkv_, n_, qd);
             dlib::alias_tensor_instance kv = view(qkv_, n_, kvd, n_ * qd);
             dlib::alias_tensor_instance vv = view(qkv_, n_, kvd, n_ * (qd + kvd));
-            o_.product_on_device(L.wq, *c[0]->t, c[0]->quantized, xn, qv);
-            o_.product_on_device(L.wk, *c[1]->t, c[1]->quantized, xn, kv);
-            o_.product_on_device(L.wv, *c[2]->t, c[2]->quantized, xn, vv);
+            o_.product_on_device(L.wq, *c[0]->t, c[0]->quantized, xn, qv, true);
+            o_.product_on_device(L.wk, *c[1]->t, c[1]->quantized, xn, kv, true);
+            o_.product_on_device(L.wv, *c[2]->t, c[2]->quantized, xn, vv, true);
         }
 
-        // The projection of the outputs of the attention in ctx_, then the feed-forward block, with both residual sums.
+        /*
+            The projection of the outputs of the attention in ctx_ with its residual sum, then the
+            feed-forward block, whose output stays in tmp_ for the sum that the next normalization
+            or the end of the pass makes (pending_).
+        */
         void finish(long layer)
         {
             const long d = m_.d_model, qd = m_.q_dim, df = m_.d_ffn;
@@ -2125,16 +2379,57 @@ namespace albireo
             dlib::alias_tensor_instance xn = view(xn_, n_, d);
             dlib::alias_tensor_instance tmp = view(tmp_, n_, d);
             dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
-            o_.product_on_device(L.wo, *c[3]->t, c[3]->quantized, attended, tmp);
-            dlib::tt::add(1, x, m_.residual_scale, tmp);
-            dlib::tt::rms_norm_rows(xn, x, norms_[2 * static_cast<size_t>(layer) + 1], m_.rms_eps);
+            o_.product_on_device(L.wo, *c[3]->t, c[3]->quantized, attended, tmp, true);
+            dlib::tt::add_rms_norm_rows(xn, x, tmp, m_.residual_scale, norms_[2 * static_cast<size_t>(layer) + 1],
+                m_.rms_eps);
             dlib::alias_tensor_instance gate = view(gate_, n_, df);
             dlib::alias_tensor_instance up = view(up_, n_, df);
-            o_.product_on_device(L.w_gate, *c[4]->t, c[4]->quantized, xn, gate);
-            o_.product_on_device(L.w_up, *c[5]->t, c[5]->quantized, xn, up);
+            o_.product_on_device(L.w_gate, *c[4]->t, c[4]->quantized, xn, gate, true);
+            o_.product_on_device(L.w_up, *c[5]->t, c[5]->quantized, xn, up, true);
             dlib::tt::silu_multiply(gate, up);
-            o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp);
-            dlib::tt::add(1, x, m_.residual_scale, tmp);
+            o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp, true);
+            // The output of the feed-forward block joins the hidden states with the next normalization, or at the end.
+            pending_ = true;
+        }
+
+        /*
+            The work of the attention of a longer pass, whose tokens must be consecutive positions
+            of one sequence: room for the keys and values of the positions the pass attends and
+            for the queries, outputs and scores of a run of its tokens, as many as
+            attention_work_bytes holds (dlib::tt::paged_attention_rows()); false when the tokens
+            do not follow one another or when that room does not hold one of them.
+        */
+        bool plan_rows(const attention_plan& plan, const dlib::kv_page_layout& layout)
+        {
+            const long T = n_;
+            if (static_cast<long>(plan.positions.size()) != T || static_cast<long>(plan.firsts.size()) != T || T < 2)
+                return false;
+            const long first = plan.positions[0];
+            for (long t = 0; t < T; ++t)
+                if (plan.positions[static_cast<size_t>(t)] != first + t
+                    || plan.firsts[static_cast<size_t>(t)] != plan.firsts[0])
+                    return false;
+            if (first < 0 || plan.firsts[0] < 0) return false;
+            const size_t limit = attention_work_bytes / sizeof(float);
+            const size_t least = dlib::tt::paged_attention_rows_scratch(T, m_.n_heads, layout, first, 1);
+            const size_t per_token = dlib::tt::paged_attention_rows_scratch(T, m_.n_heads, layout, first, 2) - least;
+            if (least > limit)
+            {
+                if (!told_work_)
+                    o_.d_.message(ALBIREO_LOG_INFO, "device: the keys and values of the " + std::to_string(first + T)
+                        + " positions a pass of '" + o_.model() + "' attends take more than the "
+                        + megabytes(attention_work_bytes) + " of the work of the attention of the device: the "
+                        "processor attends the longer passes at these positions");
+                told_work_ = true;
+                return false;
+            }
+            const long run = static_cast<long>(std::min<size_t>(static_cast<size_t>(T),
+                1 + (limit - least) / per_token));
+            work_values_ = least + static_cast<size_t>(run - 1) * per_token;
+            tensor_offload::reserve_buffer(attention_work_, work_values_);
+            first_entry_ = plan.firsts[0];
+            first_position_ = first;
+            return true;
         }
 
         /*
@@ -2537,6 +2832,8 @@ namespace albireo
         // The biases and norms of the queries and keys of each layer (copy_norms()).
         std::vector<dlib::resizable_tensor> extras_;
         dlib::resizable_tensor x_, xn_, tmp_, qkv_, ctx_, gate_, up_;
+        // Whether tmp_ holds the output of a feed-forward block that the hidden states have not received yet.
+        bool pending_ = false;
 
         // The attention of the device: whether the model and the runtime allow it, and the pass takes it.
         bool attends_ = false;
@@ -2544,6 +2841,20 @@ namespace albireo
         bool attending_ = false;
         // Whether the log told that the pages found no room.
         bool told_room_ = false;
+        /*
+            The attention of the longer passes, over all their tokens together: whether the runtime
+            allows it and the pass takes it, its work with the floats the pass uses of it
+            (plan_rows()), the entry of the first block of the sequence among the pages of the
+            plan, the position of the first token, and whether the log told that the work found no
+            room.
+        */
+        bool long_allowed_ = true;
+        bool rows_ = false;
+        dlib::resizable_tensor attention_work_;
+        size_t work_values_ = 0;
+        long first_entry_ = 0;
+        long first_position_ = 0;
+        bool told_work_ = false;
         // The pages, capacity_ of them, the bytes of the budget they hold, and the pages without a block.
         dlib::kv_page_layout layout_;
         dlib::resizable_tensor pages_;
@@ -2719,7 +3030,7 @@ namespace albireo
                 tensor_offload::reserve_buffer(routed_, rows * static_cast<size_t>(first.experts_up.cols));
                 tensor_offload::reserve_buffer(shared_, rows * static_cast<size_t>(shared_width_));
                 // The tiles of the expansions of the larger passes, so that no layer allocates.
-                if (n >= expanded_product_tokens) reserve_tiles(rows);
+                if (n >= expanded_product_tokens) reserve_tiles();
 
                 /*
                     What the states were before the pass, for the sequences whose states the host
@@ -2769,7 +3080,7 @@ namespace albireo
                 const layer_copies& c = copies_[static_cast<size_t>(layer)];
                 const mamba_constants& k = constants_[static_cast<size_t>(layer)];
                 const long d = m_.d_model, in_w = L.ssm_in.rows, dyn_w = L.ssm_dyn.rows, inner = L.wo.cols;
-                dlib::device_scope pin({ &x_, &g_, &proj_, &dyn_, &inner_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin({ &x_, &g_, &proj_, &dyn_, &inner_, &o_.tile_, &o_.saturated_ });
                 dlib::alias_tensor_instance x = rows_of(x_, n_, d);
                 dlib::alias_tensor_instance proj = view(proj_, n_, in_w);
                 dlib::alias_tensor_instance dyn = view(dyn_, n_, dyn_w);
@@ -2802,7 +3113,7 @@ namespace albireo
                 const hybrid_layer& L = m_.layers[static_cast<size_t>(layer)];
                 const layer_copies& c = copies_[static_cast<size_t>(layer)];
                 const long d = m_.d_model;
-                dlib::device_scope pin({ &x_, &attention_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin({ &x_, &attention_, &o_.tile_, &o_.saturated_ });
                 dlib::alias_tensor_instance x = rows_of(x_, n_, d);
                 // The products one after the other in one buffer, which crosses to the host in one copy.
                 const weight_matrix* matrices[9] = { &L.wq, &L.wa_k, &L.wa_v, &L.wb_k, &L.wb_v, &L.shift_k, &L.shift_v,
@@ -2845,7 +3156,7 @@ namespace albireo
                 const hybrid_layer& L = m_.layers[static_cast<size_t>(layer)];
                 const layer_copies& c = copies_[static_cast<size_t>(layer)];
                 const long d = m_.d_model, width = L.wo.cols;
-                dlib::device_scope pin({ &x_, &g_, &inner_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin({ &x_, &g_, &inner_, &o_.tile_, &o_.saturated_ });
                 dlib::alias_tensor_instance attended = view(inner_, n_, width);
                 upload(attended, gated, static_cast<size_t>(n_ * width));
                 dlib::alias_tensor_instance x = rows_of(x_, n_, d);
@@ -2863,7 +3174,7 @@ namespace albireo
                 const long d = m_.d_model, E = m_.n_experts, K = m_.n_experts_used;
                 const long dl = L.experts_up.cols, df = L.experts_down.cols, ds = L.shared_up.rows;
                 dlib::device_scope pin({ &x_, &g_, &up_, &router_, &picks_, &weights_, &latent_, &expert_up_,
-                    &expert_out_, &routed_, &shared_, &o_.tile_, &o_.tile_out_ });
+                    &expert_out_, &routed_, &shared_, &o_.tile_, &o_.saturated_ });
                 dlib::alias_tensor_instance x = rows_of(x_, n_, d);
                 dlib::alias_tensor_instance g = rows_of(g_, n_, d);
                 dlib::alias_tensor_instance up = rows_of(up_, n_, d);
@@ -2909,7 +3220,7 @@ namespace albireo
                 // Their buffer takes its size before the pins, as the buffers of begin().
                 if (with_logits)
                     tensor_offload::reserve_buffer(logits_, static_cast<size_t>(R) * static_cast<size_t>(V));
-                dlib::device_scope pin({ &x_, &g_, &logits_, &o_.tile_, &o_.tile_out_ });
+                dlib::device_scope pin({ &x_, &g_, &logits_, &o_.tile_, &o_.saturated_ });
                 if (R == 0)
                 {
 #if defined(DLIB_USE_CUDA)
@@ -3029,6 +3340,11 @@ namespace albireo
         bool timed() const override
         {
             return o_.d_.forced == 0 && o_.d_.timed_passes;
+        }
+
+        bool retreat() override
+        {
+            return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor");
         }
 
         void report(bool ok, const std::string& detail) override
@@ -3341,16 +3657,16 @@ namespace albireo
             expert_bias_.swap(biases);
         }
 
-        // The tiles of the expansions of the products of rows tokens, for every matrix a layer expands.
-        void reserve_tiles(size_t rows)
+        /*
+            The tiles of the expansions of the products of a longer pass, for every matrix a layer
+            expands: tiles of floats, the values of a hybrid decoder reaching beyond the halves.
+        */
+        void reserve_tiles()
         {
-            long tile = 1;
             size_t tile_values = 0;
             auto count = [&](const weight_matrix& W) {
                 if (!W.valid()) return;
-                const long t = tensor_offload::tile_rows(W);
-                if (t < W.rows) tile = std::max(tile, t);
-                tile_values = std::max(tile_values, static_cast<size_t>(t) * W.cols);
+                tile_values = std::max(tile_values, tensor_offload::tile_values(W, 1, dlib::gguf_precision::single));
             };
             for (const hybrid_layer& L : m_.layers)
                 for (const weight_matrix* W : { &L.ssm_in, &L.ssm_dyn, &L.wq, &L.wa_k, &L.wb_k, &L.wa_v, &L.wb_v,
@@ -3360,7 +3676,6 @@ namespace albireo
             // The logits of the rows of a pass that asks for all of them.
             count(m_.output);
             tensor_offload::reserve_buffer(o_.tile_, tile_values);
-            if (tile > 1) tensor_offload::reserve_buffer(o_.tile_out_, rows * static_cast<size_t>(tile));
         }
 
         // The n rows of cols floats of a buffer that start first floats in, as a tensor.
@@ -3750,6 +4065,10 @@ namespace albireo
         const std::string routing = config["routing"].str("auto");
         d.forced = routing == "device" ? 1 : routing == "host" ? -1 : 0;
         d.timed_passes = config["timed_passes"].as_bool(true);
+        const std::string precision = config["gemm_precision"].str("auto");
+        d.forced_precision = precision == "single" ? static_cast<int>(dlib::gguf_precision::single)
+            : precision == "tf32" ? static_cast<int>(dlib::gguf_precision::tf32)
+            : precision == "half" ? static_cast<int>(dlib::gguf_precision::half) : -1;
 
 #if defined(DLIB_USE_CUDA)
         d.backend = "cuda";

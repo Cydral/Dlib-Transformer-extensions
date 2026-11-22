@@ -14,14 +14,19 @@
         - tt::gguf_matvec() for 1 to 20 tokens and for 130 tokens, against products in double
           precision with the rows qk_dequantize_row() expands, with activations that start on
           16 bytes and with activations that do not;
-    then tt::rms_norm_rows() and tt::silu_multiply() against their definitions, and tt::add()
-    with one row added to each row of a pass, as the biases of the attention are;
-    tt::rope_rows() against the rotation in double precision; tt::paged_kv_store() and
+        - tt::gguf_gemm() for 64 and 130 tokens, in every arithmetic the device computes
+          with, through tiles of one row to the whole matrix, against the same products;
+    then tt::rms_norm_rows(), tt::add_rms_norm_rows() and tt::silu_multiply() against their
+    definitions, and tt::add() with one row added to each row of a pass, as the biases of the
+    attention are; tt::rope_rows() against the rotation in double precision, for one set of
+    rows and for two; tt::paged_kv_store() and
     tt::paged_kv_gather() against the rows the processor writes (qk_float_to_half_row(),
     qk_rotate_row() and qk_float_to_q8_row()), for heads of 32 to 256 values in half
     precision and in 8 bits; tt::paged_attention() against the attention in double precision
     over pages that hold the rows the processor wrote, for tokens near and far from the start
-    of their sequences, with several query heads per key/value head.  The operations of the
+    of their sequences, with several query heads per key/value head; tt::paged_attention_rows()
+    against tt::paged_attention() for the consecutive tokens of a sequence, from its start and
+    from further on, in runs of a few tokens and in one run.  The operations of the
     hybrid decoders follow: tt::expert_routes() against a sort of the scores, experts of
     equal rank included; tt::gguf_matvec_picked() for every format against products in
     double precision with the rows of the matrices its picks name; tt::squared_relu() and
@@ -33,7 +38,10 @@
     weights, with the time of the attention of a generated token over 4,096 positions, and
     with the time of one token in a block of a hybrid decoder of the size of those of
     Olala 1.0 mini and in a block of a dense decoder of 4 billion parameters, operation by
-    operation and as the passes of the layers chain them.
+    operation and as the passes of the layers chain them.  The measures of the longer passes
+    follow: the time of a launch of a kernel, the products of 64 and 512 tokens through tiles
+    in each arithmetic, and the attention of 512 tokens token by token and over all of them
+    together.
 */
 
 #include <algorithm>
@@ -163,6 +171,107 @@ namespace
         float* p = w.host_write_only();
         std::memset(p, 0, w.size() * sizeof(float));
         std::memcpy(p, bytes.data(), bytes.size());
+    }
+
+    // Waits for the kernels the device still runs.
+    void wait_device()
+    {
+#ifdef DLIB_USE_CUDA
+        cudaStreamSynchronize(0);
+#endif
+    }
+
+    const char* precision_name(dlib::gguf_precision p)
+    {
+        return p == dlib::gguf_precision::half ? "halves" : p == dlib::gguf_precision::tf32 ? "TF32" : "single";
+    }
+
+    const dlib::gguf_precision precisions[] = { dlib::gguf_precision::single, dlib::gguf_precision::tf32,
+        dlib::gguf_precision::half };
+
+    // The floats of the work of tt::gguf_gemm() for n tokens, cols columns and tiles of tile_rows rows.
+    size_t gemm_work(long n, long cols, long tile_rows, dlib::gguf_precision p)
+    {
+        if (p != dlib::gguf_precision::half) return static_cast<size_t>(tile_rows) * static_cast<size_t>(cols);
+        const size_t activations = (static_cast<size_t>(n) * static_cast<size_t>(cols) * 2 + 15) / 16 * 16;
+        return (activations + static_cast<size_t>(tile_rows) * static_cast<size_t>(cols) * 2 + 3) / 4;
+    }
+
+    /*
+        tt::gguf_gemm() in every arithmetic the device computes with, for 64 and 130 tokens and
+        tiles of one row, of a few rows and of the whole matrix, against products in double
+        precision with the rows qk_dequantize_row() expands; then the float that the products in
+        half precision set when an activation lies beyond the halves.
+    */
+    void check_gemm(const format& f, long rows, long cols, std::mt19937& rng)
+    {
+        const size_t rb = gb::row_bytes(f.type, cols);
+        std::vector<uint8_t> bytes(static_cast<size_t>(rows) * rb);
+        for (long r = 0; r < rows; ++r) random_row(f, bytes.data() + static_cast<size_t>(r) * rb, cols, rng);
+        dlib::resizable_tensor w;
+        load_weights(w, bytes);
+        std::vector<float> ref(static_cast<size_t>(rows * cols));
+        for (long r = 0; r < rows; ++r)
+            qk_dequantize_row(static_cast<dlib::ggml_type>(f.type), bytes.data() + static_cast<size_t>(r) * rb,
+                ref.data() + r * cols, cols);
+        for (dlib::gguf_precision p : precisions)
+        {
+            if (!dlib::tt::gguf_gemm_computes(p)) continue;
+            double worst = 0;
+            bool flagged = false;
+            for (long n : { 64L, 130L })
+            {
+                dlib::resizable_tensor x(n, cols), y(n, rows), saturated(1);
+                random_floats(x.host_write_only(), x.size(), 1.0f, rng);
+                std::vector<double> want(static_cast<size_t>(n * rows)), size(static_cast<size_t>(n * rows));
+                const float* xp = x.host();
+                for (long t = 0; t < n; ++t)
+                    for (long r = 0; r < rows; ++r)
+                    {
+                        double sum = 0, magnitude = 0;
+                        for (long i = 0; i < cols; ++i)
+                        {
+                            const double term = static_cast<double>(ref[static_cast<size_t>(r * cols + i)])
+                                * xp[t * cols + i];
+                            sum += term;
+                            magnitude += std::fabs(term);
+                        }
+                        want[static_cast<size_t>(t * rows + r)] = sum;
+                        size[static_cast<size_t>(t * rows + r)] = magnitude;
+                    }
+                for (long tile : { 1L, 7L, rows })
+                {
+                    dlib::resizable_tensor work;
+                    work.set_size(static_cast<long long>(gemm_work(n, cols, tile, p)));
+                    saturated = 0;
+                    y = 1e30f;
+                    dlib::tt::gguf_gemm(y, x, w, f.type, rows, cols, rb, work, p, saturated);
+                    const float* got = y.host();
+                    for (size_t i = 0; i < want.size(); ++i)
+                        worst = std::max(worst, std::fabs(got[i] - want[i]) / (size[i] + 1e-6));
+                    flagged = flagged || saturated.host()[0] != 0.0f;
+                }
+            }
+            // The floats keep 24 bits of the products, the tensor cores 10 of each factor, the halves 11.
+            const double tolerance = p == dlib::gguf_precision::single ? 2e-5 : 2e-3;
+            const std::string what = std::string(f.name) + " " + std::to_string(rows) + "x" + std::to_string(cols)
+                + ", products of many tokens, " + precision_name(p);
+            expect(worst <= tolerance, what + " (relative error " + std::to_string(worst) + ")");
+            expect(!flagged, what + ": no value beyond the halves");
+            std::printf("  %-7s %4ldx%-5ld products of many tokens, %-6s within %.2g of their magnitude\n", f.name,
+                rows, cols, precision_name(p), worst);
+        }
+        if (dlib::tt::gguf_gemm_computes(dlib::gguf_precision::half))
+        {
+            const long n = 64;
+            dlib::resizable_tensor x(n, cols), y(n, rows), saturated(1), work;
+            random_floats(x.host_write_only(), x.size(), 1.0f, rng);
+            x.host()[cols + 3] = 70000.0f;
+            work.set_size(static_cast<long long>(gemm_work(n, cols, rows, dlib::gguf_precision::half)));
+            saturated = 0;
+            dlib::tt::gguf_gemm(y, x, w, f.type, rows, cols, rb, work, dlib::gguf_precision::half, saturated);
+            expect(saturated.host()[0] != 0.0f, std::string(f.name) + ": an activation beyond the halves is told");
+        }
     }
 
     void check_format(const format& f, long rows, long cols, std::mt19937& rng)
@@ -308,6 +417,41 @@ namespace
         expect(worst_in_place <= 1e-5, "rms_norm_rows in place (relative error " + std::to_string(worst_in_place)
             + ")");
 
+        // The residual sum with the normalization, for rows narrower and wider than a block of the kernel.
+        double worst_sum = 0;
+        for (long wide : { 96L, 256L, 700L })
+        {
+            const long count = 5;
+            dlib::resizable_tensor h(count, wide), addend(count, wide), scale(wide), out(count, wide);
+            random_floats(h.host_write_only(), h.size(), 3.0f, rng);
+            random_floats(addend.host_write_only(), addend.size(), 3.0f, rng);
+            random_floats(scale.host_write_only(), scale.size(), 2.0f, rng);
+            std::vector<double> sums(h.size()), normalized(h.size());
+            for (long r = 0; r < count; ++r)
+            {
+                double squares = 0;
+                for (long i = 0; i < wide; ++i)
+                {
+                    const double v = h.host()[r * wide + i] + 0.6 * addend.host()[r * wide + i];
+                    sums[static_cast<size_t>(r * wide + i)] = v;
+                    squares += v * v;
+                }
+                const double factor = 1.0 / std::sqrt(squares / wide + eps);
+                for (long i = 0; i < wide; ++i)
+                    normalized[static_cast<size_t>(r * wide + i)] = sums[static_cast<size_t>(r * wide + i)] * factor
+                        * scale.host()[i];
+            }
+            dlib::tt::add_rms_norm_rows(out, h, addend, 0.6f, scale, eps);
+            for (size_t i = 0; i < h.size(); ++i)
+            {
+                worst_sum = std::max(worst_sum, std::fabs(h.host()[i] - sums[i]) / std::max(1.0, std::fabs(sums[i])));
+                worst_sum = std::max(worst_sum, std::fabs(out.host()[i] - normalized[i])
+                    / std::max(1.0, std::fabs(normalized[i])));
+            }
+        }
+        expect(worst_sum <= 1e-5, "add_rms_norm_rows (relative error " + std::to_string(worst_sum) + ")");
+        std::printf("  add_rms_norm_rows %.2g\n", worst_sum);
+
         const long n = 4099;
         dlib::resizable_tensor g(n), u(n);
         random_floats(g.host_write_only(), g.size(), 8.0f, rng);
@@ -391,6 +535,27 @@ namespace
         }
         expect(worst <= 1e-5, "rope_rows (error " + std::to_string(worst) + ")");
         std::printf("  rope_rows %.2g\n", worst);
+
+        // Two sets of rows in one call, the queries and the keys of an attention, against a call each.
+        double worst_pair = 0;
+        for (int neox = 0; neox < 2; ++neox)
+        {
+            const long tokens = 37, q_heads = 6, k_heads = 2;
+            dlib::resizable_tensor q(tokens * q_heads, hd), k(tokens * k_heads, hd), angles(tokens, dims);
+            random_floats(q.host_write_only(), q.size(), 2.0f, rng);
+            random_floats(k.host_write_only(), k.size(), 2.0f, rng);
+            random_floats(angles.host_write_only(), angles.size(), 1.0f, rng);
+            dlib::resizable_tensor q_alone(q), k_alone(k);
+            dlib::tt::rope_rows(q_alone, angles, q_heads, hd, dims, neox != 0);
+            dlib::tt::rope_rows(k_alone, angles, k_heads, hd, dims, neox != 0);
+            dlib::tt::rope_rows(q, q_heads, k, k_heads, angles, hd, dims, neox != 0);
+            for (size_t i = 0; i < q.size(); ++i)
+                worst_pair = std::max<double>(worst_pair, std::fabs(q.host()[i] - q_alone.host()[i]));
+            for (size_t i = 0; i < k.size(); ++i)
+                worst_pair = std::max<double>(worst_pair, std::fabs(k.host()[i] - k_alone.host()[i]));
+        }
+        expect(worst_pair <= 1e-6, "rope_rows of two sets of rows (error " + std::to_string(worst_pair) + ")");
+        std::printf("  rope_rows of two sets of rows %.2g\n", worst_pair);
     }
 
     // Writes the row of keys (kind 0) or of values (1) of a head at row r of a page, as the processor runtime does.
@@ -629,6 +794,85 @@ namespace
                 std::printf("  paged_attention %-14s heads of %3ld, %ld/%ld: error %.2g\n", format, hd, c.q_heads,
                     c.kv_heads, worst);
             }
+    }
+
+    /*
+        tt::paged_attention_rows() for the consecutive tokens of one sequence against
+        tt::paged_attention(), which attends the same tokens one by one: keys and values in half
+        precision and in 8 bits, several query heads per key/value head, tokens from the start of
+        the sequence and from further on, over blocks in shuffled pages that other entries of
+        the table precede, in one run of the tokens and in runs of seven.
+    */
+    void check_long_attention(std::mt19937& rng)
+    {
+        struct case_t
+        {
+            long hd, kv_heads, q_heads;
+        };
+        const case_t cases[] = { { 32, 2, 4 }, { 64, 1, 6 }, { 128, 2, 8 } };
+        const long n = 40;
+        for (int q8 = 0; q8 < 2; ++q8)
+            for (const case_t& c : cases)
+                for (long first_position : { 0L, 300L })
+                {
+                    dlib::kv_page_layout L;
+                    L.layers = 2;
+                    L.heads = c.kv_heads;
+                    L.head_dim = c.hd;
+                    L.block_positions = 64;
+                    L.q8 = q8 != 0;
+                    const long layer = 1, hd = c.hd, width = c.q_heads * hd, span = first_position + n;
+                    const long blocks = (span + L.block_positions - 1) / L.block_positions;
+                    const long first_entry = 3;
+                    std::vector<int32_t> tables(static_cast<size_t>(first_entry), 0);
+                    std::vector<int32_t> order(static_cast<size_t>(blocks));
+                    for (long i = 0; i < blocks; ++i) order[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+                    std::shuffle(order.begin(), order.end(), rng);
+                    tables.insert(tables.end(), order.begin(), order.end());
+                    std::vector<uint8_t> bytes(static_cast<size_t>(blocks) * L.page_bytes());
+                    std::vector<float> row(static_cast<size_t>(hd));
+                    for (long j = 0; j < span; ++j)
+                        for (long kind = 0; kind < 2; ++kind)
+                            for (long h = 0; h < L.heads; ++h)
+                            {
+                                random_floats(row.data(), row.size(), 2.0f, rng);
+                                if (kind == 0) row[3] *= 8.0f;
+                                host_write_row(bytes.data() + static_cast<size_t>(order[static_cast<size_t>(
+                                    j / L.block_positions)]) * L.page_bytes(), L, kind, layer, h, j % L.block_positions,
+                                    row.data());
+                            }
+                    std::vector<int32_t> tokens;
+                    for (long t = 0; t < n; ++t)
+                    {
+                        tokens.push_back(static_cast<int32_t>(first_position + t));
+                        tokens.push_back(static_cast<int32_t>(first_entry));
+                    }
+                    dlib::resizable_tensor p, tk, tb, q(n, width), one_by_one(n, width), together(n, width);
+                    load_weights(p, bytes);
+                    put_integers(tk, tokens);
+                    put_integers(tb, tables);
+                    random_floats(q.host_write_only(), q.size(), 1.0f, rng);
+                    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+                    dlib::tt::paged_attention(one_by_one, q, c.q_heads, scale, p, L, layer, tk, tb, span);
+                    double worst = 0;
+                    for (long run : { n, 7L })
+                    {
+                        dlib::resizable_tensor work;
+                        work.set_size(static_cast<long long>(dlib::tt::paged_attention_rows_scratch(n, c.q_heads, L,
+                            first_position, run)));
+                        together = 1e30f;
+                        dlib::tt::paged_attention_rows(together, q, c.q_heads, scale, p, L, layer, tb, first_entry,
+                            first_position, work);
+                        for (size_t i = 0; i < together.size(); ++i)
+                            worst = std::max<double>(worst, std::fabs(together.host()[i] - one_by_one.host()[i]));
+                    }
+                    const char* format = q8 ? "8 bits" : "half precision";
+                    expect(worst <= 5e-5, std::string("paged_attention_rows, ") + format + ", heads of "
+                        + std::to_string(hd) + ", from position " + std::to_string(first_position) + " (error "
+                        + std::to_string(worst) + ")");
+                    std::printf("  paged_attention_rows %-14s heads of %3ld, %ld/%ld, from position %3ld: error %.2g\n",
+                        format, hd, c.q_heads, c.kv_heads, first_position, worst);
+                }
     }
 
     /*
@@ -1116,8 +1360,8 @@ namespace
         One token in a block of a dense decoder of the size of those of a model of 4 billion
         parameters (a width of 2,560, 32 query heads and 8 key/value heads of 128 values, a
         feed-forward block of 9,728), its matrices in Q4_K, the token attending 1,024 positions
-        in half precision: the time of each operation alone, the device waited for after each,
-        then the time of the block as the layer pass chains its operations.
+        in half precision: the 13 operations of the layer pass for a token, each alone with the
+        device waited for after it, then the time of the block as the layer pass chains them.
     */
     void measure_dense(std::mt19937& rng)
     {
@@ -1157,6 +1401,8 @@ namespace
         dlib::resizable_tensor gate(1, df), up(1, df), angles(1, hd);
         random_floats(x.host_write_only(), x.size(), 1.0f, rng);
         gamma = 1;
+        // The output of the block before, which the first operation adds to the hidden state.
+        tmp = 0;
         float* a = angles.host_write_only();
         for (long i = 0; i < hd / 2; ++i)
         {
@@ -1168,34 +1414,32 @@ namespace
         {
             const char* name;
             std::function<void()> run;
-            const dlib::tensor* result;
         };
         const std::vector<step> steps = {
-            { "norm of the hidden state  ", [&]() { dlib::tt::rms_norm_rows(xn, x, gamma, 1e-6f); }, &xn },
-            { "attn_q      Q4_K 4096x2560", [&]() { dlib::tt::gguf_matvec(q, xn, wq, gb::q4_K, qd, d, rb_d); }, &q },
-            { "attn_k      Q4_K 1024x2560", [&]() { dlib::tt::gguf_matvec(k, xn, wk, gb::q4_K, kvd, d, rb_d); }, &k },
-            { "attn_v      Q4_K 1024x2560", [&]() { dlib::tt::gguf_matvec(v, xn, wv, gb::q4_K, kvd, d, rb_d); }, &v },
-            { "rotation of the queries   ", [&]() { dlib::tt::rope_rows(q, angles, H, hd, hd, true); }, &q },
-            { "rotation of the keys      ", [&]() { dlib::tt::rope_rows(k, angles, KVH, hd, hd, true); }, &k },
-            { "keys and values to pages  ", [&]() { dlib::tt::paged_kv_store(p, L, 0, k, v, slots); }, &k },
+            { "residual sum and norm     ", [&]() {
+                dlib::tt::add_rms_norm_rows(xn, x, tmp, 0.01f, gamma, 1e-6f); } },
+            { "attn_q      Q4_K 4096x2560", [&]() { dlib::tt::gguf_matvec(q, xn, wq, gb::q4_K, qd, d, rb_d); } },
+            { "attn_k      Q4_K 1024x2560", [&]() { dlib::tt::gguf_matvec(k, xn, wk, gb::q4_K, kvd, d, rb_d); } },
+            { "attn_v      Q4_K 1024x2560", [&]() { dlib::tt::gguf_matvec(v, xn, wv, gb::q4_K, kvd, d, rb_d); } },
+            { "rotation of queries, keys ", [&]() { dlib::tt::rope_rows(q, H, k, KVH, angles, hd, hd, true); } },
+            { "keys and values to pages  ", [&]() { dlib::tt::paged_kv_store(p, L, 0, k, v, slots); } },
             { "attention, 1,024 positions", [&]() {
-                dlib::tt::paged_attention(ctx, q, H, 0.088f, p, L, 0, tk, tb, positions); }, &ctx },
+                dlib::tt::paged_attention(ctx, q, H, 0.088f, p, L, 0, tk, tb, positions); } },
             { "attn_output Q4_K 2560x4096", [&]() {
-                dlib::tt::gguf_matvec(tmp, ctx, wo, gb::q4_K, d, qd, gb::row_bytes(gb::q4_K, qd)); }, &tmp },
-            { "residual sum              ", [&]() { dlib::tt::add(1, x, 0.01f, tmp); }, &x },
-            { "norm of the hidden state  ", [&]() { dlib::tt::rms_norm_rows(xn, x, gamma, 1e-6f); }, &xn },
+                dlib::tt::gguf_matvec(tmp, ctx, wo, gb::q4_K, d, qd, gb::row_bytes(gb::q4_K, qd)); } },
+            { "residual sum and norm     ", [&]() {
+                dlib::tt::add_rms_norm_rows(xn, x, tmp, 0.01f, gamma, 1e-6f); } },
             { "ffn_gate    Q4_K 9728x2560", [&]() {
-                dlib::tt::gguf_matvec(gate, xn, w_gate, gb::q4_K, df, d, rb_d); }, &gate },
+                dlib::tt::gguf_matvec(gate, xn, w_gate, gb::q4_K, df, d, rb_d); } },
             { "ffn_up      Q4_K 9728x2560", [&]() {
-                dlib::tt::gguf_matvec(up, xn, w_up, gb::q4_K, df, d, rb_d); }, &up },
-            { "gate times the raised rows", [&]() { dlib::tt::silu_multiply(gate, up); }, &gate },
+                dlib::tt::gguf_matvec(up, xn, w_up, gb::q4_K, df, d, rb_d); } },
+            { "gate times the raised rows", [&]() { dlib::tt::silu_multiply(gate, up); } },
             { "ffn_down    Q4_K 2560x9728", [&]() {
-                dlib::tt::gguf_matvec(tmp, gate, w_down, gb::q4_K, d, df, gb::row_bytes(gb::q4_K, df)); }, &tmp },
-            { "residual sum              ", [&]() { dlib::tt::add(1, x, 0.01f, tmp); }, &x }
+                dlib::tt::gguf_matvec(tmp, gate, w_down, gb::q4_K, d, df, gb::row_bytes(gb::q4_K, df)); } }
         };
         // Once through, so that the weights are on the device and every buffer holds values.
         for (const step& s : steps) s.run();
-        x.host();
+        wait_device();
         double sum = 0;
         for (const step& s : steps)
         {
@@ -1203,7 +1447,7 @@ namespace
             for (int i = 0; i < repeats; ++i)
             {
                 s.run();
-                s.result->host();
+                wait_device();
             }
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
                 / repeats;
@@ -1213,10 +1457,145 @@ namespace
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < repeats; ++i)
             for (const step& s : steps) s.run();
-        x.host();
+        wait_device();
         const double chained = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / repeats;
         std::printf("  dense block, one token: %8.1f us with the device waited for once (%.1f us operation by "
-            "operation); 36 such blocks, %.1f ms\n", chained * 1e6, sum * 1e6, chained * 36e3);
+            "operation, %d operations); 36 such blocks, %.1f ms\n", chained * 1e6, sum * 1e6,
+            static_cast<int>(steps.size()), chained * 36e3);
+    }
+
+    /*
+        The measures of the longer passes, on the device of the build: the time of a launch of a
+        kernel, as the passes chain them; the products of 64 and of 512 tokens with a matrix of
+        the feed-forward block of a decoder of 4 billion parameters, through tiles, in every
+        arithmetic the device computes with, and the expansion of the matrix alone; the attention
+        of 512 tokens that start a sequence with the heads of that decoder, token by token
+        (tt::paged_attention()) and over all the tokens together (tt::paged_attention_rows()).
+    */
+    void measure_long_passes(std::mt19937& rng)
+    {
+#ifdef DLIB_USE_CUDA
+        const int launches = 2000, repeats = 10;
+        const long rows = 9728, cols = 2560, tokens = 512;
+        const std::vector<long> counts = { 64, 512 };
+#else
+        const int launches = 200, repeats = 1;
+        const long rows = 1024, cols = 512, tokens = 48;
+        const std::vector<long> counts = { 64 };
+#endif
+        {
+            // A kernel over one row of 32 values: its time is the one of its launch.
+            dlib::resizable_tensor x(1, 32), gamma(1, 32), y(1, 32);
+            x = 1;
+            gamma = 1;
+            dlib::tt::rms_norm_rows(y, x, gamma, 1e-6f);
+            wait_device();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < launches; ++i) dlib::tt::rms_norm_rows(y, x, gamma, 1e-6f);
+            wait_device();
+            const double chained = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                / launches;
+            const auto t1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < launches / 10; ++i)
+            {
+                dlib::tt::rms_norm_rows(y, x, gamma, 1e-6f);
+                wait_device();
+            }
+            const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count()
+                / (launches / 10);
+            std::printf("  launch of a kernel: %6.2f us chained, %6.2f us with the device waited for\n", chained * 1e6,
+                waited * 1e6);
+        }
+
+        dlib::resizable_tensor w;
+        random_matrix(w, gb::q4_K, rows, cols, rng);
+        const size_t rb = gb::row_bytes(gb::q4_K, cols);
+        // Tiles of 64 MB of floats at most, as the engine expands them.
+        const long tile = std::min<long>(rows, static_cast<long>((size_t(64) << 20) / (sizeof(float) * cols)));
+        {
+            dlib::resizable_tensor expanded(tile, cols);
+            dlib::tt::gguf_dequantize(expanded, w, gb::q4_K, 0, tile, cols, rb);
+            wait_device();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < repeats; ++i) dlib::tt::gguf_dequantize(expanded, w, gb::q4_K, 0, tile, cols, rb);
+            wait_device();
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                / repeats;
+            std::printf("  expansion of %ld rows of Q4_K %ldx%ld to floats: %8.1f us, %6.2f billion weights a second\n",
+                tile, rows, cols, seconds * 1e6, static_cast<double>(tile) * cols / seconds / 1e9);
+        }
+        for (long n : counts)
+        {
+            dlib::resizable_tensor x(n, cols), y(n, rows), saturated(1);
+            random_floats(x.host_write_only(), x.size(), 1.0f, rng);
+            for (dlib::gguf_precision p : precisions)
+            {
+                if (!dlib::tt::gguf_gemm_computes(p)) continue;
+                dlib::resizable_tensor work;
+                work.set_size(static_cast<long long>(gemm_work(n, cols, tile, p)));
+                saturated = 0;
+                // Two products settle the kernels of the library.
+                for (int i = 0; i < 2; ++i) dlib::tt::gguf_gemm(y, x, w, gb::q4_K, rows, cols, rb, work, p, saturated);
+                wait_device();
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < repeats; ++i)
+                    dlib::tt::gguf_gemm(y, x, w, gb::q4_K, rows, cols, rb, work, p, saturated);
+                wait_device();
+                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                    / repeats;
+                std::printf("  products of %3ld tokens with Q4_K %ldx%ld through tiles, %-6s: %9.1f us, %7.1f billion "
+                    "products a second\n", n, rows, cols, precision_name(p), seconds * 1e6,
+                    static_cast<double>(n) * rows * cols / seconds / 1e9);
+            }
+        }
+
+        for (int q8 = 0; q8 < 2; ++q8)
+        {
+            dlib::kv_page_layout L;
+            L.layers = 1;
+            L.heads = 8;
+            L.head_dim = 128;
+            L.block_positions = 256;
+            L.q8 = q8 != 0;
+            const long q_heads = 32, width = q_heads * L.head_dim;
+            const long pages = (tokens + L.block_positions - 1) / L.block_positions;
+            std::vector<uint8_t> bytes(static_cast<size_t>(pages) * L.page_bytes());
+            for (auto& b : bytes) b = static_cast<uint8_t>(rng() & 0x3F);
+            dlib::resizable_tensor p, tk, tb, q(tokens, width), out(tokens, width), work;
+            load_weights(p, bytes);
+            std::vector<int32_t> tables, plan;
+            for (long i = 0; i < pages; ++i) tables.push_back(static_cast<int32_t>(i));
+            for (long t = 0; t < tokens; ++t)
+            {
+                plan.push_back(static_cast<int32_t>(t));
+                plan.push_back(0);
+            }
+            put_integers(tk, plan);
+            put_integers(tb, tables);
+            random_floats(q.host_write_only(), q.size(), 1.0f, rng);
+            work.set_size(static_cast<long long>(dlib::tt::paged_attention_rows_scratch(tokens, q_heads, L, 0,
+                tokens)));
+            double seconds[2] = { 0, 0 };
+            for (int together = 0; together < 2; ++together)
+            {
+                auto attend = [&]() {
+                    if (together)
+                        dlib::tt::paged_attention_rows(out, q, q_heads, 0.088f, p, L, 0, tb, 0, 0, work);
+                    else
+                        dlib::tt::paged_attention(out, q, q_heads, 0.088f, p, L, 0, tk, tb, tokens);
+                };
+                attend();
+                wait_device();
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < repeats; ++i) attend();
+                wait_device();
+                seconds[together] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                    / repeats;
+            }
+            std::printf("  attention of %ld tokens that start a sequence, %s: %9.1f us per layer token by token, "
+                "%9.1f us over the tokens together\n", tokens, q8 ? "8 bits" : "half precision", seconds[0] * 1e6,
+                seconds[1] * 1e6);
+        }
     }
 }
 
@@ -1262,16 +1641,19 @@ static int run_checks(int argc, char** argv)
         }
     for (const format& f : formats())
         for (const auto& s : shapes) check_format(f, s[0], s[1], rng);
+    for (const format& f : formats()) check_gemm(f, 19, 768, rng);
     check_row_operations(rng);
     check_rope(rng);
     check_kv_store(rng);
     check_attention(rng);
+    check_long_attention(rng);
     check_experts(rng);
     check_mamba(rng);
     measure(rng);
     measure_attention(rng);
     measure_hybrid(rng);
     measure_dense(rng);
+    measure_long_passes(rng);
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

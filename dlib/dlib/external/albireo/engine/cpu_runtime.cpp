@@ -1401,15 +1401,18 @@ namespace albireo
         Keeps the layer pass when passes of the device agree with the processor, a defect of the
         device or of its kernels otherwise reaching every answer: a probe of probe_tokens tokens,
         whose products read the blocks of the weights in place and which the device attends
-        itself when it can, and one of tiled_tokens() tokens, whose products go through the tiles
-        of the weights expanded and whose attention stays on the processor.  The keys and values
-        of these probes stay in half precision: rounded to 8 bits, the keys of the two passes
-        would turn the small differences of the products of the device and of the processor into
-        differences of whole steps of their rounding.  With keys and values in 8 bits, a third
-        probe checks the attention of the device over them, within a looser tolerance.  The
-        device keeps the layers while the attention of the processor serves when only its own
-        attention differs.  The state stays unchecked when the keys and values or the device lack
-        room for a probe, so that a later pass checks again.
+        token by token when it can, and one of tiled_tokens() tokens, whose products go through
+        the tiles of the weights expanded and which the device attends over all its tokens
+        together when it can.  The keys and values of these probes stay in half precision:
+        rounded to 8 bits, the keys of the two passes would turn the small differences of the
+        products of the device and of the processor into differences of whole steps of their
+        rounding.  With keys and values in 8 bits, two more probes check the attentions of the
+        device over them, within a looser tolerance: that of the few tokens, and that of the
+        longer passes on a pass of long_attention_probe_tokens tokens.  The device keeps the
+        layers while the attention of the processor serves the passes whose attention alone
+        differs, and gives up an arithmetic of lower precision of its products before the layers
+        return to the processor.  The state stays unchecked when the keys and values or the
+        device lack room for a probe, so that a later pass checks again.
     */
     long cpu_runtime::probe_size() const
     {
@@ -1461,16 +1464,67 @@ namespace albireo
             return;
         }
 
+        /*
+            The longer passes, whose products go through the tiles, and which the device attends
+            over all their tokens together when it can.  When such a pass differs, the device
+            first leaves its attention to the processor.  When the pass still differs, the device
+            gives up an arithmetic of lower precision of its products when it used one
+            (layer_pass::retreat()) and takes back the attention it left, which that arithmetic
+            may have been alone to disturb.  The pass is compared again each time.
+        */
+        long_attention_differs_ = false;
         if (tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train))
         {
-            outcome = probe_layer_pass(tiled, kv_format::f16, false, probe_tolerance, attended, detail);
-            if (outcome < 0) return;
+            bool together = attention && layer_pass_->attends_many();
+            // Whether a pass that differed left the attention of the longer passes to the processor.
+            bool left = false;
+            for (;;)
+            {
+                outcome = probe_layer_pass(tiled, kv_format::f16, together, probe_tolerance, attended, detail);
+                if (outcome < 0) return;
+                if (together && !attended)
+                {
+                    // No room for the work of that attention: the probe checked the products alone.
+                    note("no room on the device to attend the longer passes, whose attention stays on the processor");
+                    layer_pass_->allow_long_attention(false);
+                    together = false;
+                }
+                if (outcome != 0) break;
+                if (together)
+                {
+                    note(detail + ", the attention of the processor serving the longer passes");
+                    long_attention_differs_ = true;
+                    layer_pass_->allow_long_attention(false);
+                    together = false;
+                    left = true;
+                    continue;
+                }
+                if (!layer_pass_->retreat()) break;
+                if (left)
+                {
+                    note(detail + ", the products of the device returning to single precision and the device "
+                        "attending the longer passes again");
+                    long_attention_differs_ = false;
+                    layer_pass_->allow_long_attention(true);
+                    together = layer_pass_->attends_many();
+                    left = false;
+                }
+                else
+                {
+                    note(detail + ", the products of the device returning to single precision");
+                }
+            }
             note(detail);
             if (outcome == 0)
             {
                 drop_layer_pass(details);
                 return;
             }
+        }
+        else
+        {
+            // Without a longer probe, the attention of the longer passes stays unchecked: the processor keeps it.
+            layer_pass_->allow_long_attention(false);
         }
 
         if (attention && kv_.format() == kv_format::q8)
@@ -1494,6 +1548,25 @@ namespace albireo
                 note(detail);
             }
         }
+        // The attention of the longer passes over keys and values in 8 bits, on a shorter pass.
+        const long longer = long_attention_probe_tokens;
+        if (layer_pass_->attends_many() && kv_.format() == kv_format::q8 && longer > attention_tokens
+            && (cfg_.ctx_train <= 0 || longer <= cfg_.ctx_train))
+        {
+            outcome = probe_layer_pass(longer, kv_format::q8, true, q8_probe_tolerance, attended, detail);
+            if (outcome < 0) return;
+            if (outcome == 0 || !attended)
+            {
+                note(attended ? detail + ", the attention of the processor serving the longer passes"
+                    : "no room on the device to attend the longer passes over keys and values in 8 bits");
+                long_attention_differs_ = attended;
+                layer_pass_->allow_long_attention(false);
+            }
+            else
+            {
+                note(detail);
+            }
+        }
         if (layer_pass_->timed())
         {
             const long many = tiled > first && (cfg_.ctx_train <= 0 || tiled <= cfg_.ctx_train) ? tiled : 0;
@@ -1504,9 +1577,9 @@ namespace albireo
                 drop_layer_pass(details);
                 return;
             }
-            if (!device_few_)
+            if (!device_few_ && !layer_pass_->attends_many())
             {
-                // The device attends the passes of a few tokens alone, which it leaves to the processor.
+                // The device attended the passes of a few tokens alone, which it leaves to the processor.
                 layer_pass_->allow_attention(false);
                 attention_wait_ = 0;
             }
@@ -1535,6 +1608,8 @@ namespace albireo
         }
         if (outcome > 0 && attended)
         {
+            // allow_attention() lets the device attend every pass again: the longer ones stay as their probe left them.
+            if (long_attention_differs_) layer_pass_->allow_long_attention(false);
             details += (details.empty() ? "" : "; ") + detail;
             layer_pass_->report(true, details);
             return;
@@ -1576,7 +1651,9 @@ namespace albireo
                 catch (const device_failure& e)
                 {
                     // The pass is computed again below, from the states its sequences had before it.
-                    if (hybrid_pass_ && !e.memory)
+                    if (e.changed)
+                        ;
+                    else if (hybrid_pass_ && !e.memory)
                         drop_hybrid_pass(std::string("the device failed: ") + e.what());
                     else if (hybrid_pass_ && ++layer_pass_memory_failures_ >= max_layer_pass_memory_failures)
                         drop_hybrid_pass(std::string("the device lacked memory several times in a row: ") + e.what());
@@ -1609,8 +1686,13 @@ namespace albireo
             }
             catch (const device_failure& e)
             {
-                // The pass is computed again below; its keys and values are written again.
-                if (!e.memory)
+                /*
+                    The pass is computed again below; its keys and values are written again.  A
+                    device that changed its arithmetic stays in use.
+                */
+                if (e.changed)
+                    ;
+                else if (!e.memory)
                     drop_layer_pass(std::string("the device failed: ") + e.what());
                 else if (++layer_pass_memory_failures_ >= max_layer_pass_memory_failures)
                     drop_layer_pass(std::string("the device lacked memory several times in a row: ") + e.what());
@@ -1674,8 +1756,13 @@ namespace albireo
         v_.resize(static_cast<size_t>(T * kvd));
         tmp_.resize(static_cast<size_t>(T * d));
         if (on_device && !layer_pass_->begin(x_.data(), T)) return false;
-        // A pass of a few tokens, as a step of a generation, runs whole on the device when it attends it.
-        const bool attending = on_device && attention_allowed_ && T <= attention_tokens && layer_pass_->attends()
+        /*
+            A pass runs whole on the device when the device attends it: token by token for a pass
+            of a few tokens, as a step of a generation, and over all its tokens together for a
+            longer one, as a chunk of a prompt.
+        */
+        const bool attending = on_device && attention_allowed_
+            && (T <= attention_tokens ? layer_pass_->attends() : layer_pass_->attends_many())
             && plan_attention(batch, given) && layer_pass_->begin_attention(plan_);
         attended_ = attending;
 
@@ -2446,6 +2533,13 @@ namespace albireo
             {
                 note(detail + ", probed again");
                 outcome = probe_hybrid_pass(n, 1, detail);
+                if (outcome < 0) return;
+            }
+            // A pass that differs with products of lower precision is compared again without them.
+            if (outcome == 0 && hybrid_pass_->retreat())
+            {
+                note(detail + ", the products of the device returning to single precision");
+                outcome = probe_hybrid_pass(n, 2, detail);
                 if (outcome < 0) return;
             }
             note(detail);

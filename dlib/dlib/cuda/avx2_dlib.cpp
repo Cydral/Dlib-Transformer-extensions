@@ -84,6 +84,31 @@ namespace dlib
             return true;
         }
 
+        bool mish (
+            tensor& dest,
+            const tensor& src
+        )
+        {
+            if (!is_available()) return false;
+            const auto d = dest.host();
+            const auto s = src.host();
+            kernels::mish(d, s, src.size());
+            return true;
+        }
+
+        bool elu (
+            tensor& dest,
+            const tensor& src,
+            const float alpha
+        )
+        {
+            if (!is_available()) return false;
+            const auto d = dest.host();
+            const auto s = src.host();
+            kernels::elu(d, s, src.size(), alpha);
+            return true;
+        }
+
     // -----------------------------------------------------------------------------------
 
         bool softmax (

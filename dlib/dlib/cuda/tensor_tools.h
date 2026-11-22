@@ -3240,7 +3240,7 @@ namespace dlib { namespace tt
               r < rows, W being the matrix the bytes of weights encode.
             - The weights are read once for every 8 rows of src, in their compact form: this is
               the product of the generation of a few tokens, which the reading of the weights
-              bounds.  For many rows, gguf_dequantize() followed by gemm() reads them once.
+              bounds.  For many rows, gguf_gemm() reads them once.
     !*/
 
     void gguf_dequantize (
@@ -3263,6 +3263,60 @@ namespace dlib { namespace tt
               values after the other.
     !*/
 
+    bool gguf_gemm_computes (
+        gguf_precision precision
+    );
+    /*!
+        ensures
+            - Returns whether gguf_gemm() computes with that arithmetic on the device of the
+              calling thread: always for gguf_precision::single; for gguf_precision::half, on
+              a card whose compute capability is 7.0 at least, and for gguf_precision::tf32,
+              8.0 at least, the generations of the tensor cores and of their TF32 arithmetic.
+              Without CUDA, only gguf_precision::single.
+    !*/
+
+    void gguf_gemm (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes,
+        tensor& scratch,
+        gguf_precision precision,
+        tensor& saturated
+    );
+    /*!
+        requires
+            - dest, src, weights, type, rows, cols and row_bytes as for gguf_matvec(), src
+              holding n rows
+            - gguf_gemm_computes(precision) == true
+            - scratch is distinct from dest, src and weights.  With CUDA, its floats hold one
+              row of the weights at least, cols floats, or with gguf_precision::half the n
+              rows of src and one row of the weights in half precision,
+              ((n*cols*2 + 15)/16*16 + cols*2 bytes).
+            - With gguf_precision::half, saturated.size() > 0 and saturated is distinct from
+              the other tensors.
+        ensures
+            - performs the product of gguf_matvec(), dest[t*rows + r] = sum over i of
+              W[r][i]*src[t*cols + i], the way that suits many rows of src: a device expands
+              the weights into scratch, as many rows at a time as it holds, and multiplies
+              each such tile with src through cuBLAS, the weights being read once for all the
+              rows of src.  Without CUDA the function computes as gguf_matvec() does and
+              leaves scratch and saturated alone.
+            - precision selects the arithmetic of the device:
+                - gguf_precision::single: products and sums of floats.
+                - gguf_precision::tf32: the tensor cores round the weights and the values of
+                  src to 10 bits of mantissa, and add their products in single precision.
+                - gguf_precision::half: the weights and the values of src are rounded to half
+                  precision, the tensor cores adding their products in single precision.  A
+                  weight or a value of src beyond the halves (65504), or that is not a
+                  number, sets the first float of saturated to 1: dest then holds no valid
+                  product.  saturated is otherwise left as it is, so that a caller sets it to
+                  0 before a series of products and reads it once after them.
+    !*/
+
     void rms_norm_rows (
         tensor& dest,
         const tensor& src,
@@ -3280,6 +3334,28 @@ namespace dlib { namespace tt
               scales it by gamma, the RMS normalization of the decoders:
                 dest[r*w + i] == src[r*w + i]/sqrt(mean over j of src[r*w + j]^2 + eps)*gamma[i]
             - dest may be the same object as src.
+    !*/
+
+    void add_rms_norm_rows (
+        tensor& dest,
+        tensor& x,
+        const tensor& addend,
+        float factor,
+        const tensor& gamma,
+        float eps
+    );
+    /*!
+        requires
+            - gamma.size() > 0
+            - x.size() is a multiple of gamma.size()
+            - dest.size() == addend.size() == x.size()
+            - eps >= 0
+            - dest, x and addend are distinct objects
+        ensures
+            - #x == x + factor*addend, the residual sum of a block of a decoder
+            - dest holds the rows of #x normalized as rms_norm_rows(dest, #x, gamma, eps)
+              gives them: the sum that ends a block and the normalization that starts the
+              next one, in one pass over the rows.
     !*/
 
     void silu_multiply (
@@ -3321,6 +3397,27 @@ namespace dlib { namespace tt
               keep their values.
             - The cosines and sines may carry a factor, the scale of the attention that some
               extensions of the context apply with the rotation.
+    !*/
+
+    void rope_rows (
+        tensor& first_rows,
+        long first_heads,
+        tensor& second_rows,
+        long second_heads,
+        const tensor& angles,
+        long head_dim,
+        long rope_dims,
+        bool neox
+    );
+    /*!
+        requires
+            - as rope_rows(first_rows, angles, first_heads, head_dim, rope_dims, neox) and
+              rope_rows(second_rows, angles, second_heads, head_dim, rope_dims, neox)
+            - first_rows and second_rows are distinct objects whose memory does not overlap
+        ensures
+            - Applies the rotary positions to both sets of rows as these two calls do: the
+              queries and the keys of an attention, which share the angles of their tokens,
+              in one pass.
     !*/
 
     void paged_kv_store (
@@ -3411,6 +3508,63 @@ namespace dlib { namespace tt
             - The work on the positions of a token is split along them when the tokens and
               heads alone leave the device idle, the parts being merged afterwards; span bounds
               the positions of the tokens for that split.
+    !*/
+
+    size_t paged_attention_rows_scratch (
+        long n,
+        long q_heads,
+        const kv_page_layout& layout,
+        long first_position,
+        long run
+    );
+    /*!
+        requires
+            - n > 0, q_heads > 0, layout.valid() == true, first_position >= 0
+            - 0 < run <= n
+        ensures
+            - Returns the floats paged_attention_rows() needs in its scratch to attend n
+              tokens that start at first_position, run of them at a time: the keys and the
+              values of the positions [0, first_position + n), 2*layout.heads*layout.head_dim
+              floats per position, then for each token of a run its queries and outputs,
+              2*q_heads*layout.head_dim floats, and its scores, q_heads floats per position.
+    !*/
+
+    void paged_attention_rows (
+        tensor& out,
+        const tensor& queries,
+        long q_heads,
+        float scale,
+        const tensor& pages,
+        const kv_page_layout& layout,
+        long layer,
+        const tensor& tables,
+        long first_entry,
+        long first_position,
+        tensor& scratch
+    );
+    /*!
+        requires
+            - layout, layer, q_heads, pages and scale as for paged_attention()
+            - queries.size() == out.size() == n*q_heads*layout.head_dim for some n
+            - first_entry >= 0 and first_position >= 0
+            - tables holds the bits of 32-bit signed integers in its floats: tables[first_entry
+              + j] is the page of the positions [j*B, (j + 1)*B) of a sequence, B ==
+              layout.block_positions, for every j <= (first_position + n - 1)/B.
+            - out is distinct from queries, pages, tables and scratch
+            - With CUDA, scratch.size() >= paged_attention_rows_scratch(n, q_heads, layout,
+              first_position, 1), and scratch is distinct from the other tensors.
+        ensures
+            - Computes the attention of paged_attention() for n tokens that follow one another
+              in one sequence: token t sits at the position first_position + t and attends the
+              positions [0, first_position + t], whose keys and values the pages hold, those of
+              the n tokens included.
+            - A device computes the tokens together, with matrix products: it expands the keys
+              and the values of the positions into scratch, then takes the tokens by runs of as
+              many as the rest of scratch holds (paged_attention_rows_scratch()), the scores of
+              a run being one product of its queries with the keys and its outputs one product
+              of the weights with the values.  This is the attention of the long passes of a
+              prompt, whose tokens paged_attention() would attend one block each.  Without
+              CUDA the function computes token by token and leaves scratch alone.
     !*/
 
 // ----------------------------------------------------------------------------------------

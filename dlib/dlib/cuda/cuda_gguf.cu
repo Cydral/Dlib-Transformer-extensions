@@ -277,6 +277,85 @@ namespace dlib
                 }
             }
 
+            // The largest magnitude a half holds.
+            const float half_limit = 65504.0f;
+
+            /*
+                gguf_dequantize_kernel with the values rounded to half precision, eight at a time
+                when dst starts on 16 bytes.  A value beyond the halves, or that is not a number,
+                sets *saturated to 1.
+            */
+            template <int TYPE>
+            __global__ void gguf_dequantize_half_kernel(
+                const uint8_t* __restrict__ w,
+                size_t row_bytes,
+                long first,
+                long count,
+                long cols,
+                bool aligned,
+                uint16_t* __restrict__ dst,
+                float* saturated
+            )
+            {
+                const long groups = cols / 32;
+                const size_t total = static_cast<size_t>(count) * static_cast<size_t>(groups);
+                const size_t step = static_cast<size_t>(gridDim.x) * blockDim.x;
+                bool beyond = false;
+                for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += step)
+                {
+                    const long r = static_cast<long>(i / static_cast<size_t>(groups));
+                    const long g = static_cast<long>(i % static_cast<size_t>(groups));
+                    float v[32];
+                    gguf_blocks::decode_group<TYPE>(w + static_cast<size_t>(first + r) * row_bytes, g, v);
+                    uint32_t h[16];
+#pragma unroll
+                    for (int j = 0; j < 16; ++j)
+                    {
+                        beyond = beyond || !(fabsf(v[2 * j]) <= half_limit) || !(fabsf(v[2 * j + 1]) <= half_limit);
+                        h[j] = static_cast<uint32_t>(kv_pages::float_to_half(v[2 * j]))
+                            | (static_cast<uint32_t>(kv_pages::float_to_half(v[2 * j + 1])) << 16);
+                    }
+                    uint16_t* out = dst + static_cast<size_t>(r) * static_cast<size_t>(cols)
+                        + static_cast<size_t>(g) * 32;
+                    if (aligned)
+                    {
+                        uint4* out4 = reinterpret_cast<uint4*>(out);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            out4[j] = make_uint4(h[4 * j], h[4 * j + 1], h[4 * j + 2], h[4 * j + 3]);
+                    }
+                    else
+                    {
+#pragma unroll
+                        for (int j = 0; j < 16; ++j)
+                        {
+                            out[2 * j] = static_cast<uint16_t>(h[j]);
+                            out[2 * j + 1] = static_cast<uint16_t>(h[j] >> 16);
+                        }
+                    }
+                }
+                // Every thread that sets the flag writes the same value.
+                if (beyond) *saturated = 1.0f;
+            }
+
+            // dst[i] = src[i] rounded to half precision, *saturated as gguf_dequantize_half_kernel sets it.
+            __global__ void floats_to_halves_kernel(
+                const float* __restrict__ src,
+                uint16_t* __restrict__ dst,
+                size_t n,
+                float* saturated
+            )
+            {
+                bool beyond = false;
+                for (auto i : grid_stride_range(0, n))
+                {
+                    const float v = src[i];
+                    beyond = beyond || !(fabsf(v) <= half_limit);
+                    dst[i] = kv_pages::float_to_half(v);
+                }
+                if (beyond) *saturated = 1.0f;
+            }
+
             /*
                 Calls f with std::integral_constant<int, type>, so that f instantiates its kernels
                 for the format of the weights.
@@ -358,6 +437,27 @@ namespace dlib
                 with_format(type, [&](auto format) {
                     gguf_dequantize_kernel<decltype(format)::value><<<blocks, threads>>>(w, row_bytes, first, count,
                         cols, aligned, dst);
+                });
+            }
+
+            void launch_dequantize_half(
+                int type,
+                const uint8_t* w,
+                size_t row_bytes,
+                long first,
+                long count,
+                long cols,
+                uint16_t* dst,
+                float* saturated
+            )
+            {
+                const size_t groups = static_cast<size_t>(count) * static_cast<size_t>(cols / 32);
+                const bool aligned = reinterpret_cast<uintptr_t>(dst) % 16 == 0;
+                const int threads = 256;
+                const int blocks = static_cast<int>(std::min<size_t>((groups + threads - 1) / threads, 65535));
+                with_format(type, [&](auto format) {
+                    gguf_dequantize_half_kernel<decltype(format)::value><<<blocks, threads>>>(w, row_bytes, first,
+                        count, cols, aligned, dst, saturated);
                 });
             }
 
@@ -667,6 +767,47 @@ namespace dlib
                 for (int i = threadIdx.x; i < width; i += blockDim.x) y[i] = x[i] * scale * gamma[i];
             }
 
+            /*
+                x[r][i] += factor * addend[r][i], then rms_norm_rows_kernel of the rows of x into
+                dst: a block per row, which adds, sums the squares of its row and scales it.
+            */
+            __global__ void add_rms_norm_rows_kernel(
+                float* __restrict__ x,
+                const float* __restrict__ addend,
+                float factor,
+                const float* __restrict__ gamma,
+                float* __restrict__ dst,
+                int width,
+                float eps
+            )
+            {
+                __shared__ float partial[32];
+                float* xr = x + static_cast<size_t>(blockIdx.x) * width;
+                const float* a = addend + static_cast<size_t>(blockIdx.x) * width;
+                float* y = dst + static_cast<size_t>(blockIdx.x) * width;
+                float s = 0;
+                for (int i = threadIdx.x; i < width; i += blockDim.x)
+                {
+                    const float v = xr[i] + factor * a[i];
+                    xr[i] = v;
+                    s += v * v;
+                }
+                s = warp_sum(s);
+                const int lane = threadIdx.x % 32;
+                const int warp = threadIdx.x / 32;
+                if (lane == 0) partial[warp] = s;
+                __syncthreads();
+                if (warp == 0)
+                {
+                    s = lane < static_cast<int>(blockDim.x / 32) ? partial[lane] : 0.0f;
+                    s = warp_sum(s);
+                    if (lane == 0) partial[0] = s;
+                }
+                __syncthreads();
+                const float scale = 1.0f / sqrtf(partial[0] / static_cast<float>(width) + eps);
+                for (int i = threadIdx.x; i < width; i += blockDim.x) y[i] = xr[i] * scale * gamma[i];
+            }
+
             // g[i] = g[i] / (1 + exp(-g[i])) * u[i], the gate of a SwiGLU block.
             __global__ void silu_multiply_kernel(float* g, const float* __restrict__ u, size_t n)
             {
@@ -700,6 +841,43 @@ namespace dlib
                     const float* a = angles + row / static_cast<size_t>(heads) * static_cast<size_t>(rope_dims);
                     const float c = a[i], s = a[half + i];
                     float* x = rows + row * static_cast<size_t>(hd);
+                    const size_t i0 = neox ? i : 2 * i;
+                    const size_t i1 = neox ? i + half : 2 * i + 1;
+                    const float x0 = x[i0], x1 = x[i1];
+                    x[i0] = x0 * c - x1 * s;
+                    x[i1] = x0 * s + x1 * c;
+                }
+            }
+
+            /*
+                rope_rows_kernel for two sets of rows that share the angles of their tokens, the
+                queries and the keys of an attention: the pairs of the first set come first, pair k
+                of the second set being pair k - first_pairs of its rows.
+            */
+            __global__ void rope_rows_pair_kernel(
+                float* first_rows,
+                int first_heads,
+                size_t first_pairs,
+                float* second_rows,
+                int second_heads,
+                const float* __restrict__ angles,
+                int hd,
+                int rope_dims,
+                bool neox,
+                size_t pairs
+            )
+            {
+                const size_t half = static_cast<size_t>(rope_dims / 2);
+                for (auto k : grid_stride_range(0, pairs))
+                {
+                    const bool second = k >= first_pairs;
+                    const size_t local = second ? k - first_pairs : k;
+                    const size_t heads = static_cast<size_t>(second ? second_heads : first_heads);
+                    const size_t i = local % half;
+                    const size_t row = local / half;
+                    const float* a = angles + row / heads * static_cast<size_t>(rope_dims);
+                    const float c = a[i], s = a[half + i];
+                    float* x = (second ? second_rows : first_rows) + row * static_cast<size_t>(hd);
                     const size_t i0 = neox ? i : 2 * i;
                     const size_t i1 = neox ? i + half : 2 * i + 1;
                     const float x0 = x[i0], x1 = x[i1];
@@ -1047,6 +1225,152 @@ namespace dlib
             }
 
             /*
+                The keys, then the values, of the positions [0, span) of a sequence for a layer, as
+                floats and head after head (tt::paged_attention_rows()):
+                    dst[((kind * heads + h) * span + p) * hd + e]
+                is value e of head h at position p, kind 0 for the keys and 1 for the values, read
+                in the page table[p / block_positions].  The keys of the 8-bit format stay rotated,
+                as the pages store them.
+            */
+            __global__ void paged_kv_expand_kernel(
+                const uint8_t* __restrict__ pages,
+                kv_page_layout layout,
+                int layer,
+                const int32_t* __restrict__ table,
+                int span,
+                float* __restrict__ dst,
+                size_t total
+            )
+            {
+                const size_t hd = static_cast<size_t>(layout.head_dim);
+                const size_t heads = static_cast<size_t>(layout.heads);
+                const size_t B = static_cast<size_t>(layout.block_positions);
+                const size_t page_bytes = layout.page_bytes();
+                const size_t per_head = static_cast<size_t>(span) * hd;
+                for (auto i : grid_stride_range(0, total))
+                {
+                    const size_t e = i % hd;
+                    const size_t p = i / hd % static_cast<size_t>(span);
+                    const size_t head = i / per_head;
+                    const long kind = head >= heads ? 1 : 0;
+                    const long h = static_cast<long>(head - (kind ? heads : 0));
+                    const uint8_t* slab = pages + static_cast<size_t>(table[p / B]) * page_bytes
+                        + layout.slab_offset(kind, layer, h);
+                    const size_t r = p % B;
+                    if (layout.q8)
+                    {
+                        const float d = gguf_blocks::half_to_float(reinterpret_cast<const uint16_t*>(slab + B * hd)[
+                            r * (hd / 32) + e / 32]);
+                        dst[i] = d * static_cast<float>(reinterpret_cast<const int8_t*>(slab)[r * hd + e]);
+                    }
+                    else
+                    {
+                        dst[i] = gguf_blocks::half_to_float(reinterpret_cast<const uint16_t*>(slab)[r * hd + e]);
+                    }
+                }
+            }
+
+            /*
+                The queries of tokens tokens, head after head: row blockIdx.x of dst, the row of
+                head blockIdx.x / tokens of token blockIdx.x % tokens, is the row of that head of
+                that token in queries, rotated as the keys of the 8-bit format are when rotate is
+                true.  row holds hd floats of shared memory.
+            */
+            __global__ void attention_queries_kernel(
+                const float* __restrict__ queries,
+                int q_heads,
+                int tokens,
+                int hd,
+                bool rotate,
+                float* __restrict__ dst
+            )
+            {
+                extern __shared__ float row[];
+                const int h = blockIdx.x / tokens;
+                const int t = blockIdx.x % tokens;
+                const float* src = queries + (static_cast<size_t>(t) * q_heads + h) * hd;
+                float* out = dst + static_cast<size_t>(blockIdx.x) * hd;
+                if (!rotate)
+                {
+                    for (int i = threadIdx.x; i < hd; i += blockDim.x) out[i] = src[i];
+                    return;
+                }
+                for (int i = threadIdx.x; i < hd; i += blockDim.x) row[i] = kv_pages::flipped(i) ? -src[i] : src[i];
+                rotate_rows_shared(row, 1, hd);
+                for (int i = threadIdx.x; i < hd; i += blockDim.x) out[i] = row[i];
+            }
+
+            // The threads of a block of attention_softmax_kernel.
+            const int softmax_threads = 256;
+
+            /*
+                The weights of the attention of a row of scores, in place: row blockIdx.x of s holds
+                span scores of token blockIdx.x % tokens, which attends the positions [0, limit),
+                limit == first_limit + blockIdx.x % tokens; they become their softmax, and the
+                scores of the positions from limit on become 0.
+            */
+            __global__ void __launch_bounds__(softmax_threads) attention_softmax_kernel(
+                float* s,
+                int span,
+                int tokens,
+                int first_limit
+            )
+            {
+                __shared__ float reduced[softmax_threads];
+                float* row = s + static_cast<size_t>(blockIdx.x) * span;
+                const int limit = first_limit + static_cast<int>(blockIdx.x % tokens);
+                float mx = -CUDART_INF_F;
+                for (int p = threadIdx.x; p < limit; p += softmax_threads) mx = fmaxf(mx, row[p]);
+                reduced[threadIdx.x] = mx;
+                __syncthreads();
+                for (int width = softmax_threads / 2; width > 0; width >>= 1)
+                {
+                    if (static_cast<int>(threadIdx.x) < width)
+                        reduced[threadIdx.x] = fmaxf(reduced[threadIdx.x], reduced[threadIdx.x + width]);
+                    __syncthreads();
+                }
+                mx = reduced[0];
+                // Every thread has read the maximum before the sums take its place.
+                __syncthreads();
+                float sum = 0;
+                for (int p = threadIdx.x; p < limit; p += softmax_threads)
+                {
+                    const float e = expf(row[p] - mx);
+                    row[p] = e;
+                    sum += e;
+                }
+                reduced[threadIdx.x] = sum;
+                __syncthreads();
+                for (int width = softmax_threads / 2; width > 0; width >>= 1)
+                {
+                    if (static_cast<int>(threadIdx.x) < width) reduced[threadIdx.x] += reduced[threadIdx.x + width];
+                    __syncthreads();
+                }
+                const float inverse = 1.0f / reduced[0];
+                for (int p = threadIdx.x; p < span; p += softmax_threads) row[p] = p < limit ? row[p] * inverse : 0.0f;
+            }
+
+            // dst[(t * heads + h) * hd + e] = src[(h * tokens + t) * hd + e]: the rows of the heads, token after token.
+            __global__ void rows_from_heads_kernel(
+                const float* __restrict__ src,
+                int heads,
+                int tokens,
+                int hd,
+                float* __restrict__ dst,
+                size_t total
+            )
+            {
+                for (auto i : grid_stride_range(0, total))
+                {
+                    const size_t e = i % static_cast<size_t>(hd);
+                    const size_t row = i / static_cast<size_t>(hd);
+                    const size_t h = row % static_cast<size_t>(heads);
+                    const size_t t = row / static_cast<size_t>(heads);
+                    dst[i] = src[(h * static_cast<size_t>(tokens) + t) * static_cast<size_t>(hd) + e];
+                }
+            }
+
+            /*
                 The partial sums of the split attention: one buffer per card for the process, kept
                 from one call to the next and grown by half at least, so that the steps of a
                 generation neither allocate nor free memory of the device, whose release waits for
@@ -1182,6 +1506,147 @@ namespace dlib
             CHECK_CUDA(cudaGetLastError());
         }
 
+        void gguf_expand_tile (
+            const tensor& weights,
+            int type,
+            long first,
+            long count,
+            long cols,
+            size_t row_bytes,
+            float* tile
+        )
+        {
+            DLIB_CASSERT(gguf_blocks::known_format(type) && first >= 0 && count > 0 && cols > 0 && tile);
+            DLIB_CASSERT(row_bytes != 0 && row_bytes == gguf_blocks::row_bytes(type, cols));
+            DLIB_CASSERT(weights.size() * sizeof(float) >= static_cast<size_t>(first + count) * row_bytes);
+            launch_dequantize(type, reinterpret_cast<const uint8_t*>(weights.device()), row_bytes, first, count, cols,
+                tile);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void gguf_expand_half_tile (
+            const tensor& weights,
+            int type,
+            long first,
+            long count,
+            long cols,
+            size_t row_bytes,
+            uint16_t* tile,
+            float* saturated
+        )
+        {
+            DLIB_CASSERT(gguf_blocks::known_format(type) && first >= 0 && count > 0 && cols > 0 && tile && saturated);
+            DLIB_CASSERT(row_bytes != 0 && row_bytes == gguf_blocks::row_bytes(type, cols));
+            DLIB_CASSERT(weights.size() * sizeof(float) >= static_cast<size_t>(first + count) * row_bytes);
+            launch_dequantize_half(type, reinterpret_cast<const uint8_t*>(weights.device()), row_bytes, first, count,
+                cols, tile, saturated);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void floats_to_halves (
+            const float* src,
+            uint16_t* dst,
+            size_t n,
+            float* saturated
+        )
+        {
+            DLIB_CASSERT(src && dst && saturated);
+            if (n == 0) return;
+            const unsigned blocks = static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 4096));
+            floats_to_halves_kernel<<<blocks, 256>>>(src, dst, n, saturated);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void paged_kv_expand (
+            const tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const int32_t* table,
+            long span,
+            float* dst
+        )
+        {
+            DLIB_CASSERT(layout.valid() && 0 <= layer && layer < layout.layers && table && dst);
+            DLIB_CASSERT(span > 0 && span <= std::numeric_limits<int>::max());
+            const size_t total = 2 * static_cast<size_t>(layout.heads) * static_cast<size_t>(span)
+                * static_cast<size_t>(layout.head_dim);
+            const unsigned blocks = static_cast<unsigned>(std::min<size_t>((total + 255) / 256, 16384));
+            paged_kv_expand_kernel<<<blocks, 256>>>(reinterpret_cast<const uint8_t*>(pages.device()), layout,
+                static_cast<int>(layer), table, static_cast<int>(span), dst, total);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void attention_queries (
+            const float* queries,
+            long q_heads,
+            long tokens,
+            long hd,
+            bool rotate,
+            float* dst
+        )
+        {
+            DLIB_CASSERT(queries && dst && q_heads > 0 && tokens > 0 && hd > 0 && hd <= 4096);
+            DLIB_CASSERT(static_cast<long long>(q_heads) * tokens <= std::numeric_limits<int>::max());
+            attention_queries_kernel<<<static_cast<unsigned>(q_heads * tokens), 128,
+                sizeof(float) * static_cast<size_t>(hd)>>>(queries, static_cast<int>(q_heads),
+                static_cast<int>(tokens), static_cast<int>(hd), rotate, dst);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void attention_softmax (
+            float* scores,
+            long span,
+            long rows,
+            long tokens,
+            long first_limit
+        )
+        {
+            DLIB_CASSERT(scores && span > 0 && rows > 0 && tokens > 0 && first_limit > 0);
+            DLIB_CASSERT(first_limit + tokens - 1 <= span && span <= std::numeric_limits<int>::max()
+                && rows <= std::numeric_limits<int>::max());
+            attention_softmax_kernel<<<static_cast<unsigned>(rows), softmax_threads>>>(scores,
+                static_cast<int>(span), static_cast<int>(tokens), static_cast<int>(first_limit));
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void rows_from_heads (
+            const float* src,
+            long heads,
+            long tokens,
+            long hd,
+            float* dst
+        )
+        {
+            DLIB_CASSERT(src && dst && heads > 0 && tokens > 0 && hd > 0);
+            DLIB_CASSERT(heads <= std::numeric_limits<int>::max() && tokens <= std::numeric_limits<int>::max()
+                && hd <= std::numeric_limits<int>::max());
+            const size_t total = static_cast<size_t>(heads) * static_cast<size_t>(tokens) * static_cast<size_t>(hd);
+            const unsigned blocks = static_cast<unsigned>(std::min<size_t>((total + 255) / 256, 4096));
+            rows_from_heads_kernel<<<blocks, 256>>>(src, static_cast<int>(heads), static_cast<int>(tokens),
+                static_cast<int>(hd), dst, total);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void add_rms_norm_rows (
+            tensor& dest,
+            tensor& x,
+            const tensor& addend,
+            float factor,
+            const tensor& gamma,
+            float eps
+        )
+        {
+            const size_t width = gamma.size();
+            DLIB_CASSERT(width > 0 && x.size() % width == 0 && dest.size() == x.size() && addend.size() == x.size()
+                && eps >= 0);
+            DLIB_CASSERT(!is_same_object(dest, x) && !is_same_object(dest, addend) && !is_same_object(x, addend));
+            const size_t rows = x.size() / width;
+            if (rows == 0) return;
+            add_rms_norm_rows_kernel<<<static_cast<unsigned int>(rows), 256>>>(x.device(), addend.device(), factor,
+                gamma.device(), dest.device_write_only(), static_cast<int>(width), eps);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
         void rms_norm_rows (
             tensor& dest,
             const tensor& src,
@@ -1234,6 +1699,37 @@ namespace dlib
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((pairs + 255) / 256, 4096));
             rope_rows_kernel<<<blocks, 256>>>(rows.device(), angles.device(), static_cast<int>(heads),
                 static_cast<int>(head_dim), static_cast<int>(rope_dims), neox, pairs);
+            CHECK_CUDA(cudaGetLastError());
+        }
+
+        void rope_rows (
+            tensor& first_rows,
+            long first_heads,
+            tensor& second_rows,
+            long second_heads,
+            const tensor& angles,
+            long head_dim,
+            long rope_dims,
+            bool neox
+        )
+        {
+            DLIB_CASSERT(first_heads > 0 && second_heads > 0 && head_dim > 0 && rope_dims > 0 && rope_dims <= head_dim
+                && rope_dims % 2 == 0);
+            DLIB_CASSERT(angles.size() % static_cast<size_t>(rope_dims) == 0);
+            const size_t n = angles.size() / static_cast<size_t>(rope_dims);
+            DLIB_CASSERT(first_rows.size() == n * static_cast<size_t>(first_heads) * static_cast<size_t>(head_dim)
+                && second_rows.size() == n * static_cast<size_t>(second_heads) * static_cast<size_t>(head_dim));
+            DLIB_CASSERT(!is_same_object(first_rows, angles) && !is_same_object(second_rows, angles)
+                && !is_same_object(first_rows, second_rows));
+            const size_t half = static_cast<size_t>(rope_dims / 2);
+            const size_t first_pairs = n * static_cast<size_t>(first_heads) * half;
+            const size_t pairs = first_pairs + n * static_cast<size_t>(second_heads) * half;
+            if (pairs == 0) return;
+            // Every layer of a step calls it: no occupancy query of launch_kernel().
+            const unsigned blocks = static_cast<unsigned>(std::min<size_t>((pairs + 255) / 256, 4096));
+            rope_rows_pair_kernel<<<blocks, 256>>>(first_rows.device(), static_cast<int>(first_heads), first_pairs,
+                second_rows.device(), static_cast<int>(second_heads), angles.device(), static_cast<int>(head_dim),
+                static_cast<int>(rope_dims), neox, pairs);
             CHECK_CUDA(cudaGetLastError());
         }
 

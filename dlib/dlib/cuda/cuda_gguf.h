@@ -46,6 +46,15 @@ namespace dlib
             float eps
         );
 
+        void add_rms_norm_rows (
+            tensor& dest,
+            tensor& x,
+            const tensor& addend,
+            float factor,
+            const tensor& gamma,
+            float eps
+        );
+
         void silu_multiply (
             tensor& gate,
             const tensor& up
@@ -55,6 +64,17 @@ namespace dlib
             tensor& rows,
             const tensor& angles,
             long heads,
+            long head_dim,
+            long rope_dims,
+            bool neox
+        );
+
+        void rope_rows (
+            tensor& first_rows,
+            long first_heads,
+            tensor& second_rows,
+            long second_heads,
+            const tensor& angles,
             long head_dim,
             long rope_dims,
             bool neox
@@ -120,6 +140,95 @@ namespace dlib
             const tensor& src,
             const tensor& weights,
             long per_row
+        );
+
+        /*
+            The kernels of the products that cuBLAS computes (cublas_dlibapi.h): gguf_gemm() and
+            paged_attention_rows().  They read and write memory of the device, which the caller
+            holds, and return once their kernel is launched.
+        */
+
+        // tile receives the rows [first, first + count) of the matrix as floats, cols values each.
+        void gguf_expand_tile (
+            const tensor& weights,
+            int type,
+            long first,
+            long count,
+            long cols,
+            size_t row_bytes,
+            float* tile
+        );
+
+        /*
+            gguf_expand_tile() with the values rounded to half precision; *saturated becomes 1
+            when a value lies beyond the halves or is not a number.
+        */
+        void gguf_expand_half_tile (
+            const tensor& weights,
+            int type,
+            long first,
+            long count,
+            long cols,
+            size_t row_bytes,
+            uint16_t* tile,
+            float* saturated
+        );
+
+        // dst[i] = src[i] rounded to half precision for i < n, *saturated as above.
+        void floats_to_halves (
+            const float* src,
+            uint16_t* dst,
+            size_t n,
+            float* saturated
+        );
+
+        /*
+            dst receives the keys then the values of layer at the positions [0, span) of a
+            sequence whose pages table lists, as floats, head after head:
+            2*layout.heads*span*layout.head_dim floats.  The keys of the 8-bit format stay
+            rotated.
+        */
+        void paged_kv_expand (
+            const tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const int32_t* table,
+            long span,
+            float* dst
+        );
+
+        /*
+            dst receives the rows of the heads of tokens tokens, head after head, rotated as the
+            keys of the 8-bit format when rotate is true: q_heads*tokens rows of hd floats.
+        */
+        void attention_queries (
+            const float* queries,
+            long q_heads,
+            long tokens,
+            long hd,
+            bool rotate,
+            float* dst
+        );
+
+        /*
+            Each of the rows of span scores becomes its softmax over the positions [0, limit),
+            with zeros from limit on, limit == first_limit + r % tokens for row r.
+        */
+        void attention_softmax (
+            float* scores,
+            long span,
+            long rows,
+            long tokens,
+            long first_limit
+        );
+
+        // dst[(t*heads + h)*hd + e] = src[(h*tokens + t)*hd + e].
+        void rows_from_heads (
+            const float* src,
+            long heads,
+            long tokens,
+            long hd,
+            float* dst
         );
     }
 }

@@ -96,11 +96,17 @@ for family in "" _portable; do
 done
 
 # The attention of a device on the same tiny model, then the groups of products of the tiny
-# mixture and of the tiny hybrid decoder, through the host code of dlib, when the tree was
-# configured with ALBIREO_ENGINE_DLIB=ON.
+# mixture and of the tiny hybrid decoder, and the operations of dlib on the weights in their GGUF
+# formats, through the host code of dlib.  Both programs belong to the validation engine, which a
+# tree builds once configured with -DALBIREO_ENGINE_DLIB=ON; a tree without it skips the two steps.
+WITHOUT_DLIB="the tree was configured without -DALBIREO_ENGINE_DLIB=ON"
 if [ -x "$BUILD/tests/test_offload" ]; then
   step "attention of the device" "all checks passed" "$BUILD/tests/test_offload" synthetic "$WORK"
-else skip "attention of the device" "no $BUILD/tests/test_offload (ALBIREO_ENGINE_DLIB=ON)"
+else skip "attention of the device" "$WITHOUT_DLIB"
+fi
+if [ -x "$BUILD/tests/test_device_ops" ]; then
+  step "operations of the device" "all checks passed" "$BUILD/tests/test_device_ops"
+else skip "operations of the device" "$WITHOUT_DLIB"
 fi
 
 # Damaged model files, the chat format of the agents and the C interface of an engine under

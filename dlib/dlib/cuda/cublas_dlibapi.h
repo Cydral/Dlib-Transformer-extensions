@@ -7,6 +7,7 @@
 
 #include "tensor.h"
 #include "cuda_errors.h"
+#include "kv_pages.h"
 
 namespace dlib
 {    
@@ -68,6 +69,45 @@ namespace dlib
                         dest[s][k] = alpha * (lhs[s][k] * rhs[s][k]) + beta * dest[s][k]
                         where [s][k] represents the 2D plane for sample s and channel k.
     !*/
+
+    // ------------------------------------------------------------------------------------
+
+        /*
+            The products on weights in their GGUF formats and the attention of consecutive
+            tokens that cuBLAS computes, with the kernels of cuda_gguf.h.  tensor_tools.h
+            documents them.
+        */
+
+        bool gguf_gemm_computes (
+            gguf_precision precision
+        );
+
+        void gguf_gemm (
+            tensor& dest,
+            const tensor& src,
+            const tensor& weights,
+            int type,
+            long rows,
+            long cols,
+            size_t row_bytes,
+            tensor& scratch,
+            gguf_precision precision,
+            tensor& saturated
+        );
+
+        void paged_attention_rows (
+            tensor& out,
+            const tensor& queries,
+            long q_heads,
+            float scale,
+            const tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const tensor& tables,
+            long first_entry,
+            long first_position,
+            tensor& scratch
+        );
 
     // ------------------------------------------------------------------------------------
 

@@ -91,16 +91,26 @@ namespace albireo
 
     /*!
         The failure of a device during a layer_pass.  memory tells whether the device lacked
-        memory, which the end of another program may give back, rather than failed.
+        memory, which the end of another program may give back, rather than failed.  changed
+        tells that the device gave up an arithmetic that could not hold a value of the pass and
+        computes the next passes with another one: the pass is lost, and the device stays in use.
     !*/
     class device_failure : public std::runtime_error
     {
     public:
-        device_failure(const std::string& what, bool lack_of_memory)
-            : std::runtime_error(what), memory(lack_of_memory) {}
+        device_failure(const std::string& what, bool lack_of_memory, bool arithmetic_changed = false)
+            : std::runtime_error(what), memory(lack_of_memory), changed(arithmetic_changed) {}
 
         bool memory;
+        bool changed;
     };
+
+    /*!
+        The tokens of a pass up to which a device attends each token with a kernel of its own, as
+        the steps of a generation need (layer_pass::begin_attention()); it attends the tokens of a
+        longer pass together, with matrix products, when it can.
+    !*/
+    const long few_attention_tokens = 8;
 
     class layer_pass
     {
@@ -122,11 +132,13 @@ namespace albireo
                 with its products.
 
                 A device that keeps copies of the blocks of the keys and values may also attend
-                the tokens of a pass itself, as for the few tokens of a generation step: after
-                begin(), begin_attention() takes the pass, whose layers then run whole on the
-                device through attend(), and the pass exchanges nothing with the processor
-                before end(), which returns the keys and values of its tokens with the hidden
-                states.
+                the tokens of a pass itself: after begin(), begin_attention() takes the pass,
+                whose layers then run whole on the device through attend(), and the pass
+                exchanges nothing with the processor before end(), which returns the keys and
+                values of its tokens with the hidden states.  The passes of few_attention_tokens
+                tokens at most, those of a generation, are attended token by token (attends());
+                the device may attend the longer ones, the chunks of a prompt, with matrix
+                products over all their tokens (attends_many()).
 
             THREAD SAFETY
                 One thread uses an object at a time: the thread that runs the forward passes
@@ -211,6 +223,24 @@ namespace albireo
         // Lets the device attend the tokens of the passes, or keeps their attention on the processor.
         virtual void allow_attention(bool on) { (void)on; }
 
+        /*
+            Whether the device can attend the passes of more than few_attention_tokens tokens,
+            for the model and as allow_attention() and allow_long_attention() leave it.
+        */
+        virtual bool attends_many() const { return false; }
+
+        // Keeps the attention of the passes of more than few_attention_tokens tokens on the processor, or not.
+        virtual void allow_long_attention(bool on) { (void)on; }
+
+        /*!
+            ensures
+                - Called when a pass of the device differed from the processor.  Returns true
+                  when the device computed its products with an arithmetic of lower precision
+                  that it gives up for the passes to come, which the runtime then compares
+                  again; false when it has no other way to compute.
+        !*/
+        virtual bool retreat() { return false; }
+
         /*!
             requires
                 - begin() returned true, and no layer of the pass was computed yet.
@@ -222,7 +252,9 @@ namespace albireo
                   before the pass, and the layers then run through attend(); end() writes the
                   keys and values of the tokens of the pass into their blocks of the pool.
                 - Returns false when the device does not attend the pass, for lack of room for
-                  the blocks or because attends() is false: the layers then run through
+                  the blocks, because attends() is false, or, for a pass of more than
+                  few_attention_tokens tokens, because attends_many() is false or the pass holds
+                  the tokens of several sequences: the layers then run through
                   attention_inputs() and attention_output().
         !*/
         virtual bool begin_attention(const attention_plan& plan)
@@ -476,6 +508,9 @@ namespace albireo
 
         // As layer_pass::timed().
         virtual bool timed() const { return true; }
+
+        // As layer_pass::retreat().
+        virtual bool retreat() { return false; }
 
         // As layer_pass::report().
         virtual void report(bool ok, const std::string& detail) = 0;

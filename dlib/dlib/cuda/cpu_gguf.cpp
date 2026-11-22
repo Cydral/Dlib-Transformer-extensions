@@ -124,6 +124,42 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        void add_rms_norm_rows (
+            tensor& dest,
+            tensor& x,
+            const tensor& addend,
+            float factor,
+            const tensor& gamma,
+            float eps
+        )
+        {
+            const size_t width = gamma.size();
+            DLIB_CASSERT(width > 0 && x.size() % width == 0 && dest.size() == x.size() && addend.size() == x.size()
+                && eps >= 0);
+            DLIB_CASSERT(!is_same_object(dest, x) && !is_same_object(dest, addend) && !is_same_object(x, addend));
+            const size_t rows = x.size() / width;
+            float* xs = x.host();
+            const float* a = addend.host();
+            const float* g = gamma.host();
+            float* y = dest.host_write_only();
+            for (size_t r = 0; r < rows; ++r)
+            {
+                float* xr = xs + r * width;
+                const float* ar = a + r * width;
+                float* yr = y + r * width;
+                float s = 0;
+                for (size_t i = 0; i < width; ++i)
+                {
+                    xr[i] += factor * ar[i];
+                    s += xr[i] * xr[i];
+                }
+                const float scale = 1.0f / std::sqrt(s / static_cast<float>(width) + eps);
+                for (size_t i = 0; i < width; ++i) yr[i] = xr[i] * scale * g[i];
+            }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         void silu_multiply (
             tensor& gate,
             const tensor& up
@@ -172,6 +208,22 @@ namespace dlib
                     }
                 }
             }
+        }
+
+        void rope_rows (
+            tensor& first_rows,
+            long first_heads,
+            tensor& second_rows,
+            long second_heads,
+            const tensor& angles,
+            long head_dim,
+            long rope_dims,
+            bool neox
+        )
+        {
+            DLIB_CASSERT(!is_same_object(first_rows, second_rows));
+            rope_rows(first_rows, angles, first_heads, head_dim, rope_dims, neox);
+            rope_rows(second_rows, angles, second_heads, head_dim, rope_dims, neox);
         }
 
     // ----------------------------------------------------------------------------------------
@@ -313,6 +365,88 @@ namespace dlib
             }
         }
 
+        namespace
+        {
+            /*
+                The attention of one token (tt::paged_attention()): queries holds the q_heads
+                rows of its queries, table the pages of the blocks of its sequence, of which it
+                attends the positions [0, p]; out receives its q_heads rows.
+            */
+            class token_attention
+            {
+            public:
+                token_attention(const tensor& pages, const kv_page_layout& layout, long layer, long q_heads,
+                    float scale)
+                    : layout_(layout), layer_(layer), q_heads_(q_heads), scale_(scale),
+                    base_(reinterpret_cast<const uint8_t*>(pages.host())), count_(kv_page_count(pages, layout)),
+                    q_(static_cast<size_t>(layout.head_dim)), row_(static_cast<size_t>(layout.head_dim))
+                {
+                }
+
+                void operator()(const float* queries, long p, const int32_t* table, float* out)
+                {
+                    const long hd = layout_.head_dim;
+                    const long B = layout_.block_positions;
+                    const long rep = q_heads_ / layout_.heads;
+                    // The pages of the positions of the token, checked once.
+                    keys_.assign(static_cast<size_t>(p / B + 1), nullptr);
+                    values_.assign(keys_.size(), nullptr);
+                    a_.resize(static_cast<size_t>(p + 1));
+                    for (long h = 0; h < q_heads_; ++h)
+                    {
+                        const long g = h / rep;
+                        for (size_t b = 0; b < keys_.size(); ++b)
+                        {
+                            const int32_t page = table[b];
+                            DLIB_CASSERT(page >= 0 && static_cast<size_t>(page) < count_);
+                            const uint8_t* start = base_ + static_cast<size_t>(page) * layout_.page_bytes();
+                            keys_[b] = start + layout_.slab_offset(0, layer_, g);
+                            values_[b] = start + layout_.slab_offset(1, layer_, g);
+                        }
+                        const float* src = queries + static_cast<size_t>(h) * hd;
+                        for (long i = 0; i < hd; ++i) q_[static_cast<size_t>(i)] = src[i] * scale_;
+                        if (layout_.q8) kv_pages::rotate_row(q_.data(), hd);
+                        float mx = -std::numeric_limits<float>::infinity();
+                        for (long j = 0; j <= p; ++j)
+                        {
+                            kv_read_row(keys_[static_cast<size_t>(j / B)], j % B, layout_, row_.data());
+                            float d = 0;
+                            for (long i = 0; i < hd; ++i)
+                                d += q_[static_cast<size_t>(i)] * row_[static_cast<size_t>(i)];
+                            a_[static_cast<size_t>(j)] = d;
+                            mx = std::max(mx, d);
+                        }
+                        float sum = 0;
+                        for (long j = 0; j <= p; ++j)
+                        {
+                            a_[static_cast<size_t>(j)] = std::exp(a_[static_cast<size_t>(j)] - mx);
+                            sum += a_[static_cast<size_t>(j)];
+                        }
+                        float* dst = out + static_cast<size_t>(h) * hd;
+                        std::fill(dst, dst + hd, 0.0f);
+                        for (long j = 0; j <= p; ++j)
+                        {
+                            kv_read_row(values_[static_cast<size_t>(j / B)], j % B, layout_, row_.data());
+                            const float w = a_[static_cast<size_t>(j)];
+                            for (long i = 0; i < hd; ++i) dst[i] += w * row_[static_cast<size_t>(i)];
+                        }
+                        const float inv = 1.0f / sum;
+                        for (long i = 0; i < hd; ++i) dst[i] *= inv;
+                    }
+                }
+
+            private:
+                const kv_page_layout& layout_;
+                long layer_;
+                long q_heads_;
+                float scale_;
+                const uint8_t* base_;
+                size_t count_;
+                std::vector<float> q_, row_, a_;
+                std::vector<const uint8_t*> keys_, values_;
+            };
+        }
+
         void paged_attention (
             tensor& out,
             const tensor& queries,
@@ -336,66 +470,49 @@ namespace dlib
             DLIB_CASSERT(!is_same_object(out, queries) && !is_same_object(out, pages) && !is_same_object(out, tokens)
                 && !is_same_object(out, tables));
             if (n == 0) return;
-            const long rep = q_heads / layout.heads;
             const long B = layout.block_positions;
-            const size_t count = kv_page_count(pages, layout);
             const int32_t* tk = kv_integers(tokens);
             const int32_t* tb = kv_integers(tables);
-            const uint8_t* base = reinterpret_cast<const uint8_t*>(pages.host());
             const float* qs = queries.host();
             float* o = out.host();
-            std::vector<float> q(static_cast<size_t>(hd)), row(static_cast<size_t>(hd)), a;
-            std::vector<const uint8_t*> keys, values;
+            token_attention attend(pages, layout, layer, q_heads, scale);
             for (size_t t = 0; t < n; ++t)
             {
                 const long p = tk[2 * t];
                 const long f = tk[2 * t + 1];
                 DLIB_CASSERT(p >= 0 && p < span && f >= 0 && static_cast<size_t>(f + p / B) < tables.size());
-                // The pages of the positions of the token, checked once.
-                keys.assign(static_cast<size_t>(p / B + 1), nullptr);
-                values.assign(keys.size(), nullptr);
-                a.resize(static_cast<size_t>(p + 1));
-                for (long h = 0; h < q_heads; ++h)
-                {
-                    const long g = h / rep;
-                    for (size_t b = 0; b < keys.size(); ++b)
-                    {
-                        const int32_t page = tb[static_cast<size_t>(f) + b];
-                        DLIB_CASSERT(page >= 0 && static_cast<size_t>(page) < count);
-                        const uint8_t* start = base + static_cast<size_t>(page) * layout.page_bytes();
-                        keys[b] = start + layout.slab_offset(0, layer, g);
-                        values[b] = start + layout.slab_offset(1, layer, g);
-                    }
-                    const float* src = qs + t * width + static_cast<size_t>(h) * hd;
-                    for (long i = 0; i < hd; ++i) q[static_cast<size_t>(i)] = src[i] * scale;
-                    if (layout.q8) kv_pages::rotate_row(q.data(), hd);
-                    float mx = -std::numeric_limits<float>::infinity();
-                    for (long j = 0; j <= p; ++j)
-                    {
-                        kv_read_row(keys[static_cast<size_t>(j / B)], j % B, layout, row.data());
-                        float d = 0;
-                        for (long i = 0; i < hd; ++i) d += q[static_cast<size_t>(i)] * row[static_cast<size_t>(i)];
-                        a[static_cast<size_t>(j)] = d;
-                        mx = std::max(mx, d);
-                    }
-                    float sum = 0;
-                    for (long j = 0; j <= p; ++j)
-                    {
-                        a[static_cast<size_t>(j)] = std::exp(a[static_cast<size_t>(j)] - mx);
-                        sum += a[static_cast<size_t>(j)];
-                    }
-                    float* dst = o + t * width + static_cast<size_t>(h) * hd;
-                    std::fill(dst, dst + hd, 0.0f);
-                    for (long j = 0; j <= p; ++j)
-                    {
-                        kv_read_row(values[static_cast<size_t>(j / B)], j % B, layout, row.data());
-                        const float w = a[static_cast<size_t>(j)];
-                        for (long i = 0; i < hd; ++i) dst[i] += w * row[static_cast<size_t>(i)];
-                    }
-                    const float inv = 1.0f / sum;
-                    for (long i = 0; i < hd; ++i) dst[i] *= inv;
-                }
+                attend(qs + t * width, p, tb + f, o + t * width);
             }
+        }
+
+        void paged_attention_rows (
+            tensor& out,
+            const tensor& queries,
+            long q_heads,
+            float scale,
+            const tensor& pages,
+            const kv_page_layout& layout,
+            long layer,
+            const tensor& tables,
+            long first_entry,
+            long first_position
+        )
+        {
+            DLIB_CASSERT(layout.valid() && 0 <= layer && layer < layout.layers);
+            DLIB_CASSERT(q_heads > 0 && q_heads % layout.heads == 0 && first_entry >= 0 && first_position >= 0);
+            const size_t width = static_cast<size_t>(q_heads) * static_cast<size_t>(layout.head_dim);
+            DLIB_CASSERT(queries.size() % width == 0 && out.size() == queries.size());
+            DLIB_CASSERT(!is_same_object(out, queries) && !is_same_object(out, pages) && !is_same_object(out, tables));
+            const size_t n = queries.size() / width;
+            if (n == 0) return;
+            DLIB_CASSERT(static_cast<size_t>(first_entry) + (static_cast<size_t>(first_position) + n - 1)
+                / static_cast<size_t>(layout.block_positions) < tables.size());
+            const int32_t* table = kv_integers(tables) + first_entry;
+            const float* qs = queries.host();
+            float* o = out.host();
+            token_attention attend(pages, layout, layer, q_heads, scale);
+            for (size_t t = 0; t < n; ++t)
+                attend(qs + t * width, first_position + static_cast<long>(t), table, o + t * width);
         }
 
     // ----------------------------------------------------------------------------------------

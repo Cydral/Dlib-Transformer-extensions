@@ -38,16 +38,18 @@ namespace dlib
             void sigmoid (float* d, const float* s, size_t n);
             void silu (float* d, const float* s, size_t n);
             void gelu (float* d, const float* s, size_t n);
+            void mish (float* d, const float* s, size_t n);
+            void elu (float* d, const float* s, size_t n, float alpha);
             /*!
                 requires
                     - d and s point to n values; they are the same pointer or do not overlap.
                 ensures
                     - d[i] receives the function of s[i], as cpu::tanh(), cpu::sigmoid(),
-                      cpu::silu() and cpu::gelu() compute it, eight values at a time.  The
-                      exponentials are polynomials whose results lie within a few units of
-                      the last place of those of the math library; gelu() uses an
-                      approximation of the error function whose absolute error stays under
-                      1.5e-7.  A value that is not a number stays one.
+                      cpu::silu(), cpu::gelu(), cpu::mish() and cpu::elu() compute it, eight
+                      values at a time.  The exponentials are polynomials whose results lie
+                      within a few units of the last place of those of the math library;
+                      gelu() uses an approximation of the error function whose absolute error
+                      stays under 1.5e-7.  A value that is not a number stays one.
             !*/
 
             void softmax_rows (float* d, const float* s, size_t rows, size_t n, bool zero_empty_rows);

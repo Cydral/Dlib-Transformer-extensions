@@ -50,6 +50,17 @@ namespace dlib
             tensor& dest,
             const tensor& src
         );
+
+        bool mish (
+            tensor& dest,
+            const tensor& src
+        );
+
+        bool elu (
+            tensor& dest,
+            const tensor& src,
+            const float alpha
+        );
         /*!
             requires
                 - The requirements of the functions of the same names of tensor_tools.h.

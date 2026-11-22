@@ -225,11 +225,16 @@ namespace albireo
         static constexpr double q8_probe_tolerance = 0.05;
 
         /*
-            The tokens of the passes, at most, that the device attends itself when it can, as the
-            steps of a generation: the attention of the longer passes, as a prompt, stays on the
-            processor, which reads each block of keys and values once for a tile of tokens.
+            The tokens of the passes, at most, that the device attends token by token when it can,
+            as the steps of a generation, and that the runtime times apart from the longer ones:
+            a device attends a longer pass, as a chunk of a prompt, over all its tokens together
+            (layer_pass::attends_many()), or leaves its attention to the processor, which reads
+            each block of keys and values once for a tile of tokens.
         */
-        static const long attention_tokens = 8;
+        static const long attention_tokens = few_attention_tokens;
+
+        // The tokens of the probe of the attention of the longer passes of the device over keys and values in 8 bits.
+        static const long long_attention_probe_tokens = 2 * few_attention_tokens;
 
         // Failures for lack of device memory in a row after which the layers stay on the processor.
         static const int max_layer_pass_memory_failures = 4;
@@ -386,6 +391,8 @@ namespace albireo
         // Whether the device may attend the passes (false in a probe of the layers alone), and attended the last one.
         bool attention_allowed_ = true;
         bool attended_ = false;
+        // Whether the attention of the longer passes of the device differed from the processor at its probe.
+        bool long_attention_differs_ = false;
         attention_plan plan_;
         kv_pool kv_;
         std::vector<std::unique_ptr<kv_sequence>> sequences_;

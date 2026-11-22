@@ -23,6 +23,17 @@
 
 namespace dlib
 {
+    /*!
+        The arithmetic of the products of tt::gguf_gemm() on a device, which the function
+        documents (tensor_tools.h).
+    !*/
+    enum class gguf_precision : int
+    {
+        single = 0,     // weights and activations as floats, sums in single precision
+        tf32 = 1,       // the floats rounded to 10 bits of mantissa by the tensor cores, sums in single precision
+        half = 2        // weights and activations rounded to half precision, sums in single precision
+    };
+
     namespace gguf_blocks
     {
         /*!

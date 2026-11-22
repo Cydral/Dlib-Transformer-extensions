@@ -1163,6 +1163,7 @@ namespace dlib { namespace tt
         cuda::mish(dest,src);
 #else
         DLIB_NPU_TRY(mish(dest,src));
+        DLIB_AVX2_TRY(mish(dest,src));
         cpu::mish(dest,src);
 #endif
     }
@@ -1346,6 +1347,7 @@ namespace dlib { namespace tt
         cuda::elu(dest, src, alpha);
 #else
         DLIB_NPU_TRY(elu(dest, src, alpha));
+        DLIB_AVX2_TRY(elu(dest, src, alpha));
         cpu::elu(dest, src, alpha);
 #endif
     }
@@ -2065,6 +2067,41 @@ namespace dlib { namespace tt
 #endif
     }
 
+    bool gguf_gemm_computes (
+        gguf_precision precision
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        return cuda::gguf_gemm_computes(precision);
+#else
+        return precision == gguf_precision::single;
+#endif
+    }
+
+    void gguf_gemm (
+        tensor& dest,
+        const tensor& src,
+        const tensor& weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes,
+        tensor& scratch,
+        gguf_precision precision,
+        tensor& saturated
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_gemm(dest, src, weights, type, rows, cols, row_bytes, scratch, precision, saturated);
+#else
+        DLIB_CASSERT(precision == gguf_precision::single);
+        (void)scratch;
+        (void)saturated;
+        (void)precision;
+        gguf_matvec(dest, src, weights, type, rows, cols, row_bytes);
+#endif
+    }
+
     void rms_norm_rows (
         tensor& dest,
         const tensor& src,
@@ -2076,6 +2113,22 @@ namespace dlib { namespace tt
         cuda::rms_norm_rows(dest, src, gamma, eps);
 #else
         cpu::rms_norm_rows(dest, src, gamma, eps);
+#endif
+    }
+
+    void add_rms_norm_rows (
+        tensor& dest,
+        tensor& x,
+        const tensor& addend,
+        float factor,
+        const tensor& gamma,
+        float eps
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::add_rms_norm_rows(dest, x, addend, factor, gamma, eps);
+#else
+        cpu::add_rms_norm_rows(dest, x, addend, factor, gamma, eps);
 #endif
     }
 
@@ -2104,6 +2157,24 @@ namespace dlib { namespace tt
         cuda::rope_rows(rows, angles, heads, head_dim, rope_dims, neox);
 #else
         cpu::rope_rows(rows, angles, heads, head_dim, rope_dims, neox);
+#endif
+    }
+
+    void rope_rows (
+        tensor& first_rows,
+        long first_heads,
+        tensor& second_rows,
+        long second_heads,
+        const tensor& angles,
+        long head_dim,
+        long rope_dims,
+        bool neox
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::rope_rows(first_rows, first_heads, second_rows, second_heads, angles, head_dim, rope_dims, neox);
+#else
+        cpu::rope_rows(first_rows, first_heads, second_rows, second_heads, angles, head_dim, rope_dims, neox);
 #endif
     }
 
@@ -2154,6 +2225,45 @@ namespace dlib { namespace tt
         cuda::paged_attention(out, queries, q_heads, scale, pages, layout, layer, tokens, tables, span);
 #else
         cpu::paged_attention(out, queries, q_heads, scale, pages, layout, layer, tokens, tables, span);
+#endif
+    }
+
+    size_t paged_attention_rows_scratch (
+        long n,
+        long q_heads,
+        const kv_page_layout& layout,
+        long first_position,
+        long run
+    )
+    {
+        DLIB_CASSERT(n > 0 && q_heads > 0 && layout.valid() && first_position >= 0 && run > 0 && run <= n);
+        const size_t span = static_cast<size_t>(first_position) + static_cast<size_t>(n);
+        const size_t hd = static_cast<size_t>(layout.head_dim);
+        return 2 * static_cast<size_t>(layout.heads) * span * hd
+            + static_cast<size_t>(run) * (2 * static_cast<size_t>(q_heads) * hd + static_cast<size_t>(q_heads) * span);
+    }
+
+    void paged_attention_rows (
+        tensor& out,
+        const tensor& queries,
+        long q_heads,
+        float scale,
+        const tensor& pages,
+        const kv_page_layout& layout,
+        long layer,
+        const tensor& tables,
+        long first_entry,
+        long first_position,
+        tensor& scratch
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::paged_attention_rows(out, queries, q_heads, scale, pages, layout, layer, tables, first_entry,
+            first_position, scratch);
+#else
+        (void)scratch;
+        cpu::paged_attention_rows(out, queries, q_heads, scale, pages, layout, layer, tables, first_entry,
+            first_position);
 #endif
     }
 

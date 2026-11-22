@@ -117,6 +117,23 @@ namespace dlib
                     return _mm256_mul_ps(x, sigmoid256(x));
                 }
 
+                inline __m256 mish256 (__m256 x)
+                {
+                    // x - 2x/(e^2 + 2e + 2) with e = exp(x), which is x tanh(log(1 + e)): the form of cpu::mish().
+                    const __m256 two = _mm256_set1_ps(2.0f);
+                    const __m256 e = exp256(x);
+                    const __m256 delta = _mm256_add_ps(_mm256_fmadd_ps(e, e, _mm256_add_ps(e, e)), two);
+                    return _mm256_sub_ps(x, _mm256_div_ps(_mm256_add_ps(x, x), delta));
+                }
+
+                inline __m256 elu256 (__m256 x, __m256 alpha)
+                {
+                    // x above zero, alpha (exp(x) - 1) otherwise, a value that is not a number included.
+                    const __m256 below = _mm256_mul_ps(alpha, _mm256_sub_ps(exp256(x), _mm256_set1_ps(1.0f)));
+                    const __m256 positive = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_GT_OQ);
+                    return keep_nan(_mm256_blendv_ps(below, x, positive), x);
+                }
+
                 inline __m256 gelu256 (__m256 x)
                 {
                     /*
@@ -308,6 +325,17 @@ namespace dlib
                 map(d, s, n, [](__m256 v) { return gelu256(v); });
             }
 
+            void mish (float* d, const float* s, size_t n)
+            {
+                map(d, s, n, [](__m256 v) { return mish256(v); });
+            }
+
+            void elu (float* d, const float* s, size_t n, float alpha)
+            {
+                const __m256 a = _mm256_set1_ps(alpha);
+                map(d, s, n, [a](__m256 v) { return elu256(v, a); });
+            }
+
             void softmax_rows (float* d, const float* s, size_t rows, size_t n, bool zero_empty_rows)
             {
                 if (n == 0) return;
@@ -440,6 +468,8 @@ namespace dlib
             void sigmoid (float*, const float*, size_t) {}
             void silu (float*, const float*, size_t) {}
             void gelu (float*, const float*, size_t) {}
+            void mish (float*, const float*, size_t) {}
+            void elu (float*, const float*, size_t, float) {}
             void softmax_rows (float*, const float*, size_t, size_t, bool) {}
             void gguf_matvec_rows (float*, const float*, const uint8_t*, int, long, long, size_t, long, long, long) {}
         }

@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.28 LANGUAGES C CXX)
+project(albireo VERSION 1.0.29 LANGUAGES C CXX)
 
 # The version is written in four places that must agree: project() above, the numbers of
 # common/version.h, which the version resources of the programs and of the installer carry and
@@ -150,6 +150,10 @@ if (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO_ENGINE_DLIB)
 else()
    set(USE_AVX2_INSTRUCTIONS OFF CACHE BOOL "" FORCE)
 endif()
+# A DLIB_CASSERT that fails in the code of a device throws an exception, which the engines turn
+# into a failure of the device and answer with the processor.  Without this definition dlib
+# ends the process at the second one (dlib/error.h), and the service with it.
+add_compile_definitions(DLIB_NO_ABORT_ON_2ND_FATAL_ERROR)
 add_subdirectory(${ALBIREO_DLIB_DIR} dlib_build EXCLUDE_FROM_ALL)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -738,25 +742,34 @@ if (ALBIREO_PROGRAMS)
 endif()
 
 if (ALBIREO_TESTS AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO_ENGINE_DLIB))
-   # The products of a device against those of the processor kernels, on a real model.
-   add_executable(test_offload tests/test_offload.cpp engine/cpu_runtime.cpp engine/model_config.cpp
-      engine/model_file.cpp engine/qkernels.cpp engine/tensor_backend.cpp common/system_info.cpp)
-   target_include_directories(test_offload PRIVATE ${ALBIREO_INCLUDE_DIR})
-   target_compile_definitions(test_offload PRIVATE ALBIREO_TENSOR_BACKEND)
-   target_link_libraries(test_offload PRIVATE dlib::dlib)
-   if (ALBIREO_ENGINE_CUDA)
-      target_link_libraries(test_offload PRIVATE CUDA::cudart)
-      target_compile_definitions(test_offload PRIVATE ALBIREO_CUDA_MIN_CC=${ALBIREO_CUDA_MIN_CC})
-   endif()
-   if (MSVC)
-      target_compile_options(test_offload PRIVATE /arch:AVX2)
-   else()
-      target_compile_options(test_offload PRIVATE -mavx2 -mfma -mf16c)
-      find_package(Threads REQUIRED)
-      target_link_libraries(test_offload PRIVATE Threads::Threads)
-   endif()
-   albireo_output_dir(test_offload ${CMAKE_BINARY_DIR}/tests)
-   albireo_device_runtime(test_offload)
+   # test_offload: the products of a device against those of the processor kernels, on a real model.
+   # bench_offload: the tests of llama-bench on the runtime with the device of the build
+   # (tests/bench_runtime.cpp), as the engine of that device computes.
+   foreach (t test_offload bench_offload)
+      if (t STREQUAL "bench_offload")
+         set(source tests/bench_runtime.cpp)
+      else()
+         set(source tests/${t}.cpp)
+      endif()
+      add_executable(${t} ${source} engine/cpu_runtime.cpp engine/model_config.cpp
+         engine/model_file.cpp engine/qkernels.cpp engine/tensor_backend.cpp common/system_info.cpp)
+      target_include_directories(${t} PRIVATE ${ALBIREO_INCLUDE_DIR})
+      target_compile_definitions(${t} PRIVATE ALBIREO_TENSOR_BACKEND)
+      target_link_libraries(${t} PRIVATE dlib::dlib)
+      if (ALBIREO_ENGINE_CUDA)
+         target_link_libraries(${t} PRIVATE CUDA::cudart)
+         target_compile_definitions(${t} PRIVATE ALBIREO_CUDA_MIN_CC=${ALBIREO_CUDA_MIN_CC})
+      endif()
+      if (MSVC)
+         target_compile_options(${t} PRIVATE /arch:AVX2)
+      else()
+         target_compile_options(${t} PRIVATE -mavx2 -mfma -mf16c)
+         find_package(Threads REQUIRED)
+         target_link_libraries(${t} PRIVATE Threads::Threads)
+      endif()
+      albireo_output_dir(${t} ${CMAKE_BINARY_DIR}/tests)
+      albireo_device_runtime(${t})
+   endforeach()
 
    # The operations of dlib on the weights in their GGUF formats, against the processor kernels.
    add_executable(test_device_ops tests/test_device_ops.cpp engine/qkernels.cpp common/system_info.cpp)
