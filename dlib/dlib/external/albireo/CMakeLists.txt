@@ -141,6 +141,15 @@ if (ALBIREO_ENGINE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAA
       set(CMAKE_CUDA_ARCHITECTURES 50-real 61-real 70-real 75-real 86-real 89-real 89-virtual)
    endif()
 endif()
+# The device engines run on the processors with AVX2, FMA and F16C, as cpu-avx2 does: their
+# copy of dlib is compiled for these instructions as their own files are.  The trees without a
+# device engine build none of the files of dlib that compute, and the portable engine and the
+# programs stay at the instructions of every x86-64 processor.
+if (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO_ENGINE_DLIB)
+   set(USE_AVX2_INSTRUCTIONS ON CACHE BOOL "" FORCE)
+else()
+   set(USE_AVX2_INSTRUCTIONS OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(${ALBIREO_DLIB_DIR} dlib_build EXCLUDE_FROM_ALL)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

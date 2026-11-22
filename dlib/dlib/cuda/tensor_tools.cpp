@@ -19,6 +19,14 @@
 #define DLIB_NPU_TRY(call)
 #endif
 
+/*
+    DLIB_AVX2_TRY(call) runs the function of avx2_dlib.h when the processor has AVX2, FMA and
+    F16C and the function covers its arguments, and returns; otherwise the function of
+    cpu_dlib.h that follows computes.  The processor is asked at run time (avx2::is_available()),
+    so that one build serves every x86 processor.
+*/
+#define DLIB_AVX2_TRY(call) if (::dlib::avx2::call) return
+
 namespace dlib
 {
     namespace
@@ -1064,6 +1072,7 @@ namespace dlib { namespace tt
         cuda::softmax(dest, src, mode);
 #else
         DLIB_NPU_TRY(softmax(dest, src, mode));
+        DLIB_AVX2_TRY(softmax(dest, src, mode));
         cpu::softmax(dest, src, mode);
 #endif
     }
@@ -1094,6 +1103,7 @@ namespace dlib { namespace tt
         cuda::softmax_all(dest,src);
 #else
         DLIB_NPU_TRY(softmax_all(dest,src));
+        DLIB_AVX2_TRY(softmax_all(dest,src));
         cpu::softmax_all(dest,src);
 #endif
     }
@@ -1123,6 +1133,7 @@ namespace dlib { namespace tt
         cuda::sigmoid(dest,src);
 #else
         DLIB_NPU_TRY(sigmoid(dest,src));
+        DLIB_AVX2_TRY(sigmoid(dest,src));
         cpu::sigmoid(dest,src);
 #endif
     }
@@ -1273,6 +1284,7 @@ namespace dlib { namespace tt
         cuda::tanh(dest,src);
 #else
         DLIB_NPU_TRY(tanh(dest,src));
+        DLIB_AVX2_TRY(tanh(dest,src));
         cpu::tanh(dest,src);
 #endif
     }
@@ -1364,6 +1376,7 @@ namespace dlib { namespace tt
         cuda::gelu(dest,src);
 #else
         DLIB_NPU_TRY(gelu(dest,src));
+        DLIB_AVX2_TRY(gelu(dest,src));
         cpu::gelu(dest,src);
 #endif
     }
@@ -1426,6 +1439,7 @@ namespace dlib { namespace tt
         cuda::silu(dest,src);
 #else
         DLIB_NPU_TRY(silu(dest,src));
+        DLIB_AVX2_TRY(silu(dest,src));
         cpu::silu(dest,src);
 #endif
     }
@@ -2029,6 +2043,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::gguf_matvec(dest, src, weights, type, rows, cols, row_bytes);
 #else
+        DLIB_AVX2_TRY(gguf_matvec(dest, src, weights, type, rows, cols, row_bytes));
         cpu::gguf_matvec(dest, src, weights, type, rows, cols, row_bytes);
 #endif
     }

@@ -23,6 +23,7 @@ add_executable(${target_name} main.cpp tester.cpp
    array2d.cpp
    array.cpp
    assignment_learning.cpp
+   avx2.cpp
    base64.cpp
    bayes_nets.cpp
    bigint.cpp

@@ -11,6 +11,7 @@
 #include "cpu_dlib.h"
 #include "cuda_dlib.h"
 #include "cpu_gguf.h"
+#include "avx2_dlib.h"
 #include "cuda_gguf.h"
 #include "gguf_blocks.h"
 #include "kv_pages.h"

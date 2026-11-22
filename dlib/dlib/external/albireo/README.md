@@ -189,6 +189,14 @@ of their weights from the sums of the activations, and those of Q4_K, Q5_K and Q
 scales with `vpdpwssd`. The AVX-VNNI intrinsics need Visual Studio 2022 (GCC 11, Clang 12); an older
 compiler builds the other variants.
 
+Every file of an engine other than `cpu` is compiled for AVX2, FMA and F16C, the files of dlib
+included: the device engines (`cuda`, `openvino`) link the tensor tools of dlib, and the build
+turns the option `USE_AVX2_INSTRUCTIONS` of dlib on in every tree that builds one, where it prints
+"Enabling AVX2 instructions". Until version 1.0.27 these trees compiled dlib for the instructions
+of every x86-64 processor, SSE2, while the files of the engines were already compiled for AVX2.
+The tree of the programs compiles none of the files of dlib that compute, and `cpu`, the service,
+the tray and the installer stay at the instructions of every x86-64 processor.
+
 The products the NPU or the graphics processor does not take, and every product the routing of
 dlib leaves to the processor, run on the quantized kernels of the engine. The OpenVINO engine is
 therefore built once per family of kernels, so that a processor with AVX-VNNI keeps its kernels

@@ -367,6 +367,8 @@ if (NOT TARGET dlib)
          stack_trace.cpp
          cuda/cpu_dlib.cpp
          cuda/cpu_gguf.cpp
+         cuda/avx2_dlib.cpp
+         cuda/avx2_kernels.cpp
          cuda/tensor_tools.cpp
          cuda/extended_memory.cpp
          data_io/image_dataset_metadata.cpp
@@ -890,6 +892,18 @@ if (NOT TARGET dlib)
       target_include_directories(dlib PUBLIC
          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/sqlite>
          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/dlib/external/sqlite>)
+   endif()
+   # cuda/avx2_kernels.cpp holds the functions written for AVX2, FMA and F16C.  It alone is
+   # compiled for these instructions, whatever the instructions chosen for the library, and
+   # avx2::is_available() asks the processor before any of its functions runs.  On the other
+   # processors the file compiles to functions that do nothing.
+   if (NOT DLIB_ISO_CPP_ONLY)
+      if (MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|x86|X86")
+         set_source_files_properties(cuda/avx2_kernels.cpp PROPERTIES COMPILE_FLAGS "/arch:AVX2")
+      elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|Intel"
+            AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|i386|i686|AMD64|amd64|x86")
+         set_source_files_properties(cuda/avx2_kernels.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -mf16c")
+      endif()
    endif()
    target_link_libraries(dlib PUBLIC ${dlib_needed_public_libraries} ${dlib_needed_public_ldflags})
    target_link_libraries(dlib PRIVATE ${dlib_needed_private_libraries})

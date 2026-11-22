@@ -83,6 +83,12 @@
 
 #include "../cuda/cpu_dlib.cpp"
 #include "../cuda/cpu_gguf.cpp"
+/*
+    The functions for AVX2 compute when this file is compiled for AVX2 and FMA; cmake compiles
+    avx2_kernels.cpp for them whatever the options of the other files.
+*/
+#include "../cuda/avx2_dlib.cpp"
+#include "../cuda/avx2_kernels.cpp"
 #include "../cuda/tensor_tools.cpp"
 #include "../cuda/extended_memory.cpp"
 // A build that defines DLIB_USE_NPU also compiles ../cuda/npu_dlib.cpp, as a separate C++17
