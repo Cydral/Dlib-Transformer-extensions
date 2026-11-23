@@ -31,31 +31,19 @@ namespace albireo
     // answers of the administration interface; settings_store keeps the secret itself apart.
     extern const char* const relay_secret_mask;   // "********"
 
-    struct relay_settings
+    // The providers of the relay, in the order the tray and the catalog of the relay list them.
+    extern const char* const relay_providers[4];   // "openai", "chatgpt", "claude", "ollama"
+    bool known_relay_provider(const std::string& id);
+
+    struct relay_profile
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                The relay of the inference (relay.h): the external engine to which the model
-                albireo-relay sends the discussions that ask for it, the models of the
-                computer staying in place for the others.
-
-                provider is "openai", an engine of the interface of OpenAI at url (its base,
-                "https://host/v1", where /chat/completions and /models lie, or the same without
-                /v1, which relay.cpp then adds), "ollama", the
-                cloud of Ollama, or "claude", the interface of Anthropic: the last two have their
-                address and their models in relay.cpp.  auth is "key" (a bearer key, the only
-                one of the last two), "basic" (user and secret) or "none".  context, max_output,
-                images and reasoning describe the model of an "openai" engine, which the
-                program cannot know; relay.cpp knows those of the others.
-
-                pseudonymize sends the texts through Pseudalis, the anonymization service of
-                the computer, before they leave (pseudonyms.h), with the tags of its values
-                when tags is true and their substitutes alone otherwise.  keep_substitutes
-                leaves the substitutes in the answers, without their values: a check of what
-                left the computer.
+                What the relay holds for one provider: its address, its model, its
+                authentication with its secret, and what its model offers.  relay_settings is
+                the profile of the provider it points to, and keeps those given for the other
+                providers, so that a return to one of them finds its model and its key again.
         !*/
-        bool enabled = false;
-        std::string provider = "openai";        // openai, ollama or claude
         std::string url;                        // openai: the base of its interface
         std::string model;
         std::string auth = "key";               // key, basic or none
@@ -65,14 +53,68 @@ namespace albireo
         long max_output = 16384;                // openai: the tokens of an answer at most
         bool images = false;                    // openai: the model reads images
         bool reasoning = false;                 // openai: the model takes reasoning_effort
+
+        // What the secret was given for: a secret never goes to another provider, address or user.
+        std::string secret_scope(const std::string& provider) const;
+        // Whether the profile holds what a provider never set up holds.
+        bool blank() const;
+        json to_json() const;                   // the secret masked
+        void from_json(const json& j);
+    };
+
+    struct relay_settings : relay_profile
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The relay of the inference (relay.h): the external engine to which the model
+                albireo-relay sends the discussions that ask for it, the models of the
+                computer staying in place for the others.
+
+                provider is "openai", an engine of the interface of OpenAI at url (its base,
+                "https://host/v1", where /chat/completions and /models lie, or the same without
+                /v1, which relay.cpp then adds), "chatgpt", the interface of OpenAI itself,
+                "claude", the interface of Anthropic, or "ollama", the cloud of Ollama: the last
+                three have their address and their models in relay.cpp.  auth is "key" (a bearer
+                key, the only one of the last three), "basic" (user and secret) or "none".
+                context, max_output, images and reasoning describe the model of an "openai"
+                engine, which the program cannot know; relay.cpp knows those of the others.
+
+                The members of relay_profile are those of provider.  saved holds the profiles
+                given for the other providers, never the one of provider: merge() moves them
+                when the provider changes, and turning the relay off keeps them all.
+
+                pseudonymize sends the texts through Pseudalis, the anonymization service of
+                the computer, before they leave (pseudonyms.h), with the tags of its values
+                when tags is true and their substitutes alone otherwise.  keep_substitutes
+                leaves the substitutes in the answers, without their values: a check of what
+                left the computer.  These three hold for every provider.
+        !*/
+        bool enabled = false;
+        std::string provider = "openai";        // one of relay_providers
         bool pseudonymize = false;
         bool tags = false;
         bool keep_substitutes = false;          // the answers keep the substitutes, a check
+        std::map<std::string, relay_profile> saved;
 
-        // What the secret was given for: a secret never goes to another provider, address or user.
-        std::string secret_scope() const;
-        json to_json() const;                   // the secret masked
+        using relay_profile::secret_scope;
+        std::string secret_scope() const { return secret_scope(provider); }
+        json to_json() const;                   // the secrets masked, "saved" included
         void from_json(const json& j);
+
+        /*!
+            ensures
+                - Gives in out these settings with the members that changes holds: the object
+                  a client of the administration interface sends for the relay.  Its member
+                  "saved", which the service alone writes, is left aside.
+                - When changes names another provider, the profile of the provider left goes
+                  to saved, and the one saved for the provider named, or a blank one, takes its
+                  place before the other members of changes apply to it.
+                - relay_secret_mask as the secret stands for the secret stored for the provider
+                  of out, with the address, the authentication and the user it was given for
+                  only.  Returns false when they differ or when no secret is stored: a secret
+                  never goes to another server.
+        !*/
+        bool merge(const json& changes, relay_settings& out) const;
     };
 
     struct host_settings
@@ -151,7 +193,8 @@ namespace albireo
                 password of the relay goes the same way to relay.secret, encrypted for the
                 account of the service on Windows (seal_secret()) with the provider, the
                 address and the user it was given for: settings.json that names others reads
-                no secret.
+                no secret.  The secrets of the profiles saved for the other providers lie in
+                the same file, each with what it was given for.
 
                 A settings.json of an earlier version that holds settings this version
                 lacks, or another provider of the search, is written again at the start

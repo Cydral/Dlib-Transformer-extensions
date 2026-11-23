@@ -73,15 +73,19 @@ namespace ui
     HWND progress(HWND parent, int id);
     HWND listview(HWND parent, int id, DWORD style = 0);
 
+    // Places a control; a placement that repeats the previous one moves and paints nothing.
     void place(HWND control, int x, int y, int w, int h);
     // Width of a button for its text and font, at least min_width pixels.
     int button_width(HWND button, int min_width);
     // The width that fits the widest of the texts a button shows in turn, so that it keeps
     // its size, and its neighbors their places, when its text changes.
     int button_width(HWND button, int min_width, const std::vector<std::wstring>& texts);
+    // The height the text of a label takes with its font when its lines break at width pixels.
+    int text_height(HWND label, int width);
     std::wstring text_of(HWND control);
     void set_text(HWND control, const std::wstring& text);
     bool checked(HWND control);
+    // Enables or disables a control, which takes back the focus it held when it was disabled.
     void enable(HWND control, bool on);
 
     // Message box with the title of the program.

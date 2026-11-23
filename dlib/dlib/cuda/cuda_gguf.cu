@@ -277,8 +277,15 @@ namespace dlib
                 }
             }
 
-            // The largest magnitude a half holds.
-            const float half_limit = 65504.0f;
+            /*
+                Whether v lies beyond the largest magnitude a half holds (65504), or is not a
+                number.  The limit stays inside the function: with the Microsoft compiler as its
+                host, nvcc refuses in device code a floating point constant of namespace scope.
+            */
+            __device__ inline bool beyond_halves(float v)
+            {
+                return !(fabsf(v) <= 65504.0f);
+            }
 
             /*
                 gguf_dequantize_kernel with the values rounded to half precision, eight at a time
@@ -311,7 +318,7 @@ namespace dlib
 #pragma unroll
                     for (int j = 0; j < 16; ++j)
                     {
-                        beyond = beyond || !(fabsf(v[2 * j]) <= half_limit) || !(fabsf(v[2 * j + 1]) <= half_limit);
+                        beyond = beyond || beyond_halves(v[2 * j]) || beyond_halves(v[2 * j + 1]);
                         h[j] = static_cast<uint32_t>(kv_pages::float_to_half(v[2 * j]))
                             | (static_cast<uint32_t>(kv_pages::float_to_half(v[2 * j + 1])) << 16);
                     }
@@ -350,7 +357,7 @@ namespace dlib
                 for (auto i : grid_stride_range(0, n))
                 {
                     const float v = src[i];
-                    beyond = beyond || !(fabsf(v) <= half_limit);
+                    beyond = beyond || beyond_halves(v);
                     dst[i] = kv_pages::float_to_half(v);
                 }
                 if (beyond) *saturated = 1.0f;

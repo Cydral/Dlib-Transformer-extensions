@@ -99,7 +99,7 @@
       }
      },
      "400": {
-      "description": "Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the external model nor a model of the computer can take (code image_input_not_supported), a search of the web asked of another provider than Claude (web_search_not_supported) or while the relay pseudonymizes, the searches then looking for the substitutes of Pseudalis (web_search_pseudonymized)",
+      "description": "Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the external model nor a model of the computer can take (code image_input_not_supported), a search of the web asked of a provider whose models do not search the web themselves (web_search_not_supported) or while the relay pseudonymizes, the searches then looking for the substitutes of Pseudalis (web_search_pseudonymized)",
       "content": {
        "application/json": {
         "schema": {
@@ -3093,7 +3093,7 @@
        },
        "web_search": {
         "type": "boolean",
-        "description": "albireo-relay with Claude: the external model searches the web, five searches at most, which Anthropic bills; its queries come with the reasoning, its sources as links after the texts that cite them, and usage gives web_search_requests. The web access of the settings allows it, and the pseudonymization of the relay refuses it."
+        "description": "albireo-relay with Claude or ChatGPT: the external model searches the web itself, five searches at most with Claude, ten calls of the tool at most with ChatGPT, which the provider bills; its queries come with the reasoning, its sources as links in or after the texts that cite them, and usage gives web_search_requests. The web access of the settings allows it, and the pseudonymization of the relay refuses it."
        },
        "reasoning_budget": {
         "type": "integer",
@@ -3758,7 +3758,7 @@
    },
    "RelaySettings": {
     "type": "object",
-    "description": "The relay to an external engine, the model albireo-relay. A change gives the members it changes; the others stay.",
+    "description": "The relay to an external engine, the model albireo-relay. A change gives the members it changes; the others stay. url, model, auth, user, secret, context, max_output, images and reasoning are those of provider: a change of provider keeps them in saved and takes those saved for the provider named, before the other members of the change apply.",
     "properties": {
      "enabled": {
       "type": "boolean",
@@ -3768,11 +3768,12 @@
       "type": "string",
       "enum": [
        "openai",
-       "ollama",
-       "claude"
+       "chatgpt",
+       "claude",
+       "ollama"
       ],
       "default": "openai",
-      "description": "openai: an engine of the interface of OpenAI at url; ollama: the cloud of Ollama; claude: the interface of Anthropic."
+      "description": "openai: an engine of the interface of OpenAI at url; chatgpt: the interface of OpenAI itself; claude: the interface of Anthropic; ollama: the cloud of Ollama."
      },
      "url": {
       "type": "string",
@@ -3801,7 +3802,7 @@
      "secret": {
       "type": "string",
       "maxLength": 4096,
-      "description": "The key or the password, without control character, kept in relay.secret and given as ********; that value sent back keeps the stored secret when the provider, the address and the user stay the same, and is refused (code relay_secret) otherwise."
+      "description": "The key or the password, without control character, kept in relay.secret and given as ********; that value sent back keeps the secret stored for the provider named when its address and its user stay the same, and is refused (code relay_secret) otherwise."
      },
      "context": {
       "type": "integer",
@@ -3841,6 +3842,43 @@
       "type": "boolean",
       "default": false,
       "description": "The answers keep the substitutes, without their values: a check of what left the computer."
+     },
+     "saved": {
+      "type": "object",
+      "readOnly": true,
+      "description": "What was given for the other providers, by provider, each secret as ********: the service writes it when the provider changes, and a change that names it is refused.",
+      "additionalProperties": {
+       "type": "object",
+       "properties": {
+        "url": {
+         "type": "string"
+        },
+        "model": {
+         "type": "string"
+        },
+        "auth": {
+         "type": "string"
+        },
+        "user": {
+         "type": "string"
+        },
+        "secret": {
+         "type": "string"
+        },
+        "context": {
+         "type": "integer"
+        },
+        "max_output": {
+         "type": "integer"
+        },
+        "images": {
+         "type": "boolean"
+        },
+        "reasoning": {
+         "type": "boolean"
+        }
+       }
+      }
      }
     }
    },
@@ -3940,9 +3978,13 @@
       "type": "boolean",
       "description": "With the pseudonymization, the answers keep the substitutes."
      },
+     "web_search": {
+      "type": "boolean",
+      "description": "The models of the provider search the web themselves: Claude and ChatGPT."
+     },
      "web": {
       "type": "boolean",
-      "description": "The external model searches the web when a request asks for it (web_search): Claude, unless the relay pseudonymizes."
+      "description": "The external model searches the web when a request asks for it (web_search): web_search, unless the relay pseudonymizes."
      },
      "offline": {
       "type": "boolean",

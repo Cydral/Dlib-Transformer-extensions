@@ -591,8 +591,9 @@ namespace albireo
             R_LIST = 1, R_ACTION, R_VERIFY, R_IMPORT, R_UPLOAD_DONE, R_CATALOG, R_RELAY, R_RELAY_TEST, R_RELAY_SAVE,
             R_RELAY_MODELS
         };
-        // The providers of the relay and its authentications, in the order of their lists.
-        const char* const relay_providers[3] = { "openai", "ollama", "claude" };
+        // The providers of the relay, in the order of the service (relay_providers of host/settings.h), and
+        // its authentications, each in the order of its list.
+        const char* const relay_providers[4] = { "openai", "chatgpt", "claude", "ollama" };
         const char* const relay_auths[3] = { "key", "basic", "none" };
 
         // The text of an edit field without the spaces around it, in UTF-8.
@@ -647,6 +648,13 @@ namespace albireo
             } relay;
             // The providers and their models, the state of Pseudalis, and the relay of the settings.
             json relay_info, relay_saved;
+            /*
+                The provider whose profile the form shows, and what the form held for each provider
+                it showed since the settings were read: a provider chosen again finds what was typed
+                for it, else what the settings keep for it, its key masked.
+            */
+            std::string relay_shown = relay_providers[0];
+            std::map<std::string, json> relay_drafts;
             // The models of the list of the relay, in its order.
             std::vector<std::string> relay_models;
             bool relay_busy = false;
@@ -746,8 +754,9 @@ namespace albireo
                     ui::font_kind::note);
                 relay.provider_label = add(ui::label(hwnd, tr("relay_provider"), IDC_R_PROVIDER_LABEL));
                 relay.provider = add(ui::combo(hwnd, IDC_R_PROVIDER));
-                for (const char* k : { "relay_provider_openai", "relay_provider_ollama", "relay_provider_claude" })
-                    SendMessageW(relay.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(tr(k).c_str()));
+                for (const char* id : relay_providers)
+                    SendMessageW(relay.provider, CB_ADDSTRING, 0,
+                        reinterpret_cast<LPARAM>(tr((std::string("relay_provider_") + id).c_str()).c_str()));
                 SendMessageW(relay.provider, CB_SETCURSEL, 0, 0);
                 relay.url_label = add(ui::label(hwnd, tr("relay_url"), IDC_R_URL_LABEL));
                 relay.url = add(ui::edit(hwnd, L"", IDC_R_URL));
@@ -786,13 +795,16 @@ namespace albireo
 
             std::string relay_provider() const
             {
-                return relay_providers[std::min(selection(relay.provider), 2)];
+                return relay_providers[std::min(selection(relay.provider), 3)];
             }
 
-            std::string relay_auth() const
+            // The authentication of a provider: the one chosen for an engine of OpenAI, a key for the others.
+            std::string relay_auth(const std::string& provider) const
             {
-                return relay_provider() == "openai" ? relay_auths[std::min(selection(relay.auth), 2)] : "key";
+                return provider == "openai" ? relay_auths[std::min(selection(relay.auth), 2)] : "key";
             }
+
+            std::string relay_auth() const { return relay_auth(relay_provider()); }
 
             const json* provider_info(const std::string& id) const
             {
@@ -801,13 +813,65 @@ namespace albireo
                 return nullptr;
             }
 
-            // The model of the relay chosen: in the list of its provider, or typed for an engine of OpenAI.
-            std::string relay_model() const
+            // The model chosen for a provider: in the list of its models, or typed for an engine of OpenAI.
+            std::string relay_model(const std::string& provider) const
             {
-                if (relay_provider() == "openai") return field_text(relay.model_edit);
+                if (provider == "openai") return field_text(relay.model_edit);
                 const LRESULT i = SendMessageW(relay.model_list, CB_GETCURSEL, 0, 0);
                 return i >= 0 && static_cast<size_t>(i) < relay_models.size() ? relay_models[static_cast<size_t>(i)]
                     : std::string();
+            }
+
+            std::string relay_model() const { return relay_model(relay_provider()); }
+
+            /*
+                The profile of a provider as the form holds it: its address, its model, its
+                authentication and its secret, with what its model offers for an engine of OpenAI.
+            */
+            json relay_profile(const std::string& provider) const
+            {
+                json p = json::object();
+                const std::string auth = relay_auth(provider);
+                p["url"] = provider == "openai" ? field_text(relay.url) : std::string();
+                p["model"] = relay_model(provider);
+                p["auth"] = auth;
+                p["user"] = auth == "basic" ? field_text(relay.user) : std::string();
+                p["secret"] = auth == "none" ? std::string() : field_text(relay.secret);
+                if (provider == "openai")
+                {
+                    const long long context = std::wcstoll(ui::text_of(relay.context).c_str(), nullptr, 10);
+                    const long long output = std::wcstoll(ui::text_of(relay.output).c_str(), nullptr, 10);
+                    p["context"] = std::min<long long>(std::max<long long>(context, 1024), 1LL << 24);
+                    p["max_output"] = std::min<long long>(std::max<long long>(output, 16), 1LL << 20);
+                    p["images"] = ui::checked(relay.images);
+                    p["reasoning"] = ui::checked(relay.reasoning);
+                }
+                return p;
+            }
+
+            // The profile that the settings keep for a provider: the one of the relay, or one saved beside it.
+            const json& stored_relay_profile(const std::string& provider) const
+            {
+                return provider == relay_saved["provider"].str(relay_providers[0]) ? relay_saved
+                    : relay_saved["saved"][provider];
+            }
+
+            // Shows a profile in the form; one that holds nothing gives the fields their defaults.
+            void show_relay_profile(const json& p)
+            {
+                const std::string auth = p["auth"].str("key");
+                for (int i = 0; i < 3; ++i)
+                    if (auth == relay_auths[i]) SendMessageW(relay.auth, CB_SETCURSEL, i, 0);
+                ui::set_text(relay.url, widen(p["url"].as_string()));
+                ui::set_text(relay.user, widen(p["user"].as_string()));
+                ui::set_text(relay.secret, widen(p["secret"].as_string()));
+                ui::set_text(relay.context, std::to_wstring(p["context"].as_int(131072)));
+                ui::set_text(relay.output, std::to_wstring(p["max_output"].as_int(16384)));
+                const std::pair<HWND, const char*> boxes[] = { { relay.images, "images" },
+                    { relay.reasoning, "reasoning" } };
+                for (const auto& b : boxes)
+                    SendMessageW(b.first, BM_SETCHECK, p[b.second].as_bool(false) ? BST_CHECKED : BST_UNCHECKED, 0);
+                fill_relay_models(p["model"].as_string());
             }
 
             void load_relay()
@@ -827,24 +891,18 @@ namespace albireo
             void fill_relay()
             {
                 const json& r = relay_saved;
+                relay_drafts.clear();
                 SendMessageW(relay.enabled, BM_SETCHECK, r["enabled"].as_bool(false) ? BST_CHECKED : BST_UNCHECKED, 0);
-                const std::string provider = r["provider"].str("openai");
-                for (int i = 0; i < 3; ++i)
-                    if (provider == relay_providers[i]) SendMessageW(relay.provider, CB_SETCURSEL, i, 0);
-                const std::string auth = r["auth"].str("key");
-                for (int i = 0; i < 3; ++i)
-                    if (auth == relay_auths[i]) SendMessageW(relay.auth, CB_SETCURSEL, i, 0);
-                ui::set_text(relay.url, widen(r["url"].as_string()));
-                ui::set_text(relay.user, widen(r["user"].as_string()));
-                ui::set_text(relay.secret, widen(r["secret"].as_string()));
-                ui::set_text(relay.context, std::to_wstring(r["context"].as_int(131072)));
-                ui::set_text(relay.output, std::to_wstring(r["max_output"].as_int(16384)));
-                const std::pair<HWND, const char*> boxes[] = { { relay.images, "images" },
-                    { relay.reasoning, "reasoning" }, { relay.pseudonymize, "pseudonymize" }, { relay.tags, "tags" },
-                    { relay.keep, "keep_substitutes" } };
+                relay_shown = relay_providers[0];
+                for (int i = 0; i < 4; ++i)
+                    if (r["provider"].as_string() == relay_providers[i]) relay_shown = relay_providers[i];
+                for (int i = 0; i < 4; ++i)
+                    if (relay_shown == relay_providers[i]) SendMessageW(relay.provider, CB_SETCURSEL, i, 0);
+                const std::pair<HWND, const char*> boxes[] = { { relay.pseudonymize, "pseudonymize" },
+                    { relay.tags, "tags" }, { relay.keep, "keep_substitutes" } };
                 for (const auto& b : boxes)
                     SendMessageW(b.first, BM_SETCHECK, r[b.second].as_bool(false) ? BST_CHECKED : BST_UNCHECKED, 0);
-                fill_relay_models(r["model"].as_string());
+                show_relay_profile(r);
                 list_relay_models();
             }
 
@@ -887,7 +945,9 @@ namespace albireo
                         { "o", ui::format_decimal(m["max_output"].as_double(), 0) } })
                         + L" · " + tr("relay_traits_images") + L" " + (m["images"].as_bool(false) ? tr("relay_yes")
                         : tr("relay_no")) + L" · " + tr("relay_traits_reasoning") + L" " + reasoning;
+                    // What a request costs with the providers that bill each of them.
                     if (relay_provider() == "ollama") text += L"\n" + tr("relay_ollama_note");
+                    if (relay_provider() == "chatgpt") text += L"\n" + tr("relay_chatgpt_note");
                     return text;
                 }
                 return L"";
@@ -947,28 +1007,15 @@ namespace albireo
                 layout(rc.right, rc.bottom);
             }
 
-            // The relay as the form gives it, for its test and its saving.
+            // The relay as the form gives it, for its test and its saving: its provider with the profile shown.
             json relay_form() const
             {
                 json r = json::object();
                 const std::string provider = relay_provider();
-                const std::string auth = relay_auth();
                 r["enabled"] = ui::checked(relay.enabled);
                 r["provider"] = provider;
-                r["url"] = provider == "openai" ? field_text(relay.url) : std::string();
-                r["model"] = relay_model();
-                r["auth"] = auth;
-                r["user"] = auth == "basic" ? field_text(relay.user) : std::string();
-                r["secret"] = auth == "none" ? std::string() : field_text(relay.secret);
-                if (provider == "openai")
-                {
-                    const long long context = std::wcstoll(ui::text_of(relay.context).c_str(), nullptr, 10);
-                    const long long output = std::wcstoll(ui::text_of(relay.output).c_str(), nullptr, 10);
-                    r["context"] = std::min<long long>(std::max<long long>(context, 1024), 1LL << 24);
-                    r["max_output"] = std::min<long long>(std::max<long long>(output, 16), 1LL << 20);
-                    r["images"] = ui::checked(relay.images);
-                    r["reasoning"] = ui::checked(relay.reasoning);
-                }
+                const json profile = relay_profile(provider);
+                for (const auto& kv : profile.items()) r[kv.first] = kv.second;
                 r["pseudonymize"] = ui::checked(relay.pseudonymize);
                 r["tags"] = ui::checked(relay.tags);
                 r["keep_substitutes"] = ui::checked(relay.keep);
@@ -1131,8 +1178,10 @@ namespace albireo
                     field_w, px(240));
                 if (IsWindowVisible(relay.traits))
                 {
-                    ui::place(relay.traits, field_x, y - px(2), field_w, px(40));
-                    y += px(42);
+                    // The traits of the model and the note of its provider take the lines their width leaves them.
+                    const int lines = std::max(px(18), ui::text_height(relay.traits, field_w));
+                    ui::place(relay.traits, field_x, y - px(2), field_w, lines);
+                    y += lines + px(6);
                 }
                 field(relay.context_label, relay.context, px(120), px(26));
                 field(relay.output_label, relay.output, px(120), px(26));
@@ -1940,14 +1989,16 @@ namespace albireo
                     if (code != CBN_SELCHANGE) break;
                     {
                         /*
-                            The stored key stands for the provider it was given for: another provider
-                            takes its own, and the stored one shows again with its provider.
+                            The form keeps what it held for the provider left, and shows for the
+                            provider taken what it held for it before, else what the settings keep for
+                            it: the mask of its key stands for the key stored for that provider.
                         */
-                        const bool saved = relay_provider() == relay_saved["provider"].as_string();
-                        const std::wstring mask = widen(relay_saved["secret"].as_string());
-                        if (!saved && ui::text_of(relay.secret) == mask) ui::set_text(relay.secret, L"");
-                        if (saved && ui::text_of(relay.secret).empty()) ui::set_text(relay.secret, mask);
-                        fill_relay_models(saved ? relay_saved["model"].as_string() : std::string());
+                        const std::string taken = relay_provider();
+                        if (taken == relay_shown) break;
+                        relay_drafts[relay_shown] = relay_profile(relay_shown);
+                        relay_shown = taken;
+                        const auto draft = relay_drafts.find(taken);
+                        show_relay_profile(draft != relay_drafts.end() ? draft->second : stored_relay_profile(taken));
                         list_relay_models();
                     }
                     break;

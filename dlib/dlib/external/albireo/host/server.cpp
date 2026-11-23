@@ -938,9 +938,7 @@ namespace albireo
             };
             for (const char* key : { "enabled", "images", "reasoning", "pseudonymize", "tags", "keep_substitutes" })
                 if (r.contains(key) && !r[key].is_bool()) return fail(key);
-            const std::string provider = r["provider"].as_string();
-            if (r.contains("provider") && provider != "openai" && provider != "ollama" && provider != "claude")
-                return fail("provider");
+            if (r.contains("provider") && !known_relay_provider(r["provider"].as_string())) return fail("provider");
             const std::string auth = r["auth"].as_string();
             if (r.contains("auth") && auth != "key" && auth != "basic" && auth != "none") return fail("auth");
             if (r.contains("url") && !(plain_text(r["url"], 2048)
@@ -959,27 +957,6 @@ namespace albireo
             if (r.contains("max_output")
                 && !(output.is_integer() && output.as_int() >= 16 && output.as_int() <= (1 << 20)))
                 return fail("max_output");
-            return true;
-        }
-
-        /*
-            The relay of current with the members that changes gives.  The mask of the secret stands
-            for the stored secret with the provider, the address and the user it was given for only,
-            so that it never goes to another server: false when they changed.
-        */
-        bool merge_relay(const relay_settings& current, const json& changes, relay_settings& out)
-        {
-            json merged = current.to_json();
-            for (const auto& kv : changes.items()) merged[kv.first] = kv.second;
-            out.from_json(merged);
-            if (out.provider == "openai" && out.auth == "none")
-            {
-                out.secret.clear();
-                return true;
-            }
-            if (out.secret != relay_secret_mask) return true;
-            if (current.secret.empty() || out.secret_scope() != current.secret_scope()) return false;
-            out.secret = current.secret;
             return true;
         }
 
@@ -1707,7 +1684,7 @@ namespace albireo
                 return;
             }
             relay_settings r;
-            if (!merge_relay(s->settings().get().relay, body, r))
+            if (!s->settings().get().relay.merge(body, r))
             {
                 send_error(res, 400, "invalid_request_error", "the masked key of the relay applies to its stored "
                     "provider, address and user only: type the key or the password again", "relay_secret");
@@ -1882,7 +1859,7 @@ namespace albireo
                     return;
                 }
                 relay_settings relay = current.relay;
-                if (changes.contains("relay") && !merge_relay(current.relay, changes["relay"], relay))
+                if (changes.contains("relay") && !current.relay.merge(changes["relay"], relay))
                 {
                     relay_masked_elsewhere = true;
                     return;

@@ -2305,11 +2305,12 @@ namespace albireo
         r["image_mode"] = mode;
         r["images"] = mode != "none";
         /*
-            Claude searches the web itself when a request asks for it (web_search), the web access
-            allowing it, unless Pseudalis replaces the names of the texts, which its searches would
-            then look for.
+            Claude and the models of OpenAI search the web themselves when a request asks for it
+            (web_search), the web access allowing it, unless Pseudalis replaces the names of the
+            texts, which their searches would then look for.
         */
-        r["web"] = st.relay.provider == "claude" && !st.relay.pseudonymize;
+        r["web_search"] = relay_provider_searches(st.relay.provider);
+        r["web"] = relay_provider_searches(st.relay.provider) && !st.relay.pseudonymize;
         if (st.relay.enabled && st.relay.pseudonymize && relay_) r["pseudalis"] = relay_->pseudonymization_status();
         return r;
     }

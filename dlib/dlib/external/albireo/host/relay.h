@@ -25,12 +25,15 @@
     web application, or any client of its interface, and the external engine, whose address
     and key the clients never see; the other models keep the engine of the computer.
 
-    Three providers are known: "openai", any engine of the interface of OpenAI (the base of its
-    interface in the settings, a key, a user and a password, or nothing), "ollama", the cloud of
-    Ollama (https://ollama.com/v1, interface of OpenAI, a key), and "claude", the interface of
-    Anthropic (https://api.anthropic.com/v1/messages, a key).  The models of the last two are
-    known with their context window, the tokens of their answers, their images and their
-    reasoning; those of an "openai" engine come from the settings.
+    Four providers are known: "openai", any engine of the interface of OpenAI (the base of its
+    interface in the settings, a key, a user and a password, or nothing), "chatgpt", the
+    interface of OpenAI itself (https://api.openai.com/v1/responses, a key), "claude", the
+    interface of Anthropic (https://api.anthropic.com/v1/messages, a key), and "ollama", the
+    cloud of Ollama (https://ollama.com/v1, interface of OpenAI, a key).  The models of the last
+    three are known with their context window, the tokens of their answers, their images and
+    their reasoning; those of an "openai" engine come from the settings.  The settings keep
+    what was given for each provider, its key included, while the relay points to another one
+    (relay_settings).
 
     With the pseudonymization, the texts of a request leave through Pseudalis (pseudonyms.h):
     each personal value is replaced by its substitute, or its tag, and the answer gets the
@@ -63,8 +66,11 @@ namespace albireo
         std::string default_effort;
     };
 
-    // The models that relay.cpp knows for a provider ("claude", "ollama"), newest first; none for "openai".
+    // The models that relay.cpp knows for a provider ("chatgpt", "claude", "ollama"), newest first; none for "openai".
     std::vector<relay_model> known_relay_models(const std::string& provider);
+
+    // Whether the models of a provider search the web themselves when a request asks for it: "claude" and "chatgpt".
+    bool relay_provider_searches(const std::string& provider);
 
     // Whether url can be the base of the interface of an "openai" engine: http:// or https://, no query.
     bool valid_relay_url(const std::string& url);
@@ -75,7 +81,7 @@ namespace albireo
     /*!
         ensures
             - Gives in m the model that r names, with its traits: those relay.cpp knows for
-              "claude" and "ollama", those of the settings for "openai".
+              "chatgpt", "claude" and "ollama", those of the settings for "openai".
             - Returns false when r names no model, or a model its provider does not offer here.
     !*/
     bool relay_model_of(const relay_settings& r, relay_model& m);
@@ -95,8 +101,8 @@ namespace albireo
               address is "localhost" or a name under .localhost, reached at 127.0.0.1, an IP
               address of the local network (loopback, private or link-local), or a name of the
               network, which each request resolves (http_resolve_local()), refuses when one of
-              its addresses lies elsewhere, and reaches at an address it checked.  The providers "ollama" and
-              "claude" need the Internet.  Otherwise why tells it.
+              its addresses lies elsewhere, and reaches at an address it checked.  The providers
+              "chatgpt", "claude" and "ollama" need the Internet.  Otherwise why tells it.
     !*/
     bool relay_offline_ready(const relay_settings& r, std::string& why);
 
@@ -147,7 +153,9 @@ namespace albireo
                   events go to sink, from another thread, until the end or the error.  The
                   sampling passes as numbers alone, and the stop sequences only without
                   pseudonymization; the answers of Claude take 64000 tokens at most when the
-                  request gives no bound.
+                  request gives no bound.  With "web_search": true, Claude and the models of
+                  OpenAI search the web themselves, the web access of the settings allowing it
+                  and the pseudonymization being off.
                 - Returns false, with error, the HTTP status and the code of the refusal, when
                   the relay refuses the request at once: turned off or incomplete, an engine
                   out of reach of the offline mode, too many answers in progress, tools, or
@@ -220,6 +228,20 @@ namespace albireo
         static const size_t max_bases = 32;
         static const int unlisted_seconds = 600;
 
+        /*
+            What OpenAI refused to the account of a key of "chatgpt", by the SHA-256 of the key:
+            the summary of the reasoning or the stream, which the requests of that key leave out
+            until the service stops.  max_refused keys at most.
+        */
+        struct refused_options
+        {
+            bool summary = false;
+            bool stream = false;
+        };
+        std::mutex refused_m_;
+        std::map<std::string, refused_options> refused_;
+        static const size_t max_refused = 16;
+
         // The descriptions of the images by the SHA-256 of their data URL, max_descriptions at most.
         std::mutex descriptions_m_;
         std::list<std::pair<std::string, std::string>> descriptions_;
@@ -229,8 +251,9 @@ namespace albireo
     /*!
         Reserved for the tests (tests/test_host.cpp).  No setting and no route reaches it.
         ensures
-            - Sends the requests of the provider "claude" or "ollama" to origin ("http://127.0.0.1:port"),
-              where a test server answers as the provider; an empty origin gives them their address back.
+            - Sends the requests of the provider "chatgpt", "claude" or "ollama" to origin
+              ("http://127.0.0.1:port"), where a test server answers as the provider; an empty origin
+              gives them their address back.
     !*/
     void relay_origin_for_tests(const std::string& provider, const std::string& origin);
 

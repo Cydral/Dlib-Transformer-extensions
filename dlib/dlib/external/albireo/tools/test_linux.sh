@@ -237,6 +237,30 @@ if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
         | grep -o '"secret":"[^"]*"'
     }
     step "service relay key masked" '"secret":"\*{8}"' masked
+    # Another provider with a key of its own, then back to the first one with the mask of its key: the service keeps
+    # both, out of settings.json, and refuses the mask for a provider that has no key.
+    step "service relay OpenAI models" '"id":"gpt-6.2-astra"' curl -sk --max-time 5 \
+      https://localhost:$PORT/albireo/v1/relay
+    OTHER='{"relay": {"provider": "chatgpt", "model": "gpt-6.2-sol", "secret": "sk-test-1111"}}'
+    step "service relay other provider" '"ok":true' curl -sk --max-time 10 -X PUT "${ADMIN[@]}" -d "$OTHER" \
+      https://localhost:$PORT/albireo/v1/settings
+    BACK='{"relay": {"provider": "claude", "secret": "********"}}'
+    step "service relay provider back" '"ok":true' curl -sk --max-time 10 -X PUT "${ADMIN[@]}" -d "$BACK" \
+      https://localhost:$PORT/albireo/v1/settings
+    profiles() {
+      local settings
+      if grep -q "sk-test-" "$HOME_DIR/settings.json"; then echo "a key is in settings.json"; return 1; fi
+      settings=$(curl -sk --max-time 5 -H "X-Albireo-Admin: $TOKEN" https://localhost:$PORT/albireo/v1/settings)
+      case "$settings" in
+        *'"provider":"claude"'*'"model":"claude-opus-5-5"'*'"saved":{"chatgpt":{'*'"model":"gpt-6.2-sol"'*) ;;
+        *) echo "profiles lost: $settings"; return 1 ;;
+      esac
+      echo "both profiles kept: claude, and chatgpt saved beside it"
+    }
+    step "service relay profiles" "both profiles kept" profiles
+    NO_KEY='{"relay": {"provider": "ollama", "secret": "********"}}'
+    step "service relay mask elsewhere" '"code":"relay_secret"' curl -sk --max-time 10 -X PUT "${ADMIN[@]}" \
+      -d "$NO_KEY" https://localhost:$PORT/albireo/v1/settings
     ASK='{"model": "albireo-relay", "messages": [{"role": "user", "content": "Hi"}]}'
     step "service relay offline" 'Claude needs the Internet' curl -sk --max-time 10 \
       -H "Content-Type: application/json" -d "$ASK" https://localhost:$PORT/v1/chat/completions

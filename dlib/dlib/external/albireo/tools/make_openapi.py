@@ -49,9 +49,9 @@ generation_replies = dict(engine_replies, **{
 relay_replies = dict(generation_replies, **{
     "400": reply("Invalid request; for albireo-relay, tools, sounds, several choices, images that neither the "
                  "external model nor a model of the computer can take (code image_input_not_supported), a search "
-                 "of the web asked of another provider than Claude (web_search_not_supported) or while the relay "
-                 "pseudonymizes, the searches then looking for the substitutes of Pseudalis "
-                 "(web_search_pseudonymized)", ref("Error")),
+                 "of the web asked of a provider whose models do not search the web themselves "
+                 "(web_search_not_supported) or while the relay pseudonymizes, the searches then looking for the "
+                 "substitutes of Pseudalis (web_search_pseudonymized)", ref("Error")),
     "403": reply("albireo-relay: a search of the web asked while the web access of the settings is off (code "
                  "web_access_off)", ref("Error")),
     "404": reply("Unknown or inactive model; for albireo-relay, a relay turned off, incomplete or out of reach of "
@@ -209,9 +209,10 @@ schemas = {
                                                 "For albireo-relay, the level of effort of the external model among "
                                                 "those it takes (efforts in /albireo/v1/relay), its own without "
                                                 "one."},
-            "web_search": {"type": "boolean", "description": "albireo-relay with Claude: the external model searches "
-                           "the web, five searches at most, which Anthropic bills; its queries come with the "
-                           "reasoning, its sources as links after the texts that cite them, and usage gives "
+            "web_search": {"type": "boolean", "description": "albireo-relay with Claude or ChatGPT: the external "
+                           "model searches the web itself, five searches at most with Claude, ten calls of the "
+                           "tool at most with ChatGPT, which the provider bills; its queries come with the "
+                           "reasoning, its sources as links in or after the texts that cite them, and usage gives "
                            "web_search_requests. The web access of the settings allows it, and the "
                            "pseudonymization of the relay refuses it."},
             "reasoning_budget": {"type": "integer", "minimum": -1, "nullable": True,
@@ -416,11 +417,15 @@ schemas = {
                                       "provider is read as wikipedia."},
         "relay": ref("RelaySettings")}},
     "RelaySettings": {"type": "object", "description": "The relay to an external engine, the model albireo-relay. "
-                      "A change gives the members it changes; the others stay.", "properties": {
+                      "A change gives the members it changes; the others stay. url, model, auth, user, secret, "
+                      "context, max_output, images and reasoning are those of provider: a change of provider "
+                      "keeps them in saved and takes those saved for the provider named, before the other "
+                      "members of the change apply.", "properties": {
         "enabled": {"type": "boolean", "default": False},
-        "provider": {"type": "string", "enum": ["openai", "ollama", "claude"], "default": "openai",
-                     "description": "openai: an engine of the interface of OpenAI at url; ollama: the cloud of "
-                                    "Ollama; claude: the interface of Anthropic."},
+        "provider": {"type": "string", "enum": ["openai", "chatgpt", "claude", "ollama"], "default": "openai",
+                     "description": "openai: an engine of the interface of OpenAI at url; chatgpt: the interface "
+                                    "of OpenAI itself; claude: the interface of Anthropic; ollama: the cloud of "
+                                    "Ollama."},
         "url": {"type": "string", "maxLength": 2048, "description": "openai: the base of its interface, http:// or "
                 "https://, without query, where /chat/completions and /models lie; without /v1, the relay adds it "
                 "when the models answer there only."},
@@ -430,9 +435,9 @@ schemas = {
         "user": {"type": "string", "maxLength": 256, "description": "basic: the user, without ':'."},
         "secret": {"type": "string", "maxLength": 4096,
                    "description": "The key or the password, without control character, kept in relay.secret and "
-                                  "given as ********; that value sent back keeps the stored secret when the "
-                                  "provider, the address and the user stay the same, and is refused (code "
-                                  "relay_secret) otherwise."},
+                                  "given as ********; that value sent back keeps the secret stored for the "
+                                  "provider named when its address and its user stay the same, and is refused "
+                                  "(code relay_secret) otherwise."},
         "context": {"type": "integer", "minimum": 1024, "maximum": 16777216, "default": 131072,
                     "description": "openai: the context window of its model."},
         "max_output": {"type": "integer", "minimum": 16, "maximum": 1048576, "default": 16384,
@@ -446,7 +451,16 @@ schemas = {
                  "description": "The values leave as their tags rather than as their substitutes alone."},
         "keep_substitutes": {"type": "boolean", "default": False,
                              "description": "The answers keep the substitutes, without their values: a check of "
-                                            "what left the computer."}}},
+                                            "what left the computer."},
+        "saved": {"type": "object", "readOnly": True,
+                  "description": "What was given for the other providers, by provider, each secret as ********: "
+                                 "the service writes it when the provider changes, and a change that names it is "
+                                 "refused.",
+                  "additionalProperties": {"type": "object", "properties": {
+                      "url": {"type": "string"}, "model": {"type": "string"}, "auth": {"type": "string"},
+                      "user": {"type": "string"}, "secret": {"type": "string"}, "context": {"type": "integer"},
+                      "max_output": {"type": "integer"}, "images": {"type": "boolean"},
+                      "reasoning": {"type": "boolean"}}}}}},
     "RelayModel": {"type": "object", "properties": {
         "id": {"type": "string"}, "name": {"type": "string"}, "context": {"type": "integer"},
         "max_output": {"type": "integer"}, "images": {"type": "boolean"},
@@ -464,8 +478,10 @@ schemas = {
         "pseudonymize": {"type": "boolean"}, "tags": {"type": "boolean"},
         "keep_substitutes": {"type": "boolean", "description": "With the pseudonymization, the answers keep the "
                              "substitutes."},
+        "web_search": {"type": "boolean", "description": "The models of the provider search the web themselves: "
+                       "Claude and ChatGPT."},
         "web": {"type": "boolean", "description": "The external model searches the web when a request asks for it "
-                "(web_search): Claude, unless the relay pseudonymizes."},
+                "(web_search): web_search, unless the relay pseudonymizes."},
         "offline": {"type": "boolean", "description": "The offline mode, which keeps an engine of the interface of "
                     "OpenAI on this computer or its local network alone: ready is false for the other providers and "
                     "for a public address."},

@@ -17,6 +17,7 @@ namespace albireo
     const char* const embedding_role = "embedding";
     const char* const proxy_password_mask = "********";
     const char* const relay_secret_mask = "********";
+    const char* const relay_providers[4] = { "openai", "chatgpt", "claude", "ollama" };
 
     namespace
     {
@@ -49,11 +50,14 @@ namespace albireo
             return join_path(parent_path(settings_path), "proxy.secret");
         }
 
-        // The file of the secret of the relay, with what it was given for, beside settings.json.
+        // The file of the secrets of the relay, each with what it was given for, beside settings.json.
         std::string relay_secret_path(const std::string& settings_path)
         {
             return join_path(parent_path(settings_path), "relay.secret");
         }
+
+        // The bytes of relay.secret at most: the secrets of four providers, sealed.
+        const size_t relay_secret_bytes = 256 * 1024;
 
         // A value of a setting that is one of values, else def.
         std::string one_of(const std::string& value, std::initializer_list<const char*> values, const char* def)
@@ -141,7 +145,14 @@ namespace albireo
         return password_span(proxy, from, length) && proxy.compare(from, length, proxy_password_mask) == 0;
     }
 
-    std::string relay_settings::secret_scope() const
+    bool known_relay_provider(const std::string& id)
+    {
+        for (const char* p : relay_providers)
+            if (id == p) return true;
+        return false;
+    }
+
+    std::string relay_profile::secret_scope(const std::string& provider) const
     {
         json j = json::object();
         j["provider"] = provider;
@@ -151,11 +162,16 @@ namespace albireo
         return j.dump();
     }
 
-    json relay_settings::to_json() const
+    bool relay_profile::blank() const
+    {
+        const relay_profile d;
+        return url.empty() && model.empty() && auth == d.auth && user.empty() && secret.empty()
+            && context == d.context && max_output == d.max_output && images == d.images && reasoning == d.reasoning;
+    }
+
+    json relay_profile::to_json() const
     {
         json j = json::object();
-        j["enabled"] = enabled;
-        j["provider"] = provider;
         j["url"] = url;
         j["model"] = model;
         j["auth"] = auth;
@@ -165,17 +181,12 @@ namespace albireo
         j["max_output"] = static_cast<long long>(max_output);
         j["images"] = images;
         j["reasoning"] = reasoning;
-        j["pseudonymize"] = pseudonymize;
-        j["tags"] = tags;
-        j["keep_substitutes"] = keep_substitutes;
         return j;
     }
 
-    void relay_settings::from_json(const json& j)
+    void relay_profile::from_json(const json& j)
     {
-        const relay_settings d;
-        enabled = j["enabled"].as_bool(d.enabled);
-        provider = one_of(j["provider"].str(d.provider), { "openai", "ollama", "claude" }, "openai");
+        const relay_profile d;
         url = j["url"].str(d.url);
         model = j["model"].str(d.model);
         auth = one_of(j["auth"].str(d.auth), { "key", "basic", "none" }, "key");
@@ -187,9 +198,77 @@ namespace albireo
         max_output = m >= 16 && m <= (1LL << 20) ? static_cast<long>(m) : d.max_output;
         images = j["images"].as_bool(d.images);
         reasoning = j["reasoning"].as_bool(d.reasoning);
+    }
+
+    json relay_settings::to_json() const
+    {
+        // The members in the order the earlier versions wrote them, the saved profiles after them.
+        const json profile = relay_profile::to_json();
+        json j = json::object();
+        j["enabled"] = enabled;
+        j["provider"] = provider;
+        for (const auto& kv : profile.items()) j[kv.first] = kv.second;
+        j["pseudonymize"] = pseudonymize;
+        j["tags"] = tags;
+        j["keep_substitutes"] = keep_substitutes;
+        json kept = json::object();
+        for (const auto& kv : saved) kept[kv.first] = kv.second.to_json();
+        j["saved"] = kept;
+        return j;
+    }
+
+    void relay_settings::from_json(const json& j)
+    {
+        const relay_settings d;
+        relay_profile::from_json(j);
+        enabled = j["enabled"].as_bool(d.enabled);
+        provider = j["provider"].str(d.provider);
+        if (!known_relay_provider(provider)) provider = d.provider;
         pseudonymize = j["pseudonymize"].as_bool(d.pseudonymize);
         tags = j["tags"].as_bool(d.tags);
         keep_substitutes = j["keep_substitutes"].as_bool(d.keep_substitutes);
+        saved.clear();
+        for (const auto& kv : j["saved"].items())
+        {
+            if (!known_relay_provider(kv.first) || kv.first == provider || !kv.second.is_object()) continue;
+            relay_profile p;
+            p.from_json(kv.second);
+            if (!p.blank()) saved[kv.first] = p;
+        }
+    }
+
+    bool relay_settings::merge(const json& changes, relay_settings& out) const
+    {
+        out = *this;
+        const std::string asked = changes["provider"].as_string();
+        if (known_relay_provider(asked) && asked != provider)
+        {
+            const relay_profile left = *this;
+            const auto kept = saved.find(asked);
+            static_cast<relay_profile&>(out) = kept == saved.end() ? relay_profile() : kept->second;
+            out.saved.erase(asked);
+            if (!left.blank()) out.saved[provider] = left;
+            out.provider = asked;
+        }
+        // The profiles with their secrets, which the document of the settings masks.
+        const relay_settings held = out;
+        json merged = out.to_json();
+        for (const auto& kv : changes.items())
+        {
+            // The provider changed above when changes names one that exists; no other name replaces it.
+            if (kv.first != "saved" && kv.first != "provider") merged[kv.first] = kv.second;
+        }
+        out.from_json(merged);
+        out.saved = held.saved;
+        if (out.provider == "openai" && out.auth == "none")
+        {
+            out.secret.clear();
+            return true;
+        }
+        if (out.secret != relay_secret_mask) return true;
+        if (held.secret.empty() || out.secret_scope() != held.secret_scope()) return false;
+        out.secret = held.secret;
+        return true;
     }
 
     json host_settings::to_json() const
@@ -332,23 +411,42 @@ namespace albireo
         {
             log_warning("settings: the password of the proxy cannot move from " + path_ + " to proxy.secret");
         }
-        if (s_.relay.secret == relay_secret_mask)
+        /*
+            The secrets of the relay: the one of its provider and those of the profiles saved for
+            the others, each stored for a provider, an address and a user.  A secret that
+            settings.json holds in clear moves to relay.secret with them.
+        */
+        bool masked = s_.relay.secret == relay_secret_mask;
+        bool in_clear = !masked && !s_.relay.secret.empty();
+        for (const auto& kv : s_.relay.saved)
         {
-            // The secret stored for this provider, this address and this user.
+            masked = masked || kv.second.secret == relay_secret_mask;
+            in_clear = in_clear || (kv.second.secret != relay_secret_mask && !kv.second.secret.empty());
+        }
+        if (masked)
+        {
             std::string sealed, record_text;
             json record;
-            const bool read = read_file(relay_secret_path(path_), sealed, 64 * 1024) && open_secret(sealed, record_text)
-                && json::parse(record_text, record) && record["scope"].as_string() == s_.relay.secret_scope();
-            s_.relay.secret = read ? record["secret"].as_string() : std::string();
-            if (!read) log_warning("settings: the secret of the relay is not stored, the relay goes without it");
+            const bool read = read_file(relay_secret_path(path_), sealed, relay_secret_bytes)
+                && open_secret(sealed, record_text) && json::parse(record_text, record);
+            auto stored = [&](relay_profile& p, const std::string& provider, const json& entry) {
+                if (p.secret != relay_secret_mask) return;
+                const bool found = read && entry["scope"].as_string() == p.secret_scope(provider);
+                p.secret = found ? entry["secret"].as_string() : std::string();
+                if (!found)
+                    log_warning("settings: the secret of the relay for " + provider + " is not stored, the relay goes "
+                        "without it");
+            };
+            // Read through a const reference, which adds no member to the record.
+            const json& entries = record;
+            stored(s_.relay, s_.relay.provider, entries);
+            for (auto& kv : s_.relay.saved) stored(kv.second, kv.first, entries["saved"][kv.first]);
             record = json();
             wipe_secret(sealed);
             wipe_secret(record_text);
         }
-        else if (!s_.relay.secret.empty() && !write())
-        {
+        if (in_clear && !write())
             log_warning("settings: the secret of the relay cannot move from " + path_ + " to relay.secret");
-        }
         // Written again once the password of the proxy is back in the settings: from its copy, or without the
         // settings of an earlier version and the key of its search provider.
         if ((restored || obsolete || file_exists(obsolete_key_path(path_))) && !write())
@@ -363,12 +461,24 @@ namespace albireo
         const bool password = masked_proxy(s_.proxy) != s_.proxy;
         if (password && !write_file_restricted(secret, s_.proxy)) return false;
         const std::string relay_secret = relay_secret_path(path_);
-        const bool relay_key = !s_.relay.secret.empty();
+        bool relay_key = !s_.relay.secret.empty();
+        for (const auto& kv : s_.relay.saved) relay_key = relay_key || !kv.second.secret.empty();
         if (relay_key)
         {
+            // The secret of the provider of the relay, then those of the profiles saved for the others.
             json record = json::object();
             record["scope"] = s_.relay.secret_scope();
             record["secret"] = s_.relay.secret;
+            json others = json::object();
+            for (const auto& kv : s_.relay.saved)
+            {
+                if (kv.second.secret.empty()) continue;
+                json one = json::object();
+                one["scope"] = kv.second.secret_scope(kv.first);
+                one["secret"] = kv.second.secret;
+                others[kv.first] = one;
+            }
+            if (others.size() > 0) record["saved"] = others;
             std::string text = record.dump(), sealed;
             record = json();
             const bool kept = seal_secret(text, L"Albireo relay secret", sealed)

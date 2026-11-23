@@ -209,6 +209,8 @@ namespace albireo
             { "relay_provider", { "Provider", "Fournisseur", "Anbieter", "Fornitore", "Proveedor" } },
             { "relay_provider_openai", { "Engine of the OpenAI interface", "Moteur de l'interface OpenAI",
                 "Engine der OpenAI-Schnittstelle", "Motore dell'interfaccia OpenAI", "Motor de la interfaz OpenAI" } },
+            { "relay_provider_chatgpt", { "ChatGPT (OpenAI)", "ChatGPT (OpenAI)", "ChatGPT (OpenAI)",
+                "ChatGPT (OpenAI)", "ChatGPT (OpenAI)" } },
             { "relay_provider_ollama", { "Ollama (cloud)", "Ollama (cloud)", "Ollama (Cloud)", "Ollama (cloud)",
                 "Ollama (nube)" } },
             { "relay_provider_claude", { "Claude (Anthropic)", "Claude (Anthropic)", "Claude (Anthropic)",
@@ -253,6 +255,16 @@ namespace albireo
                 "Jede Anfrage wird pro Token mit dem Guthaben des Kontos bezahlt.",
                 "Ogni richiesta è pagata a token con i crediti dell'account.",
                 "Cada solicitud se paga por token con los créditos de la cuenta." } },
+            { "relay_chatgpt_note", { "The key comes from the API platform of OpenAI, which bills each request per "
+                "token, apart from a ChatGPT subscription.",
+                "La clé vient de la plateforme API d'OpenAI, qui facture chaque requête au jeton, en dehors d'un "
+                "abonnement ChatGPT.",
+                "Der Schlüssel stammt von der API-Plattform von OpenAI, die jede Anfrage pro Token abrechnet, "
+                "unabhängig von einem ChatGPT-Abonnement.",
+                "La chiave proviene dalla piattaforma API di OpenAI, che fattura ogni richiesta a token, al di fuori "
+                "di un abbonamento ChatGPT.",
+                "La clave procede de la plataforma API de OpenAI, que factura cada solicitud por token, aparte de una "
+                "suscripción a ChatGPT." } },
             { "relay_privacy", { "Before the texts leave, Pseudalis can replace their personal values; the answers get "
                 "them back on this computer.",
                 "Avant que les textes partent, Pseudalis peut remplacer leurs valeurs personnelles ; les réponses les "
@@ -274,15 +286,15 @@ namespace albireo
                 "Inviare i tag dei valori (altrimenti solo i loro sostituti)",
                 "Enviar las etiquetas de los valores (si no, solo sus sustitutos)" } },
             { "relay_offline_note", { "Offline mode: only an engine of this computer or of the local network stays "
-                "within reach; Ollama and Claude need the Internet.",
-                "Mode hors ligne : seul un moteur de cet ordinateur ou du réseau local reste joignable ; Ollama et "
-                "Claude demandent l'accès à Internet.",
-                "Offlinemodus: Nur eine Engine dieses Computers oder des lokalen Netzwerks bleibt erreichbar; Ollama "
-                "und Claude benötigen das Internet.",
-                "Modalità offline: resta raggiungibile solo un motore di questo computer o della rete locale; Ollama "
-                "e Claude richiedono Internet.",
-                "Modo sin conexión: solo sigue accesible un motor de este equipo o de la red local; Ollama y Claude "
-                "necesitan Internet." } },
+                "within reach; ChatGPT, Claude and Ollama need the Internet.",
+                "Mode hors ligne : seul un moteur de cet ordinateur ou du réseau local reste joignable ; ChatGPT, "
+                "Claude et Ollama demandent l'accès à Internet.",
+                "Offlinemodus: Nur eine Engine dieses Computers oder des lokalen Netzwerks bleibt erreichbar; "
+                "ChatGPT, Claude und Ollama benötigen das Internet.",
+                "Modalità offline: resta raggiungibile solo un motore di questo computer o della rete locale; "
+                "ChatGPT, Claude e Ollama richiedono Internet.",
+                "Modo sin conexión: solo sigue accesible un motor de este equipo o de la red local; ChatGPT, Claude y "
+                "Ollama necesitan Internet." } },
             { "relay_keep", { "Leave the substitutes in the answers, to check what leaves this computer",
                 "Laisser les substituts dans les réponses, pour vérifier ce qui quitte cet ordinateur",
                 "Ersatzwerte in den Antworten belassen, um zu prüfen, was diesen Computer verlässt",

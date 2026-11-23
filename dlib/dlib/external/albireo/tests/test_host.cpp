@@ -50,12 +50,14 @@
     search of Wikipedia answers from the same server with its documents.  Both routes refuse to
     work offline or with the web access turned off, and a search without provider is refused.
     The relay keeps its secret in relay.secret, never in settings.json, for the provider, the
-    address and the user it was given for; it restores the substitutes of an answer cut at any
-    place, at the boundaries of words, its memory of the pseudonymization serves a text again
-    without Pseudalis and forgets the oldest and the idle values, and its requests reach a local
-    server that answers as an engine of the interface of OpenAI, as Ollama and as Claude, and as
-    Pseudalis: the texts and the descriptions of the images leave pseudonymized, the answers come
-    back with their values, and a refusal of the key names neither the key nor the address.
+    address and the user it was given for, and keeps beside it what was given for the other
+    providers, which a return to one of them finds again; it restores the substitutes of an
+    answer cut at any place, at the boundaries of words, its memory of the pseudonymization
+    serves a text again without Pseudalis and forgets the oldest and the idle values, and its
+    requests reach a local server that answers as an engine of the interface of OpenAI, as
+    OpenAI itself (the Responses interface), as Ollama and as Claude, and as Pseudalis: the texts
+    and the descriptions of the images leave pseudonymized, the answers come back with their
+    values, and a refusal of the key names neither the key nor the address.
 */
 
 #include <algorithm>
@@ -1941,8 +1943,8 @@ int main(int argc, char** argv)
     }
 
     {
-        // The relay: its secret in the settings, the restoration of the substitutes, the memory of the
-        // pseudonymization, and the requests of its three providers to a local server that answers as each.
+        // The relay: its secrets in the settings, the restoration of the substitutes, the memory of the
+        // pseudonymization, and the requests of its four providers to a local server that answers as each.
         const std::string folder = albireo::join_path(work, "relay-settings");
         albireo::make_dirs(folder);
         const std::string file = albireo::join_path(folder, "settings.json");
@@ -1985,6 +1987,104 @@ int main(int argc, char** argv)
         check(elsewhere && !albireo::file_exists(secret_file),
             "a settings.json that names another provider reads no key, and relay.secret goes with the key");
 
+        /*
+            The profiles: the relay keeps what was given for each provider, its key included, while
+            it points to another one, turned off or not, and a return to a provider finds it again.
+        */
+        {
+            const std::string profiles = albireo::join_path(work, "relay-profiles");
+            albireo::make_dirs(profiles);
+            const std::string profiles_file = albireo::join_path(profiles, "settings.json");
+            const std::string claude_key = "sk-ant-profile-1111", openai_key = "sk-oai-profile-2222";
+            const std::string password = "basic-profile-3333";
+            auto change = [](const albireo::relay_settings& from, const std::string& changes,
+                albireo::relay_settings& to) { return from.merge(json::parse_or_null(changes), to); };
+            bool merged = false, mask_elsewhere = false;
+            {
+                albireo::settings_store store(profiles_file);
+                albireo::relay_settings first, second, third, refused;
+                merged = change(store.get().relay, "{\"enabled\": true, \"provider\": \"claude\", \"model\": "
+                    "\"claude-opus-5-5\", \"secret\": \"" + claude_key + "\"}", first)
+                    && change(first, "{\"provider\": \"chatgpt\", \"model\": \"gpt-6.2-sol\", \"secret\": \""
+                        + openai_key + "\"}", second)
+                    && second.provider == "chatgpt" && second.secret == openai_key && second.saved.count("claude") == 1
+                    && second.saved["claude"].secret == claude_key && second.saved["claude"].model == "claude-opus-5-5"
+                    && second.saved.count("openai") == 0;
+                // The mask of the key of the provider left gives no key to the provider taken.
+                mask_elsewhere = !change(second, "{\"provider\": \"ollama\", \"secret\": \"********\"}", refused);
+                merged = merged && change(second, "{\"provider\": \"openai\", \"url\": \"http://127.0.0.1:9/v1\", "
+                    "\"auth\": \"basic\", \"user\": \"anna\", \"secret\": \"" + password + "\", \"model\": \"local\", "
+                    "\"context\": 8192}", third)
+                    && third.saved.size() == 2 && third.saved["chatgpt"].secret == openai_key;
+                store.update([&](albireo::host_settings& s) { s.relay = third; });
+            }
+            const std::string written = read_text(profiles_file) + read_text(profiles_file + ".bak");
+            bool hidden = true;
+            for (const std::string& secret : { claude_key, openai_key, password })
+                hidden = hidden && written.find(secret) == std::string::npos;
+            const json document = json::parse_or_null(read_text(profiles_file));
+            hidden = hidden && document["relay"]["saved"]["claude"]["secret"].as_string() == "********"
+                && document["relay"]["saved"]["chatgpt"]["model"].as_string() == "gpt-6.2-sol";
+            bool reread = false, back_again = false, moved_refused = false, same_address = false, cleared = false;
+            {
+                albireo::settings_store store(profiles_file);
+                const albireo::relay_settings r = store.get().relay;
+                reread = r.provider == "openai" && r.secret == password && r.saved.count("claude") == 1
+                    && r.saved.at("claude").secret == claude_key && r.saved.at("chatgpt").secret == openai_key;
+                albireo::relay_settings off, back, moved, same, emptied;
+                // The relay turned off, then back to Claude with the mask of its key.
+                back_again = change(r, "{\"enabled\": false}", off) && !off.enabled && off.secret == password
+                    && off.saved.size() == 2
+                    && change(off, "{\"enabled\": true, \"provider\": \"claude\", \"secret\": \"********\"}", back)
+                    && back.enabled && back.provider == "claude" && back.secret == claude_key
+                    && back.model == "claude-opus-5-5" && back.url.empty() && back.saved.count("claude") == 0
+                    && back.saved.at("openai").secret == password && back.saved.at("openai").user == "anna"
+                    && back.saved.at("openai").context == 8192 && back.saved.at("chatgpt").secret == openai_key
+                    && back.to_json().dump().find(openai_key) == std::string::npos
+                    && back.to_json()["saved"]["openai"]["secret"].as_string() == "********";
+                // The stored password goes back to its own address, and to no other one.
+                moved_refused = !change(back, "{\"provider\": \"openai\", \"url\": \"http://127.0.0.1:10/v1\", "
+                    "\"secret\": \"********\"}", moved);
+                same_address = change(back, "{\"provider\": \"openai\", \"secret\": \"********\"}", same)
+                    && same.secret == password && same.url == "http://127.0.0.1:9/v1" && same.auth == "basic"
+                    && same.user == "anna" && same.model == "local" && same.saved.at("claude").secret == claude_key;
+                // A key emptied for a provider leaves those of the others.
+                cleared = change(back, "{\"provider\": \"chatgpt\", \"secret\": \"\"}", emptied)
+                    && emptied.secret.empty() && emptied.model == "gpt-6.2-sol"
+                    && emptied.saved.at("claude").secret == claude_key;
+                store.update([&](albireo::host_settings& s) { s.relay = back; });
+            }
+            check(merged && mask_elsewhere && hidden && reread,
+                "the relay keeps the model and the key given for each provider while it points to another one, the "
+                "keys out of settings.json and read again at the next start");
+            check(back_again && moved_refused && same_address && cleared,
+                "a return to a provider finds its model and its key again, the relay turned off in between, the mask "
+                "standing for the key of that provider at its own address only");
+            // A settings.json edited so that a saved profile names another address reads no secret for it.
+            json tampered = json::parse_or_null(read_text(profiles_file));
+            tampered["relay"]["saved"]["openai"]["url"] = "http://evil.example/v1";
+            write_text(profiles_file, tampered.dump());
+            bool withheld = false;
+            {
+                albireo::settings_store store(profiles_file);
+                const albireo::relay_settings r = store.get().relay;
+                withheld = r.secret == claude_key && r.saved.at("openai").secret.empty()
+                    && r.saved.at("chatgpt").secret == openai_key;
+            }
+            // A document of an earlier version, without profiles, reads as before and gains none.
+            write_text(profiles_file, "{\"relay\": {\"enabled\": true, \"provider\": \"ollama\", \"model\": "
+                "\"gemma4:31b\", \"secret\": \"sk-clear-4444\"}, \"settings_version\": 3}");
+            bool earlier = false;
+            {
+                albireo::settings_store store(profiles_file);
+                earlier = store.get().relay.provider == "ollama" && store.get().relay.secret == "sk-clear-4444"
+                    && store.get().relay.saved.empty()
+                    && read_text(profiles_file).find("sk-clear") == std::string::npos;
+            }
+            check(withheld && earlier, "a saved profile edited to name another address reads no secret, and a "
+                "document without profiles reads as before, its key in clear moved to relay.secret");
+        }
+
         // The values come back in an answer cut at any place, at the boundaries of words only.
         std::map<std::string, std::string> values;
         values["Xoydoeh Nuggwdfsorn"] = "Jean Dupont";
@@ -2014,6 +2114,7 @@ int main(int argc, char** argv)
         {
             std::mutex m;
             int anonymized = 0;
+            int responses = 0;      // the requests of the Responses interface received
             std::string mode = "ok";
             json body;
             httplib::Headers headers;
@@ -2213,6 +2314,125 @@ int main(int argc, char** argv)
                 sse += "event: " + json::parse_or_null(e)["type"].as_string() + "\ndata: " + e + "\n\n";
             res.set_content(sse, "text/event-stream");
         });
+        // The Responses interface of OpenAI: the events of a response, or the refusals and the ends of its modes.
+        relay_server.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
+            const std::string mode = record(req);
+            const json in = json::parse_or_null(req.body);
+            {
+                std::lock_guard<std::mutex> lock(mock.m);
+                ++mock.responses;
+            }
+            // Each event on one line, as a stream gives it.
+            auto stream = [&](const std::vector<std::string>& events) {
+                std::string sse;
+                for (const std::string& e : events)
+                {
+                    const json one = json::parse_or_null(e);
+                    sse += "event: " + one["type"].as_string() + "\ndata: " + one.dump() + "\n\n";
+                }
+                res.set_content(sse, "text/event-stream");
+            };
+            // An account that OpenAI did not verify: no summary of the reasoning, then no stream.
+            const bool unverified = mode == "unverified";
+            if (unverified && (in["reasoning"].contains("summary") || in["stream"].as_bool(false)))
+            {
+                const std::string param = in["reasoning"].contains("summary") ? "reasoning.summary" : "stream";
+                res.status = 400;
+                res.set_content("{\"error\": {\"message\": \"Your organization must be verified to use " + param
+                    + ".\", \"type\": \"invalid_request_error\", \"param\": \"" + param
+                    + "\", \"code\": \"unsupported_value\"}}", "application/json");
+                return;
+            }
+            if (unverified)
+            {
+                res.set_content(R"({"object": "response", "status": "completed", "output": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "One idea."}]},
+                    {"type": "web_search_call", "status": "completed", "action": {"type": "search",
+                        "queries": ["capitale Italie", "Rome"]}},
+                    {"type": "message", "role": "assistant", "phase": "final_answer", "content": [
+                        {"type": "output_text", "text": "Entier.", "annotations": [
+                            {"type": "url_citation", "url": "https://example.org/a", "title": "A"}]}]}],
+                    "usage": {"input_tokens": 7, "output_tokens": 3}})", "application/json");
+                return;
+            }
+            if (mode == "incomplete")
+            {
+                // The accented letter as an escape of JSON, written outside a raw string.
+                stream({ "{\"type\": \"response.output_text.delta\", \"output_index\": 0, \"content_index\": 0, "
+                        "\"delta\": \"Le d\\u00e9but\"}",
+                    R"({"type": "response.incomplete", "response": {"status": "incomplete", "incomplete_details":
+                        {"reason": "max_output_tokens"}, "usage": {"input_tokens": 9, "output_tokens": 16}}})" });
+                return;
+            }
+            if (mode == "unauthorized")
+            {
+                // The refusal of OpenAI, which quotes the first and the last characters of the key.
+                res.status = 401;
+                res.set_content("{\"error\": {\"message\": \"Incorrect API key provided: sk-test-****cret. You can "
+                    "find your API key at https://platform.openai.com/account/api-keys.\", \"type\": "
+                    "\"invalid_request_error\", \"code\": \"invalid_api_key\"}}", "application/json");
+                return;
+            }
+            if (mode == "failed")
+            {
+                // An error that quotes the key, which the answer masks.
+                stream({ R"({"type": "response.failed", "response": {"status": "failed", "error": {"code":
+                    "server_error", "message": "The model failed for sk-test-secret."}}})" });
+                return;
+            }
+            // A search of the web: a search, a page opened, then a text that cites two sources, one in its words.
+            if (in["tools"].is_array())
+            {
+                stream({ R"({"type": "response.output_item.added", "output_index": 0, "item": {"type":
+                        "web_search_call", "id": "ws_1", "status": "in_progress"}})",
+                    R"({"type": "response.web_search_call.searching", "item_id": "ws_1", "output_index": 0})",
+                    R"({"type": "response.output_item.done", "output_index": 0, "item": {"type": "web_search_call",
+                        "id": "ws_1", "status": "completed", "action": {"type": "search", "query":
+                        "capitale Italie"}}})",
+                    R"({"type": "response.output_item.done", "output_index": 1, "item": {"type": "web_search_call",
+                        "id": "ws_2", "status": "completed", "action": {"type": "open_page", "url":
+                        "https://fr.wikipedia.org/wiki/Rome"}}})",
+                    R"({"type": "response.output_item.added", "output_index": 2, "item": {"type": "message", "id":
+                        "msg_1", "role": "assistant", "phase": "final_answer", "content": []}})",
+                    R"({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 2, "content_index":
+                        0, "delta": "Rome est la capitale ([fr.wikipedia.org](https://fr.wikipedia.org/wiki/Rome))."})",
+                    R"({"type": "response.content_part.done", "item_id": "msg_1", "output_index": 2, "content_index":
+                        0, "part": {"type": "output_text", "text":
+                        "Rome est la capitale ([fr.wikipedia.org](https://fr.wikipedia.org/wiki/Rome)).",
+                        "annotations": [{"type": "url_citation", "url": "https://fr.wikipedia.org/wiki/Rome",
+                        "title": "Rome"}, {"type": "url_citation", "url": "https://www.governo.it/it", "title":
+                        "Governo"}]}})",
+                    R"({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens":
+                        40, "output_tokens": 15}}})" });
+                return;
+            }
+            stream({ R"({"type": "response.created", "response": {"status": "in_progress"}})",
+                R"({"type": "response.output_item.added", "output_index": 0, "item": {"type": "reasoning", "id":
+                    "rs_1", "summary": []}})",
+                R"({"type": "response.reasoning_summary_part.added", "item_id": "rs_1", "output_index": 0,
+                    "summary_index": 0, "part": {"type": "summary_text", "text": ""}})",
+                R"({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0,
+                    "summary_index": 0, "delta": "First "})",
+                R"({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0,
+                    "summary_index": 0, "delta": "idea."})",
+                R"({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0,
+                    "summary_index": 1, "delta": "Second idea."})",
+                R"({"type": "response.output_item.added", "output_index": 1, "item": {"type": "message", "id":
+                    "msg_0", "role": "assistant", "phase": "commentary", "content": []}})",
+                R"({"type": "response.output_text.delta", "item_id": "msg_0", "output_index": 1, "content_index": 0,
+                    "delta": "I check the facts."})",
+                R"({"type": "response.output_item.added", "output_index": 2, "item": {"type": "message", "id":
+                    "msg_1", "role": "assistant", "phase": "final_answer", "content": []}})",
+                R"({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 2, "content_index": 0,
+                    "delta": "Bon"})",
+                R"({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 2, "content_index": 0,
+                    "delta": "jour !"})",
+                R"({"type": "response.content_part.done", "item_id": "msg_1", "output_index": 2, "content_index": 0,
+                    "part": {"type": "output_text", "text": "Bonjour !", "annotations": []}})",
+                R"({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 21,
+                    "output_tokens": 11, "input_tokens_details": {"cached_tokens": 4}, "output_tokens_details":
+                    {"reasoning_tokens": 6}}}})" });
+        });
         relay_server.Get("/v1/models", [&](const httplib::Request& req, httplib::Response& res) {
             if (req.get_header_value("Authorization") != "Bearer sk-test-secret")
             {
@@ -2228,6 +2448,7 @@ int main(int argc, char** argv)
         const std::string origin = "http://127.0.0.1:" + std::to_string(relay_port);
         check(relay_listening, "the server of the relay listens on the port " + std::to_string(relay_port));
         albireo::pseudalis_client::endpoint_for_tests(origin);
+        albireo::relay_origin_for_tests("chatgpt", origin);
         albireo::relay_origin_for_tests("claude", origin);
         albireo::relay_origin_for_tests("ollama", origin);
 
@@ -2538,6 +2759,205 @@ int main(int argc, char** argv)
             "shown with the reasoning and its source as a link after the text, and the web access turned off or the "
             "pseudonymization of the relay refuses it (" + searched_text + ")");
 
+        /*
+            ChatGPT, the Responses interface of OpenAI: the system in its role, the earlier answer as a
+            final answer, the image as a data URL, the effort and the summary of the reasoning, the bound
+            of the answer, no sampling, no copy kept; the summary and the commentary come as the reasoning.
+        */
+        set_relay([&](albireo::relay_settings& r) {
+            r.provider = "chatgpt";
+            r.model = "gpt-6.2-astra";
+            r.secret = "sk-test-secret";
+        });
+        json chatgpt = json::object();
+        chatgpt["model"] = albireo::relay_model_id;
+        chatgpt["temperature"] = 0.7;
+        chatgpt["top_p"] = 0.9;
+        chatgpt["stop"] = "END";
+        chatgpt["max_tokens"] = 4;
+        chatgpt["reasoning_effort"] = "high";
+        chatgpt["messages"] = json::parse_or_null("[{\"role\": \"system\", \"content\": \"Be brief.\"}, "
+            "{\"role\": \"user\", \"content\": \"Hi\"}, {\"role\": \"assistant\", \"content\": \"Hello.\"}, "
+            "{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Hello again\"}]}]");
+        chatgpt["messages"].at(3)["content"].push_back(picture);
+        int asked_before = 0;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            asked_before = mock.responses;
+        }
+        answered = ask(chatgpt, a, status, code);
+        std::string bearer;
+        int asked_after = 0;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            body = mock.body;
+            const auto h = mock.headers.find("Authorization");
+            bearer = h == mock.headers.end() ? std::string() : h->second;
+            asked_after = mock.responses;
+        }
+        const json chatgpt_done = json::parse_or_null(a->done);
+        check(answered && a->error.empty() && a->content == "Bonjour !"
+            && a->reasoning == "First idea.\n\nSecond idea.\n\nI check the facts."
+            && chatgpt_done["usage"]["prompt_tokens"].as_int() == 21
+            && chatgpt_done["usage"]["completion_tokens"].as_int() == 11
+            && chatgpt_done["usage"]["cached_tokens"].as_int() == 4
+            && chatgpt_done["finish_reason"].as_string() == "stop" && asked_after == asked_before + 1,
+            "the answer of ChatGPT streams back, the summary of its reasoning and its commentary as the reasoning, "
+            "with its usage (" + a->content + " | " + a->reasoning + " | " + a->error + ")");
+        {
+            const json& sent_body = body;
+            const json& input = sent_body["input"];
+            check(sent_body["model"].as_string() == "gpt-6.2-astra" && input.size() == 4
+                && input[0]["role"].as_string() == "system" && input[0]["content"].as_string() == "Be brief."
+                && input[1]["content"][0]["type"].as_string() == "input_text"
+                && input[2]["role"].as_string() == "assistant" && input[2]["content"].as_string() == "Hello."
+                && input[2]["phase"].as_string() == "final_answer"
+                && input[3]["content"][0]["text"].as_string() == "Hello again"
+                && input[3]["content"][1]["type"].as_string() == "input_image"
+                && input[3]["content"][1]["image_url"].as_string().compare(0, 22, "data:image/png;base64,") == 0
+                && sent_body["reasoning"]["effort"].as_string() == "high"
+                && sent_body["reasoning"]["summary"].as_string() == "auto"
+                && sent_body["store"].is_bool() && !sent_body["store"].as_bool(true)
+                && sent_body["stream"].as_bool(false) && sent_body["max_output_tokens"].as_int() == 16
+                && !sent_body.contains("temperature") && !sent_body.contains("top_p") && !sent_body.contains("stop")
+                && !sent_body.contains("tools") && !sent_body.contains("messages")
+                && bearer == "Bearer sk-test-secret",
+                "the request of ChatGPT has its roles, its image, its effort, the summary of its reasoning and its "
+                "bound of 16 tokens at least, no sampling, no copy kept, the key in its header (" + body.dump() + ")");
+        }
+
+        // The search of the web of ChatGPT: its tool, its query with the reasoning, the source its text does not name.
+        json chatgpt_search = chatgpt;
+        chatgpt_search["web_search"] = true;
+        chatgpt_search["reasoning_effort"] = "none";
+        answered = ask(chatgpt_search, a, status, code);
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            body = mock.body;
+        }
+        {
+            const json& sent_body = body;
+            const json found_done = json::parse_or_null(a->done);
+            check(answered && sent_body["tools"][0]["type"].as_string() == "web_search"
+                && sent_body["max_tool_calls"].as_int() == 10 && !sent_body["reasoning"].contains("effort")
+                && a->content == "Rome est la capitale ([fr.wikipedia.org](https://fr.wikipedia.org/wiki/Rome))."
+                    " ([governo.it](https://www.governo.it/it))"
+                && a->reasoning == "\nweb_search: capitale Italie\n"
+                && found_done["usage"]["web_search_requests"].as_int() == 1,
+                "ChatGPT searches the web when the request asks for it, its query shown with the reasoning, the "
+                "sources of its text as links, those its words name already left as they are, and a level of effort "
+                "its model does not take left out (" + a->content + " | " + a->reasoning + " | " + a->error + ")");
+        }
+        // A model that takes the level none receives it, without the summary of a reasoning it does not make.
+        set_relay([&](albireo::relay_settings& r) {
+            r.provider = "chatgpt";
+            r.model = "gpt-6.1-terra";
+            r.secret = "sk-test-secret";
+        });
+        chatgpt_search.erase("web_search");
+        answered = ask(chatgpt_search, a, status, code);
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            body = mock.body;
+        }
+        {
+            const json& sent_body = body;
+            check(answered && sent_body["reasoning"]["effort"].as_string() == "none"
+                && !sent_body["reasoning"].contains("summary") && sent_body["model"].as_string() == "gpt-6.1-terra",
+                "a model of OpenAI that takes the level none receives it without the summary of the reasoning");
+        }
+        // An answer cut at its bound, then one that fails with an error that quotes the key.
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            mock.mode = "incomplete";
+        }
+        const bool cut = ask(chatgpt, a, status, code) && a->content == "Le d\xC3\xA9" "but"
+            && json::parse_or_null(a->done)["finish_reason"].as_string() == "length"
+            && json::parse_or_null(a->done)["usage"]["completion_tokens"].as_int() == 16;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            mock.mode = "failed";
+        }
+        const bool failed = ask(chatgpt, a, status, code)
+            && json::parse_or_null(a->error)["code"].as_string() == "relay_failed"
+            && a->error.find("The model failed") != std::string::npos && a->error.find("sk-test") == std::string::npos;
+        const std::string failed_text = a->error;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            mock.mode = "unauthorized";
+        }
+        const bool key_refused = ask(chatgpt, a, status, code)
+            && json::parse_or_null(a->error)["code"].as_string() == "relay_refused"
+            && a->error.find("Incorrect API key provided: ********.") != std::string::npos
+            && a->error.find("cret") == std::string::npos && a->error.find("sk-test") == std::string::npos;
+        check(cut && failed && key_refused, "an answer of ChatGPT cut at its bound ends as length, one that fails ends "
+            "with its error, and a refused key with its reason, the key they quote masked, whole or in part ("
+            + failed_text + " | " + a->error + ")");
+        /*
+            An account that OpenAI did not verify: the request goes again without the summary of the
+            reasoning, then without the stream, the answer is read whole, and the next request of the
+            key leaves both out at once.
+        */
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            mock.mode = "unverified";
+            asked_before = mock.responses;
+        }
+        const bool retried = ask(chatgpt, a, status, code) && a->error.empty()
+            && a->content == "Entier. ([example.org](https://example.org/a))"
+            && a->reasoning == "One idea.\nweb_search: capitale Italie\n\nweb_search: Rome\n"
+            && json::parse_or_null(a->done)["usage"]["prompt_tokens"].as_int() == 7
+            && json::parse_or_null(a->done)["usage"]["web_search_requests"].as_int() == 1;
+        const std::string retried_text = a->content + " | " + a->reasoning + " | " + a->error;
+        int asked_first = 0;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            asked_first = mock.responses - asked_before;
+            asked_before = mock.responses;
+        }
+        const bool remembered = ask(chatgpt, a, status, code) && a->content.compare(0, 7, "Entier.") == 0;
+        {
+            std::lock_guard<std::mutex> lock(mock.m);
+            asked_after = mock.responses - asked_before;
+            body = mock.body;
+            mock.mode = "ok";
+        }
+        {
+            const json& sent_body = body;
+            check(retried && asked_first == 3 && remembered && asked_after == 1
+                && !sent_body["reasoning"].contains("summary") && sent_body["stream"].is_bool()
+                && !sent_body["stream"].as_bool(true),
+                "a request that OpenAI refuses for the summary of its reasoning, then for its stream, goes again "
+                "without them and is read whole, as the next request of the key is at once (" + retried_text + ", "
+                + std::to_string(asked_first) + " and " + std::to_string(asked_after) + " requests)");
+        }
+        // The catalog and the test of the provider, which needs the Internet.
+        {
+            const json catalog = albireo::relay_catalog();
+            const json& listed_providers = catalog["providers"];
+            std::string order;
+            for (const json& p : listed_providers.elements()) order += p["id"].as_string() + " ";
+            albireo::relay_settings openai_itself = hs.relay;
+            const json reached = relay.test(openai_itself);
+            const json described_relay = albireo::relay_description(openai_itself);
+            std::string offline_why;
+            check(order == "openai chatgpt claude ollama " && listed_providers[1]["models"].size() == 5
+                && listed_providers[1]["models"][0]["id"].as_string() == "gpt-6.2-astra"
+                && listed_providers[1]["models"][0]["efforts"].size() == 5
+                && listed_providers[1]["models"][2]["efforts"][0].as_string() == "none"
+                && listed_providers[1]["auths"].size() == 1 && albireo::known_relay_models("chatgpt").size() == 5
+                && albireo::relay_provider_searches("chatgpt") && albireo::relay_provider_searches("claude")
+                && !albireo::relay_provider_searches("ollama") && !albireo::relay_provider_searches("openai")
+                && reached["ok"].as_bool(false) && reached["models"].size() == 2
+                && described_relay["provider_name"].as_string() == "OpenAI"
+                && described_relay["context"].as_int() == 922000 && described_relay["max_output"].as_int() == 128000
+                && described_relay["images"].as_bool(false)
+                && !albireo::relay_offline_ready(openai_itself, offline_why)
+                && offline_why.find("needs the Internet") != std::string::npos,
+                "the catalog lists the four providers and the five models of OpenAI with their traits, the test of "
+                "its key lists its models, and the offline mode refuses it (" + order + reached.dump() + ")");
+        }
+
         // Ollama: the reasoning of a model that turns it on or off, the image as is.
         set_relay([&](albireo::relay_settings& r) {
             r.provider = "ollama";
@@ -2558,7 +2978,7 @@ int main(int argc, char** argv)
         json ollama_web = ollama;
         ollama_web["web_search"] = true;
         check(!ask(ollama_web, a, status, code) && status == 400 && code == "web_search_not_supported",
-            "the search of the web of the relay takes Claude alone");
+            "the search of the web of the relay takes the providers whose models search the web themselves");
 
         // The refusals before any request.
         json tools = request;
@@ -2680,6 +3100,7 @@ int main(int argc, char** argv)
                     && !s["reason"].as_string().empty();
             check(coherent, "the state of Pseudalis names by a code why it is not reached (" + s.dump() + ")");
         }
+        albireo::relay_origin_for_tests("chatgpt", "");
         albireo::relay_origin_for_tests("claude", "");
         albireo::relay_origin_for_tests("ollama", "");
         relay_server.stop();

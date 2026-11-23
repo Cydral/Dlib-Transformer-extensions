@@ -1423,20 +1423,24 @@ function relayName(r) {
 const relayReadRate = 2000;
 const relayWriteRate = 60;
 
+/*
+    What the external model of the relay offers, as the service gives it for its provider: its reasoning with its
+    levels of effort, its context, and its own search of the web (web_search), which the pseudonymization turns off.
+*/
 function relayCapabilities() {
   const r = relayStatus() || {};
   const thinking = r.thinking || 'none';
   const context = r.context || 0;
   return { reasoning: thinking !== 'none', reasoningAlways: thinking === 'always', tools: false, context,
     working: context, read: relayReadRate, write: relayWriteRate, relay: true, webSearch: !!r.web,
-    webPseudonymized: r.provider === 'claude' && !!r.pseudonymize,
+    webPseudonymized: !!r.web_search && !!r.pseudonymize, modelName: r.name || r.model || '',
     efforts: Array.isArray(r.efforts) ? r.efforts : [], defaultEffort: r.default_effort || '' };
 }
 
 /*
     Why the Web button of a discussion of the relay is off: '' when its external model searches the web itself
-    (Claude), Pseudalis leaving the names of the texts as they are, and the service gives the web access, the
-    reason otherwise.
+    (Claude, the models of OpenAI), Pseudalis leaving the names of the texts as they are, and the service gives
+    the web access, the reason otherwise.
 */
 function relayWebUnavailable(caps) {
   if (!caps.webSearch) return t(caps.webPseudonymized ? 'relayWebPseudonymized' : 'relayNoTools');
@@ -4983,8 +4987,10 @@ function renderComposerState() {
     ui.reasonButton.dataset.label = label;
     ui.reasonButton.innerHTML = icon('spark') + '<span>' + escapeHtml(label) + '</span>';
   }
-  ui.reasonButton.classList.toggle('on', efforts ? !!level : reasoning);
-  ui.reasonButton.setAttribute('aria-pressed', String(efforts ? !!level : reasoning));
+  // The level none, which some external models take, asks for no reasoning: the button then shows off.
+  const pressed = efforts ? !!level && level !== 'none' : reasoning;
+  ui.reasonButton.classList.toggle('on', pressed);
+  ui.reasonButton.setAttribute('aria-pressed', String(pressed));
   ui.reasonButton.disabled = !caps.reasoning;
   // A model trained to reason before every answer answers directly without the button, as the other models do.
   ui.reasonButton.title = efforts ? t('effortHint') : t('reasoningHint');
@@ -5000,7 +5006,7 @@ function renderComposerState() {
   ui.webButton.classList.toggle('on', webOn);
   ui.webButton.setAttribute('aria-pressed', String(webOn));
   ui.webButton.disabled = !!reason;
-  ui.webButton.title = reason || (caps.relay ? t('relayWebHint') : t('webHint'));
+  ui.webButton.title = reason || (caps.relay ? t('relayWebHint', { model: caps.modelName }) : t('webHint'));
   // The attachments the model of the function reads, the images while the context has places for them.
   const room = imageRoom(c);
   if (ui.fileInput) ui.fileInput.accept = acceptFor(role, room);
@@ -6287,7 +6293,7 @@ async function runTurn(c, abort, turn) {
         turn.promptTokens = fitted.tokens;
       }
       const body = { model: 'albireo-' + role, messages: fitted.messages, reasoning };
-      // The level of effort of an external model chosen for the discussion, and the search of the web of Claude.
+      // The level of effort of an external model chosen for the discussion, and its own search of the web.
       if (caps.relay && caps.efforts.includes(c.effort)) body.reasoning_effort = c.effort;
       if (caps.relay && webChosen(c) && !relayWebUnavailable(caps)) body.web_search = true;
       if (stepTools) body.tools = stepTools;

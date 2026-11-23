@@ -87,6 +87,24 @@ namespace albireo
             { "glm-5.3-flash", "GLM-5.3 Flash", 1000000, 32768, true, "always", "low high max", "" },
         };
 
+        /*
+            The five latest models of the interface of OpenAI that every key reaches, the newest
+            first (developers.openai.com, November 2026): each reads images, reasons before every
+            answer and takes the levels of effort of its page, the two of the generation 6.2 refusing
+            none.  Their context window holds 1050000 tokens, 128000 of them for the answer: the
+            922000 left are those a request may hold, which the relay gives as their context.  The
+            default of a model is the level its page gives it, empty when its page gives none.
+        */
+        const known_model chatgpt_models[] = {
+            { "gpt-6.2-astra", "GPT-6.2 Astra", 922000, 128000, true, "always", "low medium high xhigh max", "" },
+            { "gpt-6.2-sol", "GPT-6.2 Sol", 922000, 128000, true, "always", "low medium high xhigh max", "" },
+            { "gpt-6.1-terra", "GPT-6.1 Terra", 922000, 128000, true, "always", "none low medium high xhigh max",
+                "medium" },
+            { "gpt-6.1-sol", "GPT-6.1 Sol", 922000, 128000, true, "always", "low medium high xhigh max", "medium" },
+            { "gpt-6-luna", "GPT-6 Luna", 922000, 128000, true, "always", "none low medium high xhigh max",
+                "medium" },
+        };
+
         // The levels of effort of an engine of the interface of OpenAI whose model reasons.
         const char* const openai_efforts = "low medium high";
 
@@ -101,6 +119,13 @@ namespace albireo
             them (web_search): each one is billed by Anthropic, and a turn this short never pauses.
         */
         const long long claude_web_searches = 5;
+
+        /*
+            The calls of the tool of the web that an answer of ChatGPT makes at most, when its request
+            asks for the search (web_search): its searches, which OpenAI bills one by one, and the
+            pages it opens or reads through, which count with them.
+        */
+        const long long chatgpt_web_calls = 10;
 
         std::mutex origins_m;
         std::map<std::string, std::string> test_origins;
@@ -161,6 +186,7 @@ namespace albireo
             return j;
         }
 
+        // The name of a provider for people: OpenAI for its own interface as for the engines that speak it.
         const char* provider_name(const std::string& provider)
         {
             if (provider == "claude") return "Claude";
@@ -203,7 +229,10 @@ namespace albireo
 
         /*
             A text of the external engine without the secret, the user and the host of the settings,
-            which an error may quote: a gateway that echoes the header of the authentication.
+            which an error may quote: a gateway that echoes the header of the authentication.  A
+            key quoted with a part of it masked, as OpenAI quotes the first and the last characters
+            of a key it refuses, goes whole: every run of letters, digits, hyphens and underscores
+            around three asterisks or more.
         */
         std::string redacted(std::string text, const relay_settings& r)
         {
@@ -228,6 +257,17 @@ namespace albireo
             for (const std::string& h : hidden)
                 for (size_t at = text.find(h); at != std::string::npos; at = text.find(h, at + 8))
                     text.replace(at, h.size(), "********");
+            auto of_a_key = [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '*';
+            };
+            for (size_t at = text.find("***"); at != std::string::npos; at = text.find("***", at))
+            {
+                size_t begin = at, end = at;
+                while (begin > 0 && of_a_key(text[begin - 1])) --begin;
+                while (end < text.size() && of_a_key(text[end])) ++end;
+                text.replace(begin, end - begin, "********");
+                at = begin + 8;
+            }
             return text;
         }
 
@@ -936,9 +976,88 @@ namespace albireo
         }
 
         /*
-            The sources of a text of Claude, the links that follow it: the domain of each address of
-            the web cited, once each, in markdown, which the web application shows as links.  The
-            addresses that are not http:// or https:// are left out.
+            The body of a request of the Responses interface of OpenAI, with its search of the web
+            when web is true, the summary of its reasoning when summary is true, and its stream
+            when stream is true.  The system messages keep their role, an earlier answer goes as a
+            text of the assistant marked as a final answer, and the images of the user as data
+            URLs.  No sampling parameter leaves, the models of this generation refusing
+            temperature and top_p, and OpenAI keeps no copy of the answer for later (store).
+        */
+        json chatgpt_body(const relay_model& m, const std::vector<message>& msgs, const json& request,
+            const std::string& effort, bool web, bool summary, bool stream)
+        {
+            json body = json::object();
+            body["model"] = m.id;
+            json input = json::array();
+            for (const message& msg : msgs)
+            {
+                json one = json::object();
+                one["role"] = msg.role;
+                if (msg.role == "user")
+                {
+                    json parts = json::array();
+                    for (const part& p : msg.parts)
+                    {
+                        json c = json::object();
+                        if (p.image)
+                        {
+                            c["type"] = "input_image";
+                            c["image_url"] = p.text;
+                        }
+                        else if (!p.text.empty())
+                        {
+                            c["type"] = "input_text";
+                            c["text"] = p.text;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                        parts.push_back(c);
+                    }
+                    if (parts.size() == 0) continue;
+                    one["content"] = parts;
+                }
+                else
+                {
+                    std::string text;
+                    for (const part& p : msg.parts)
+                        if (!p.image && !p.text.empty()) text += (text.empty() ? "" : "\n\n") + p.text;
+                    if (text.empty()) continue;
+                    one["content"] = text;
+                    if (msg.role == "assistant") one["phase"] = "final_answer";
+                }
+                input.push_back(one);
+            }
+            body["input"] = input;
+            // The bound of the answer, its reasoning included, when the request gives one, within those of the model.
+            for (const char* k : { "max_tokens", "max_completion_tokens" })
+            {
+                const long long n = request[k].as_int(0);
+                if (n > 0) body["max_output_tokens"] = std::min<long long>(std::max<long long>(n, 16), m.max_output);
+            }
+            json reasoning = json::object();
+            if (!effort.empty()) reasoning["effort"] = effort;
+            if (summary && effort != "none") reasoning["summary"] = "auto";
+            body["reasoning"] = reasoning;
+            body["store"] = false;
+            body["stream"] = stream;
+            if (web)
+            {
+                json tool = json::object();
+                tool["type"] = "web_search";
+                json tools = json::array();
+                tools.push_back(tool);
+                body["tools"] = tools;
+                body["max_tool_calls"] = chatgpt_web_calls;
+            }
+            return body;
+        }
+
+        /*
+            The sources of a text, the links that follow it: the domain of each address of the web
+            cited, once each, in markdown, which the web application shows as links.  The addresses
+            that are not http:// or https:// are left out.
         */
         std::string source_links(const std::vector<std::string>& urls)
         {
@@ -977,6 +1096,188 @@ namespace albireo
             return "stop";
         }
 
+        class responses_reader
+        {
+            /*!
+                WHAT THIS OBJECT REPRESENTS
+                    An answer of the Responses interface of OpenAI as it is read, from the
+                    events of its stream (event()) or from the response sent whole (whole()).
+                    The text of the final answer goes to emit as the content.  The summary of
+                    the reasoning, the messages marked as a commentary, which the model writes
+                    while it works, and the queries of its searches of the web go as the
+                    reasoning, each piece a blank line after the one before.  The sources that
+                    a text cites without their address in its own words follow it as links.
+            !*/
+        public:
+            typedef std::function<void(int kind, const std::string& text)> emitter;
+
+            explicit responses_reader(emitter emit) : emit_(std::move(emit)) {}
+
+            std::string finish = "stop";
+            std::string failure;                // the message of the error that ended the answer
+            long long input_tokens = 0, output_tokens = 0, cached_tokens = 0;
+            long long web_searches = 0;         // the searches of the web, which OpenAI bills one by one
+            bool ended = false;
+
+            void event(const std::string& name, const json& e)
+            {
+                const std::string type = e["type"].is_string() ? e["type"].as_string() : name;
+                const long long at = e["output_index"].as_int(0);
+                if (type == "response.output_item.added")
+                {
+                    if (e["item"]["type"].as_string() == "message" && e["item"]["phase"].as_string() == "commentary")
+                        commentary_.push_back(at);
+                }
+                else if (type == "response.output_text.delta" || type == "response.refusal.delta")
+                {
+                    if (aside(at)) think("message " + std::to_string(at), e["delta"].as_string());
+                    else emit_(ALBIREO_EVENT_CONTENT, e["delta"].as_string());
+                }
+                else if (type == "response.reasoning_summary_text.delta" || type == "response.reasoning_text.delta")
+                {
+                    think("summary " + std::to_string(at) + " " + std::to_string(e["summary_index"].as_int(0)),
+                        e["delta"].as_string());
+                }
+                else if (type == "response.content_part.done")
+                {
+                    if (!aside(at)) emit_(ALBIREO_EVENT_CONTENT, sources_of(e["part"]));
+                }
+                else if (type == "response.output_item.done")
+                {
+                    if (e["item"]["type"].as_string() == "web_search_call") search(e["item"]);
+                }
+                else if (type == "response.completed" || type == "response.incomplete")
+                {
+                    end(e["response"]);
+                }
+                else if (type == "response.failed")
+                {
+                    fail(e["response"]["error"]);
+                }
+                else if (type == "error")
+                {
+                    fail(e["error"].is_object() ? e["error"] : e);
+                }
+            }
+
+            void whole(const json& response)
+            {
+                long long at = 0;
+                for (const json& item : response["output"].elements())
+                {
+                    const std::string kind = item["type"].as_string();
+                    const std::string piece = "item " + std::to_string(at++);
+                    if (kind == "reasoning")
+                    {
+                        long long n = 0;
+                        for (const json& part : item["summary"].elements())
+                            think(piece + " " + std::to_string(n++), part["text"].as_string());
+                    }
+                    else if (kind == "web_search_call")
+                    {
+                        search(item);
+                    }
+                    else if (kind == "message")
+                    {
+                        const bool commentary = item["phase"].as_string() == "commentary";
+                        for (const json& part : item["content"].elements())
+                        {
+                            const std::string text = part["type"].as_string() == "refusal"
+                                ? part["refusal"].as_string() : part["text"].as_string();
+                            if (commentary) think(piece, text);
+                            else emit_(ALBIREO_EVENT_CONTENT, text + sources_of(part));
+                        }
+                    }
+                }
+                if (response["status"].as_string() == "failed") fail(response["error"]);
+                else end(response);
+            }
+
+        private:
+            bool aside(long long output_index) const
+            {
+                return std::find(commentary_.begin(), commentary_.end(), output_index) != commentary_.end();
+            }
+
+            // A piece of the reasoning, a blank line after the piece before it.
+            void think(const std::string& piece, const std::string& text)
+            {
+                if (text.empty()) return;
+                if (!piece_.empty() && piece != piece_) emit_(ALBIREO_EVENT_REASONING, "\n\n");
+                piece_ = piece;
+                emit_(ALBIREO_EVENT_REASONING, text);
+            }
+
+            // The queries of a search of the web, shown with the reasoning as those of Claude are.
+            void search(const json& item)
+            {
+                const json& action = item["action"];
+                if (action["type"].as_string() != "search") return;
+                ++web_searches;
+                std::vector<std::string> queries;
+                if (action["query"].is_string()) queries.push_back(action["query"].as_string());
+                for (const json& q : action["queries"].elements())
+                    if (q.is_string() && queries.size() < 8
+                        && std::find(queries.begin(), queries.end(), q.as_string()) == queries.end())
+                        queries.push_back(q.as_string());
+                for (const std::string& q : queries)
+                    if (!q.empty()) emit_(ALBIREO_EVENT_REASONING, "\nweb_search: " + q.substr(0, 300) + "\n");
+            }
+
+            /*
+                The links of the sources that a part of a text cites (url_citation) and that its
+                words do not hold already: the model writes its citations as links in the text
+                itself, which then needs none after it.
+            */
+            static std::string sources_of(const json& part)
+            {
+                if (!part["text"].is_string()) return std::string();
+                const std::string& text = part["text"].as_string();
+                std::vector<std::string> urls;
+                for (const json& a : part["annotations"].elements())
+                {
+                    if (a["type"].as_string() != "url_citation" || !a["url"].is_string() || urls.size() >= 16) continue;
+                    if (text.find(a["url"].as_string()) == std::string::npos) urls.push_back(a["url"].as_string());
+                }
+                return source_links(urls);
+            }
+
+            // The usage of a response and the reason of one that ends before its last word.
+            void end(const json& response)
+            {
+                const json& usage = response["usage"];
+                input_tokens = usage["input_tokens"].as_int(input_tokens);
+                output_tokens = usage["output_tokens"].as_int(output_tokens);
+                cached_tokens = usage["input_tokens_details"]["cached_tokens"].as_int(cached_tokens);
+                const std::string why = response["incomplete_details"]["reason"].as_string();
+                if (why == "max_output_tokens") finish = "length";
+                else if (why == "content_filter") finish = "content_filter";
+                ended = true;
+            }
+
+            void fail(const json& error)
+            {
+                failure = error["message"].is_string() ? error["message"].as_string() : error["code"].as_string();
+                if (failure.empty()) failure = "the response failed";
+            }
+
+            emitter emit_;
+            std::vector<long long> commentary_;     // the places of the messages marked as a commentary
+            std::string piece_;                     // the piece of the reasoning written last
+        };
+
+        /*
+            What the error of a request of the Responses interface refuses to the account of its key,
+            by the parameter it names: "reasoning.summary", the summary of the reasoning, which
+            OpenAI gives to the organizations it verified, or "stream".  Empty for another error.
+        */
+        std::string refused_option(const std::string& error_body)
+        {
+            const json e = json::parse_or_null(error_body.substr(0, 64 * 1024));
+            const std::string param = e["error"]["param"].as_string();
+            return param == "reasoning.summary" || param == "stream" ? param : std::string();
+        }
+
         json error_event(const std::string& message, const std::string& code)
         {
             json e = json::object();
@@ -995,7 +1296,14 @@ namespace albireo
             for (const known_model& k : claude_models) list.push_back(model_of(k));
         if (provider == "ollama")
             for (const known_model& k : ollama_models) list.push_back(model_of(k));
+        if (provider == "chatgpt")
+            for (const known_model& k : chatgpt_models) list.push_back(model_of(k));
         return list;
+    }
+
+    bool relay_provider_searches(const std::string& provider)
+    {
+        return provider == "claude" || provider == "chatgpt";
     }
 
     bool valid_relay_url(const std::string& url)
@@ -1017,6 +1325,7 @@ namespace albireo
         }
         if (r.provider == "claude") return "https://api.anthropic.com/v1";
         if (r.provider == "ollama") return "https://ollama.com/v1";
+        if (r.provider == "chatgpt") return "https://api.openai.com/v1";
         std::string url = r.url;
         while (!url.empty() && url.back() == '/') url.pop_back();
         return url;
@@ -1098,7 +1407,7 @@ namespace albireo
     json relay_catalog()
     {
         json providers = json::array();
-        for (const char* id : { "openai", "ollama", "claude" })
+        for (const char* id : relay_providers)
         {
             relay_settings r;
             r.provider = id;
@@ -1205,12 +1514,12 @@ namespace albireo
         if (request["tools"].size() > 0)
             return refuse(400, "tools_not_supported", "the relay takes no tools: the agent mode and the web access "
                 "stay with the models of the computer");
-        // The search of the web that Claude makes itself, which the web access of the settings allows.
+        // The search of the web that the external model makes itself, which the web access of the settings allows.
         if (request["web_search"].as_bool(false))
         {
-            if (st.relay.provider != "claude")
-                return refuse(400, "web_search_not_supported", "the search of the web of the relay takes Claude, which "
-                    "searches the web itself");
+            if (!relay_provider_searches(st.relay.provider))
+                return refuse(400, "web_search_not_supported", "the search of the web of the relay takes a provider "
+                    "whose models search the web themselves, Claude or ChatGPT");
             if (!st.web_access) return refuse(403, "web_access_off", "the administrator turned the web access off");
             // Pseudalis replaces the names before they leave: the searches would look for its substitutes.
             if (st.relay.pseudonymize)
@@ -1425,23 +1734,38 @@ namespace albireo
             else reasoning_off = true;
         }
         const bool claude = r.provider == "claude";
+        const bool chatgpt = r.provider == "chatgpt";
         // The settings of the answer itself: the web access and the pseudonymization may have changed since submit().
-        const bool web = claude && request["web_search"].as_bool(false) && st.web_access && !r.pseudonymize;
-        const json body = claude ? claude_body(m, msgs, request, effort, web)
-                                 : openai_body(r, m, msgs, request, effort, reasoning_off);
+        const bool web = relay_provider_searches(r.provider) && request["web_search"].as_bool(false) && st.web_access
+            && !r.pseudonymize;
+        // What OpenAI refused to the account of this key, which its requests leave out.
+        const std::string account = chatgpt ? sha256_hex(r.secret) : std::string();
+        refused_options left_out;
+        if (chatgpt)
+        {
+            std::lock_guard<std::mutex> lock(refused_m_);
+            const auto known = refused_.find(account);
+            if (known != refused_.end()) left_out = known->second;
+        }
+        json body = claude ? claude_body(m, msgs, request, effort, web)
+            : chatgpt ? chatgpt_body(m, msgs, request, effort, web, !left_out.summary, !left_out.stream)
+            : openai_body(r, m, msgs, request, effort, reasoning_off);
         msgs.clear();
 
         // The base of an engine of the interface of OpenAI, as typed or with /v1, which its models tell once.
         const std::string base = base_of(r, &j->control);
         url_parts u;
-        if (!parse_url(base + (claude ? "/messages" : "/chat/completions"), u))
+        if (!parse_url(base + (claude ? "/messages" : chatgpt ? "/responses" : "/chat/completions"), u))
         {
             fail("the relay has no valid address", "relay_unavailable");
             return;
         }
         std::string error, refusal;
         const bool offline = st.offline;
-        std::shared_ptr<httplib::Client> client = relay_client(r, offline, u.origin, 300, error, refusal);
+        // The time a provider may stay silent: the ten minutes of the libraries of OpenAI for its models, whose
+        // reasoning may come without its summary, five minutes for the others.
+        std::shared_ptr<httplib::Client> client = relay_client(r, offline, u.origin, chatgpt ? 600 : 300, error,
+            refusal);
         if (!client)
         {
             // A refusal of the offline mode answers with the code offline, an engine out of reach with its own.
@@ -1514,6 +1838,7 @@ namespace albireo
             if (kind == "web_search_tool_result" && b["content"]["error_code"].is_string())
                 emit(ALBIREO_EVENT_REASONING, "\nweb_search: " + b["content"]["error_code"].as_string() + "\n");
         };
+        responses_reader responses(emit);
         auto on_event = [&](const std::string& name, const std::string& data) {
             if (!claude && data == "[DONE]")
             {
@@ -1523,6 +1848,15 @@ namespace albireo
             const json e = json::parse_or_null(data);
             if (!e.is_object()) return;
             ++events;
+            if (chatgpt)
+            {
+                responses.event(name, e);
+                ended = ended || responses.ended;
+                if (!responses.failure.empty())
+                    provider_failure = "the external engine ended its answer with an error: "
+                        + redacted(responses.failure, r).substr(0, 300);
+                return;
+            }
             if (claude)
             {
                 const std::string type = e["type"].is_string() ? e["type"].as_string() : name;
@@ -1614,12 +1948,6 @@ namespace albireo
             }
         };
 
-        httplib::Request req;
-        req.method = "POST";
-        req.path = u.target;
-        req.headers = headers_of(r);
-        req.body = body.dump();
-        req.set_header("Content-Type", "application/json");
         int status = 0;
         std::string error_body;
         sse_reader reader;
@@ -1630,7 +1958,7 @@ namespace albireo
         */
         std::string type;
         bool sniffed = false;
-        req.response_handler = [&](const httplib::Response& res) {
+        auto on_response = [&](const httplib::Response& res) {
             status = res.status;
             type = res.get_header_value("Content-Type");
             std::transform(type.begin(), type.end(), type.begin(),
@@ -1639,7 +1967,7 @@ namespace albireo
             sniffed = streamed || type.find("json") != std::string::npos;
             return !j->control.cancelled();
         };
-        req.content_receiver = [&](const char* data, size_t n, uint64_t, uint64_t) {
+        auto on_content = [&](const char* data, size_t n, uint64_t, uint64_t) {
             if (j->control.cancelled()) return false;
             if (status != 200)
             {
@@ -1677,31 +2005,84 @@ namespace albireo
             }
             return provider_failure.empty();
         };
-        httplib::Response res;
         httplib::Error transfer = httplib::Error::Success;
         bool sent = false;
-        try
+        // Sends the body, whose answer the two functions above read as it comes.
+        auto send = [&]() {
+            httplib::Request req;
+            req.method = "POST";
+            req.path = u.target;
+            req.headers = headers_of(r);
+            req.body = body.dump();
+            req.set_header("Content-Type", "application/json");
+            req.response_handler = on_response;
+            req.content_receiver = on_content;
+            httplib::Response res;
+            status = 0;
+            error_body.clear();
+            transfer = httplib::Error::Success;
+            sent = false;
+            try
+            {
+                sent = client->send(req, res, transfer);
+            }
+            catch (...)
+            {
+                // The cancellation of the requests of the service, before the connection.
+                transfer = httplib::Error::Canceled;
+            }
+        };
+        send();
+        /*
+            A request that OpenAI refuses for the summary of its reasoning, which it gives to the
+            organizations it verified, or for its stream, goes again without the one refused, as
+            the next requests of the key do: the answer then comes without its reasoning, or whole.
+        */
+        for (int again = 0; chatgpt && again < 2 && status == 400 && !j->control.cancelled(); ++again)
         {
-            sent = client->send(req, res, transfer);
+            const std::string refused = refused_option(error_body);
+            if (refused == "reasoning.summary" && !left_out.summary)
+            {
+                left_out.summary = true;
+                body["reasoning"].erase("summary");
+            }
+            else if (refused == "stream" && !left_out.stream)
+            {
+                left_out.stream = true;
+                body["stream"] = false;
+            }
+            else
+            {
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(refused_m_);
+                if (refused_.size() >= max_refused && refused_.find(account) == refused_.end()) refused_.clear();
+                refused_[account] = left_out;
+            }
+            send();
         }
-        catch (...)
-        {
-            // The cancellation of the requests of the service, before the connection.
-            transfer = httplib::Error::Canceled;
-        }
-        req.body.clear();
-        req.headers.clear();
+        body = json();
         j->control.release();
         if (status == 200 && sent && streamed) reader.finish(on_event);
         if (status == 200 && sent && !streamed && !too_large)
         {
             /*
-                An answer sent whole: the completion of the interface of OpenAI, or the message of
-                Anthropic, read as the last events of a stream would be.
+                An answer sent whole: the completion or the response of the interface of OpenAI,
+                or the message of Anthropic, read as the last events of a stream would be.
             */
             const json a = json::parse_or_null(whole);
             wipe_secret(whole);
-            if (claude && a["content"].is_array())
+            if (chatgpt && a["output"].is_array())
+            {
+                ++events;
+                responses.whole(a);
+                ended = responses.ended;
+                if (!responses.failure.empty())
+                    provider_failure = "the external engine answered with an error: "
+                        + redacted(responses.failure, r).substr(0, 300);
+            }
+            else if (claude && a["content"].is_array())
             {
                 ++events;
                 for (const json& b : a["content"].elements())
@@ -1777,6 +2158,14 @@ namespace albireo
             fail("the external engine gave no answer that the relay can read", "relay_failed");
             return;
         }
+        if (chatgpt)
+        {
+            finish = responses.finish;
+            prompt_tokens = responses.input_tokens;
+            completion_tokens = responses.output_tokens;
+            cached_tokens = responses.cached_tokens;
+            web_searches = responses.web_searches;
+        }
         // The substitutes that the end of the answer completes, then the end itself.
         const std::string reasoning_rest = reasoning_restorer.finish();
         if (!reasoning_rest.empty()) j->sink(ALBIREO_EVENT_REASONING, reasoning_rest);
@@ -1790,7 +2179,7 @@ namespace albireo
         usage["completion_tokens"] = completion_tokens;
         usage["total_tokens"] = prompt_tokens + completion_tokens;
         usage["cached_tokens"] = cached_tokens;
-        // The searches of the web of Claude, which Anthropic bills apart.
+        // The searches of the web of the external model, which its provider bills apart.
         if (web_searches > 0) usage["web_search_requests"] = web_searches;
         json timings = json::object();
         timings["queued_ms"] = 0.0;

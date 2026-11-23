@@ -82,6 +82,20 @@ namespace ui
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
         }
 
+        /*
+            A list to choose from shows the height of its field whatever height it is given, the
+            rest of that height going to its list.  This subclass changes nothing of the control:
+            its data holds the height the control was last given, which place() compares with the
+            next one.
+        */
+        const UINT_PTR given_height = 1;
+
+        LRESULT CALLBACK keep_height(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR)
+        {
+            if (msg == WM_NCDESTROY) RemoveWindowSubclass(w, keep_height, id);
+            return DefSubclassProc(w, msg, wp, lp);
+        }
+
         struct png_source
         {
             const void* data = nullptr;
@@ -280,6 +294,7 @@ namespace ui
         const DWORD kind = editable ? (CBS_DROPDOWN | CBS_AUTOHSCROLL) : CBS_DROPDOWNLIST;
         HWND c = create(parent, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | kind, id);
         set_font(c, parent);
+        SetWindowSubclass(c, keep_height, given_height, 0);
         return c;
     }
 
@@ -336,10 +351,19 @@ namespace ui
         RECT r;
         GetWindowRect(control, &r);
         MapWindowPoints(HWND_DESKTOP, GetParent(control), reinterpret_cast<POINT*>(&r), 2);
-        if (r.left == x && r.top == y && r.right - r.left == w && r.bottom - r.top == h) return;
+        /*
+            A placement that repeats the previous one is left out, so that a window laid out at
+            each of its refreshes paints nothing again and leaves an open list open.  The height
+            a list to choose from was given stands for the one it shows.
+        */
+        DWORD_PTR given = 0;
+        const bool list = GetWindowSubclass(control, keep_height, given_height, &given) != FALSE;
+        const int height = list ? static_cast<int>(given) : static_cast<int>(r.bottom - r.top);
+        if (r.left == x && r.top == y && r.right - r.left == w && height == h) return;
         // A control that moves paints itself again: the pixels it would carry along may
         // hold a part of a sibling that moved before it.
         SetWindowPos(control, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        if (list) SetWindowSubclass(control, keep_height, given_height, static_cast<DWORD_PTR>(h));
     }
 
     int button_width(HWND button, int min_width, const std::vector<std::wstring>& texts)
@@ -363,6 +387,19 @@ namespace ui
         return button_width(button, min_width, { text_of(button) });
     }
 
+    int text_height(HWND label, int width)
+    {
+        const std::wstring text = text_of(label);
+        if (text.empty() || width <= 0) return 0;
+        HDC dc = GetDC(label);
+        HGDIOBJ old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(label, WM_GETFONT, 0, 0)));
+        RECT r = { 0, 0, width, 0 };
+        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(label, dc);
+        return static_cast<int>(r.bottom);
+    }
+
     std::wstring text_of(HWND control)
     {
         const int n = GetWindowTextLengthW(control);
@@ -384,7 +421,17 @@ namespace ui
 
     void enable(HWND control, bool on)
     {
+        /*
+            Windows takes the focus from a control disabled while it holds it and gives it to no
+            other one.  The control takes it back when it is enabled again, unless another
+            control took it in between or the window is no longer the active one.
+        */
+        static HWND held = nullptr;
+        if (!on && GetFocus() == control) held = control;
         EnableWindow(control, on ? TRUE : FALSE);
+        if (!on || held != control) return;
+        held = nullptr;
+        if (GetFocus() == nullptr && GetActiveWindow() == GetAncestor(control, GA_ROOT)) SetFocus(control);
     }
 
     int message(HWND owner, const std::wstring& text, UINT flags)
