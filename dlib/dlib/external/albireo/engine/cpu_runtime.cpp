@@ -1502,8 +1502,8 @@ namespace albireo
                 if (!layer_pass_->retreat()) break;
                 if (left)
                 {
-                    note(detail + ", the products of the device returning to single precision and the device "
-                        "attending the longer passes again");
+                    note(detail + ", the products of the device taking an arithmetic of higher precision and the "
+                        "device attending the longer passes again");
                     long_attention_differs_ = false;
                     layer_pass_->allow_long_attention(true);
                     together = layer_pass_->attends_many();
@@ -1511,7 +1511,7 @@ namespace albireo
                 }
                 else
                 {
-                    note(detail + ", the products of the device returning to single precision");
+                    note(detail + ", the products of the device taking an arithmetic of higher precision");
                 }
             }
             note(detail);
@@ -2538,7 +2538,7 @@ namespace albireo
             // A pass that differs with products of lower precision is compared again without them.
             if (outcome == 0 && hybrid_pass_->retreat())
             {
-                note(detail + ", the products of the device returning to single precision");
+                note(detail + ", the products of the device taking an arithmetic of higher precision");
                 outcome = probe_hybrid_pass(n, 2, detail);
                 if (outcome < 0) return;
             }

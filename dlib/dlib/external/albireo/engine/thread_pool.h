@@ -14,6 +14,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "../common/system_info.h"
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #define ALBIREO_CPU_RELAX() _mm_pause()
@@ -232,6 +234,8 @@ namespace albireo
 
         void worker_loop(int thread, uint64_t seen)
         {
+            // The workers compute what someone waits for: Windows leaves them at full speed.
+            leave_thread_throttling();
             for (;;)
             {
                 // Spin for a while, then sleep until the next section.

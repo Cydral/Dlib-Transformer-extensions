@@ -283,6 +283,16 @@ than on 8 threads at each stage of the table (19.48 tokens per second against 15
 A processor whose efficient cores are slower may write faster on its performance cores alone, which
 `threads` sets and `bench_runtime model.gguf --threads 8,24` measures.
 
+Windows infers the quality of service of a thread that asks for none. Its documentation gives the
+threads of a background service the level it names Utility, which on battery takes the most
+efficient processor frequency and the efficient cores; a program whose window is hidden gets the
+same treatment, and one whose window is visible out of focus a level between that one and the high
+one. The service therefore asks for the high quality of service for its process when it starts
+(`SetProcessInformation()`, a line of its log tells it), and the worker threads of the engines ask
+for it themselves in any program that loads them (`SetThreadInformation()`), as `bench_runtime`
+does for its process. The environment variable `ALBIREO_THREAD_QOS=system` leaves the choice to
+Windows, to measure what it changes or to favour the battery.
+
 On 24 threads of that machine, Qwen3 0.6B Q4_K_M read its first pass at 1172 to 1290 tokens per
 second with the graph against 1304 to 1354, its later passes at 317 to 428 against 1063 to 1088, and
 wrote at 38.9 to 43.3 against 80.6 to 87.7; three answers of Qwen3-VL 4B written at once came at
@@ -495,11 +505,18 @@ in a budget:
   (`tt::gguf_gemm()`), each tile writing its columns of the result in place. The card computes
   these products in the arithmetic it runs fastest among those it has: single precision, the single
   precision of the tensor cores (TF32, from the compute capability 8.0 on), or weights and
-  activations in half precision with sums in single precision (from 7.0 on). The first such product
-  times them on its matrix with 256 rows of zeros, a first run settling the kernels of cuBLAS, and
-  the log gives the times; `gemm_precision` imposes one (`single`, `tf32`, `half`). The halves serve
-  the layers of the dense models alone: a pass that holds a value beyond them (65504) is computed
-  again by the processor, and the passes that follow leave the halves. A block of
+  activations in half precision with sums in single precision (from 7.0 on). The first pass of 64
+  tokens or more times them with 256 rows of zeros on the quantized matrix of most weights of its
+  first layer, a first product settling the kernels of cuBLAS and the shortest of three others
+  counting, and the log gives the times: timed on the first matrix a pass met, a square matrix of
+  1,536 columns, two arithmetics came out equal at the hundredth of a millisecond while the prompts
+  of that model ran half as fast again with one of them. `gemm_precision` imposes one (`single`,
+  `tf32`, `half`). The halves serve the layers of the dense models alone: a pass that holds a value
+  beyond them (65504) is computed again by the processor, and the passes of that model that follow
+  leave the halves. A pass that differs from the processor at the start of a model gives up one
+  arithmetic at a time, the halves then the one of the tensor cores, and is compared again; what a
+  model gives up stays its own, the other models keeping the arithmetics the card runs fastest.
+  A block of
   eight warps copies the activations of up to eight tokens to its shared memory by chunks of 1,024
   columns, which its warps read 16 bytes at a time without conflicts of banks: each lane read its
   own group of 32 activations from the caches before, 128 bytes away from those of the next lanes,
@@ -537,8 +554,18 @@ that ends a block in the same launch as the normalization that follows it
 keys, the rotary positions, those of the queries and of the keys in one launch, and the attention
 ([`dlib/cuda/kv_pages.h`](../../cuda/kv_pages.h), `tt::paged_kv_store()`, `tt::paged_attention()`
 and `tt::paged_attention_rows()`): it keeps copies of the pages of keys and values in their format
-and writes the keys and values of the tokens of the pass into them. A layer of a generated token
-is 13 launches, where it was 16. For a pass of up to 8 tokens, as a step of the generation, a
+and writes the keys and values of the tokens of the pass into them. For a pass of fewer than 64
+tokens, the matrices of one format and one width that multiply the same rows go to the card
+together, up to three in a launch whose blocks each compute a matrix (`tt::gguf_matvec_group()`):
+the queries, keys and values of a layer, and the nine inputs of the attention of a hybrid layer in
+three launches. The two products of the feed-forward block of a token and their gate take one
+launch, a warp reading the row of both matrices (`tt::gguf_matvec_swiglu()`). A layer of a
+generated token is 9 launches, where it was 13, or 10 when its values keep another format than its
+queries and keys, as in half the layers of a Q4_K_M file. On a GeForce RTX 5070 Ti Laptop GPU a
+launch chained to the others took 6.5 microseconds, and 13 launches at that cost are 85 of the 282
+microseconds of a block of the size of Qwen3 4B. `test_device_ops` prints the time of a block both
+ways.
+For a pass of up to 8 tokens, as a step of the generation, a
 block of the card attends each token and key/value head, the positions of a token
 split among the blocks of the card when its heads alone would leave most of it idle, the partial
 sums being merged afterwards (the split of FlashDecoding). For a longer pass, as a chunk of a

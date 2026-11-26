@@ -55,6 +55,7 @@
 
 #include "../common/log.h"
 #include "../common/platform.h"
+#include "../common/system_info.h"
 #include "../common/version.h"
 #include "engine_host.h"
 #include "service.h"
@@ -86,6 +87,15 @@ namespace
     // Runs the service, again after each restart it asks for; returns the exit code.
     int serve(bool console)
     {
+        /*
+            The service computes answers someone waits for.  Windows infers the quality of
+            service of a process that asks for none, and may run the threads of a service at
+            a low processor frequency and on the efficient cores of a hybrid processor: the
+            process asks for the high quality of service, for its own threads and for those
+            of the runtimes its engines load.
+        */
+        if (albireo::leave_process_throttling())
+            albireo::log_info("service: the process computes outside the power throttling of the system");
         int failures = 0;
         while (!stop_requested)
         {

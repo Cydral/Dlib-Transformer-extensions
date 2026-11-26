@@ -1360,8 +1360,11 @@ namespace
         One token in a block of a dense decoder of the size of those of a model of 4 billion
         parameters (a width of 2,560, 32 query heads and 8 key/value heads of 128 values, a
         feed-forward block of 9,728), its matrices in Q4_K, the token attending 1,024 positions
-        in half precision: the 13 operations of the layer pass for a token, each alone with the
-        device waited for after it, then the time of the block as the layer pass chains them.
+        in half precision: the 13 operations of a block taken one by one, each alone with the
+        device waited for after it, then chained; and the 9 launches of the layer pass, which
+        computes the queries, keys and values in one launch and the two products of the
+        feed-forward block with their gate in another (tt::gguf_matvec_group(),
+        tt::gguf_matvec_swiglu()), with the same values.
     */
     void measure_dense(std::mt19937& rng)
     {
@@ -1462,6 +1465,74 @@ namespace
         std::printf("  dense block, one token: %8.1f us with the device waited for once (%.1f us operation by "
             "operation, %d operations); 36 such blocks, %.1f ms\n", chained * 1e6, sum * 1e6,
             static_cast<int>(steps.size()), chained * 36e3);
+
+        dlib::tensor* qkv[3] = { &q, &k, &v };
+        const dlib::tensor* qkv_weights[3] = { &wq, &wk, &wv };
+        const long qkv_rows[3] = { qd, kvd, kvd };
+        const std::vector<step> launches = {
+            { "residual sum and norm     ", [&]() {
+                dlib::tt::add_rms_norm_rows(xn, x, tmp, 0.01f, gamma, 1e-6f); } },
+            { "attn_q, attn_k and attn_v ", [&]() {
+                dlib::tt::gguf_matvec_group(qkv, xn, qkv_weights, 3, gb::q4_K, qkv_rows, d, rb_d); } },
+            { "rotation of queries, keys ", [&]() { dlib::tt::rope_rows(q, H, k, KVH, angles, hd, hd, true); } },
+            { "keys and values to pages  ", [&]() { dlib::tt::paged_kv_store(p, L, 0, k, v, slots); } },
+            { "attention, 1,024 positions", [&]() {
+                dlib::tt::paged_attention(ctx, q, H, 0.088f, p, L, 0, tk, tb, positions); } },
+            { "attn_output Q4_K 2560x4096", [&]() {
+                dlib::tt::gguf_matvec(tmp, ctx, wo, gb::q4_K, d, qd, gb::row_bytes(gb::q4_K, qd)); } },
+            { "residual sum and norm     ", [&]() {
+                dlib::tt::add_rms_norm_rows(xn, x, tmp, 0.01f, gamma, 1e-6f); } },
+            { "ffn_gate, ffn_up, the gate", [&]() {
+                dlib::tt::gguf_matvec_swiglu(gate, up, xn, w_gate, w_up, gb::q4_K, df, d, rb_d); } },
+            { "ffn_down    Q4_K 2560x9728", [&]() {
+                dlib::tt::gguf_matvec(tmp, gate, w_down, gb::q4_K, d, df, gb::row_bytes(gb::q4_K, df)); } }
+        };
+        /*
+            The launch of the three matrices against the three products one by one, before the
+            rotation turns their rows, then the gated values of one launch against the two
+            products and their gate.
+        */
+        auto values = [](const dlib::tensor& t) { return std::vector<float>(t.host(), t.host() + t.size()); };
+        steps[1].run();
+        steps[2].run();
+        steps[3].run();
+        const std::vector<float> q_ref = values(q), k_ref = values(k), v_ref = values(v);
+        launches[1].run();
+        expect(values(q) == q_ref && values(k) == k_ref && values(v) == v_ref,
+            "the queries, keys and values of one launch equal the three products launched one by one");
+        steps[9].run();
+        steps[10].run();
+        steps[11].run();
+        const std::vector<float> gate_ref = values(gate);
+        launches[7].run();
+        const std::vector<float> gated = values(gate);
+        float apart = 0, size = 1e-6f;
+        for (size_t i = 0; i < gate_ref.size(); ++i)
+        {
+            apart = std::max(apart, std::abs(gate_ref[i] - gated[i]));
+            size = std::max(size, std::abs(gate_ref[i]));
+        }
+        expect(apart <= 1e-5f * size, "the gated values of one launch follow the two products and their gate");
+        wait_device();
+        for (size_t i : { size_t(1), size_t(7) })
+        {
+            const auto start = std::chrono::steady_clock::now();
+            for (int r = 0; r < repeats; ++r)
+            {
+                launches[i].run();
+                wait_device();
+            }
+            std::printf("  dense block, %s in one launch: %8.1f us\n", launches[i].name,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() / repeats * 1e6);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i)
+            for (const step& s : launches) s.run();
+        wait_device();
+        const double fewer = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / repeats;
+        std::printf("  dense block, one token as the layer pass launches it: %8.1f us in %d launches, against %.1f us "
+            "in %d; 36 such blocks, %.1f ms\n", fewer * 1e6, static_cast<int>(launches.size()), chained * 1e6,
+            static_cast<int>(steps.size()), fewer * 36e3);
     }
 
     /*

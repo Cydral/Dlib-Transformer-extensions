@@ -282,11 +282,13 @@ namespace albireo
 
         /*
             The rows of zeros with which a device times the arithmetics of the products of its
-            longer passes (tensor_offload::choose_precision()), and the bytes the work of the
+            longer passes (tensor_offload::choose_precision()), the products it times in each
+            arithmetic after one that settles the kernels, and the bytes the work of the
             attention of such a pass takes at most on the device, its keys and values expanded
             and the scores of a run of its tokens (dlib::tt::paged_attention_rows()).
         */
         const long precision_probe_tokens = 256;
+        const int precision_timed_runs = 3;
         const size_t attention_work_bytes = size_t(384) << 20;
 
         // The pages of keys and values a first growth of the copies of a layer pass makes at least.
@@ -1337,20 +1339,125 @@ namespace albireo
                 return;
             }
             if (d_.precision.load(std::memory_order_relaxed) < 0) choose_precision(W, w);
-            const dlib::gguf_precision precision = static_cast<dlib::gguf_precision>(
-                (halves ? d_.precision : d_.float_precision).load(std::memory_order_relaxed));
+            const dlib::gguf_precision precision = precision_of(halves);
             reserve_buffer(tile_, tile_values(W, n, precision));
             if (precision == dlib::gguf_precision::half) halves_used_ = true;
             dlib::tt::gguf_gemm(y, x, w, type, W.rows, W.cols, W.row_bytes, tile_, precision, saturated_);
         }
 
+        // The matrices a launch of the device multiplies together (dlib::tt::gguf_matvec_group()).
+        static const int grouped_products = 3;
+
         /*
-            Chooses the arithmetic of the products of the longer passes, the first of which calls
-            it with its matrix: the one the configuration imposes ("gemm_precision"), or the
-            fastest of those the device computes with, timed on rows of zeros.  A first product in
-            each arithmetic settles the kernels of cuBLAS, a second one is timed, the device waited
-            for; an arithmetic that fails is left out, and a failure of the measure itself leaves
-            the products in single precision.
+            The products of the rows of x with count matrices, y[i] taking the one with W[i],
+            whose copy is c[i].  For a pass of a few tokens, the matrices kept in one GGUF format
+            and of one width go to the device together, up to grouped_products of them in a
+            launch (dlib::tt::gguf_matvec_group()): the time of a token on the device counts its
+            launches as well as the bytes it reads.  The other products go one by one
+            (product_on_device()).
+        */
+        void products_on_device(const weight_matrix* const* W, const copy* const* c, dlib::tensor* const* y, int count,
+            const dlib::tensor& x, bool halves = false)
+        {
+            const long n = x.num_samples();
+            std::vector<bool>& done = grouped_done_;
+            done.assign(static_cast<size_t>(count), false);
+            for (int i = 0; i < count; ++i)
+            {
+                if (done[static_cast<size_t>(i)]) continue;
+                done[static_cast<size_t>(i)] = true;
+                if (n >= expanded_product_tokens || !c[i]->quantized)
+                {
+                    product_on_device(*W[i], *c[i]->t, c[i]->quantized, x, *y[i], halves);
+                    continue;
+                }
+                dlib::tensor* dests[grouped_products] = { y[i] };
+                const dlib::tensor* weights[grouped_products] = { c[i]->t.get() };
+                long rows[grouped_products] = { W[i]->rows };
+                int members = 1;
+                for (int j = i + 1; j < count && members < grouped_products; ++j)
+                {
+                    if (done[static_cast<size_t>(j)] || !c[j]->quantized || W[j]->type != W[i]->type
+                        || W[j]->cols != W[i]->cols || W[j]->row_bytes != W[i]->row_bytes)
+                        continue;
+                    done[static_cast<size_t>(j)] = true;
+                    dests[members] = y[j];
+                    weights[members] = c[j]->t.get();
+                    rows[members] = W[j]->rows;
+                    ++members;
+                }
+                dlib::tt::gguf_matvec_group(dests, x, weights, members, static_cast<int>(W[i]->type), rows, W[i]->cols,
+                    W[i]->row_bytes);
+            }
+        }
+
+        /*
+            gate = silu(x Wg^T) * (x Wu^T), the gated values of a SwiGLU block, up serving as work.
+            For a pass of a few tokens whose two matrices share their GGUF format, the device
+            computes them in one launch for a token (dlib::tt::gguf_matvec_swiglu()); otherwise
+            the two products and their gate follow one another.
+        */
+        void gated_product_on_device(const weight_matrix& Wg, const copy& cg, const weight_matrix& Wu, const copy& cu,
+            const dlib::tensor& x, dlib::tensor& gate, dlib::tensor& up, bool halves = false)
+        {
+            if (x.num_samples() < expanded_product_tokens && cg.quantized && cu.quantized && Wg.type == Wu.type
+                && Wg.rows == Wu.rows && Wg.cols == Wu.cols && Wg.row_bytes == Wu.row_bytes)
+            {
+                dlib::tt::gguf_matvec_swiglu(gate, up, x, *cg.t, *cu.t, static_cast<int>(Wg.type), Wg.rows, Wg.cols,
+                    Wg.row_bytes);
+                return;
+            }
+            product_on_device(Wg, *cg.t, cg.quantized, x, gate, halves);
+            product_on_device(Wu, *cu.t, cu.quantized, x, up, halves);
+            dlib::tt::silu_multiply(gate, up);
+        }
+
+        /*
+            The arithmetic of a product of the longer passes of the model: the fastest one of the
+            device, or the fastest one of floats when the values of the product may lie beyond
+            the halves (halves false) or when the model left the halves, and single precision
+            once the model gave up the others (retreat_precision()).
+        */
+        dlib::gguf_precision precision_of(bool halves) const
+        {
+            if (single_only_) return dlib::gguf_precision::single;
+            return static_cast<dlib::gguf_precision>(
+                (halves && !no_halves_ ? d_.precision : d_.float_precision).load(std::memory_order_relaxed));
+        }
+
+        /*
+            Lets a pass of n tokens choose the arithmetic of the products of the longer passes on
+            the quantized matrix of most weights among those given, before its first product
+            through tiles.  The widest products of a layer decide the time of a pass, and the
+            arithmetics differ on them by more than the measure varies, which a narrow matrix
+            does not ensure.
+        */
+        void choose_precision_among(long n, std::initializer_list<std::pair<const weight_matrix*, const copy*>> given)
+        {
+            if (n < expanded_product_tokens || d_.precision.load(std::memory_order_relaxed) >= 0) return;
+            const weight_matrix* W = nullptr;
+            const copy* c = nullptr;
+            size_t most = 0;
+            for (const auto& m : given)
+            {
+                if (!m.first || !m.second || !m.second->quantized) continue;
+                const size_t weights = static_cast<size_t>(m.first->rows) * static_cast<size_t>(m.first->cols);
+                if (weights <= most) continue;
+                most = weights;
+                W = m.first;
+                c = m.second;
+            }
+            if (W) choose_precision(*W, *c->t);
+        }
+
+        /*
+            Chooses the arithmetic of the products of the longer passes: the one the configuration
+            imposes ("gemm_precision"), or the fastest of those the device computes with, timed on
+            rows of zeros with the matrix W, which a pass gives (choose_precision_among()) or
+            which is the one of the first of these products.  A first product in each arithmetic
+            settles the kernels of cuBLAS, precision_timed_runs others are timed, the device
+            waited for, and the shortest one counts; an arithmetic that fails is left out, and a
+            failure of the measure itself leaves the products in single precision.
         */
         void choose_precision(const weight_matrix& W, const dlib::tensor& w)
         {
@@ -1403,14 +1510,16 @@ namespace albireo
                         double seconds = -1;
                         try
                         {
-                            for (int run = 0; run < 2; ++run)
+                            for (int run = 0; run <= precision_timed_runs; ++run)
                             {
                                 cuda_check(cudaStreamSynchronize(0), "wait for the device");
                                 const auto start = std::chrono::steady_clock::now();
                                 dlib::tt::gguf_gemm(y, x, w, type, W.rows, W.cols, W.row_bytes, work, p, flag);
                                 cuda_check(cudaStreamSynchronize(0), "product of the tiles of a matrix on the device");
-                                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-                                    .count();
+                                const double taken = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - start).count();
+                                // The first product settles the kernels: the shortest of the others counts.
+                                if (run > 0 && (seconds < 0 || taken < seconds)) seconds = taken;
                             }
                         }
                         catch (const std::exception&)
@@ -1425,7 +1534,7 @@ namespace albireo
                         if (seconds < 0)
                             std::snprintf(text, sizeof(text), "%s%s failed", separator, precision_name(p));
                         else
-                            std::snprintf(text, sizeof(text), "%s%s %.2f ms", separator, precision_name(p),
+                            std::snprintf(text, sizeof(text), "%s%s %.3f ms", separator, precision_name(p),
                                 seconds * 1e3);
                         detail += text;
                         if (seconds < 0) continue;
@@ -1441,9 +1550,11 @@ namespace albireo
                         }
                     }
                     d_.message(ALBIREO_LOG_INFO, std::string("device: the products of the longer passes run in ")
-                        + precision_name(static_cast<gguf_precision>(best)) + ", the fastest for a matrix of "
-                        + std::to_string(W.rows) + " x " + std::to_string(W.cols) + " and " + std::to_string(n)
-                        + " tokens (" + detail + ")");
+                        + precision_name(static_cast<gguf_precision>(best)) + (best == best_floats ? std::string()
+                            : std::string(", or in ") + precision_name(static_cast<gguf_precision>(best_floats))
+                                + " when their values may lie beyond the halves")
+                        + ", the fastest for a matrix of " + std::to_string(W.rows) + " x " + std::to_string(W.cols)
+                        + " and " + std::to_string(n) + " tokens (" + detail + ")");
                 }
                 catch (const std::exception& e)
                 {
@@ -1504,32 +1615,34 @@ namespace albireo
         }
 
         /*
-            Gives up the arithmetics of lower precision for the products to come; false when the
-            device already computes them in single precision.
+            Gives up, for the products of the longer passes of the model to come, the arithmetic
+            of lowest precision they use: the halves first for a pass that computes with them
+            (halves), then the arithmetic of the tensor cores.  False when these products already
+            run in single precision.  The other models keep the arithmetics the device computes
+            fastest.
         */
-        bool retreat_precision(const std::string& why)
+        bool retreat_precision(const std::string& why, bool halves)
         {
-            const int single = static_cast<int>(dlib::gguf_precision::single);
-            if (d_.precision.load() == single && d_.float_precision.load() == single) return false;
             if (d_.precision.load() < 0) return false;
-            d_.precision = single;
-            d_.float_precision = single;
-            d_.message(ALBIREO_LOG_WARNING, "device: the products of the longer passes return to single precision ("
-                + why + ")");
+            const dlib::gguf_precision before = precision_of(halves);
+            if (before == dlib::gguf_precision::single) return false;
+            if (before == dlib::gguf_precision::half) no_halves_ = true;
+            else single_only_ = true;
+            d_.message(ALBIREO_LOG_WARNING, std::string("device: the products of the longer passes go on in ")
+                + precision_name(precision_of(halves)) + " (" + why + ")");
             return true;
         }
 
         /*
-            Keeps the products in half precision out of the passes to come, a value of a pass
-            having exceeded the halves: they go on in the fastest arithmetic of floats.
+            Keeps the products in half precision out of the passes of the model to come, a value
+            of a pass having exceeded the halves: they go on in the fastest arithmetic of floats.
         */
         void leave_halves()
         {
-            if (d_.precision.load() != static_cast<int>(dlib::gguf_precision::half)) return;
-            d_.precision = d_.float_precision.load();
+            if (no_halves_ || precision_of(true) != dlib::gguf_precision::half) return;
+            no_halves_ = true;
             d_.message(ALBIREO_LOG_INFO, "device: a value of a pass of '" + model_ + "' lies beyond the half "
-                "precision: the products of the longer passes go on in "
-                + precision_name(static_cast<dlib::gguf_precision>(d_.precision.load())));
+                "precision: the products of its longer passes go on in " + precision_name(precision_of(true)));
         }
 
         static const char* precision_name(dlib::gguf_precision p)
@@ -1919,6 +2032,15 @@ namespace albireo
         */
         dlib::resizable_tensor tile_, saturated_;
         bool halves_used_ = false;
+        /*
+            The arithmetics the products of the longer passes of the model gave up: the halves,
+            after a value beyond them or a pass that differed from the processor, and every
+            arithmetic but single precision, after a pass that still differed.
+        */
+        bool no_halves_ = false;
+        bool single_only_ = false;
+        // The matrices of a call of products_on_device() whose product is launched.
+        std::vector<bool> grouped_done_;
         // The matrix expanded on the host before it goes to w_ (CUDA).
         std::vector<float> expanded_;
         // The layer pass of the model, which keeps copies of its keys and values.
@@ -2004,6 +2126,13 @@ namespace albireo
                         for (const weight_matrix* W : { &L.wq, &L.wk, &L.wv, &L.wo, &L.w_gate, &L.w_up, &L.w_down })
                             tile_values = std::max(tile_values, tensor_offload::tile_values(*W, n));
                     tensor_offload::reserve_buffer(o_.tile_, tile_values);
+                    if (!m_.layers.empty())
+                    {
+                        const dense_layer& L = m_.layers[0];
+                        o_.choose_precision_among(n, { { &L.wq, copies_[0] }, { &L.wk, copies_[1] },
+                            { &L.wv, copies_[2] }, { &L.wo, copies_[3] }, { &L.w_gate, copies_[4] },
+                            { &L.w_up, copies_[5] }, { &L.w_down, copies_[6] } });
+                    }
                 }
                 n_ = n;
                 pending_ = false;
@@ -2079,7 +2208,7 @@ namespace albireo
 
         bool retreat() override
         {
-            return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor");
+            return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor", true);
         }
 
         bool begin_attention(const attention_plan& plan) override
@@ -2360,9 +2489,9 @@ namespace albireo
             dlib::alias_tensor_instance qv = view(qkv_, n_, qd);
             dlib::alias_tensor_instance kv = view(qkv_, n_, kvd, n_ * qd);
             dlib::alias_tensor_instance vv = view(qkv_, n_, kvd, n_ * (qd + kvd));
-            o_.product_on_device(L.wq, *c[0]->t, c[0]->quantized, xn, qv, true);
-            o_.product_on_device(L.wk, *c[1]->t, c[1]->quantized, xn, kv, true);
-            o_.product_on_device(L.wv, *c[2]->t, c[2]->quantized, xn, vv, true);
+            const weight_matrix* matrices[3] = { &L.wq, &L.wk, &L.wv };
+            dlib::tensor* products[3] = { &qv, &kv, &vv };
+            o_.products_on_device(matrices, c, products, 3, xn, true);
         }
 
         /*
@@ -2384,9 +2513,7 @@ namespace albireo
                 m_.rms_eps);
             dlib::alias_tensor_instance gate = view(gate_, n_, df);
             dlib::alias_tensor_instance up = view(up_, n_, df);
-            o_.product_on_device(L.w_gate, *c[4]->t, c[4]->quantized, xn, gate, true);
-            o_.product_on_device(L.w_up, *c[5]->t, c[5]->quantized, xn, up, true);
-            dlib::tt::silu_multiply(gate, up);
+            o_.gated_product_on_device(L.w_gate, *c[4], L.w_up, *c[5], xn, gate, up, true);
             o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp, true);
             // The output of the feed-forward block joins the hidden states with the next normalization, or at the end.
             pending_ = true;
@@ -2988,6 +3115,15 @@ namespace albireo
             {
                 if (!gather_copies()) return false;
                 if (constants_.empty()) copy_constants();
+                if (!copies_.empty())
+                {
+                    // The widest of the matrices of the first layer whose products go through tiles.
+                    const hybrid_layer& L = m_.layers[0];
+                    const layer_copies& c = copies_[0];
+                    o_.choose_precision_among(n, { { L.mamba ? &L.ssm_in : &L.wq, c.a }, { &L.wo, c.wo },
+                        { &L.latent_down, c.latent_down }, { &L.latent_up, c.latent_up },
+                        { &L.shared_up, c.shared_up }, { &L.shared_down, c.shared_down } });
+                }
                 ++clock_;
                 for (const segment& s : segments)
                 {
@@ -3121,12 +3257,16 @@ namespace albireo
                 const tensor_offload::copy* copies[9] = { c.a, c.b, c.wa_v, c.wb_k, c.wb_v, c.shift_k, c.shift_v,
                     c.noise, c.gate };
                 long at = 0;
+                std::vector<dlib::alias_tensor_instance> views;
+                views.reserve(9);
+                dlib::tensor* products[9];
                 for (int i = 0; i < 9; ++i)
                 {
-                    dlib::alias_tensor_instance y = view(attention_, n_, matrices[i]->rows, at);
-                    o_.product_on_device(*matrices[i], *copies[i]->t, copies[i]->quantized, x, y);
+                    views.push_back(view(attention_, n_, matrices[i]->rows, at));
                     at += n_ * matrices[i]->rows;
                 }
+                for (int i = 0; i < 9; ++i) products[i] = &views[static_cast<size_t>(i)];
+                o_.products_on_device(matrices, copies, products, 9, x);
                 const float* all = download(view(attention_, at, 1), static_cast<size_t>(at));
                 const size_t n = static_cast<size_t>(n_);
                 const size_t qd = static_cast<size_t>(L.wq.rows), fa = static_cast<size_t>(L.wa_k.rows);
@@ -3344,7 +3484,7 @@ namespace albireo
 
         bool retreat() override
         {
-            return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor");
+            return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor", false);
         }
 
         void report(bool ok, const std::string& detail) override

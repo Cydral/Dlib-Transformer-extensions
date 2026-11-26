@@ -237,7 +237,8 @@ namespace albireo
                 - Called when a pass of the device differed from the processor.  Returns true
                   when the device computed its products with an arithmetic of lower precision
                   that it gives up for the passes to come, which the runtime then compares
-                  again; false when it has no other way to compute.
+                  again; false when it has no other way to compute.  A call gives up one
+                  arithmetic, the one of lowest precision among those the pass still uses.
         !*/
         virtual bool retreat() { return false; }
 

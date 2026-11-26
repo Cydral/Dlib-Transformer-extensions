@@ -29,6 +29,29 @@ namespace dlib
             size_t row_bytes
         );
 
+        void gguf_matvec_group (
+            tensor* const* dests,
+            const tensor& src,
+            const tensor* const* weights,
+            int count,
+            int type,
+            const long* rows,
+            long cols,
+            size_t row_bytes
+        );
+
+        void gguf_matvec_swiglu (
+            tensor& dest,
+            tensor& work,
+            const tensor& src,
+            const tensor& gate_weights,
+            const tensor& up_weights,
+            int type,
+            long rows,
+            long cols,
+            size_t row_bytes
+        );
+
         void gguf_dequantize (
             tensor& dest,
             const tensor& weights,

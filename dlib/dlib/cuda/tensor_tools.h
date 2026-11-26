@@ -3243,6 +3243,60 @@ namespace dlib { namespace tt
               bounds.  For many rows, gguf_gemm() reads them once.
     !*/
 
+    void gguf_matvec_group (
+        tensor* const* dests,
+        const tensor& src,
+        const tensor* const* weights,
+        int count,
+        int type,
+        const long* rows,
+        long cols,
+        size_t row_bytes
+    );
+    /*!
+        requires
+            - 1 <= count <= 3
+            - dests, weights and rows point to count elements
+            - for all p < count: *dests[p], src, *weights[p], type, rows[p], cols and row_bytes
+              meet the requirements of gguf_matvec()
+            - the tensors of dests are distinct objects
+        ensures
+            - performs gguf_matvec(*dests[p], src, *weights[p], type, rows[p], cols, row_bytes)
+              for all p < count, with the same values: the products of several matrices of one
+              format and one width with the same rows, such as the queries, keys and values
+              of an attention block.
+            - With CUDA, the device computes the count products in one launch for every 8 rows
+              of src, where gguf_matvec() takes a launch for each matrix.  The time of the
+              generation of a token counts its launches as well as its readings.
+    !*/
+
+    void gguf_matvec_swiglu (
+        tensor& dest,
+        tensor& work,
+        const tensor& src,
+        const tensor& gate_weights,
+        const tensor& up_weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes
+    );
+    /*!
+        requires
+            - dest, src, gate_weights, type, rows, cols and row_bytes meet the requirements of
+              gguf_matvec(), and so do dest, src and up_weights
+            - work.size() == dest.size()
+            - dest, work and src are distinct objects
+        ensures
+            - performs: #dest[i] == g[i]*sigmoid(g[i])*u[i], g being the product of
+              gguf_matvec() with gate_weights and u the one with up_weights: the gated values
+              of a SwiGLU feed-forward block, as these two products followed by
+              silu_multiply() give them.
+            - With CUDA and a src of one row, the device computes dest in one launch and leaves
+              work as it is.  Otherwise the function computes the two products and their gate,
+              and work holds the product with up_weights.
+    !*/
+
     void gguf_dequantize (
         tensor& dest,
         const tensor& weights,

@@ -2050,6 +2050,48 @@ namespace dlib { namespace tt
 #endif
     }
 
+    void gguf_matvec_group (
+        tensor* const* dests,
+        const tensor& src,
+        const tensor* const* weights,
+        int count,
+        int type,
+        const long* rows,
+        long cols,
+        size_t row_bytes
+    )
+    {
+        DLIB_CASSERT(count >= 1 && count <= 3 && dests && weights && rows);
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_matvec_group(dests, src, weights, count, type, rows, cols, row_bytes);
+#else
+        for (int p = 0; p < count; ++p)
+            gguf_matvec(*dests[p], src, *weights[p], type, rows[p], cols, row_bytes);
+#endif
+    }
+
+    void gguf_matvec_swiglu (
+        tensor& dest,
+        tensor& work,
+        const tensor& src,
+        const tensor& gate_weights,
+        const tensor& up_weights,
+        int type,
+        long rows,
+        long cols,
+        size_t row_bytes
+    )
+    {
+        DLIB_CASSERT(work.size() == dest.size() && !is_same_object(dest, work));
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_matvec_swiglu(dest, work, src, gate_weights, up_weights, type, rows, cols, row_bytes);
+#else
+        gguf_matvec(dest, src, gate_weights, type, rows, cols, row_bytes);
+        gguf_matvec(work, src, up_weights, type, rows, cols, row_bytes);
+        silu_multiply(dest, work);
+#endif
+    }
+
     void gguf_dequantize (
         tensor& dest,
         const tensor& weights,

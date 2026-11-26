@@ -53,6 +53,56 @@ namespace dlib
                 return s;
             }
 
+            // The matrices a launch of gguf_matvec_kernel or of gguf_matvec_k_kernel computes at most.
+            const int matvec_parts = 3;
+
+            /*
+                The matrices of one format and one width that a launch multiplies by the same rows
+                of x: their blocks, their rows, the blocks of the grid that compute each of them,
+                a matrix after the other, and where their products go.  A paired launch (PAIR)
+                reads two matrices of rows[0] rows and writes to y[0], for its single row of x,
+                silu(w[0] x) * (w[1] x), the gated values of a SwiGLU block.
+            */
+            struct matvec_set
+            {
+                const uint8_t* w[matvec_parts];
+                float* y[matvec_parts];
+                int rows[matvec_parts];
+                int blocks[matvec_parts];
+            };
+
+            /*
+                acc[t] += the products of the 32 values v of a group with the group lane of row t
+                of the chunk that xs holds, for t < n.
+            */
+            template <int N>
+            __device__ __forceinline__ void add_group_products(
+                const float* v,
+                const float* xs,
+                int lane,
+                int n,
+                float* acc
+            )
+            {
+#pragma unroll
+                for (int t = 0; t < N; ++t)
+                {
+                    if (t < n)
+                    {
+                        const float4* x4 = reinterpret_cast<const float4*>(xs + (t * matvec_chunk + lane)
+                            * matvec_stride);
+                        float s = 0;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                        {
+                            const float4 a = x4[i];
+                            s += v[4 * i] * a.x + v[4 * i + 1] * a.y + v[4 * i + 2] * a.z + v[4 * i + 3] * a.w;
+                        }
+                        acc[t] += s;
+                    }
+                }
+            }
+
             /*
                 y[t * rows + r] = sum over i of W[r][i] * x[t * cols + i], for t < n <= N and r < rows.
 
@@ -65,30 +115,46 @@ namespace dlib
                 of contiguous blocks, and the warp adds the sums of its lanes.  A lane adds the
                 products of a group in the same order for every token and every n, so that a token
                 gets the same result in any launch.
+
+                The launch computes the matrices of set, each by its own blocks, or with PAIR the
+                gated values of its two matrices (matvec_set), a warp then computing the row of
+                both.
             */
-            template <int TYPE, int N>
+            template <int TYPE, int N, bool PAIR>
             __global__ void __launch_bounds__(32 * warps_per_block) gguf_matvec_kernel(
-                const uint8_t* __restrict__ w,
+                matvec_set set,
                 size_t row_bytes,
-                int rows,
                 int cols,
                 const float* __restrict__ x,
                 int n,
-                bool aligned,
-                float* __restrict__ y
+                bool aligned
             )
             {
                 __shared__ __align__(16) float xs[N * matvec_chunk * matvec_stride];
                 const int lane = threadIdx.x;
                 const int thread = threadIdx.y * 32 + lane;
-                const int row = blockIdx.x * warps_per_block + threadIdx.y;
+                int part = 0;
+                int block = blockIdx.x;
+                if (!PAIR && block >= set.blocks[0])
+                {
+                    block -= set.blocks[0];
+                    part = 1;
+                    if (block >= set.blocks[1])
+                    {
+                        block -= set.blocks[1];
+                        part = 2;
+                    }
+                }
+                const int rows = set.rows[part];
+                const int row = block * warps_per_block + threadIdx.y;
                 // A warp past the matrix copies its share of x and computes nothing.
                 const bool computes = row < rows;
-                const uint8_t* wr = w + static_cast<size_t>(computes ? row : 0) * row_bytes;
+                const uint8_t* wr = set.w[part] + static_cast<size_t>(computes ? row : 0) * row_bytes;
+                const uint8_t* wr2 = set.w[PAIR ? 1 : part] + static_cast<size_t>(computes ? row : 0) * row_bytes;
                 const int groups = cols / 32;
-                float acc[N];
+                float acc[N], acc2[N];
 #pragma unroll
-                for (int t = 0; t < N; ++t) acc[t] = 0;
+                for (int t = 0; t < N; ++t) acc[t] = acc2[t] = 0;
                 for (int first = 0; first < groups; first += matvec_chunk)
                 {
                     const int count = groups - first < matvec_chunk ? groups - first : matvec_chunk;
@@ -123,27 +189,25 @@ namespace dlib
                     {
                         float v[32];
                         gguf_blocks::decode_group<TYPE>(wr, first + lane, v);
-#pragma unroll
-                        for (int t = 0; t < N; ++t)
+                        add_group_products<N>(v, xs, lane, n, acc);
+                        if (PAIR)
                         {
-                            if (t < n)
-                            {
-                                const float4* x4 = reinterpret_cast<const float4*>(xs + (t * matvec_chunk + lane)
-                                    * matvec_stride);
-                                float s = 0;
-#pragma unroll
-                                for (int i = 0; i < 8; ++i)
-                                {
-                                    const float4 a = x4[i];
-                                    s += v[4 * i] * a.x + v[4 * i + 1] * a.y + v[4 * i + 2] * a.z + v[4 * i + 3] * a.w;
-                                }
-                                acc[t] += s;
-                            }
+                            gguf_blocks::decode_group<TYPE>(wr2, first + lane, v);
+                            add_group_products<N>(v, xs, lane, n, acc2);
                         }
                     }
                 }
                 // A warp past the matrix leaves once the last barrier is behind it.
                 if (!computes) return;
+                if (PAIR)
+                {
+                    // The expression of silu_multiply_kernel, so that both ways give the same values.
+                    const float g = warp_sum(acc[0]);
+                    const float u = warp_sum(acc2[0]);
+                    if (lane == 0) set.y[0][row] = g / (1.0f + expf(-g)) * u;
+                    return;
+                }
+                float* y = set.y[part];
 #pragma unroll
                 for (int t = 0; t < N; ++t)
                 {
@@ -162,33 +226,46 @@ namespace dlib
                 one super-block at a time, each lane taking the products of its 8 values with the n
                 rows of x, which the block copies to its shared memory by chunks of 4 super-blocks.
                 The warp adds the sums of its lanes.  A lane adds its products in the same order for
-                every token and every n, so that a token gets the same result in any launch.
+                every token and every n, so that a token gets the same result in any launch.  set
+                and PAIR as for gguf_matvec_kernel.
             */
-            template <int TYPE, int N>
+            template <int TYPE, int N, bool PAIR>
             __global__ void __launch_bounds__(32 * warps_per_block) gguf_matvec_k_kernel(
-                const uint8_t* __restrict__ w,
+                matvec_set set,
                 size_t row_bytes,
-                int rows,
                 int cols,
                 const float* __restrict__ x,
                 int n,
-                bool aligned,
-                float* __restrict__ y
+                bool aligned
             )
             {
                 const int span = matvec_supers * 256;
                 __shared__ __align__(16) float xs[N * matvec_supers * 256];
                 const int lane = threadIdx.x;
                 const int thread = threadIdx.y * 32 + lane;
-                const int row = blockIdx.x * warps_per_block + threadIdx.y;
+                int part = 0;
+                int block = blockIdx.x;
+                if (!PAIR && block >= set.blocks[0])
+                {
+                    block -= set.blocks[0];
+                    part = 1;
+                    if (block >= set.blocks[1])
+                    {
+                        block -= set.blocks[1];
+                        part = 2;
+                    }
+                }
+                const int rows = set.rows[part];
+                const int row = block * warps_per_block + threadIdx.y;
                 // A warp past the matrix copies its share of x and computes nothing.
                 const bool computes = row < rows;
-                const uint8_t* wr = w + static_cast<size_t>(computes ? row : 0) * row_bytes;
+                const uint8_t* wr = set.w[part] + static_cast<size_t>(computes ? row : 0) * row_bytes;
+                const uint8_t* wr2 = set.w[PAIR ? 1 : part] + static_cast<size_t>(computes ? row : 0) * row_bytes;
                 const size_t block_bytes = TYPE == gguf_blocks::q4_K ? 144 : 210;
                 const int supers = cols / 256;
-                float acc[N];
+                float acc[N], acc2[N];
 #pragma unroll
-                for (int t = 0; t < N; ++t) acc[t] = 0;
+                for (int t = 0; t < N; ++t) acc[t] = acc2[t] = 0;
                 for (int first = 0; first < supers; first += matvec_supers)
                 {
                     const int count = supers - first < matvec_supers ? supers - first : matvec_supers;
@@ -221,13 +298,29 @@ namespace dlib
                     {
 #pragma unroll
                         for (int s = 0; s < matvec_supers; ++s)
+                        {
                             if (s < count)
+                            {
                                 gguf_blocks::lane_products<TYPE, N>(wr + static_cast<size_t>(first + s) * block_bytes,
                                     xs + s * 256, span, n, lane, acc);
+                                if (PAIR)
+                                    gguf_blocks::lane_products<TYPE, N>(wr2 + static_cast<size_t>(first + s)
+                                        * block_bytes, xs + s * 256, span, n, lane, acc2);
+                            }
+                        }
                     }
                 }
                 // A warp past the matrix leaves once the last barrier is behind it.
                 if (!computes) return;
+                if (PAIR)
+                {
+                    // The expression of silu_multiply_kernel, so that both ways give the same values.
+                    const float g = warp_sum(acc[0]);
+                    const float u = warp_sum(acc2[0]);
+                    if (lane == 0) set.y[0][row] = g / (1.0f + expf(-g)) * u;
+                    return;
+                }
+                float* y = set.y[part];
 #pragma unroll
                 for (int t = 0; t < N; ++t)
                 {
@@ -388,43 +481,85 @@ namespace dlib
                 }
             }
 
-            template <int N>
+            // The blocks of the grid that compute the rows of a matrix, a warp a row.
+            inline int matvec_blocks(int rows)
+            {
+                return (rows + warps_per_block - 1) / warps_per_block;
+            }
+
+            /*
+                Launches the products of the count matrices of set, which share type, row_bytes and
+                cols, with the n <= N rows of x; with PAIR, the gated values of its two matrices
+                with the single row of x (matvec_set).
+            */
+            template <int N, bool PAIR>
             void launch_matvec(
                 int type,
-                const uint8_t* w,
+                matvec_set set,
+                int count,
                 size_t row_bytes,
-                int rows,
                 int cols,
                 const float* x,
-                int n,
-                float* y
+                int n
             )
             {
                 // The rows of x start on 16 bytes when x does: cols is a multiple of 32.
                 const bool aligned = reinterpret_cast<uintptr_t>(x) % 16 == 0;
                 const dim3 threads(32, warps_per_block);
-                const dim3 blocks((rows + warps_per_block - 1) / warps_per_block);
+                int total = 0;
+                bool words = true;
+                for (int p = 0; p < matvec_parts; ++p)
+                {
+                    if (p >= count)
+                    {
+                        set.w[p] = nullptr;
+                        set.y[p] = nullptr;
+                        set.rows[p] = 0;
+                    }
+                    set.blocks[p] = PAIR ? 0 : matvec_blocks(set.rows[p]);
+                    total += set.blocks[p];
+                    words = words && reinterpret_cast<uintptr_t>(set.w[p]) % 4 == 0;
+                }
+                if (PAIR) total = matvec_blocks(set.rows[0]);
+                const dim3 blocks(total);
                 /*
                     The K-quants of most models read their super-blocks in contiguous accesses: Q6_K by
                     bytes, Q4_K by words of 4 bytes, which its rows start on when the matrix does, a row
                     of Q4_K holding a multiple of 16 bytes.
                 */
-                if (type == gguf_blocks::q4_K && reinterpret_cast<uintptr_t>(w) % 4 == 0)
+                if (type == gguf_blocks::q4_K && words)
                 {
-                    gguf_matvec_k_kernel<gguf_blocks::q4_K, N><<<blocks, threads>>>(w, row_bytes, rows, cols, x, n,
-                        aligned, y);
+                    gguf_matvec_k_kernel<gguf_blocks::q4_K, N, PAIR><<<blocks, threads>>>(set, row_bytes, cols, x, n,
+                        aligned);
                     return;
                 }
                 if (type == gguf_blocks::q6_K)
                 {
-                    gguf_matvec_k_kernel<gguf_blocks::q6_K, N><<<blocks, threads>>>(w, row_bytes, rows, cols, x, n,
-                        aligned, y);
+                    gguf_matvec_k_kernel<gguf_blocks::q6_K, N, PAIR><<<blocks, threads>>>(set, row_bytes, cols, x, n,
+                        aligned);
                     return;
                 }
                 with_format(type, [&](auto format) {
-                    gguf_matvec_kernel<decltype(format)::value, N><<<blocks, threads>>>(w, row_bytes, rows, cols, x,
-                        n, aligned, y);
+                    gguf_matvec_kernel<decltype(format)::value, N, PAIR><<<blocks, threads>>>(set, row_bytes, cols,
+                        x, n, aligned);
                 });
+            }
+
+            // launch_matvec() for the n <= max_matvec_rows rows of x, with the kernels of the least N that holds them.
+            inline void launch_matvec_rows(
+                int type,
+                const matvec_set& set,
+                int count,
+                size_t row_bytes,
+                int cols,
+                const float* x,
+                int n
+            )
+            {
+                if (n == 1) launch_matvec<1, false>(type, set, count, row_bytes, cols, x, n);
+                else if (n == 2) launch_matvec<2, false>(type, set, count, row_bytes, cols, x, n);
+                else if (n <= 4) launch_matvec<4, false>(type, set, count, row_bytes, cols, x, n);
+                else launch_matvec<8, false>(type, set, count, row_bytes, cols, x, n);
             }
 
             void launch_dequantize(
@@ -1474,22 +1609,99 @@ namespace dlib
             DLIB_CASSERT(dest.size() == static_cast<size_t>(n) * static_cast<size_t>(rows));
             DLIB_CASSERT(weights.size() * sizeof(float) >= static_cast<size_t>(rows) * row_bytes);
             if (n == 0) return;
-            const uint8_t* w = reinterpret_cast<const uint8_t*>(weights.device());
+            tensor* dests[1] = { &dest };
+            const tensor* matrices[1] = { &weights };
+            gguf_matvec_group(dests, src, matrices, 1, type, &rows, cols, row_bytes);
+        }
+
+        void gguf_matvec_group (
+            tensor* const* dests,
+            const tensor& src,
+            const tensor* const* weights,
+            int count,
+            int type,
+            const long* rows,
+            long cols,
+            size_t row_bytes
+        )
+        {
+            DLIB_CASSERT(count >= 1 && count <= matvec_parts && dests && weights && rows);
+            DLIB_CASSERT(gguf_blocks::known_format(type) && cols > 0);
+            DLIB_CASSERT(static_cast<long long>(cols) <= std::numeric_limits<int>::max());
+            DLIB_CASSERT(row_bytes != 0 && row_bytes == gguf_blocks::row_bytes(type, cols));
+            DLIB_CASSERT(src.size() % static_cast<size_t>(cols) == 0);
+            const long n = static_cast<long>(src.size() / static_cast<size_t>(cols));
+            for (int p = 0; p < count; ++p)
+            {
+                DLIB_CASSERT(dests[p] && weights[p] && rows[p] > 0
+                    && static_cast<long long>(rows[p]) <= std::numeric_limits<int>::max());
+                DLIB_CASSERT(!is_same_object(*dests[p], src) && !is_same_object(*dests[p], *weights[p]));
+                DLIB_CASSERT(dests[p]->size() == static_cast<size_t>(n) * static_cast<size_t>(rows[p]));
+                DLIB_CASSERT(weights[p]->size() * sizeof(float) >= static_cast<size_t>(rows[p]) * row_bytes);
+                for (int q = 0; q < p; ++q) DLIB_CASSERT(!is_same_object(*dests[p], *dests[q]));
+            }
+            if (n == 0) return;
             const float* x = src.device();
-            float* y = dest.device_write_only();
+            matvec_set set = {};
+            float* y[matvec_parts] = {};
+            for (int p = 0; p < count; ++p)
+            {
+                set.w[p] = reinterpret_cast<const uint8_t*>(weights[p]->device());
+                set.rows[p] = static_cast<int>(rows[p]);
+                y[p] = dests[p]->device_write_only();
+            }
             for (long t0 = 0; t0 < n; t0 += max_matvec_rows)
             {
                 const int k = static_cast<int>(std::min<long>(max_matvec_rows, n - t0));
-                const float* xk = x + static_cast<size_t>(t0) * static_cast<size_t>(cols);
-                float* yk = y + static_cast<size_t>(t0) * static_cast<size_t>(rows);
-                const int r = static_cast<int>(rows);
-                const int c = static_cast<int>(cols);
-                if (k == 1) launch_matvec<1>(type, w, row_bytes, r, c, xk, k, yk);
-                else if (k == 2) launch_matvec<2>(type, w, row_bytes, r, c, xk, k, yk);
-                else if (k <= 4) launch_matvec<4>(type, w, row_bytes, r, c, xk, k, yk);
-                else launch_matvec<8>(type, w, row_bytes, r, c, xk, k, yk);
+                for (int p = 0; p < count; ++p)
+                    set.y[p] = y[p] + static_cast<size_t>(t0) * static_cast<size_t>(rows[p]);
+                launch_matvec_rows(type, set, count, row_bytes, static_cast<int>(cols),
+                    x + static_cast<size_t>(t0) * static_cast<size_t>(cols), k);
                 CHECK_CUDA(cudaGetLastError());
             }
+        }
+
+        void gguf_matvec_swiglu (
+            tensor& dest,
+            tensor& work,
+            const tensor& src,
+            const tensor& gate_weights,
+            const tensor& up_weights,
+            int type,
+            long rows,
+            long cols,
+            size_t row_bytes
+        )
+        {
+            DLIB_CASSERT(gguf_blocks::known_format(type) && rows > 0 && cols > 0);
+            DLIB_CASSERT(static_cast<long long>(rows) <= std::numeric_limits<int>::max()
+                && static_cast<long long>(cols) <= std::numeric_limits<int>::max());
+            DLIB_CASSERT(row_bytes != 0 && row_bytes == gguf_blocks::row_bytes(type, cols));
+            DLIB_CASSERT(src.size() % static_cast<size_t>(cols) == 0);
+            DLIB_CASSERT(dest.size() == src.size() / static_cast<size_t>(cols) * static_cast<size_t>(rows)
+                && work.size() == dest.size());
+            DLIB_CASSERT(!is_same_object(dest, src) && !is_same_object(work, src) && !is_same_object(dest, work));
+            DLIB_CASSERT(!is_same_object(dest, gate_weights) && !is_same_object(dest, up_weights)
+                && !is_same_object(work, gate_weights) && !is_same_object(work, up_weights));
+            DLIB_CASSERT(gate_weights.size() * sizeof(float) >= static_cast<size_t>(rows) * row_bytes
+                && up_weights.size() * sizeof(float) >= static_cast<size_t>(rows) * row_bytes);
+            if (src.size() == 0) return;
+            if (src.size() != static_cast<size_t>(cols))
+            {
+                // More rows than the paired kernels take: the two products, then their gate.
+                gguf_matvec(dest, src, gate_weights, type, rows, cols, row_bytes);
+                gguf_matvec(work, src, up_weights, type, rows, cols, row_bytes);
+                silu_multiply(dest, work);
+                return;
+            }
+            matvec_set set = {};
+            set.w[0] = reinterpret_cast<const uint8_t*>(gate_weights.device());
+            set.w[1] = reinterpret_cast<const uint8_t*>(up_weights.device());
+            set.rows[0] = set.rows[1] = static_cast<int>(rows);
+            const float* x = src.device();
+            set.y[0] = dest.device_write_only();
+            launch_matvec<1, true>(type, set, 2, row_bytes, static_cast<int>(cols), x, 1);
+            CHECK_CUDA(cudaGetLastError());
         }
 
         void gguf_dequantize (

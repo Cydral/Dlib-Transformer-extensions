@@ -103,6 +103,28 @@ namespace albireo
     // Name of this computer.
     std::string host_name();
 
+    /*!
+        ensures
+            - Under Windows, takes the calling thread out of the power throttling of the
+              system (the high quality of service of SetThreadInformation()).  The system
+              infers the quality of service of a thread that asks for none: it may lower the
+              processor frequency of the threads of a service or of a program whose window
+              is out of focus, and keep them on the efficient cores of a hybrid processor.
+              A thread that computes an answer someone waits for calls this function once.
+            - Returns true when the system took the request; false, with nothing changed, on
+              another system, on a Windows without this setting, or when the environment
+              variable ALBIREO_THREAD_QOS is "system", which leaves the choice to Windows.
+    !*/
+    bool leave_thread_throttling();
+
+    /*!
+        ensures
+            - As leave_thread_throttling() for every thread of the process
+              (SetProcessInformation()), for a program whose whole work is to compute: the
+              service of the product and its measuring tools.
+    !*/
+    bool leave_process_throttling();
+
 }
 
 #endif // ALBIREO_COMMON_SYSTEM_INFO_H_

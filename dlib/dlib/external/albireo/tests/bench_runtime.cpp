@@ -460,6 +460,12 @@ int main(int argc, char** argv)
     if (!parse(argc, argv, o)) return usage();
     if (o.threads.empty()) o.threads.push_back(std::max(1, read_cpu_info().physical_cores));
     if (o.floats) qk_set_integer_prompt(false);
+    /*
+        The thread that starts the sections computes with the workers, at the same quality of
+        service: asked for the process, and for this thread should the system refuse the first.
+    */
+    const bool process_unthrottled = leave_process_throttling();
+    const bool unthrottled = leave_thread_throttling() || process_unthrottled;
     try
     {
         auto file = std::make_shared<model_file>(o.model);
@@ -469,9 +475,9 @@ int main(int argc, char** argv)
 #else
         const std::string engine = "processor";
 #endif
-        std::printf("bench_runtime: %s, %.2f GiB, %s, kernels %s, passes of %ld tokens, %ld repetitions\n",
+        std::printf("bench_runtime: %s, %.2f GiB, %s, kernels %s, passes of %ld tokens, %ld repetitions%s\n",
             o.model.c_str(), static_cast<double>(file->size()) / static_cast<double>(size_t(1) << 30), engine.c_str(),
-            qk_isa(), o.batch, o.repetitions);
+            qk_isa(), o.batch, o.repetitions, unthrottled ? ", high quality of service asked of the system" : "");
         file->warm_up(false);
         for (int threads : o.threads)
             if (!run(o, file, cfg, threads)) return 2;

@@ -1115,6 +1115,65 @@ namespace
             }
     }
 
+    /*
+        tt::gguf_matvec_group() against tt::gguf_matvec() for each of its matrices, whose values
+        it must give, with one, two and three matrices and with rows of src beyond one launch;
+        tt::gguf_matvec_swiglu() against the two products and tt::silu_multiply(), with one row,
+        which a device computes in one launch, and with several.
+    */
+    void test_grouped_products()
+    {
+        dlib::rand rnd;
+        const int types[5] = { gguf_blocks::f32, gguf_blocks::bf16, gguf_blocks::q8_0, gguf_blocks::q4_K,
+            gguf_blocks::q6_K };
+        for (int type : types)
+        {
+            const bool k_quant = type == gguf_blocks::q4_K || type == gguf_blocks::q6_K;
+            const long cols = k_quant ? 1280 : 1056;
+            const long rows[3] = { 19, 8, 5 };
+            const size_t row_bytes = gguf_blocks::row_bytes(type, cols);
+            resizable_tensor w[3], w_up;
+            for (int p = 0; p < 3; ++p) store_bytes(w[p], random_weight_rows(type, rows[p], cols, rnd));
+            store_bytes(w_up, random_weight_rows(type, rows[0], cols, rnd));
+            for (long n : { 1L, 3L, 11L })
+            {
+                resizable_tensor x(n, cols);
+                for (float& v : x) v = rnd.get_random_gaussian();
+                resizable_tensor alone[3], grouped[3];
+                for (int p = 0; p < 3; ++p)
+                {
+                    alone[p].set_size(n, rows[p]);
+                    grouped[p].set_size(n, rows[p]);
+                    tt::gguf_matvec(alone[p], x, w[p], type, rows[p], cols, row_bytes);
+                    resizable_tensor expected(n, rows[p]);
+                    cpu::gguf_matvec(expected, x, w[p], type, rows[p], cols, row_bytes);
+                    const float size = 1 + max(abs(mat(expected)));
+                    DLIB_TEST_MSG(max(abs(mat(alone[p]) - mat(expected))) < 1e-4 * size, "type " << type);
+                }
+                for (int count = 1; count <= 3; ++count)
+                {
+                    tensor* dests[3] = { &grouped[0], &grouped[1], &grouped[2] };
+                    const tensor* weights[3] = { &w[0], &w[1], &w[2] };
+                    for (int p = 0; p < 3; ++p) grouped[p] = 1e30f;
+                    tt::gguf_matvec_group(dests, x, weights, count, type, rows, cols, row_bytes);
+                    for (int p = 0; p < count; ++p)
+                        DLIB_TEST_MSG(max(abs(mat(grouped[p]) - mat(alone[p]))) == 0, "type " << type << ", "
+                            << count << " matrices, " << n << " rows, matrix " << p);
+                }
+                resizable_tensor gate(n, rows[0]), up(n, rows[0]), gated(n, rows[0]), work(n, rows[0]);
+                tt::gguf_matvec(gate, x, w[0], type, rows[0], cols, row_bytes);
+                tt::gguf_matvec(up, x, w_up, type, rows[0], cols, row_bytes);
+                tt::silu_multiply(gate, up);
+                gated = 1e30f;
+                work = 0;
+                tt::gguf_matvec_swiglu(gated, work, x, w[0], w_up, type, rows[0], cols, row_bytes);
+                const float size = 1 + max(abs(mat(gate)));
+                DLIB_TEST_MSG(max(abs(mat(gated) - mat(gate))) < 1e-5 * size, "type " << type << ", " << n
+                    << " rows: " << max(abs(mat(gated) - mat(gate))));
+            }
+        }
+    }
+
     // tt::mamba3_step() over several tokens in one call against one call per token.
     void test_mamba3_step_tokens()
     {
@@ -1177,6 +1236,7 @@ namespace
             test_mamba3_step_tokens();
             print_spinner();
             test_long_pass_operations();
+            test_grouped_products();
             print_spinner();
             test_expert_operations();
             print_spinner();

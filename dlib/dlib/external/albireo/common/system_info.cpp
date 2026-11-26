@@ -280,4 +280,62 @@ namespace albireo
 #endif
     }
 
+#if defined(_WIN32)
+    namespace
+    {
+        /*
+            THREAD_POWER_THROTTLING_STATE and PROCESS_POWER_THROTTLING_STATE of Windows, which
+            share their layout, with the values of their constants: some toolchains declare
+            neither the structures nor ThreadPowerThrottling, and SetThreadInformation() is
+            looked up in kernel32, where a Windows before 8 lacks it.
+        */
+        struct power_throttling_state
+        {
+            ULONG version;
+            ULONG control_mask;
+            ULONG state_mask;
+        };
+        const ULONG power_throttling_version = 1;
+        const ULONG power_throttling_execution_speed = 0x1;
+        // ThreadPowerThrottling of THREAD_INFORMATION_CLASS, ProcessPowerThrottling of PROCESS_INFORMATION_CLASS.
+        const int thread_power_throttling = 3;
+        const int process_power_throttling = 4;
+
+        using set_information_function = BOOL (WINAPI*)(HANDLE, int, void*, DWORD);
+
+        bool leave_throttling(const char* function, HANDLE target, int information_class)
+        {
+            char asked[16];
+            const DWORD length = GetEnvironmentVariableA("ALBIREO_THREAD_QOS", asked, sizeof(asked));
+            if (length > 0 && length < sizeof(asked) && lstrcmpiA(asked, "system") == 0) return false;
+            const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+            if (!kernel) return false;
+            const set_information_function set = reinterpret_cast<set_information_function>(
+                reinterpret_cast<void*>(GetProcAddress(kernel, function)));
+            if (!set) return false;
+            // The control mask names the mechanism, and the cleared state mask turns it off.
+            power_throttling_state state = { power_throttling_version, power_throttling_execution_speed, 0 };
+            return set(target, information_class, &state, sizeof(state)) != 0;
+        }
+    }
+#endif
+
+    bool leave_thread_throttling()
+    {
+#if defined(_WIN32)
+        return leave_throttling("SetThreadInformation", GetCurrentThread(), thread_power_throttling);
+#else
+        return false;
+#endif
+    }
+
+    bool leave_process_throttling()
+    {
+#if defined(_WIN32)
+        return leave_throttling("SetProcessInformation", GetCurrentProcess(), process_power_throttling);
+#else
+        return false;
+#endif
+    }
+
 }
