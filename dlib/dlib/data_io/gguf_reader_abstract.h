@@ -472,6 +472,119 @@ namespace dlib
               wider format than its base format, is thereby named after its base format.
     !*/
 
+
+    // ---------------------------------------------------------------------------------
+
+    uint16_t gguf_float_to_half(float f);
+    uint16_t gguf_float_to_bf16(float f);
+    /*!
+        ensures
+            - returns f in IEEE half precision, or in bfloat16, rounded to the nearest
+              value with ties to even; values beyond the range of half precision become
+              infinities and NaN stays NaN. They invert the readings of gguf_dequantize.h.
+    !*/
+
+    void gguf_encode_floats(const float* src, size_t count, ggml_type type, std::vector<uint8_t>& dst);
+    /*!
+        requires
+            - type is F32, F16, BF16 or Q8_0
+            - count is a multiple of 32 for Q8_0
+        ensures
+            - #dst holds the count values of src encoded in type, as a tensor of that type
+              stores them: Q8_0 in blocks of 32 values sharing a scale in half precision,
+              amax / 127, each value rounded to the nearest integer, as ggml quantizes it.
+        throws
+            - std::runtime_error for another type.
+    !*/
+
+    class gguf_writer
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The writer of a GGUF container, version 3: typed metadata, then tensors,
+                gathered in memory and written in one pass. A value keeps the type it is
+                given, so a container read by gguf_reader and copied through
+                copy_metadata() and add_tensor() is written back with the same types,
+                the same tensors and the same alignment.
+
+                It serves to save a model trained or fine-tuned by the library in the
+                container the runtimes of the ecosystem import, export_gguf_weights() and
+                runtime_transformer::write_merged_gguf() among them.
+        !*/
+
+    public:
+        void set_alignment(uint64_t a);
+        uint64_t alignment() const;
+        /*!
+            requires
+                - a is a power of two from 1 to 65536
+            ensures
+                - the tensor data and every tensor start on a multiple of a, 32 by default.
+        !*/
+
+        void set(const std::string& key, const gguf_value& value);
+        void set_string(const std::string& key, const std::string& s);
+        void set_uint32(const std::string& key, uint32_t x);
+        void set_int32(const std::string& key, int32_t x);
+        void set_float32(const std::string& key, float x);
+        void set_bool(const std::string& key, bool x);
+        void set_string_array(const std::string& key, const std::vector<std::string>& a);
+        void set_int32_array(const std::string& key, const std::vector<int32_t>& a);
+        void set_float32_array(const std::string& key, const std::vector<float>& a);
+        /*!
+            ensures
+                - sets the metadata value of key, replacing a previous one. general.alignment
+                  sets the alignment instead.
+            throws
+                - std::runtime_error for an array of arrays.
+        !*/
+
+        bool has(const std::string& key) const;
+        void erase(const std::string& key);
+
+        void copy_metadata(const gguf_reader& source);
+        /*!
+            ensures
+                - sets every metadata value of source, and its alignment.
+        !*/
+
+        void add_tensor(const std::string& name, ggml_type type, const std::vector<uint64_t>& dims,
+            std::vector<uint8_t> bytes);
+        /*!
+            requires
+                - dims holds 1 to 8 positive dimensions, dims[0] the contiguous one and a
+                  multiple of the block size of type
+                - bytes holds the tensor as stored in type
+            ensures
+                - appends the tensor, written in the order of the calls.
+            throws
+                - std::runtime_error for a name given twice, an empty name, or bytes that do
+                  not match the shape and the type.
+        !*/
+
+        void add_tensor(const std::string& name, const std::vector<uint64_t>& dims, const float* values,
+            ggml_type type = ggml_type::F32);
+        /*!
+            requires
+                - values holds the product of dims floats, dims[0] contiguous
+            ensures
+                - appends the tensor encoded in type by gguf_encode_floats().
+        !*/
+
+        size_t num_tensors() const;
+
+        void write(std::ostream& out) const;
+        void write(const std::string& path) const;
+        /*!
+            ensures
+                - writes the container. The second form writes it next to path under a
+                  temporary name and renames it over path once complete, so that a reader
+                  never meets a partial container under the final name.
+            throws
+                - std::runtime_error when the stream or the file fails.
+        !*/
+    };
+
 }
 
 #endif // DLIB_GGUF_READER_ABSTRACT_H_

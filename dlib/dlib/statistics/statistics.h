@@ -818,6 +818,50 @@ namespace dlib
 // ----------------------------------------------------------------------------------------
 
     template <
+        typename T,
+        typename U,
+        typename alloc1,
+        typename alloc2
+        >
+    T weighted_median (
+        const std::vector<T,alloc1>& values,
+        const std::vector<U,alloc2>& weights
+    )
+    {
+        DLIB_CASSERT(values.size() == weights.size() && values.size() > 0,
+            "\t T weighted_median(values,weights)"
+            << "\n\t values and weights must be non-empty and of the same length."
+            << "\n\t values.size():  " << values.size()
+            << "\n\t weights.size(): " << weights.size());
+
+        std::vector<size_t> order(values.size());
+        double total = 0;
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            DLIB_CASSERT(weights[i] >= 0, "\t weighted_median(): weight " << i << " is negative");
+            order[i] = i;
+            total += weights[i];
+        }
+        DLIB_CASSERT(total > 0, "\t weighted_median(): the weights sum to zero");
+
+        std::sort(order.begin(), order.end(),
+            [&values](size_t a, size_t b) { return values[a] < values[b]; });
+        /* The lower weighted median: the smallest value whose cumulative weight reaches half
+           of the total. */
+        const double half = total / 2;
+        double cumulative = 0;
+        for (size_t i : order)
+        {
+            cumulative += weights[i];
+            if (cumulative >= half)
+                return values[i];
+        }
+        return values[order.back()];
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    template <
         typename T, 
         typename alloc
         >

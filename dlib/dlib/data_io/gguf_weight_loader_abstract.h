@@ -110,7 +110,9 @@ namespace dlib
             - Dequantizes and repacks every weight of g into the parameter tensors
               of net, in network visit order: lm_head (output.weight, or the
               embedding table when spec.tied_embeddings is true), the final norm,
-              then each transformer block, and finally the embedding table.
+              then each transformer block, and finally the embedding table, which
+              the embedding layer exposes both as its parameter tensor and through
+              get_embeddings().
             - Linear layers larger than their GGUF source (weights followed by an
               unused bias slot) have the trailing part zeroed.
             - When opt.verbose is true, prints the applied RoPE state and a block
@@ -120,6 +122,64 @@ namespace dlib
               tensor does not match the expected size, or if the number of
               parameter tensors of net does not match the layer-order assumption
               (which indicates that net_type does not correspond to spec).
+    !*/
+
+    // ---------------------------------------------------------------------------------
+
+    template <typename net_type>
+    parameter_layout decoder_parameter_layout(
+        net_type& net,
+        const model_spec& spec
+    );
+    /*!
+        requires
+            - net_type is a network_type of decoder_transformer_config whose shapes match spec
+            - the parameters of net are allocated
+        ensures
+            - returns get_parameter_layout(net) with the packed attention tensor of each
+              block split into its query (d_model, n_heads*head_dim), key and value
+              (d_model, n_kv_heads*head_dim) and output (n_heads*head_dim, d_model)
+              matrices, followed by a vector block for its normalization gains and biases
+              when it holds any: the matrices the operations of delta_consolidator on
+              singular values and on curvature apply to.
+        throws
+            - std::runtime_error when net does not match spec.
+    !*/
+
+    template <typename net_type>
+    void export_gguf_weights(
+        net_type& net,
+        const model_spec& spec,
+        gguf_writer& w,
+        ggml_type matrix_type = ggml_type::F32,
+        const gguf_load_options& opt = gguf_load_options()
+    );
+    /*!
+        requires
+            - net_type is a network_type of decoder_transformer_config whose shapes match spec
+            - the parameters of net are allocated
+            - matrix_type is F32, F16, BF16 or Q8_0
+        ensures
+            - the inverse of import_gguf_weights(): adds to w every weight of net under the
+              tensor names of the architecture spec.arch_name, the matrices transposed back
+              to the rows of the container and encoded in matrix_type (a matrix whose rows
+              cannot hold whole Q8_0 blocks in F16), the vectors in F32, the output head as
+              output.weight whatever spec.tied_embeddings says, since the compiled decoder
+              trains a head of its own; for the qwen2 and
+              qwen3 architectures, or opt.rope_permute, the rows of the query and key
+              projections, their biases and their normalization gains go back to the
+              split-half rotary layout.
+            - sets in w the metadata of that architecture that detect_model() reads: the
+              block count, the widths, the heads, the key length when the width of a head
+              is not d_model / n_heads, the normalization epsilon, the rotary base, the
+              vocabulary size and the file type; the context length (2048) and general.name
+              when w has none.
+            - The tokenizer and the chat template are left to the caller, who copies them
+              from the container or the tokenizer the vocabulary came from.
+            - A container written this way and loaded by import_gguf_weights() or by
+              runtime_transformer computes the logits net computes.
+        throws
+            - std::runtime_error when net does not match spec.
     !*/
 
     // ---------------------------------------------------------------------------------

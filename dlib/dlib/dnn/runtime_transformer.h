@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -176,6 +177,7 @@ namespace dlib
 
         void load(gguf_reader& g, const model_spec& spec, const gguf_load_options& opt)
         {
+            drop_adapters();
             spec_ = spec;
             // The layers start anew: no context, no position read.
             cap_ = keep_ = cur_len_ = 0;
@@ -386,6 +388,7 @@ namespace dlib
 
             for (layer& L : layers_)
             {
+                const size_t li = static_cast<size_t>(&L - layers_.data());
                 /* ---- attention block ---- */
                 tt::rms_normalize(eps, xn_, rms_scale_, x_, L.attn_norm_g, true);
 
@@ -401,6 +404,9 @@ namespace dlib
                     tt::gemm(0.0f, qv, 1.0f, xv, false, weight(L.wq), false);
                     tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
                     tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
+                    adapt(li, 0, xv, L.wq, qv);
+                    adapt(li, 1, xv, L.wk, kv_v);
+                    adapt(li, 2, xv, L.wv, vv);
                     if (L.bq.size())
                     {
                         ensure_ones(N);
@@ -463,6 +469,7 @@ namespace dlib
                     auto cv = c_2d(ctx_flat_, 0);
                     auto ov = o_2d(attn_out_, 0);
                     tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
+                    adapt(li, 3, cv, L.wo, ov);
                 }
                 add_residual(x_, attn_out_);
 
@@ -481,6 +488,8 @@ namespace dlib
                         auto uv = f_2d(up_, 0);
                         tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
                         tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                        adapt(li, 4, nv, L.w_gate, gv);
+                        adapt(li, 5, nv, L.w_up, uv);
                     }
                     sig_.copy_size(gate_);
                     tt::sigmoid(sig_, gate_);
@@ -492,6 +501,7 @@ namespace dlib
                         auto hv = h_2d(gate_, 0);
                         auto fv = f_2d(ffn_out_, 0);
                         tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
+                        adapt(li, 6, hv, L.w_down, fv);
                     }
                 }
                 add_residual(x_, ffn_out_);
@@ -566,6 +576,7 @@ namespace dlib
 
             for (layer& L : layers_)
             {
+                const size_t li = static_cast<size_t>(&L - layers_.data());
                 /* ---- attention block ---- */
                 tt::rms_normalize(eps, xn_, rms_scale_, x_, L.attn_norm_g, true);
 
@@ -581,6 +592,9 @@ namespace dlib
                     tt::gemm(0.0f, qv, 1.0f, xv, false, weight(L.wq), false);
                     tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
                     tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
+                    adapt(li, 0, xv, L.wq, qv);
+                    adapt(li, 1, xv, L.wk, kv_v);
+                    adapt(li, 2, xv, L.wv, vv);
                     if (L.bq.size())
                     {
                         ensure_ones(1);
@@ -649,6 +663,7 @@ namespace dlib
                     auto cv = c_2d(ctx_flat_, 0);
                     auto ov = o_2d(attn_out_, 0);
                     tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
+                    adapt(li, 3, cv, L.wo, ov);
                 }
                 add_residual(x_, attn_out_);
 
@@ -667,6 +682,8 @@ namespace dlib
                         auto uv = f_2d(up_, 0);
                         tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
                         tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                        adapt(li, 4, nv, L.w_gate, gv);
+                        adapt(li, 5, nv, L.w_up, uv);
                     }
                     sig_.copy_size(gate_);
                     tt::sigmoid(sig_, gate_);
@@ -678,6 +695,7 @@ namespace dlib
                         auto hv = h_2d(gate_, 0);
                         auto fv = f_2d(ffn_out_, 0);
                         tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
+                        adapt(li, 6, hv, L.w_down, fv);
                     }
                 }
                 add_residual(x_, ffn_out_);
@@ -698,6 +716,291 @@ namespace dlib
         }
 
         const model_spec& spec() const { return spec_; }
+
+        // Low-rank fine-tuning of a dense decoder
+
+        /* One adapted projection: the tensor of the container it adapts, its block and
+           projection, its geometry, and the position of its [A | B | m] block in the
+           packed parameters. */
+        struct adapter_site
+        {
+            std::string tensor_name;
+            long layer = 0;
+            int projection = 0;
+            adapter_geometry geometry;
+            size_t offset = 0;
+        };
+
+        static const char* projection_name(int p)
+        {
+            static const char* names[] = { "attn_q", "attn_k", "attn_v", "attn_output",
+                                           "ffn_gate", "ffn_up", "ffn_down" };
+            DLIB_CASSERT(p >= 0 && p < 7);
+            return names[p];
+        }
+
+        size_t configure_adapters(const adapter_plan& plan, unsigned long seed = 0)
+        {
+            if (layers_.empty())
+                throw std::runtime_error("runtime_transformer: load a model before configuring adapters");
+            if (spec_.hybrid() || spec_.n_experts > 0)
+                throw std::runtime_error("runtime_transformer: adapters are offered for dense decoders only");
+            adapters_.clear();
+            sites_.clear();
+            site_of_.assign(layers_.size() * 7, -1);
+            traces_.clear();
+            plan_ = plan;
+            adapter_params_.set_size(0, 0, 0, 0);
+            adapter_grads_.set_size(0, 0, 0, 0);
+            if (!plan.active())
+                return 0;
+
+            size_t total = 0;
+            for (size_t li = 0; li < layers_.size(); ++li)
+            {
+                for (int p = 0; p < 7; ++p)
+                {
+                    const stored_matrix& m = projection(layers_[li], p);
+                    /* The query and the value follow their own switches; the key, the output
+                       and the feed-forward projections follow the switch of the plain
+                       projections. */
+                    const bool wanted = (p == 0 && plan.attention_query) || (p == 2 && plan.attention_value)
+                        || ((p == 1 || p >= 3) && plan.projection);
+                    if (!wanted || !plan.covers(m.out_dim))
+                        continue;
+                    low_rank_adapter a;
+                    a.configure(m.in_dim, m.out_dim, plan.rank, plan.method, plan.alpha);
+                    adapter_site site;
+                    site.tensor_name = "blk." + std::to_string(li) + "." + projection_name(p) + ".weight";
+                    site.layer = static_cast<long>(li);
+                    site.projection = p;
+                    site.geometry = a.geometry();
+                    site.offset = total;
+                    total += a.parameter_count();
+                    site_of_[li * 7 + static_cast<size_t>(p)] = static_cast<long>(adapters_.size());
+                    adapters_.push_back(a);
+                    sites_.push_back(site);
+                }
+            }
+            if (total == 0)
+                return 0;
+            adapter_params_.set_size(static_cast<long>(total));
+            adapter_params_ = 0;
+            adapter_grads_.set_size(static_cast<long>(total));
+            adapter_grads_ = 0;
+            dlib::rand rnd(seed);
+            for (size_t s = 0; s < adapters_.size(); ++s)
+            {
+                const adapter_site& site = sites_[s];
+                low_rank_adapter& a = adapters_[s];
+                auto av = a.a_view()(adapter_params_, site.geometry.a_offset(site.offset));
+                auto bv = a.b_view()(adapter_params_, site.geometry.b_offset(site.offset));
+                auto mv = a.m_view()(adapter_params_, site.geometry.m_offset(site.offset));
+                a.initialize(weight(projection(layers_[static_cast<size_t>(site.layer)], site.projection)),
+                    av, bv, mv, rnd);
+            }
+            return adapters_.size();
+        }
+
+        bool adapters_active() const { return !adapters_.empty(); }
+        const adapter_plan& adapter_configuration() const { return plan_; }
+        const std::vector<adapter_site>& adapter_sites() const { return sites_; }
+        size_t adapter_parameter_count() const { return adapter_params_.size(); }
+        tensor& adapter_parameters() { return adapter_params_; }
+        const tensor& adapter_parameters() const { return adapter_params_; }
+        const tensor& adapter_gradients() const { return adapter_grads_; }
+        void zero_adapter_gradients() { if (adapter_grads_.size()) adapter_grads_ = 0; }
+
+        /* The packed parameters as consecutive blocks, A as (in_dim, rank), B as
+           (out_dim, rank) and m as one row, in the order of adapter_sites(). */
+        parameter_layout adapter_layout() const
+        {
+            parameter_layout layout;
+            for (const adapter_site& s : sites_)
+            {
+                layout.add_block(s.geometry.in_dim, s.geometry.rank);
+                layout.add_block(s.geometry.out_dim, s.geometry.rank);
+                if (s.geometry.m_count())
+                    layout.add_block(1, s.geometry.out_dim);
+            }
+            return layout;
+        }
+
+        /* Runs the sequence forward, keeping what the backward pass needs, then adds to the
+           adapter gradients gradient_scale times the gradient of the summed cross-entropy of
+           the supervised positions: those whose target is a token, a negative target leaving
+           its position out. Returns the summed loss and sets supervised to the number of
+           supervised positions. The adapters must be configured; no context may be open. */
+        double accumulate_adapter_gradients(const std::vector<int>& tokens, const std::vector<int>& targets,
+            long& supervised, double gradient_scale = 1.0)
+        {
+            supervised = 0;
+            if (!adapters_active())
+                throw std::runtime_error("runtime_transformer: no adapter to train");
+            DLIB_CASSERT(!tokens.empty() && tokens.size() == targets.size());
+            DLIB_CASSERT(cur_len_ == 0, "accumulate_adapter_gradients() needs an empty cache");
+            forward_train(tokens);
+            const double loss = cross_entropy(targets, supervised, true, static_cast<float>(gradient_scale));
+            if (supervised > 0)
+                backward_train();
+            return loss;
+        }
+
+        /* The summed cross-entropy of the supervised positions of a sequence, adapters
+           included, and their number. Leaves the cache empty. */
+        double evaluate_loss(const std::vector<int>& tokens, const std::vector<int>& targets, long& supervised)
+        {
+            DLIB_CASSERT(!tokens.empty() && tokens.size() == targets.size());
+            if (spec_.hybrid())
+                throw std::runtime_error("runtime_transformer: evaluate_loss() is offered for dense decoders");
+            reset_cache();
+            forward_prefill(tokens);
+            const double loss = cross_entropy(targets, supervised, false, 1.0f);
+            reset_cache();
+            return loss;
+        }
+
+        /* Folds every adapter into the weight it adapts and removes the adapters. The
+           adapted weights become resident in single precision. */
+        void merge_adapters()
+        {
+            for (size_t s = 0; s < adapters_.size(); ++s)
+            {
+                const adapter_site& site = sites_[s];
+                stored_matrix& m = projection(layers_[static_cast<size_t>(site.layer)], site.projection);
+                make_resident(m);
+                low_rank_adapter& a = adapters_[s];
+                auto av = a.a_view()(adapter_params_, site.geometry.a_offset(site.offset));
+                auto bv = a.b_view()(adapter_params_, site.geometry.b_offset(site.offset));
+                auto mv = a.m_view()(adapter_params_, site.geometry.m_offset(site.offset));
+                a.merge_into_base(av, bv, mv, m.resident);
+                merged_sites_.push_back(site);
+            }
+            const std::vector<adapter_site> merged = merged_sites_;
+            adapter_plan none;
+            configure_adapters(none);
+            merged_sites_ = merged;
+        }
+
+        /* A copy of the container the model was loaded from, with the adapted weights
+           merged and encoded in type (F32, F16, BF16 or Q8_0; a weight whose rows cannot
+           hold whole Q8_0 blocks is written in F16). Every other tensor and every
+           metadata value is copied as it is. */
+        void write_merged_gguf(gguf_reader& source, const std::string& path, ggml_type type = ggml_type::Q8_0)
+        {
+            gguf_writer w;
+            w.copy_metadata(source);
+            std::vector<uint8_t> raw;
+            std::vector<float> gg;
+            for (const gguf_tensor_info& t : source.tensors())
+            {
+                long site_index = -1;
+                for (size_t s = 0; s < sites_.size(); ++s)
+                    if (sites_[s].tensor_name == t.name)
+                        site_index = static_cast<long>(s);
+                // A weight an earlier merge_adapters() changed is written as the engine holds it.
+                const adapter_site* folded = nullptr;
+                for (const adapter_site& f : merged_sites_)
+                    if (f.tensor_name == t.name)
+                        folded = &f;
+                if (site_index < 0 && folded == nullptr)
+                {
+                    source.read_tensor_raw(t, raw);
+                    w.add_tensor(t.name, t.type, t.dims, raw);
+                    continue;
+                }
+                const adapter_site& site = site_index >= 0 ? sites_[static_cast<size_t>(site_index)] : *folded;
+                stored_matrix& m = projection(layers_[static_cast<size_t>(site.layer)], site.projection);
+                resizable_tensor merged;
+                {
+                    const tensor& base = weight(m);
+                    merged.copy_size(base);
+                    memcpy(merged, base);
+                }
+                if (site_index >= 0)
+                {
+                    low_rank_adapter a = adapters_[static_cast<size_t>(site_index)];
+                    auto av = a.a_view()(adapter_params_, site.geometry.a_offset(site.offset));
+                    auto bv = a.b_view()(adapter_params_, site.geometry.b_offset(site.offset));
+                    auto mv = a.m_view()(adapter_params_, site.geometry.m_offset(site.offset));
+                    a.merge_into_base(av, bv, mv, merged);
+                }
+                // Back to the [out, in] rows of the container, undoing the rotary permutation.
+                const long in = m.in_dim, out = m.out_dim, hd = head_dim(), half = hd / 2;
+                gg.assign(static_cast<size_t>(in) * out, 0.0f);
+                const float* src = merged.host();
+                for (long o = 0; o < out; ++o)
+                {
+                    long od = o;
+                    if (m.permute)
+                    {
+                        const long r = o % hd;
+                        od = (o / hd) * hd + ((r < half) ? (2 * r) : (2 * (r - half) + 1));
+                    }
+                    float* row = gg.data() + static_cast<size_t>(o) * in;
+                    for (long i = 0; i < in; ++i)
+                        row[i] = src[static_cast<size_t>(i) * out + od];
+                }
+                const ggml_type as = (type == ggml_type::Q8_0 && in % 32 != 0) ? ggml_type::F16 : type;
+                w.add_tensor(t.name, t.dims, gg.data(), as);
+            }
+            w.write(path);
+        }
+
+        void save_adapters(std::ostream& out) const
+        {
+            dlib::serialize("runtime_adapters", out);
+            dlib::serialize(model_signature(), out);
+            dlib::serialize(plan_.rank, out);
+            dlib::serialize(static_cast<int>(plan_.method), out);
+            dlib::serialize(plan_.alpha, out);
+            dlib::serialize(plan_.attention_query, out);
+            dlib::serialize(plan_.attention_value, out);
+            dlib::serialize(plan_.projection, out);
+            dlib::serialize(plan_.max_width, out);
+            dlib::serialize(adapter_params_, out);
+        }
+
+        void load_adapters(std::istream& in)
+        {
+            std::string tag, signature;
+            dlib::deserialize(tag, in);
+            if (tag != "runtime_adapters")
+                throw serialization_error("runtime_transformer: not an adapter archive");
+            dlib::deserialize(signature, in);
+            if (signature != model_signature())
+                throw serialization_error("runtime_transformer: the adapters were trained on another model");
+            adapter_plan plan;
+            int method = 0;
+            dlib::deserialize(plan.rank, in);
+            dlib::deserialize(method, in);
+            if (method < 0 || method > 2 || plan.rank < 0 || plan.rank > 4096)
+                throw serialization_error("runtime_transformer: invalid adapter configuration");
+            plan.method = static_cast<adapter_method>(method);
+            dlib::deserialize(plan.alpha, in);
+            dlib::deserialize(plan.attention_query, in);
+            dlib::deserialize(plan.attention_value, in);
+            dlib::deserialize(plan.projection, in);
+            dlib::deserialize(plan.max_width, in);
+            resizable_tensor params;
+            dlib::deserialize(params, in);
+            // A failure leaves the adapters as they were.
+            const adapter_plan old_plan = plan_;
+            resizable_tensor old_params;
+            old_params.copy_size(adapter_params_);
+            if (adapter_params_.size())
+                memcpy(old_params, adapter_params_);
+            configure_adapters(plan);
+            if (params.size() != adapter_params_.size())
+            {
+                configure_adapters(old_plan);
+                if (old_params.size() == adapter_params_.size() && old_params.size())
+                    memcpy(adapter_params_, old_params);
+                throw serialization_error("runtime_transformer: adapter parameters of a wrong size");
+            }
+            memcpy(adapter_params_, params);
+        }
+
 
         /* Self-contained runtime archive: the model spec and every weight in its
            current storage form, quantized blocks at rest or dequantized floats. This
@@ -775,6 +1078,7 @@ namespace dlib
 
         void load(std::istream& in)
         {
+            drop_adapters();
             std::string tag;
             dlib::deserialize(tag, in);
             if (tag != "rtm_1" && tag != "rtm_2")
@@ -1720,6 +2024,472 @@ namespace dlib
         resizable_tensor m_in_, m_dyn_, m_out_, factor_a_, factor_b_, shift_, noise_, diff_, latent_, routed_;
         resizable_tensor all_logits_, all_hidden_;
         bool own_context_ = false;
+
+        // Adapters and training
+
+        void drop_adapters()
+        {
+            adapters_.clear();
+            sites_.clear();
+            merged_sites_.clear();
+            site_of_.clear();
+            traces_.clear();
+            plan_ = adapter_plan();
+            adapter_params_.set_size(0, 0, 0, 0);
+            adapter_grads_.set_size(0, 0, 0, 0);
+        }
+
+        stored_matrix& projection(layer& L, int p)
+        {
+            switch (p)
+            {
+            case 0: return L.wq;
+            case 1: return L.wk;
+            case 2: return L.wv;
+            case 3: return L.wo;
+            case 4: return L.w_gate;
+            case 5: return L.w_up;
+            default: return L.w_down;
+            }
+        }
+
+        long site_index(size_t li, int p) const
+        {
+            if (adapters_.empty()) return -1;
+            return site_of_[li * 7 + static_cast<size_t>(p)];
+        }
+
+        /* Adds the adapter of projection p of layer li to y = x.W, where one is configured.
+           The base weight is read by DoRA only, so LoRA never materializes it again. */
+        void adapt(size_t li, int p, const tensor& x, stored_matrix& w, tensor& y)
+        {
+            const long s = site_index(li, p);
+            if (s < 0) return;
+            low_rank_adapter& a = adapters_[static_cast<size_t>(s)];
+            const adapter_site& site = sites_[static_cast<size_t>(s)];
+            auto av = a.a_view()(adapter_params_, site.geometry.a_offset(site.offset));
+            auto bv = a.b_view()(adapter_params_, site.geometry.b_offset(site.offset));
+            auto mv = a.m_view()(adapter_params_, site.geometry.m_offset(site.offset));
+            const tensor& base = site.geometry.method == adapter_method::dora
+                ? weight(w) : static_cast<const tensor&>(adapter_params_);
+            a.forward(x, base, av, bv, mv, y);
+        }
+
+        /* dx += dy.W' for projection p of layer li, through its adapter when it has one,
+           whose parameter gradients then receive their part. */
+        void project_backward(size_t li, int p, const tensor& x, stored_matrix& w, const tensor& dy, tensor& dx)
+        {
+            const long s = site_index(li, p);
+            if (s < 0)
+            {
+                tt::gemm(1.0f, dx, 1.0f, dy, false, weight(w), true);
+                return;
+            }
+            low_rank_adapter& a = adapters_[static_cast<size_t>(s)];
+            const adapter_site& site = sites_[static_cast<size_t>(s)];
+            auto av = a.a_view()(adapter_params_, site.geometry.a_offset(site.offset));
+            auto bv = a.b_view()(adapter_params_, site.geometry.b_offset(site.offset));
+            auto mv = a.m_view()(adapter_params_, site.geometry.m_offset(site.offset));
+            auto dav = a.a_view()(adapter_grads_, site.geometry.a_offset(site.offset));
+            auto dbv = a.b_view()(adapter_grads_, site.geometry.b_offset(site.offset));
+            auto dmv = a.m_view()(adapter_grads_, site.geometry.m_offset(site.offset));
+            a.backward(x, weight(w), av, bv, mv, dy, dx, dav, dbv, dmv);
+        }
+
+        void make_resident(stored_matrix& m)
+        {
+            if (m.resident.size() != 0)
+                return;
+            const tensor& w = weight(m);
+            m.resident.copy_size(w);
+            memcpy(m.resident, w);
+            m.raw.clear();
+            m.raw.shrink_to_fit();
+        }
+
+        std::string model_signature() const
+        {
+            std::ostringstream sout;
+            sout << spec_.arch_name << ':' << spec_.n_layers << ':' << spec_.d_model << ':' << spec_.d_ffn << ':'
+                 << spec_.n_heads << ':' << spec_.n_kv_heads << ':' << head_dim() << ':' << spec_.vocab_size;
+            return sout.str();
+        }
+
+        /* What the backward pass of one block reads: its inputs, the normalizations and
+           their scales, the queries and keys before and after their normalization and
+           rotation, the attention weights, and the activations of the feed-forward block.
+           The attention weights take n_heads*N*N floats per block, which bounds the length
+           of a training sequence before anything else does. */
+        struct layer_trace
+        {
+            resizable_tensor x_in, attn_scale, xn_attn;
+            resizable_tensor q_pre, k_pre, q_scale, k_scale;
+            resizable_tensor q_rot, k_rot, v, attn, ctx_flat;
+            resizable_tensor x_mid, ffn_scale, xn_ffn, gate, up, hidden;
+        };
+
+        void forward_train(const std::vector<int>& tokens)
+        {
+            const long N  = static_cast<long>(tokens.size());
+            const long d  = spec_.d_model;
+            const long H  = spec_.n_heads;
+            const long KV = spec_.n_kv_heads;
+            const long hd = head_dim();
+            const long F  = spec_.d_ffn;
+            const long rep = H / KV;
+            const float qk_scale = spec_.attention_scale > 0.0
+                ? static_cast<float>(spec_.attention_scale)
+                : 1.0f / std::sqrt(static_cast<float>(hd));
+            const float eps = static_cast<float>(spec_.rms_eps);
+
+            x_.set_size(1, 1, N, d);
+            {
+                float* xh = x_.host_write_only();
+                for (long t = 0; t < N; ++t)
+                {
+                    const long id = tokens[static_cast<size_t>(t)];
+                    DLIB_CASSERT(id >= 0 && id < spec_.vocab_size, "token id out of range");
+                    gather_embedding_row(id, xh + t * d);
+                }
+            }
+            if (spec_.embedding_scale != 1.0)
+                tt::affine_transform(x_, x_, static_cast<float>(spec_.embedding_scale), 0.0f);
+            build_trig_caches(N);
+            build_causal_mask(N);
+            traces_.resize(layers_.size());
+
+            for (size_t li = 0; li < layers_.size(); ++li)
+            {
+                layer& L = layers_[li];
+                layer_trace& T = traces_[li];
+                T.x_in.copy_size(x_);
+                memcpy(T.x_in, x_);
+                tt::rms_normalize(eps, T.xn_attn, T.attn_scale, x_, L.attn_norm_g, true);
+
+                q_flat_.set_size(1, 1, N, H * hd);
+                k_flat_.set_size(1, 1, N, KV * hd);
+                v_flat_.set_size(1, 1, N, KV * hd);
+                {
+                    alias_tensor x_2d(N, d), q_2d(N, H * hd), kv_2d(N, KV * hd);
+                    auto xv = x_2d(T.xn_attn, 0);
+                    auto qv = q_2d(q_flat_, 0);
+                    auto kv_v = kv_2d(k_flat_, 0);
+                    auto vv = kv_2d(v_flat_, 0);
+                    tt::gemm(0.0f, qv, 1.0f, xv, false, weight(L.wq), false);
+                    tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
+                    tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
+                    adapt(li, 0, xv, L.wq, qv);
+                    adapt(li, 1, xv, L.wk, kv_v);
+                    adapt(li, 2, xv, L.wv, vv);
+                    if (L.bq.size())
+                    {
+                        ensure_ones(N);
+                        tt::gemm(1.0f, qv, 1.0f, ones_, false, L.bq, false);
+                        tt::gemm(1.0f, kv_v, 1.0f, ones_, false, L.bk, false);
+                        tt::gemm(1.0f, vv, 1.0f, ones_, false, L.bv, false);
+                    }
+                }
+                T.q_rot.set_size(1, H, N, hd);
+                T.k_rot.set_size(1, KV, N, hd);
+                T.v.set_size(1, KV, N, hd);
+                tt::split_heads(false, T.q_rot, q_flat_);
+                tt::split_heads(false, T.k_rot, k_flat_);
+                tt::split_heads(false, T.v, v_flat_);
+                if (L.qnorm_g.size() != 0)
+                {
+                    T.q_pre.copy_size(T.q_rot);
+                    memcpy(T.q_pre, T.q_rot);
+                    T.k_pre.copy_size(T.k_rot);
+                    memcpy(T.k_pre, T.k_rot);
+                    tt::rms_normalize(eps, T.q_rot, T.q_scale, T.q_pre, L.qnorm_g, true);
+                    tt::rms_normalize(eps, T.k_rot, T.k_scale, T.k_pre, L.knorm_g, true);
+                }
+                tt::apply_rotary_positional_embedding(false, T.q_rot, cos_cache_, sin_cache_);
+                tt::apply_rotary_positional_embedding(false, T.k_rot, cos_cache_, sin_cache_);
+
+                k_rep_.set_size(1, H, N, hd);
+                v_rep_.set_size(1, H, N, hd);
+                for (long h = 0; h < H; ++h)
+                {
+                    tt::copy_tensor(false, k_rep_, h, T.k_rot, h / rep, 1);
+                    tt::copy_tensor(false, v_rep_, h, T.v, h / rep, 1);
+                }
+                scores_.set_size(1, H, N, N);
+                tt::gemm(0.0f, scores_, qk_scale, T.q_rot, false, k_rep_, true, operation_mode::PLANE_WISE);
+                {
+                    alias_tensor plane(1, 1, N, N);
+                    for (long h = 0; h < H; ++h)
+                    {
+                        auto sp = plane(scores_, static_cast<size_t>(h) * N * N);
+                        tt::add(sp, sp, mask_);
+                    }
+                }
+                T.attn.copy_size(scores_);
+                tt::softmax(T.attn, scores_, operation_mode::PLANE_WISE);
+                ctx4_.set_size(1, H, N, hd);
+                tt::gemm(0.0f, ctx4_, 1.0f, T.attn, false, v_rep_, false, operation_mode::PLANE_WISE);
+                T.ctx_flat.set_size(1, 1, N, H * hd);
+                tt::merge_heads(false, T.ctx_flat, ctx4_);
+                attn_out_.set_size(1, 1, N, d);
+                {
+                    alias_tensor c_2d(N, H * hd), o_2d(N, d);
+                    auto cv = c_2d(T.ctx_flat, 0);
+                    auto ov = o_2d(attn_out_, 0);
+                    tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
+                    adapt(li, 3, cv, L.wo, ov);
+                }
+                add_residual(x_, attn_out_);
+
+                T.x_mid.copy_size(x_);
+                memcpy(T.x_mid, x_);
+                tt::rms_normalize(eps, T.xn_ffn, T.ffn_scale, x_, L.ffn_norm_g, true);
+                T.gate.set_size(1, 1, N, F);
+                T.up.set_size(1, 1, N, F);
+                {
+                    alias_tensor n_2d(N, d), f_2d(N, F);
+                    auto nv = n_2d(T.xn_ffn, 0);
+                    auto gv = f_2d(T.gate, 0);
+                    auto uv = f_2d(T.up, 0);
+                    tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
+                    tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                    adapt(li, 4, nv, L.w_gate, gv);
+                    adapt(li, 5, nv, L.w_up, uv);
+                }
+                sig_.copy_size(T.gate);
+                tt::sigmoid(sig_, T.gate);
+                T.hidden.copy_size(T.gate);
+                tt::multiply(false, T.hidden, T.gate, sig_);
+                tt::multiply(false, T.hidden, T.hidden, T.up);
+                ffn_out_.set_size(1, 1, N, d);
+                {
+                    alias_tensor h_2d(N, F), f_2d(N, d);
+                    auto hv = h_2d(T.hidden, 0);
+                    auto fv = f_2d(ffn_out_, 0);
+                    tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
+                    adapt(li, 6, hv, L.w_down, fv);
+                }
+                add_residual(x_, ffn_out_);
+            }
+
+            final_x_.copy_size(x_);
+            memcpy(final_x_, x_);
+            tt::rms_normalize(eps, xn_, final_scale_, x_, final_norm_g_, true);
+            logits_.set_size(1, 1, N, spec_.vocab_size);
+            {
+                alias_tensor n_2d(N, d), l_2d(N, spec_.vocab_size);
+                auto nv = n_2d(xn_, 0);
+                auto lv = l_2d(logits_, 0);
+                tt::gemm(0.0f, lv, logit_alpha(), nv, false, weight(lm_head_), false);
+            }
+        }
+
+        float logit_alpha() const
+        {
+            return spec_.logit_scale > 0.0 ? 1.0f / static_cast<float>(spec_.logit_scale) : 1.0f;
+        }
+
+        /* Summed cross-entropy of the supervised positions of logits_. With gradient set,
+           dlogits_ receives scale times its gradient. */
+        double cross_entropy(const std::vector<int>& targets, long& supervised, bool gradient, float scale)
+        {
+            const long N = logits_.nr();
+            const long V = spec_.vocab_size;
+            DLIB_CASSERT(static_cast<long>(targets.size()) == N);
+            const float* lg = logits_.host();
+            float* dl = nullptr;
+            if (gradient)
+            {
+                dlogits_.copy_size(logits_);
+                dl = dlogits_.host_write_only();
+                std::fill(dl, dl + dlogits_.size(), 0.0f);
+            }
+            double loss = 0;
+            supervised = 0;
+            for (long t = 0; t < N; ++t)
+            {
+                const int y = targets[static_cast<size_t>(t)];
+                if (y < 0)
+                    continue;
+                DLIB_CASSERT(y < V, "target out of range");
+                const float* row = lg + static_cast<size_t>(t) * V;
+                float mx = row[0];
+                for (long v = 1; v < V; ++v) mx = std::max(mx, row[v]);
+                double sum = 0;
+                for (long v = 0; v < V; ++v) sum += std::exp(static_cast<double>(row[v] - mx));
+                loss += std::log(sum) - (row[y] - mx);
+                ++supervised;
+                if (dl)
+                {
+                    float* g = dl + static_cast<size_t>(t) * V;
+                    const double inv = 1.0 / sum;
+                    for (long v = 0; v < V; ++v)
+                        g[v] = static_cast<float>(scale * std::exp(static_cast<double>(row[v] - mx)) * inv);
+                    g[y] -= scale;
+                }
+            }
+            return loss;
+        }
+
+        void backward_train()
+        {
+            const long N  = logits_.nr();
+            const long d  = spec_.d_model;
+            const long H  = spec_.n_heads;
+            const long KV = spec_.n_kv_heads;
+            const long hd = head_dim();
+            const long F  = spec_.d_ffn;
+            const long rep = H / KV;
+            const float qk_scale = spec_.attention_scale > 0.0
+                ? static_cast<float>(spec_.attention_scale)
+                : 1.0f / std::sqrt(static_cast<float>(hd));
+            const float rs = static_cast<float>(spec_.residual_scale);
+            gamma_grad_.set_size(1, 1, 1, d);
+            head_gamma_grad_.set_size(1, 1, 1, hd);
+
+            // logits = alpha . xn.W_head, then the final normalization.
+            dxn_.set_size(1, 1, N, d);
+            {
+                alias_tensor l_2d(N, spec_.vocab_size), n_2d(N, d);
+                auto gl = l_2d(dlogits_, 0);
+                auto gn = n_2d(dxn_, 0);
+                tt::gemm(0.0f, gn, logit_alpha(), gl, false, weight(lm_head_), true);
+            }
+            dx_.copy_size(final_x_);
+            dx_ = 0;
+            tt::rms_normalize_gradient(dxn_, final_scale_, final_x_, final_norm_g_, dx_, gamma_grad_, dscale_, true);
+
+            for (size_t step = layers_.size(); step-- > 0; )
+            {
+                layer& L = layers_[step];
+                layer_trace& T = traces_[step];
+
+                /* ---- feed-forward block: x_out = x_mid + rs.down(silu(gate) * up) ---- */
+                dres_.copy_size(dx_);
+                tt::affine_transform(dres_, dx_, rs, 0.0f);
+                dhidden_.copy_size(T.hidden);
+                dhidden_ = 0;
+                {
+                    alias_tensor h_2d(N, F), f_2d(N, d);
+                    auto hv = h_2d(T.hidden, 0);
+                    auto gy = f_2d(dres_, 0);
+                    auto gh = h_2d(dhidden_, 0);
+                    project_backward(step, 6, hv, L.w_down, gy, gh);
+                }
+                sig_.copy_size(T.gate);
+                tt::sigmoid(sig_, T.gate);
+                silu_.copy_size(T.gate);
+                tt::multiply(false, silu_, T.gate, sig_);
+                dup_.copy_size(T.gate);
+                tt::multiply(false, dup_, dhidden_, silu_);
+                // silu'(g) = s.(1 + g.(1 - s)), with s = sigmoid(g)
+                work_.copy_size(T.gate);
+                tt::affine_transform(work_, sig_, -1.0f, 1.0f);
+                tt::multiply(false, work_, work_, T.gate);
+                tt::affine_transform(work_, work_, 1.0f, 1.0f);
+                tt::multiply(false, work_, work_, sig_);
+                dgate_.copy_size(T.gate);
+                tt::multiply(false, dgate_, dhidden_, T.up);
+                tt::multiply(false, dgate_, dgate_, work_);
+                dxn_.copy_size(T.xn_ffn);
+                dxn_ = 0;
+                {
+                    alias_tensor n_2d(N, d), f_2d(N, F);
+                    auto nv = n_2d(T.xn_ffn, 0);
+                    auto gn = n_2d(dxn_, 0);
+                    auto gg = f_2d(dgate_, 0);
+                    auto gu = f_2d(dup_, 0);
+                    project_backward(step, 4, nv, L.w_gate, gg, gn);
+                    project_backward(step, 5, nv, L.w_up, gu, gn);
+                }
+                tt::rms_normalize_gradient(dxn_, T.ffn_scale, T.x_mid, L.ffn_norm_g, dx_, gamma_grad_, dscale_, true);
+
+                /* ---- attention block: x_mid = x_in + rs.(attention . W_o) ---- */
+                tt::affine_transform(dres_, dx_, rs, 0.0f);
+                dctx_flat_.copy_size(T.ctx_flat);
+                dctx_flat_ = 0;
+                {
+                    alias_tensor c_2d(N, H * hd), o_2d(N, d);
+                    auto cv = c_2d(T.ctx_flat, 0);
+                    auto go = o_2d(dres_, 0);
+                    auto gc = c_2d(dctx_flat_, 0);
+                    project_backward(step, 3, cv, L.wo, go, gc);
+                }
+                dctx4_.set_size(1, H, N, hd);
+                tt::split_heads(false, dctx4_, dctx_flat_);
+
+                k_rep_.set_size(1, H, N, hd);
+                v_rep_.set_size(1, H, N, hd);
+                for (long h = 0; h < H; ++h)
+                {
+                    tt::copy_tensor(false, k_rep_, h, T.k_rot, h / rep, 1);
+                    tt::copy_tensor(false, v_rep_, h, T.v, h / rep, 1);
+                }
+                dattn_.set_size(1, H, N, N);
+                tt::gemm(0.0f, dattn_, 1.0f, dctx4_, false, v_rep_, true, operation_mode::PLANE_WISE);
+                dv_rep_.set_size(1, H, N, hd);
+                tt::gemm(0.0f, dv_rep_, 1.0f, T.attn, true, dctx4_, false, operation_mode::PLANE_WISE);
+                tt::softmax_gradient(dattn_, T.attn, dattn_, operation_mode::PLANE_WISE);
+                dq_.set_size(1, H, N, hd);
+                tt::gemm(0.0f, dq_, qk_scale, dattn_, false, k_rep_, false, operation_mode::PLANE_WISE);
+                dk_rep_.set_size(1, H, N, hd);
+                tt::gemm(0.0f, dk_rep_, qk_scale, dattn_, true, T.q_rot, false, operation_mode::PLANE_WISE);
+
+                // The heads that share a key and value channel sum their gradients into it.
+                dk_.set_size(1, KV, N, hd);
+                dv_.set_size(1, KV, N, hd);
+                dk_ = 0;
+                dv_ = 0;
+                for (long h = 0; h < H; ++h)
+                {
+                    tt::copy_tensor(true, dk_, h / rep, dk_rep_, h, 1);
+                    tt::copy_tensor(true, dv_, h / rep, dv_rep_, h, 1);
+                }
+                tt::apply_rotary_positional_embedding(true, dq_, cos_cache_, sin_cache_);
+                tt::apply_rotary_positional_embedding(true, dk_, cos_cache_, sin_cache_);
+                if (L.qnorm_g.size() != 0)
+                {
+                    dpre_.copy_size(dq_);
+                    dpre_ = 0;
+                    tt::rms_normalize_gradient(dq_, T.q_scale, T.q_pre, L.qnorm_g, dpre_, head_gamma_grad_, dscale_, true);
+                    memcpy(dq_, dpre_);
+                    dpre_.copy_size(dk_);
+                    dpre_ = 0;
+                    tt::rms_normalize_gradient(dk_, T.k_scale, T.k_pre, L.knorm_g, dpre_, head_gamma_grad_, dscale_, true);
+                    memcpy(dk_, dpre_);
+                }
+                q_flat_.set_size(1, 1, N, H * hd);
+                k_flat_.set_size(1, 1, N, KV * hd);
+                v_flat_.set_size(1, 1, N, KV * hd);
+                tt::merge_heads(false, q_flat_, dq_);
+                tt::merge_heads(false, k_flat_, dk_);
+                tt::merge_heads(false, v_flat_, dv_);
+                dxn_.copy_size(T.xn_attn);
+                dxn_ = 0;
+                {
+                    alias_tensor x_2d(N, d), q_2d(N, H * hd), kv_2d(N, KV * hd);
+                    auto xv = x_2d(T.xn_attn, 0);
+                    auto gx = x_2d(dxn_, 0);
+                    auto gq = q_2d(q_flat_, 0);
+                    auto gk = kv_2d(k_flat_, 0);
+                    auto gv = kv_2d(v_flat_, 0);
+                    project_backward(step, 0, xv, L.wq, gq, gx);
+                    project_backward(step, 1, xv, L.wk, gk, gx);
+                    project_backward(step, 2, xv, L.wv, gv, gx);
+                }
+                tt::rms_normalize_gradient(dxn_, T.attn_scale, T.x_in, L.attn_norm_g, dx_, gamma_grad_, dscale_, true);
+            }
+        }
+
+        std::vector<low_rank_adapter> adapters_;
+        std::vector<adapter_site> sites_;
+        std::vector<adapter_site> merged_sites_;
+        std::vector<long> site_of_;
+        adapter_plan plan_;
+        resizable_tensor adapter_params_, adapter_grads_;
+        std::vector<layer_trace> traces_;
+        resizable_tensor final_x_, final_scale_, dlogits_, dx_, dxn_, dres_, dscale_, gamma_grad_, head_gamma_grad_;
+        resizable_tensor dhidden_, silu_, dup_, dgate_, work_, dctx_flat_, dctx4_, dattn_, dv_rep_, dq_, dk_rep_;
+        resizable_tensor dk_, dv_, dpre_;
     };
 }
 

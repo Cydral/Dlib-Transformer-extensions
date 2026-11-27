@@ -353,6 +353,117 @@ namespace dlib
     !*/
 
 // ----------------------------------------------------------------------------------------
+// The learnable parameters of a network as one vector
+// ----------------------------------------------------------------------------------------
+
+    class visitor_parameter_layout
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A visitor for visit_learnable_parameters() that appends a block to a
+                parameter_layout for every non-empty tensor it visits, as many rows as the
+                tensor has samples.
+        !*/
+    public:
+        explicit visitor_parameter_layout (parameter_layout& layout);
+        void operator() (tensor& t);
+    };
+
+    class visitor_get_parameters
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A visitor that appends the values of every non-empty tensor it visits to a
+                vector.
+        !*/
+    public:
+        explicit visitor_get_parameters (std::vector<float>& values);
+        void operator() (tensor& t);
+    };
+
+    class visitor_set_parameters
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A visitor that writes consecutive values of a vector into every non-empty
+                tensor it visits, and counts the values it used.
+        !*/
+    public:
+        explicit visitor_set_parameters (const std::vector<float>& values);
+        void operator() (tensor& t);
+        size_t position () const;
+    };
+
+    template <typename net_type>
+    parameter_layout get_parameter_layout (
+        net_type& net
+    );
+    /*!
+        requires
+            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
+              add_tag_layer.
+            - the parameters of net are allocated, by a forward pass or a deserialization.
+        ensures
+            - returns the layout of the vector get_parameter_vector() builds: one block per
+              non-empty tensor visit_learnable_parameters() reaches, in its order.
+    !*/
+
+    template <typename net_type>
+    void get_parameter_vector (
+        net_type& net,
+        std::vector<float>& values
+    );
+    /*!
+        requires
+            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
+              add_tag_layer.
+        ensures
+            - #values holds every learnable parameter of net, tensor after tensor, in the
+              order of get_parameter_layout(net). Two networks of the same type and of the
+              same allocation yield vectors that match position by position.
+    !*/
+
+    template <typename net_type>
+    void set_parameter_vector (
+        net_type& net,
+        const std::vector<float>& values
+    );
+    /*!
+        requires
+            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
+              add_tag_layer.
+        ensures
+            - writes values back into the learnable parameters of net, the inverse of
+              get_parameter_vector().
+        throws
+            - dlib::error if values does not hold exactly as many values as net.
+    !*/
+
+    template <typename net_type>
+    void accumulate_squared_gradients (
+        net_type& net,
+        std::vector<float>& accumulator,
+        float weight = 1
+    );
+    /*!
+        requires
+            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
+              add_tag_layer.
+            - the parameter gradients of net were just computed, by
+              compute_parameter_gradients() for instance, and not yet applied.
+        ensures
+            - adds weight times the square of every parameter gradient to accumulator, at
+              the position of the parameter in get_parameter_vector(); accumulator is first
+              set to zeros of that size when it has another size.
+            - Averaged over steps, the accumulator estimates the diagonal of the empirical
+              Fisher information that curvature_summary condenses.
+        throws
+            - dlib::error when net holds networks of its own (the modules of hrm_, experts,
+              encoders), whose gradients its layers do not expose.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
 // Low-rank adaptation across a network
 // ----------------------------------------------------------------------------------------
 

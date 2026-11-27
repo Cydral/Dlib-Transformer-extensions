@@ -263,6 +263,152 @@ namespace dlib
                   (adopted by load(), or rebuilt from a runtime archive).
         !*/
 
+        // Low-rank fine-tuning of a dense decoder
+
+        struct adapter_site
+        {
+            /*!
+                WHAT THIS OBJECT REPRESENTS
+                    One adapted projection: the name of the tensor of the container it
+                    adapts ("blk.3.attn_q.weight"), its block, its projection (an index of
+                    projection_name()), the geometry of its adapter, and the position of
+                    its [A | B | m] block in adapter_parameters().
+            !*/
+            std::string tensor_name;
+            long layer = 0;
+            int projection = 0;
+            adapter_geometry geometry;
+            size_t offset = 0;
+        };
+
+        static const char* projection_name(int p);
+        /*!
+            requires
+                - 0 <= p < 7
+            ensures
+                - returns attn_q, attn_k, attn_v, attn_output, ffn_gate, ffn_up or ffn_down.
+        !*/
+
+        size_t configure_adapters(const adapter_plan& plan, unsigned long seed = 0);
+        /*!
+            requires
+                - a dense decoder is loaded (no mixture of experts, no hybrid layers)
+            ensures
+                - Gives a low-rank adapter (low_rank_adapter, LoRA or DoRA) to the
+                  projections plan selects, within plan.covers(): the query for
+                  plan.attention_query, the value for plan.attention_value, and the key,
+                  the output projection and the three projections of the feed-forward
+                  block for plan.projection. The output head is never adapted.
+                - The base weights stay frozen, quantized at rest or resident as loaded.
+                  The adapters start inert, A drawn from seed and B zero, so the model
+                  computes exactly what it computed before.
+                - forward_prefill() and step() apply the adapters from then on.
+                - An inactive plan removes the adapters. Returns the number of adapters.
+            throws
+                - std::runtime_error when no model is loaded or the model is not dense.
+        !*/
+
+        bool adapters_active() const;
+        const adapter_plan& adapter_configuration() const;
+        const std::vector<adapter_site>& adapter_sites() const;
+        size_t adapter_parameter_count() const;
+        tensor& adapter_parameters();
+        const tensor& adapter_parameters() const;
+        const tensor& adapter_gradients() const;
+        void zero_adapter_gradients();
+        /*!
+            ensures
+                - adapter_parameters() holds every adapter, site after site, and
+                  adapter_gradients() their gradients in the same layout. An optimizer
+                  updates the first from the second, tt::compute_adam_update() for
+                  instance; the engine reads the parameters at every forward.
+        !*/
+
+        parameter_layout adapter_layout() const;
+        /*!
+            ensures
+                - returns the layout of adapter_parameters(): for each site, A as an
+                  (in_dim, rank) block, B as an (out_dim, rank) block, and m as a one-row
+                  block for DoRA. This is the layout delta_consolidator and
+                  curvature_summary take.
+        !*/
+
+        double accumulate_adapter_gradients(const std::vector<int>& tokens, const std::vector<int>& targets,
+            long& supervised, double gradient_scale = 1.0);
+        /*!
+            requires
+                - adapters_active()
+                - tokens.size() == targets.size() > 0
+                - every token and every non-negative target is below spec().vocab_size
+                - the cache is empty
+            ensures
+                - Runs tokens forward under the causal mask, keeping the activations the
+                  backward pass reads, then adds to adapter_gradients() gradient_scale
+                  times the gradient of the summed cross-entropy of the supervised
+                  positions: position t predicts targets[t], and a negative target leaves
+                  its position out. A supervised fine-tuning example thus supervises its
+                  answer only, and a document every position.
+                - The activations kept for the backward pass grow with the square of the
+                  sequence length: the attention weights of every head of every block,
+                  n_layers*n_heads*N*N floats, besides a few N*width tensors per block.
+                - The gradient flows through the frozen weights, the normalizations,
+                  rotary positions, grouped-query attention, the query and key
+                  normalization of the families that have one, and the gated feed-forward
+                  block, exactly as the forward computed them.
+                - Returns the summed loss; #supervised is the number of supervised
+                  positions. With nothing supervised, the gradients are left as they were.
+            throws
+                - std::runtime_error when no adapter is configured.
+        !*/
+
+        double evaluate_loss(const std::vector<int>& tokens, const std::vector<int>& targets, long& supervised);
+        /*!
+            requires
+                - a dense decoder is loaded
+                - tokens.size() == targets.size() > 0
+                - tokens fit the context when one is set
+            ensures
+                - returns the summed cross-entropy of the supervised positions, adapters
+                  included, and sets #supervised to their number. The cache is empty on
+                  return.
+        !*/
+
+        void merge_adapters();
+        /*!
+            ensures
+                - folds every adapter into the weight it adapts, which becomes resident in
+                  single precision, and removes the adapters. The model computes what it
+                  computed with them, to rounding.
+        !*/
+
+        void write_merged_gguf(gguf_reader& source, const std::string& path, ggml_type type = ggml_type::Q8_0);
+        /*!
+            requires
+                - source is the container the model was loaded from
+                - type is F32, F16, BF16 or Q8_0
+            ensures
+                - writes to path a copy of source in which every adapted weight is replaced
+                  by the weight merged with its adapter, and every weight an earlier
+                  merge_adapters() folded by the weight the engine holds, in the rows and the rotary layout
+                  of the container, encoded in type (F16 for a weight whose rows cannot hold
+                  whole Q8_0 blocks). Every other tensor is copied byte for byte, and every
+                  metadata value as it is, tokenizer and chat template included. The
+                  adapters stay in place.
+            throws
+                - std::runtime_error when the file cannot be written.
+        !*/
+
+        void save_adapters(std::ostream& out) const;
+        void load_adapters(std::istream& in);
+        /*!
+            ensures
+                - save the adapter configuration and parameters with a signature of the
+                  model, and restore them onto the same model.
+            throws
+                - serialization_error when the archive was written for another model or is
+                  damaged; the adapters in place are then kept.
+        !*/
+
         void save(std::ostream& out) const;
         /*!
             ensures

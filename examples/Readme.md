@@ -37,6 +37,7 @@
   - [`slm_vision_tower_ex.cpp`](#slm_vision_tower_excpp)
   - [`slm_vit_classify_ex.cpp` and `slm_vit_ssl_ex.cpp`](#slm_vit_classify_excpp-and-slm_vit_ssl_excpp)
   - [`slm_distill_ex.cpp`](#slm_distill_excpp)
+  - [`slm_federated_ex.cpp`](#slm_federated_excpp)
   - [`slm_embed_ex.cpp`](#slm_embed_excpp)
   - [`slm_extended_memory_ex.cpp`](#slm_extended_memory_excpp)
   - [`slm_npu_offload_ex.cpp`](#slm_npu_offload_excpp)
@@ -120,6 +121,8 @@ Then the interoperability and specialization track, which can be read independen
    Protect the **personal data** of documents with reversible tags, and train a small **span tagger** that says, for any string, what is personal and where it starts and ends.
 17. [`slm_npu_offload_ex.cpp`](#slm_npu_offload_excpp)  
    See what the **NPU** and the **integrated GPU** of the processor bring to the primitives of a transformer and to a training run, with routing decided at run time.
+18. [`slm_federated_ex.cpp`](#slm_federated_excpp)  
+   Learn a text by heart **across students that each hold one part of it**, and check that the model a master consolidates from their updates recites it whole.
 
 A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides embedded datasets and utilities used throughout the examples, and [`slm_tools/`](slm_tools) holds the Python witnesses used to verify the C++ paths against reference implementations.
 
@@ -669,6 +672,68 @@ The transfer is bounded by the corpus, and the example says so plainly: the teac
 
 ### Why this example matters
 It is the model factory. The architecture becomes a parameter, the teacher and the corpus become inputs, and the recording becomes a reusable asset.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_federated_ex.cpp`
+
+### Purpose
+Check the whole federated training device on a text that **no student holds whole**, learned by heart from the updates of the students alone, and that the consolidated model then **recites from its first token**.
+
+### What the example teaches
+The text is split into as many parts as there are students, at the line ends nearest to equal shares, and each student, in a thread of its own, holds one part, preceded by the window of bytes before it, which only serves as context. A student never sends its text and the master never sends one: every exchange goes through a relay that the participants call, one compartment per task, and carries numbers only. A round goes as follows:
+1. the master posts a command to train from the state of the round, with the digest of that state;
+2. each student trains for a few steps on its part and posts its **update** (the state of the round minus the state it reached), compressed with **error feedback**, a **factored summary of the curvature** it measured, and the loss of the state of the round on its part;
+3. the master **consolidates** the updates into one direction;
+4. with `curvature_consensus`, the students measure the loss of three step lengths along it on their parts, and the master keeps the best one or rejects the round, where `average` and `outer_momentum` apply the step in full;
+5. every replica applies the same step to the same state and checks the digest of the result.
+
+Once the federation ends, the program, standing for the owner of the text and outside the master, makes the consolidated model recite from the start token and measures, for each part, the share of its bytes the model predicts from the text before them. As a control, the same students train apart for as many steps, and their two models are averaged once.
+
+### What it shows
+With the defaults (two students, twelve rounds of twenty-five steps, the perceptron), the consolidated model of each of the three methods recites the 631 bytes of the sonnet without an error. Each student trained alone holds its own part and about 15 % of the other one, and the average of the two models recites nothing, although it predicts 87 % of each part from the right text before it:
+
+```
+  model                                            recited   part 1   part 2
+  federation, average                           631 of 631   100.0%   100.0%
+  federation, outer_momentum                    631 of 631   100.0%   100.0%
+  federation, curvature_consensus               631 of 631   100.0%   100.0%
+  student 0 trained alone                       311 of 631   100.0%    15.0%
+  student 1 trained alone                         0 of 631    13.8%   100.0%
+  average of the students alone                   0 of 631    87.1%    86.6%
+```
+
+Averaging the weights of the two students once loses what each one knew; the rounds, which bring every student back to the consolidated state before it trains again, join the two parts. With `--students 3`, the three methods again recite the whole text. The run takes less than a minute on two cores.
+
+### Two networks, two stages
+- **Recite** (`--stage recite`, the default): a network compiled into the program learns the first text from scratch. The default is a perceptron over a window of sixteen bytes (`--arch mlp`), which holds the text after a few hundred steps; `--arch transformer` takes a small decoder (`decoder_transformer_config`), which needs more rounds and whose states the master also writes as GGUF containers through `export_gguf_weights()`. The federation only handles vectors of parameters (`get_parameter_vector()`, `set_parameter_vector()`, `get_parameter_layout()`), so any network can take their place.
+- **Adapt** (`--stage adapt` with `--model`, or `--stage both` after the decoder): the consolidated container is **loaded at run time** by `runtime_transformer`, which trains LoRA adapters on every projection through its own backward pass (`accumulate_adapter_gradients()`) so that the model learns a second text, split between the students the same way. The pool keeps the adapters and the container with the adapters merged (`write_merged_gguf()`), and the check loads that container afresh and makes it recite from the title. `--model` takes any dense decoder in a GGUF file, whose own tokenizer splits the text.
+
+With `--arch transformer --stage both`, the decoder (47,776 parameters) predicts 98 to 99 % of each part after forty rounds, and its recitation drifts after a few dozen bytes, where the perceptron recites the whole text after twelve rounds. The adapt stage then loads its container, and after thirty rounds the LoRA adapters of rank 32 (45,056 parameters) give merged containers that predict 92 to 99 % of each part of the second sonnet, depending on the method. The container consolidated by `curvature_consensus`, which ends with the lowest loss (0.106 against 0.156 for `average` and 0.283 for `outer_momentum`), predicts 98.9 and 99.4 % of its parts and recites its first three lines from the title. That run takes five to seven minutes on two cores.
+
+### The consolidation
+`delta_consolidator` offers three methods, compared on the same initial state:
+- `average`: FedAvg, the weighted mean of the updates applied in full;
+- `outer_momentum`: DiLoCo, the same mean through an outer Nesterov momentum;
+- `curvature_consensus`: each coordinate weighted by the curvature each student measured there, shrunk where the students disagree, each block of an update bounded by a multiple of the median across three students or more, and the step length chosen on the losses of the students, by their median from three students on and by their mean below.
+
+Every stage of the consolidation has a switch on the command line (`--curvature-mix`, `--consensus`, `--spectral`, `--norm-bound`, `--multipliers`, `--outer-lr`, `--outer-momentum`), and `--text` takes any text to learn.
+
+### The master
+It keeps its last three accepted states in `--pool`, each as a `.dat` archive and, for the decoder, a `.gguf` container, written under a temporary name and renamed. `--pause-at` and `--stop-at` show the two controls of an operator: the students pause between two steps and resume where they were, and a stop keeps the last state every replica agreed on. A student out of step asks for the state and receives it alone; a student that fails leaves the quorum.
+
+### Main technical choices
+- Payloads from another participant are read with `deserialize_bounded()`, which checks every declared length against the bytes received before anything is allocated, and a `compressed_delta` refuses any scale or value out of the range of a float, so what it decodes is finite. The relay bounds a payload by the size of the model: 8 bytes per parameter plus 1 MiB, 64 MiB at least.
+- The bounds of `curvature_consensus` hold against a hostile student once three or more take part. With two students, or with `average` and `outer_momentum`, one student can move the direction or have every round rejected.
+- The update of a replica is applied by `apply_consolidated_step()`, which depends on its arguments only, so the master and the students reach the same state bit for bit.
+- The library runs its parallel loops in the thread of each student (`DLIB_NUM_THREADS=0` unless set), so the students do not wait on one another and a run repeats bit for bit; a build with FMA instructions moves the last decimals. Each computing thread takes the values below the smallest normal float as zeros, which keeps the arithmetic at its normal speed.
+- With `--model` and a model of real size, each student loads its own copy of the model in floats and each accepted round writes the merged container in floats, four bytes per parameter for each student and each kept state. A `DLIB_NUM_THREADS` set beforehand gives the students and the checks more cores, and the runs then no longer repeat bit for bit.
+- The relay holds one lock, released before a participant does anything else, and every wait has a deadline and reads the stop flags.
+
+### Why this example matters
+It is the first iteration of a distributed training product. The mechanisms it shows live in the library (`dnn/utilities.h`, `dnn/visitors.h`, `dnn/runtime_transformer.h`, `data_io/gguf_reader.h`, `data_io/gguf_weight_loader.h`), and a product replaces the in-memory relay by a network one.
 
 [⬆ Back to top](#on-this-page)
 

@@ -367,6 +367,10 @@ namespace dlib
                 std::cout << "  loaded block " << b << "\r" << std::flush;
         }
 
+        /* The embedding table is the parameter tensor of the embedding layer, last in the
+           visit order, and is filled below through get_embeddings(). */
+        if (k + 1 == params.size() && params.back()->size() == static_cast<size_t>(V) * d)
+            params.pop_back();
         if (k != params.size())
             throw std::runtime_error("import_gguf_weights: assigned " + std::to_string(k)
                 + " of " + std::to_string(params.size())
@@ -385,6 +389,205 @@ namespace dlib
 
         if (opt.verbose)
             std::cout << "  loaded " << k << " parameter tensors plus the embedding table\n";
+    }
+
+    namespace gguf_load_impl
+    {
+        /* The inverse of transpose_into: a Dlib [in_dim, out_dim] row-major matrix back to the
+           [out_dim, in_dim] rows of the container, the per-head rotary permutation undone. */
+        inline void transpose_from(const float* src, long out_dim, long in_dim, std::vector<float>& dst,
+            long head_dim, bool rope_permute)
+        {
+            dst.assign(static_cast<size_t>(out_dim) * in_dim, 0.0f);
+            const long half = head_dim / 2;
+            for (long o = 0; o < out_dim; ++o)
+            {
+                long od = o;
+                if (rope_permute && head_dim > 0)
+                {
+                    const long r = o % head_dim;
+                    od = (o / head_dim) * head_dim + ((r < half) ? (2 * r) : (2 * (r - half) + 1));
+                }
+                float* drow = dst.data() + static_cast<size_t>(o) * in_dim;
+                for (long i = 0; i < in_dim; ++i)
+                    drow[i] = src[static_cast<size_t>(i) * out_dim + od];
+            }
+        }
+
+        // A vector indexed like the rows of a permuted projection, back to the container order.
+        inline std::vector<float> unpermute_vector(const float* src, long dim, long head_dim, bool rope_permute)
+        {
+            std::vector<float> dst(static_cast<size_t>(dim));
+            const long half = head_dim / 2;
+            for (long o = 0; o < dim; ++o)
+            {
+                long od = o;
+                if (rope_permute && head_dim > 0)
+                {
+                    const long r = o % head_dim;
+                    od = (o / head_dim) * head_dim + ((r < half) ? (2 * r) : (2 * (r - half) + 1));
+                }
+                dst[static_cast<size_t>(o)] = src[od];
+            }
+            return dst;
+        }
+
+        /* The parameter tensors of a decoder_transformer_config network in the order of
+           import_gguf_weights(): the output head, the final norm, then for each block from
+           the last [ffn_down, ffn_up, ffn_gate, ffn_norm, attention, attn_norm], and the
+           embedding table last. */
+        template <typename net_type>
+        std::vector<tensor*> decoder_parameter_tensors(net_type& net, const model_spec& spec)
+        {
+            std::vector<tensor*> params;
+            visit_learnable_parameters(net, [&params](tensor& t) { if (t.size() > 0) params.push_back(&t); });
+            const size_t expected = 3 + 6 * static_cast<size_t>(spec.n_layers);
+            if (params.size() != expected)
+                throw std::runtime_error("export_gguf_weights: the network holds " + std::to_string(params.size())
+                    + " parameter tensors where a decoder of " + std::to_string(spec.n_layers)
+                    + " blocks holds " + std::to_string(expected) + "; run a forward pass first");
+            return params;
+        }
+    }
+
+    /* The layout of the parameters of a decoder_transformer_config network, with each
+       packed attention tensor split into its query, key, value and output matrices, as
+       consolidation and spectral operations need them. */
+    template <typename net_type>
+    parameter_layout decoder_parameter_layout(net_type& net, const model_spec& spec)
+    {
+        parameter_layout layout = get_parameter_layout(net);
+        const long d = spec.d_model, hd = spec.head_dim > 0 ? spec.head_dim : spec.d_model / spec.n_heads;
+        const long qd = spec.n_heads * hd, kv = spec.n_kv_heads * hd;
+        if (layout.num_blocks() != 3 + 6 * static_cast<size_t>(spec.n_layers))
+            throw std::runtime_error("decoder_parameter_layout: the network does not match the specification");
+        /* A split moves the blocks after the one it splits: the attention tensors are split
+           from the last in the layout, block 0 of the decoder, to the first. */
+        for (long b = 0; b < spec.n_layers; ++b)
+        {
+            const size_t at = 2 + 6 * static_cast<size_t>(spec.n_layers - 1 - b) + 4;
+            if (layout.block(at).size < 2 * static_cast<size_t>(d) * (qd + kv))
+                throw std::runtime_error("decoder_parameter_layout: unexpected attention parameters");
+            layout.split_block(at, { { d, qd }, { d, kv }, { d, kv }, { qd, d } });
+        }
+        return layout;
+    }
+
+    /* Writes the weights of a decoder_transformer_config network into a container under the
+       architecture of spec, with the metadata of that architecture: the inverse of
+       import_gguf_weights(). Matrices are encoded in matrix_type (a matrix whose rows cannot
+       hold whole Q8_0 blocks falls back to F16), vectors in F32. The tokenizer and the chat
+       template are left to the caller, who copies them from where the vocabulary came from. */
+    template <typename net_type>
+    void export_gguf_weights(net_type& net, const model_spec& spec, gguf_writer& w,
+        ggml_type matrix_type = ggml_type::F32, const gguf_load_options& opt = gguf_load_options())
+    {
+        using namespace gguf_load_impl;
+        std::vector<tensor*> params = decoder_parameter_tensors(net, spec);
+        const long d = spec.d_model;
+        const long hd = spec.head_dim > 0 ? spec.head_dim : spec.d_model / spec.n_heads;
+        const long qd = spec.n_heads * hd, kv = spec.n_kv_heads * hd, ff = spec.d_ffn;
+        const long V = spec.vocab_size, L = spec.n_layers;
+        const bool neox = opt.rope_permute || spec.arch_name == "qwen2" || spec.arch_name == "qwen3";
+        const std::string a = spec.arch_name;
+
+        w.set_string("general.architecture", a);
+        if (!w.has("general.name"))
+            w.set_string("general.name", spec.model_name.empty() ? a : spec.model_name);
+        w.set_uint32(a + ".block_count", static_cast<uint32_t>(L));
+        w.set_uint32(a + ".embedding_length", static_cast<uint32_t>(d));
+        w.set_uint32(a + ".feed_forward_length", static_cast<uint32_t>(ff));
+        w.set_uint32(a + ".attention.head_count", static_cast<uint32_t>(spec.n_heads));
+        w.set_uint32(a + ".attention.head_count_kv", static_cast<uint32_t>(spec.n_kv_heads));
+        w.set_float32(a + ".attention.layer_norm_rms_epsilon", static_cast<float>(spec.rms_eps));
+        w.set_float32(a + ".rope.freq_base", static_cast<float>(spec.rope_freq_base));
+        w.set_uint32(a + ".vocab_size", static_cast<uint32_t>(V));
+        if (!w.has(a + ".context_length"))
+            w.set_uint32(a + ".context_length", 2048);
+        if (hd * spec.n_heads != d)
+        {
+            w.set_uint32(a + ".attention.key_length", static_cast<uint32_t>(hd));
+            w.set_uint32(a + ".attention.value_length", static_cast<uint32_t>(hd));
+        }
+        const uint32_t file_type = matrix_type == ggml_type::F16 ? 1 : matrix_type == ggml_type::Q8_0 ? 7
+            : matrix_type == ggml_type::BF16 ? 32 : 0;
+        w.set_uint32("general.file_type", file_type);
+
+        auto put_matrix = [&](const std::string& name, const float* src, long out_dim, long in_dim, bool permute)
+        {
+            std::vector<float> rows;
+            transpose_from(src, out_dim, in_dim, rows, hd, permute);
+            const ggml_type t = (matrix_type == ggml_type::Q8_0 && in_dim % 32 != 0) ? ggml_type::F16 : matrix_type;
+            w.add_tensor(name, { static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim) }, rows.data(), t);
+        };
+        auto put_vector = [&](const std::string& name, const float* src, long n)
+        {
+            w.add_tensor(name, { static_cast<uint64_t>(n) }, src, ggml_type::F32);
+        };
+
+        size_t k = 0;
+        const tensor& head = *params[k++];
+        if (head.size() != static_cast<size_t>(d) * V)
+            throw std::runtime_error("export_gguf_weights: unexpected output head");
+        const tensor& out_norm = *params[k++];
+        const tensor& embd = *params.back();
+        if (embd.size() != static_cast<size_t>(V) * d || out_norm.size() != static_cast<size_t>(d))
+            throw std::runtime_error("export_gguf_weights: unexpected embedding table or final norm");
+
+        /* The embedding table is [vocab, d_model] in both layouts: the rows of the container
+           are the rows of the table. */
+        w.add_tensor("token_embd.weight", { static_cast<uint64_t>(d), static_cast<uint64_t>(V) }, embd.host(),
+            (matrix_type == ggml_type::Q8_0 && d % 32 != 0) ? ggml_type::F16 : matrix_type);
+        put_vector("output_norm.weight", out_norm.host(), d);
+        // The compiled decoder trains an output head of its own: the container always carries it.
+        put_matrix("output.weight", head.host(), V, d, false);
+
+        for (long b = L - 1; b >= 0; --b)
+        {
+            const std::string p = "blk." + std::to_string(b) + ".";
+            const tensor& down = *params[k++];
+            const tensor& up = *params[k++];
+            const tensor& gate = *params[k++];
+            const tensor& ffn_norm = *params[k++];
+            const tensor& attn = *params[k++];
+            const tensor& attn_norm = *params[k++];
+            if (down.size() != static_cast<size_t>(ff) * d || up.size() != static_cast<size_t>(d) * ff
+                || gate.size() != static_cast<size_t>(d) * ff)
+                throw std::runtime_error("export_gguf_weights: unexpected feed-forward tensors in " + p);
+            put_matrix(p + (opt.swap_gate_up ? "ffn_gate" : "ffn_up") + ".weight", up.host(), ff, d, false);
+            put_matrix(p + (opt.swap_gate_up ? "ffn_up" : "ffn_gate") + ".weight", gate.host(), ff, d, false);
+            put_matrix(p + "ffn_down.weight", down.host(), d, ff, false);
+            put_vector(p + "ffn_norm.weight", ffn_norm.host(), d);
+            put_vector(p + "attn_norm.weight", attn_norm.host(), d);
+
+            const size_t nq = static_cast<size_t>(d) * qd, nkv = static_cast<size_t>(d) * kv;
+            const size_t ng = spec.qk_norm ? static_cast<size_t>(hd) : 0;
+            if (attn.size() < 2 * nq + 2 * nkv + 2 * ng)
+                throw std::runtime_error("export_gguf_weights: unexpected attention tensor in " + p);
+            const float* f = attn.host();
+            put_matrix(p + "attn_q.weight", f, qd, d, neox);
+            put_matrix(p + "attn_k.weight", f + nq, kv, d, neox);
+            put_matrix(p + "attn_v.weight", f + nq + nkv, kv, d, false);
+            put_matrix(p + "attn_output.weight", f + nq + 2 * nkv, d, qd, false);
+            if (spec.qk_norm)
+            {
+                const float* gq = f + 2 * nq + 2 * nkv;
+                std::vector<float> vq = unpermute_vector(gq, hd, hd, neox);
+                std::vector<float> vk = unpermute_vector(gq + ng, hd, hd, neox);
+                put_vector(p + "attn_q_norm.weight", vq.data(), hd);
+                put_vector(p + "attn_k_norm.weight", vk.data(), hd);
+            }
+            const size_t nb = static_cast<size_t>(qd) + 2 * static_cast<size_t>(kv);
+            if (attn.size() == 2 * nq + 2 * nkv + 2 * ng + nb)
+            {
+                const float* bb = f + 2 * nq + 2 * nkv + 2 * ng;
+                std::vector<float> bq = unpermute_vector(bb, qd, hd, neox);
+                std::vector<float> bk = unpermute_vector(bb + qd, kv, hd, neox);
+                put_vector(p + "attn_q.bias", bq.data(), qd);
+                put_vector(p + "attn_k.bias", bk.data(), kv);
+                put_vector(p + "attn_v.bias", bb + qd + kv, kv);
+            }
+        }
     }
 }
 

@@ -181,6 +181,8 @@ A built-in **web chat interface** and an **OpenAI-compatible endpoint** (`/v1/ch
 
 The two methods trade the same thing in opposite directions. Pruning starts from the teacher's weights and cannot change the architecture; logit distillation starts from nothing and can change everything. At an equal budget the first wins, which is exactly why the second exists.
 
+**Federated training across hosts that keep their data.** Students train on their own data and send updates, compressed with error feedback, with a factored summary of the curvature they measured; a master consolidates them, weighing each coordinate by that curvature, shrinking the directions the students dispute and choosing the step on their held-out losses, and keeps its last states as Dlib archives and GGUF containers. The same protocol fine-tunes a model **loaded at run time** from a GGUF container: `runtime_transformer` trains LoRA and DoRA adapters through its own backward pass and writes the container back with the adapters merged. [`slm_federated_ex.cpp`](examples/Readme.md#slm_federated_excpp) runs a master and its students in threads on a text split between them, and the consolidated model recites the whole text while each student trained alone holds its own part only and the average of their models recites nothing.
+
 ### Retrieval, for answering from documents
 
 An embedding model is the decoder already covered here **with its last step removed**: instead of projecting the final hidden state onto the vocabulary, it returns that state. Containers say so themselves — one such model declares itself a `qwen3`, carries the usual blocks and final normalization, and has no output projection at all — so the same loader reads them with no special case.

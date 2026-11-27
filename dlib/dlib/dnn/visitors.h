@@ -4,6 +4,7 @@
 #define DLIB_DNn_VISITORS_H_
 
 #include "visitors_abstract.h"
+#include "utilities.h"
 #include "input.h"
 #include "layers.h"
 #include "transformer.h"
@@ -505,6 +506,148 @@ namespace dlib
         std::vector<resizable_tensor> averages_;
         resizable_tensor scratch_;
     };
+
+// ----------------------------------------------------------------------------------------
+// The learnable parameters of a network as one vector
+// ----------------------------------------------------------------------------------------
+
+    class visitor_parameter_layout
+    {
+    public:
+        explicit visitor_parameter_layout (parameter_layout& layout) : layout_(layout) {}
+
+        void operator() (tensor& t)
+        {
+            if (t.size() == 0)
+                return;
+            const long rows = std::max<long>(1, t.num_samples());
+            layout_.add_block(rows, static_cast<long>(t.size() / static_cast<size_t>(rows)));
+        }
+
+    private:
+        parameter_layout& layout_;
+    };
+
+    class visitor_get_parameters
+    {
+    public:
+        explicit visitor_get_parameters (std::vector<float>& values) : values_(values) {}
+
+        void operator() (tensor& t)
+        {
+            if (t.size() == 0)
+                return;
+            const float* p = t.host();
+            values_.insert(values_.end(), p, p + t.size());
+        }
+
+    private:
+        std::vector<float>& values_;
+    };
+
+    class visitor_set_parameters
+    {
+    public:
+        explicit visitor_set_parameters (const std::vector<float>& values) : values_(values) {}
+
+        void operator() (tensor& t)
+        {
+            if (t.size() == 0)
+                return;
+            DLIB_CASSERT(position_ + t.size() <= values_.size(),
+                "set_parameter_vector: the vector is shorter than the parameters of the network");
+            std::memcpy(t.host_write_only(), values_.data() + position_, t.size() * sizeof(float));
+            position_ += t.size();
+        }
+
+        size_t position () const { return position_; }
+
+    private:
+        const std::vector<float>& values_;
+        size_t position_ = 0;
+    };
+
+    template <typename net_type>
+    parameter_layout get_parameter_layout (
+        net_type& net
+    )
+    {
+        parameter_layout layout;
+        visit_learnable_parameters(net, visitor_parameter_layout(layout));
+        return layout;
+    }
+
+    template <typename net_type>
+    void get_parameter_vector (
+        net_type& net,
+        std::vector<float>& values
+    )
+    {
+        values.clear();
+        visit_learnable_parameters(net, visitor_get_parameters(values));
+    }
+
+    template <typename net_type>
+    void set_parameter_vector (
+        net_type& net,
+        const std::vector<float>& values
+    )
+    {
+        size_t expected = 0;
+        visit_learnable_parameters(net, [&expected](tensor& t) { expected += t.size(); });
+        if (expected != values.size())
+            throw error("set_parameter_vector: the vector holds " + std::to_string(values.size()) +
+                        " values where the network holds " + std::to_string(expected));
+        /* The visitor is copied into the traversal, so the position it reached is read back
+           through a reference held outside. */
+        visitor_set_parameters writer(values);
+        visit_learnable_parameters(net, [&writer](tensor& t) { writer(t); });
+        if (writer.position() != values.size())
+            throw error("set_parameter_vector: the vector holds " + std::to_string(values.size()) +
+                        " values where the network holds " + std::to_string(writer.position()));
+    }
+
+    template <typename net_type>
+    void accumulate_squared_gradients (
+        net_type& net,
+        std::vector<float>& accumulator,
+        float weight = 1
+    )
+    {
+        /* The gradients are those of the computational layers of net itself, matched with
+           the parameter tensors of the same layers; a network that holds networks of its own
+           keeps gradients this traversal does not reach. */
+        std::vector<tensor*> params, grads;
+        visit_layer_parameters(net, [&params](size_t, tensor& t) { params.push_back(&t); });
+        visit_layer_parameter_gradients(net, [&grads](size_t, tensor& t) { grads.push_back(&t); });
+        size_t learnable = 0;
+        visit_learnable_parameters(net, [&learnable](tensor& t) { learnable += t.size(); });
+        size_t total = 0;
+        for (const tensor* p : params)
+            total += p->size();
+        if (total != learnable || params.size() != grads.size())
+            throw error("accumulate_squared_gradients: the network holds parameters out of reach of its "
+                        "layer gradients");
+        if (accumulator.size() != total)
+            accumulator.assign(total, 0.0f);
+        size_t at = 0;
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            const size_t n = params[i]->size();
+            if (n == 0)
+                continue;
+            if (grads[i]->size() == n)
+            {
+                const float* g = grads[i]->host();
+                float* a = accumulator.data() + at;
+                for (size_t j = 0; j < n; ++j)
+                    a[j] += weight * g[j] * g[j];
+            }
+            at += n;
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------------------
 // Low-rank adaptation across a network

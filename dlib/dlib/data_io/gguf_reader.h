@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <istream>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <streambuf>
 #include <utility>
@@ -610,6 +612,365 @@ namespace dlib
             }
         return bytes.empty() ? std::string() : std::string(ggml_type_name(dominant));
     }
+
+    /* Round to nearest even conversions of a float to the two 16-bit formats of the
+       container, the inverses of the readings of gguf_dequantize.h. */
+    inline uint16_t gguf_float_to_half(float f)
+    {
+        uint32_t x;
+        std::memcpy(&x, &f, 4);
+        const uint32_t sign = (x >> 16) & 0x8000u;
+        const uint32_t ex = (x >> 23) & 0xffu;
+        uint32_t mant = x & 0x7fffffu;
+        if (ex == 0xffu)
+            return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 0x200u : 0u));
+        const int e = static_cast<int>(ex) - 127 + 15;
+        if (e >= 31)
+            return static_cast<uint16_t>(sign | 0x7c00u);
+        if (e <= 0)
+        {
+            if (e < -10)
+                return static_cast<uint16_t>(sign);
+            mant |= 0x800000u;
+            const int shift = 14 - e;
+            uint32_t h = mant >> shift;
+            const uint32_t rem = mant & ((1u << shift) - 1);
+            const uint32_t half = 1u << (shift - 1);
+            if (rem > half || (rem == half && (h & 1u)))
+                ++h;
+            return static_cast<uint16_t>(sign | h);
+        }
+        uint32_t h = (static_cast<uint32_t>(e) << 10) | (mant >> 13);
+        const uint32_t rem = mant & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u)))
+            ++h;   // a carry into the exponent is the correct rounding, up to infinity
+        return static_cast<uint16_t>(sign | h);
+    }
+
+    inline uint16_t gguf_float_to_bf16(float f)
+    {
+        uint32_t x;
+        std::memcpy(&x, &f, 4);
+        if ((x & 0x7fffffffu) > 0x7f800000u)
+            return static_cast<uint16_t>((x >> 16) | 0x40u);   // quiet NaN
+        x += 0x7fffu + ((x >> 16) & 1u);
+        return static_cast<uint16_t>(x >> 16);
+    }
+
+    /* Encodes count floats in one of the formats a writer produces: F32, F16, BF16, or Q8_0
+       (blocks of 32 values sharing one scale in half precision, as ggml quantizes them). */
+    inline void gguf_encode_floats(const float* src, size_t count, ggml_type type, std::vector<uint8_t>& dst)
+    {
+        dst.clear();
+        switch (type)
+        {
+        case ggml_type::F32:
+            dst.resize(count * 4);
+            if (count) std::memcpy(dst.data(), src, count * 4);
+            return;
+        case ggml_type::F16:
+        case ggml_type::BF16:
+            dst.resize(count * 2);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const uint16_t h = type == ggml_type::F16 ? gguf_float_to_half(src[i]) : gguf_float_to_bf16(src[i]);
+                std::memcpy(dst.data() + 2 * i, &h, 2);
+            }
+            return;
+        case ggml_type::Q8_0:
+        {
+            if (count % 32 != 0)
+                throw std::runtime_error("gguf_encode_floats: Q8_0 needs a multiple of 32 values");
+            dst.resize(count / 32 * 34);
+            for (size_t b = 0; b < count / 32; ++b)
+            {
+                const float* x = src + 32 * b;
+                float amax = 0;
+                for (int j = 0; j < 32; ++j) amax = std::max(amax, std::abs(x[j]));
+                const float d = amax / 127.0f;
+                const float id = d != 0 ? 1.0f / d : 0.0f;
+                const uint16_t hd = gguf_float_to_half(d);
+                uint8_t* out = dst.data() + 34 * b;
+                std::memcpy(out, &hd, 2);
+                for (int j = 0; j < 32; ++j)
+                    out[2 + j] = static_cast<uint8_t>(static_cast<int8_t>(std::lround(x[j] * id)));
+            }
+            return;
+        }
+        default:
+            throw std::runtime_error(std::string("gguf_encode_floats: cannot encode ") + ggml_type_name(type));
+        }
+    }
+
+    /* Builds a GGUF container in memory, metadata then tensors, and writes it in one pass.
+       Every value keeps the type it is given, so a container read by gguf_reader and copied
+       through copy_metadata() is written back with the same types. */
+    class gguf_writer
+    {
+    public:
+        void set_alignment(uint64_t a)
+        {
+            if (a == 0 || a > 65536 || (a & (a - 1)) != 0)
+                throw std::runtime_error("gguf_writer: invalid alignment");
+            alignment_ = a;
+        }
+        uint64_t alignment() const { return alignment_; }
+
+        void set(const std::string& key, const gguf_value& value)
+        {
+            if (key == "general.alignment")
+            {
+                set_alignment(static_cast<uint64_t>(value.as_int()));
+                return;
+            }
+            if (value.type == gguf_type::ARRAY && value.array_type == gguf_type::ARRAY)
+                throw std::runtime_error("gguf_writer: nested arrays are not supported");
+            meta_[key] = value;
+        }
+
+        void set_string(const std::string& key, const std::string& s)
+        {
+            gguf_value v; v.type = gguf_type::STRING; v.s = s; set(key, v);
+        }
+        void set_uint32(const std::string& key, uint32_t x)
+        {
+            gguf_value v; v.type = gguf_type::UINT32; v.i = x; set(key, v);
+        }
+        void set_int32(const std::string& key, int32_t x)
+        {
+            gguf_value v; v.type = gguf_type::INT32; v.i = x; set(key, v);
+        }
+        void set_float32(const std::string& key, float x)
+        {
+            gguf_value v; v.type = gguf_type::FLOAT32; v.d = x; set(key, v);
+        }
+        void set_bool(const std::string& key, bool x)
+        {
+            gguf_value v; v.type = gguf_type::BOOL; v.i = x ? 1 : 0; set(key, v);
+        }
+        void set_string_array(const std::string& key, const std::vector<std::string>& a)
+        {
+            gguf_value v; v.type = gguf_type::ARRAY; v.array_type = gguf_type::STRING; v.arr_str = a; set(key, v);
+        }
+        void set_int32_array(const std::string& key, const std::vector<int32_t>& a)
+        {
+            gguf_value v; v.type = gguf_type::ARRAY; v.array_type = gguf_type::INT32;
+            v.arr_int.assign(a.begin(), a.end());
+            set(key, v);
+        }
+        void set_float32_array(const std::string& key, const std::vector<float>& a)
+        {
+            gguf_value v; v.type = gguf_type::ARRAY; v.array_type = gguf_type::FLOAT32;
+            v.arr_float.assign(a.begin(), a.end());
+            set(key, v);
+        }
+
+        bool has(const std::string& key) const { return meta_.find(key) != meta_.end(); }
+        void erase(const std::string& key) { meta_.erase(key); }
+
+        void copy_metadata(const gguf_reader& source)
+        {
+            for (const auto& kv : source.metadata())
+                set(kv.first, kv.second);
+            set_alignment(source.alignment());
+        }
+
+        // A tensor given as the bytes of its format, a block-aligned first dimension for the quantized ones.
+        void add_tensor(const std::string& name, ggml_type type, const std::vector<uint64_t>& dims,
+            std::vector<uint8_t> bytes)
+        {
+            if (name.empty() || dims.empty() || dims.size() > 8)
+                throw std::runtime_error("gguf_writer: invalid tensor '" + name + "'");
+            if (index_.count(name))
+                throw std::runtime_error("gguf_writer: tensor '" + name + "' given twice");
+            uint64_t n = 1;
+            for (uint64_t d : dims)
+            {
+                if (d == 0 || n > (uint64_t(1) << 60) / d)
+                    throw std::runtime_error("gguf_writer: dimensions of '" + name + "' out of range");
+                n *= d;
+            }
+            const ggml_type_traits tr = get_ggml_type_traits(type);
+            if (tr.block_size == 0 || dims[0] % tr.block_size != 0
+                || bytes.size() != n / tr.block_size * tr.type_size)
+                throw std::runtime_error("gguf_writer: the bytes of '" + name + "' do not match its shape and type");
+            entry e;
+            e.info.name = name;
+            e.info.type = type;
+            e.info.dims = dims;
+            e.info.nbytes = bytes.size();
+            e.bytes = std::move(bytes);
+            index_[name] = tensors_.size();
+            tensors_.push_back(std::move(e));
+        }
+
+        // A tensor given as floats, row-major with dims[0] contiguous, encoded in type.
+        void add_tensor(const std::string& name, const std::vector<uint64_t>& dims, const float* values,
+            ggml_type type = ggml_type::F32)
+        {
+            if (dims.empty() || dims.size() > 8 || values == nullptr)
+                throw std::runtime_error("gguf_writer: invalid tensor '" + name + "'");
+            uint64_t n = 1;
+            for (uint64_t d : dims)
+            {
+                if (d == 0 || n > (uint64_t(1) << 60) / d)
+                    throw std::runtime_error("gguf_writer: dimensions of '" + name + "' out of range");
+                n *= d;
+            }
+            std::vector<uint8_t> bytes;
+            gguf_encode_floats(values, static_cast<size_t>(n), type, bytes);
+            add_tensor(name, type, dims, std::move(bytes));
+        }
+
+        size_t num_tensors() const { return tensors_.size(); }
+
+        void write(std::ostream& out) const
+        {
+            put<uint32_t>(out, 0x46554747u);
+            put<uint32_t>(out, 3);
+            put<uint64_t>(out, tensors_.size());
+            const bool own_alignment = alignment_ != 32;
+            put<uint64_t>(out, meta_.size() + (own_alignment ? 1 : 0));
+            uint64_t pos = 24;
+            for (const auto& kv : meta_)
+                pos += put_entry(out, kv.first, kv.second);
+            if (own_alignment)
+            {
+                gguf_value v; v.type = gguf_type::UINT32; v.i = static_cast<int64_t>(alignment_);
+                pos += put_entry(out, "general.alignment", v);
+            }
+            uint64_t offset = 0;
+            for (const entry& e : tensors_)
+            {
+                pos += put_string(out, e.info.name);
+                put<uint32_t>(out, static_cast<uint32_t>(e.info.dims.size()));
+                pos += 4;
+                for (uint64_t d : e.info.dims) { put<uint64_t>(out, d); pos += 8; }
+                put<uint32_t>(out, static_cast<uint32_t>(e.info.type));
+                put<uint64_t>(out, offset);
+                pos += 12;
+                offset = align(offset + e.bytes.size());
+            }
+            pad(out, align(pos) - pos);
+            uint64_t written = 0;
+            for (const entry& e : tensors_)
+            {
+                out.write(reinterpret_cast<const char*>(e.bytes.data()), static_cast<std::streamsize>(e.bytes.size()));
+                written += e.bytes.size();
+                pad(out, align(written) - written);
+                written = align(written);
+            }
+            if (!out)
+                throw std::runtime_error("gguf_writer: write failed");
+        }
+
+        /* Written next to the destination and renamed over it once complete, so that a
+           reader never meets a partial container under the final name. */
+        void write(const std::string& path) const
+        {
+            const std::string tmp = path + ".part";
+            {
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                if (!out)
+                    throw std::runtime_error("gguf_writer: cannot create " + tmp);
+                write(out);
+                out.flush();
+                if (!out)
+                    throw std::runtime_error("gguf_writer: write failed for " + tmp);
+            }
+            // Where a rename keeps no file under the target name, the target goes first.
+            if (std::rename(tmp.c_str(), path.c_str()) == 0)
+                return;
+            std::remove(path.c_str());
+            if (std::rename(tmp.c_str(), path.c_str()) != 0)
+                throw std::runtime_error("gguf_writer: cannot rename " + tmp + " to " + path);
+        }
+
+    private:
+        struct entry
+        {
+            gguf_tensor_info info;
+            std::vector<uint8_t> bytes;
+        };
+
+        uint64_t align(uint64_t x) const { return (x + alignment_ - 1) / alignment_ * alignment_; }
+
+        template <typename T>
+        static void put(std::ostream& out, T v) { out.write(reinterpret_cast<const char*>(&v), sizeof(T)); }
+
+        static void pad(std::ostream& out, uint64_t n)
+        {
+            static const char zeros[64] = { 0 };
+            while (n > 0)
+            {
+                const uint64_t k = std::min<uint64_t>(n, sizeof(zeros));
+                out.write(zeros, static_cast<std::streamsize>(k));
+                n -= k;
+            }
+        }
+
+        static uint64_t put_string(std::ostream& out, const std::string& s)
+        {
+            put<uint64_t>(out, s.size());
+            out.write(s.data(), static_cast<std::streamsize>(s.size()));
+            return 8 + s.size();
+        }
+
+        static uint64_t put_scalar(std::ostream& out, gguf_type t, int64_t i, double d, const std::string& s)
+        {
+            switch (t)
+            {
+            case gguf_type::UINT8:   put<uint8_t>(out, static_cast<uint8_t>(i)); return 1;
+            case gguf_type::INT8:    put<int8_t>(out, static_cast<int8_t>(i)); return 1;
+            case gguf_type::UINT16:  put<uint16_t>(out, static_cast<uint16_t>(i)); return 2;
+            case gguf_type::INT16:   put<int16_t>(out, static_cast<int16_t>(i)); return 2;
+            case gguf_type::UINT32:  put<uint32_t>(out, static_cast<uint32_t>(i)); return 4;
+            case gguf_type::INT32:   put<int32_t>(out, static_cast<int32_t>(i)); return 4;
+            case gguf_type::UINT64:  put<uint64_t>(out, static_cast<uint64_t>(i)); return 8;
+            case gguf_type::INT64:   put<int64_t>(out, i); return 8;
+            case gguf_type::BOOL:    put<uint8_t>(out, i ? 1 : 0); return 1;
+            case gguf_type::FLOAT32: put<float>(out, static_cast<float>(d)); return 4;
+            case gguf_type::FLOAT64: put<double>(out, d); return 8;
+            case gguf_type::STRING:  return put_string(out, s);
+            default: throw std::runtime_error("gguf_writer: invalid scalar metadata type");
+            }
+        }
+
+        static uint64_t put_entry(std::ostream& out, const std::string& key, const gguf_value& v)
+        {
+            uint64_t n = put_string(out, key);
+            put<uint32_t>(out, static_cast<uint32_t>(v.type));
+            n += 4;
+            if (v.type != gguf_type::ARRAY)
+                return n + put_scalar(out, v.type, v.i, v.d, v.s);
+            put<uint32_t>(out, static_cast<uint32_t>(v.array_type));
+            n += 4;
+            if (v.array_type == gguf_type::STRING)
+            {
+                put<uint64_t>(out, v.arr_str.size());
+                n += 8;
+                for (const std::string& s : v.arr_str) n += put_string(out, s);
+            }
+            else if (v.array_type == gguf_type::FLOAT32 || v.array_type == gguf_type::FLOAT64)
+            {
+                put<uint64_t>(out, v.arr_float.size());
+                n += 8;
+                for (double d : v.arr_float) n += put_scalar(out, v.array_type, 0, d, std::string());
+            }
+            else
+            {
+                put<uint64_t>(out, v.arr_int.size());
+                n += 8;
+                for (int64_t i : v.arr_int) n += put_scalar(out, v.array_type, i, 0.0, std::string());
+            }
+            return n;
+        }
+
+        std::map<std::string, gguf_value> meta_;
+        std::vector<entry> tensors_;
+        std::map<std::string, size_t> index_;
+        uint64_t alignment_ = 32;
+    };
 }
 
 #endif // DLIB_GGUF_READER_H_

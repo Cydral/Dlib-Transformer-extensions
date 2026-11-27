@@ -33,6 +33,31 @@ namespace dlib
 // ----------------------------------------------------------------------------------------
 
     template <
+        typename T,
+        typename U,
+        typename alloc1,
+        typename alloc2
+        >
+    T weighted_median (
+        const std::vector<T,alloc1>& values,
+        const std::vector<U,alloc2>& weights
+    );
+    /*!
+        requires
+            - values.size() == weights.size()
+            - values.size() > 0
+            - all the weights are >= 0 and at least one of them is > 0
+        ensures
+            - returns the lower weighted median of values: the smallest values[i] such that
+              the weights of the values not larger than it sum to at least half of the
+              total weight.
+            - With equal weights this is the lower median of values.  A value of zero
+              weight is never returned.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    template <
         typename T, 
         typename alloc
         >

@@ -7,6 +7,7 @@
 #include <dlib/cuda/gguf_blocks.h>
 #include <dlib/dnn.h>
 #include <dlib/dnn/runtime_transformer.h>
+#include <dlib/data_io/gguf_weight_loader.h>
 #include <dlib/rand.h>
 #include <algorithm>
 #include <cmath>
@@ -1271,14 +1272,304 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------------------
+
+    /*
+        The writer: every metadata type and every float format it encodes, read back by the
+        reader, a copy of a container through copy_metadata() and add_tensor() of its raw
+        bytes, and the conversions to the 16-bit formats on values they hold exactly.
+    */
+    void test_gguf_writer()
+    {
+        gguf_writer w;
+        w.set_string("general.architecture", "llama");
+        w.set_uint32("llama.block_count", 3);
+        w.set_int32("test.negative", -7);
+        w.set_float32("test.float", 0.375f);
+        w.set_bool("test.flag", true);
+        w.set_string_array("test.strings", { "a", "", "\xc4\xa0x" });
+        w.set_int32_array("test.ints", { 1, -2, 3 });
+        w.set_float32_array("test.floats", { 0.5f, -1.25f });
+        std::vector<float> values(64);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = static_cast<float>(std::sin(0.3 * i)) * (i % 5 == 0 ? 4.0f : 1.0f);
+        w.add_tensor("f32", { 32, 2 }, values.data(), ggml_type::F32);
+        w.add_tensor("f16", { 32, 2 }, values.data(), ggml_type::F16);
+        w.add_tensor("bf16", { 64 }, values.data(), ggml_type::BF16);
+        w.add_tensor("q8_0", { 32, 2 }, values.data(), ggml_type::Q8_0);
+        bool refused = false;
+        try { w.add_tensor("f32", { 64 }, values.data()); }
+        catch (const std::runtime_error&) { refused = true; }
+        DLIB_TEST(refused);
+        refused = false;
+        try { w.add_tensor("odd", { 31 }, values.data(), ggml_type::Q8_0); }
+        catch (const std::runtime_error&) { refused = true; }
+        DLIB_TEST(refused);
+
+        std::ostringstream sout;
+        w.write(sout);
+        const std::string bytes = sout.str();
+        gguf_reader g(bytes.data(), bytes.size());
+        DLIB_TEST(g.version() == 3);
+        DLIB_TEST(g.get_str("general.architecture") == "llama");
+        DLIB_TEST(g.at("llama.block_count").type == gguf_type::UINT32 && g.get_int("llama.block_count") == 3);
+        DLIB_TEST(g.at("test.negative").type == gguf_type::INT32 && g.get_int("test.negative") == -7);
+        DLIB_TEST(g.get_double("test.float") == 0.375);
+        DLIB_TEST(g.at("test.flag").type == gguf_type::BOOL && g.get_int("test.flag") == 1);
+        DLIB_TEST(g.at("test.strings").arr_str == std::vector<std::string>({ "a", "", "\xc4\xa0x" }));
+        DLIB_TEST(g.at("test.ints").arr_int == std::vector<int64_t>({ 1, -2, 3 }));
+        DLIB_TEST(g.at("test.floats").arr_float == std::vector<double>({ 0.5, -1.25 }));
+        DLIB_TEST(g.tensors().size() == 4);
+
+        const double bounds[] = { 0.0, 2e-3, 1.6e-2, 2.5e-2 };
+        const char* names[] = { "f32", "f16", "bf16", "q8_0" };
+        for (int k = 0; k < 4; ++k)
+        {
+            const gguf_tensor_info* t = g.find_tensor(names[k]);
+            DLIB_TEST(t != nullptr);
+            std::vector<float> back;
+            gguf_read_dequantized(g, *t, back);
+            DLIB_TEST(back.size() == values.size());
+            double worst = 0;
+            for (size_t i = 0; i < values.size(); ++i)
+                worst = std::max(worst, static_cast<double>(std::abs(back[i] - values[i])) /
+                    std::max(1.0f, std::abs(values[i])));
+            DLIB_TEST_MSG(worst <= bounds[k], names[k] << " " << worst);
+        }
+
+        // A copy through the writer keeps every tensor byte for byte.
+        gguf_writer copy;
+        copy.copy_metadata(g);
+        std::vector<uint8_t> raw;
+        for (const gguf_tensor_info& t : g.tensors())
+        {
+            g.read_tensor_raw(t, raw);
+            copy.add_tensor(t.name, t.type, t.dims, raw);
+        }
+        std::ostringstream cout2;
+        copy.write(cout2);
+        const std::string copied = cout2.str();
+        gguf_reader c(copied.data(), copied.size());
+        DLIB_TEST(c.metadata().size() == g.metadata().size());
+        for (const gguf_tensor_info& t : g.tensors())
+        {
+            std::vector<uint8_t> a, b;
+            g.read_tensor_raw(t, a);
+            const gguf_tensor_info* u = c.find_tensor(t.name);
+            DLIB_TEST(u != nullptr && u->type == t.type && u->dims == t.dims);
+            c.read_tensor_raw(*u, b);
+            DLIB_TEST(a == b);
+        }
+
+        for (float x : { 0.0f, 1.0f, -2.5f, 65504.0f, 6.103515625e-05f, 5.960464477539063e-08f })
+            DLIB_TEST(gguf_half_to_float(gguf_float_to_half(x)) == x);
+        DLIB_TEST(std::isinf(gguf_half_to_float(gguf_float_to_half(1e6f))));
+        uint16_t h = gguf_float_to_bf16(1.5f);
+        uint32_t bits = static_cast<uint32_t>(h) << 16;
+        float f;
+        std::memcpy(&f, &bits, 4);
+        DLIB_TEST(f == 1.5f);
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    /*
+        A decoder compiled into the library, written as a GGUF container: the runtime engine
+        and a second compiled network loaded from it compute its logits. Then low-rank
+        adapters on the runtime engine: inert at the start, gradients equal to finite
+        differences, merged weights equal to the adapted model, archives that restore them.
+    */
+    template <bool qk_norm>
+    using tiny_decoder = decoder_transformer_config<40, 2, 4, 2, 32, 2, 1, 8, qk_norm>;
+
+    template <bool qk_norm>
+    void test_decoder_export_and_adapters(const std::string& arch, adapter_method method)
+    {
+        using net_type = typename tiny_decoder<qk_norm>::template network_type<true>;
+        net_type net;
+        std::vector<matrix<int, 0, 1>> x(1, matrix<int, 0, 1>(10));
+        for (long t = 0; t < 10; ++t) x[0](t) = static_cast<int>((t * 7 + 3) % 40);
+        resizable_tensor in;
+        net.to_tensor(x.begin(), x.end(), in);
+        net.forward(in);
+        // Gains away from one, so that every normalization carries a value of its own.
+        dlib::rand rnd(9);
+        visit_learnable_parameters(net, [&rnd](tensor& t) {
+            if (t.num_samples() * t.k() == static_cast<long>(t.size()) && t.size() < 64)
+                for (float& v : t) v = 1.0f + 0.2f * static_cast<float>(rnd.get_random_gaussian());
+        });
+        net.forward(in);
+        const tensor& compiled = net.subnet().get_output();
+        const std::vector<float> reference(compiled.begin(), compiled.end());
+
+        model_spec spec;
+        spec.arch_name = arch;
+        spec.n_layers = 2;
+        spec.n_heads = 4;
+        spec.n_kv_heads = 2;
+        spec.d_model = 32;
+        spec.head_dim = 8;
+        spec.d_ffn = 64;
+        spec.vocab_size = 40;
+        spec.qk_norm = qk_norm;
+        const parameter_layout layout = decoder_parameter_layout(net, spec);
+        DLIB_TEST(layout.size() == count_parameters(net));
+        gguf_writer w;
+        export_gguf_weights(net, spec, w, ggml_type::F32);
+        std::ostringstream sout;
+        w.write(sout);
+        const std::string bytes = sout.str();
+        gguf_reader g(bytes.data(), bytes.size());
+        const model_spec read = detect_model(g);
+        DLIB_TEST(read.arch_name == arch && read.n_layers == 2 && read.d_model == 32 && read.head_dim == 8);
+        DLIB_TEST(read.qk_norm == qk_norm && read.vocab_size == 40);
+
+        gguf_load_options opt;
+        opt.verbose = false;
+        runtime_transformer rt;
+        rt.set_quantized_at_rest(false);
+        rt.load(g, read, opt);
+        std::vector<int> tokens(10), targets(10);
+        for (int t = 0; t < 10; ++t)
+        {
+            tokens[t] = x[0](t);
+            targets[t] = t % 3 == 0 ? -1 : (t * 11 + 5) % 40;
+        }
+        auto max_gap = [](const tensor& a, const std::vector<float>& b)
+        {
+            double m = 0;
+            const float* p = a.host();
+            for (size_t i = 0; i < b.size(); ++i) m = std::max(m, static_cast<double>(std::abs(p[i] - b[i])));
+            return m;
+        };
+        DLIB_TEST_MSG(max_gap(rt.forward_prefill(tokens), reference) < 1e-4, arch);
+        rt.reset_cache();
+
+        net_type imported;
+        import_gguf_weights(imported, g, read, opt);
+        imported.forward(in);
+        DLIB_TEST(max_gap(imported.subnet().get_output(), reference) < 1e-4);
+
+        // Adapters start inert.
+        adapter_plan plan;
+        plan.rank = 4;
+        plan.method = method;
+        plan.alpha = 8;
+        plan.projection = true;
+        DLIB_TEST(rt.configure_adapters(plan, 3) == 14);
+        DLIB_TEST(rt.adapter_layout().size() == rt.adapter_parameter_count());
+        DLIB_TEST(max_gap(rt.forward_prefill(tokens), reference) < 1e-4);
+        rt.reset_cache();
+
+        float* p = rt.adapter_parameters().host();
+        for (size_t i = 0; i < rt.adapter_parameter_count(); ++i)
+            p[i] += 0.05f * static_cast<float>(rnd.get_random_gaussian());
+        long supervised = 0;
+        rt.zero_adapter_gradients();
+        const double loss = rt.accumulate_adapter_gradients(tokens, targets, supervised);
+        long evaluated = 0;
+        DLIB_TEST(supervised == 6);
+        DLIB_TEST(std::abs(rt.evaluate_loss(tokens, targets, evaluated) - loss) < 1e-4 && evaluated == 6);
+        const std::vector<float> grad(rt.adapter_gradients().begin(), rt.adapter_gradients().end());
+
+        /* The derivative along a random direction, by central differences in double steps
+           large enough for single precision, against the gradient. */
+        std::vector<float> dir(grad.size()), base(p, p + grad.size());
+        double analytic = 0, dnorm = 0;
+        for (size_t i = 0; i < dir.size(); ++i)
+        {
+            dir[i] = static_cast<float>(rnd.get_random_gaussian());
+            dnorm += dir[i] * dir[i];
+        }
+        for (size_t i = 0; i < dir.size(); ++i)
+        {
+            dir[i] /= static_cast<float>(std::sqrt(dnorm));
+            analytic += dir[i] * grad[i];
+        }
+        auto loss_at = [&](double eps)
+        {
+            float* q = rt.adapter_parameters().host();
+            for (size_t i = 0; i < dir.size(); ++i) q[i] = base[i] + static_cast<float>(eps) * dir[i];
+            long s = 0;
+            return rt.evaluate_loss(tokens, targets, s);
+        };
+        const double eps = 1e-2;
+        const double numeric = (loss_at(eps) - loss_at(-eps)) / (2 * eps);
+        loss_at(0);
+        DLIB_TEST_MSG(std::abs(numeric - analytic) <= 2e-3 * std::max(1.0, std::abs(numeric)),
+            arch << " " << numeric << " " << analytic);
+        // And a few coordinates of the largest gradients one by one.
+        std::vector<size_t> order(grad.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + 8, order.end(),
+            [&grad](size_t a, size_t b) { return std::abs(grad[a]) > std::abs(grad[b]); });
+        for (int k = 0; k < 8; ++k)
+        {
+            const size_t i = order[static_cast<size_t>(k)];
+            float* q = rt.adapter_parameters().host();
+            q[i] = base[i] + 1e-2f;
+            long s = 0;
+            const double up = rt.evaluate_loss(tokens, targets, s);
+            q = rt.adapter_parameters().host();
+            q[i] = base[i] - 1e-2f;
+            const double down = rt.evaluate_loss(tokens, targets, s);
+            q = rt.adapter_parameters().host();
+            q[i] = base[i];
+            const double num = (up - down) / 2e-2;
+            DLIB_TEST_MSG(std::abs(num - grad[i]) <= 0.02 * std::abs(grad[i]) + 1e-3, num << " " << grad[i]);
+        }
+
+        // The merged container and the merge in place compute the adapted model.
+        const tensor& adapted = rt.forward_prefill(tokens);
+        const std::vector<float> with(adapted.begin(), adapted.end());
+        rt.reset_cache();
+        const std::string path = "test_gguf_merged.gguf";
+        rt.write_merged_gguf(g, path, ggml_type::F32);
+        {
+            gguf_reader m(path);
+            runtime_transformer merged;
+            merged.set_quantized_at_rest(false);
+            merged.load(m, detect_model(m), opt);
+            DLIB_TEST(max_gap(merged.forward_prefill(tokens), with) < 1e-4);
+        }
+        std::remove(path.c_str());
+
+        std::ostringstream aout;
+        rt.save_adapters(aout);
+        runtime_transformer other;
+        other.set_quantized_at_rest(false);
+        other.load(g, read, opt);
+        std::istringstream ain(aout.str());
+        other.load_adapters(ain);
+        DLIB_TEST(max_gap(other.forward_prefill(tokens), with) < 1e-6);
+
+        rt.merge_adapters();
+        DLIB_TEST(!rt.adapters_active());
+        DLIB_TEST(max_gap(rt.forward_prefill(tokens), with) < 1e-4);
+        rt.reset_cache();
+        // The weights a merge folded are written as the engine holds them.
+        rt.write_merged_gguf(g, path, ggml_type::F32);
+        {
+            gguf_reader m(path);
+            runtime_transformer folded;
+            folded.set_quantized_at_rest(false);
+            folded.load(m, detect_model(m), opt);
+            DLIB_TEST(max_gap(folded.forward_prefill(tokens), with) < 1e-4);
+        }
+        std::remove(path.c_str());
+    }
+
+// ----------------------------------------------------------------------------------------
+
     class gguf_tester : public tester
     {
     public:
         gguf_tester (
         ) :
             tester ("test_gguf",
-                    "Runs tests on the GGUF reader (metadata, tensors, dequantization, damaged files) and on "
-                    "the hybrid decoders of the runtime engine.")
+                    "Runs tests on the GGUF reader (metadata, tensors, dequantization, damaged files), the "
+                    "GGUF writer, the export of compiled decoders, the hybrid decoders of the runtime engine "
+                    "and the training of its adapters.")
         {}
 
         void perform_test (
@@ -1300,6 +1591,12 @@ namespace
             test_expert_operations();
             print_spinner();
             test_hybrid_decoder();
+            print_spinner();
+            test_gguf_writer();
+            print_spinner();
+            test_decoder_export_and_adapters<false>("llama", adapter_method::lora);
+            test_decoder_export_and_adapters<true>("qwen3", adapter_method::lora);
+            test_decoder_export_and_adapters<true>("qwen3", adapter_method::dora);
 #ifdef DLIB_USE_CUDA
             print_spinner();
             test_mamba3_step_devices();
