@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -29,6 +30,21 @@ namespace dlib
     {
         namespace
         {
+            /*
+                The stream the functions of this file launch on for the calling thread: the default
+                one, or the stream of a gguf_launch_graphs that records or routes the launches of
+                the thread.  Every launch of the file takes its stream from next_launch(), which
+                counts it, so that a recording knows the launches it must hold.
+            */
+            thread_local cudaStream_t launch_stream = nullptr;
+            thread_local unsigned long long launches_made = 0;
+
+            inline cudaStream_t next_launch()
+            {
+                ++launches_made;
+                return launch_stream;
+            }
+
             // The rows a block of gguf_matvec_kernel computes, one warp each.
             const int warps_per_block = 8;
 
@@ -59,7 +75,8 @@ namespace dlib
             /*
                 The matrices of one format and one width that a launch multiplies by the same rows
                 of x: their blocks, their rows, the blocks of the grid that compute each of them,
-                a matrix after the other, and where their products go.  A paired launch (PAIR)
+                a matrix after the other, where their products go, and the bias of rows[p] values
+                that the launch adds to the products of matrix p, or null.  A paired launch (PAIR)
                 reads two matrices of rows[0] rows and writes to y[0], for its single row of x,
                 silu(w[0] x) * (w[1] x), the gated values of a SwiGLU block.
             */
@@ -67,6 +84,7 @@ namespace dlib
             {
                 const uint8_t* w[matvec_parts];
                 float* y[matvec_parts];
+                const float* b[matvec_parts];
                 int rows[matvec_parts];
                 int blocks[matvec_parts];
             };
@@ -208,11 +226,12 @@ namespace dlib
                     return;
                 }
                 float* y = set.y[part];
+                const float* b = set.b[part];
 #pragma unroll
                 for (int t = 0; t < N; ++t)
                 {
                     const float s = warp_sum(acc[t]);
-                    if (lane == 0 && t < n) y[static_cast<size_t>(t) * rows + row] = s;
+                    if (lane == 0 && t < n) y[static_cast<size_t>(t) * rows + row] = b ? s + b[row] : s;
                 }
             }
 
@@ -321,11 +340,12 @@ namespace dlib
                     return;
                 }
                 float* y = set.y[part];
+                const float* b = set.b[part];
 #pragma unroll
                 for (int t = 0; t < N; ++t)
                 {
                     const float s = warp_sum(acc[t]);
-                    if (lane == 0 && t < n) y[static_cast<size_t>(t) * rows + row] = s;
+                    if (lane == 0 && t < n) y[static_cast<size_t>(t) * rows + row] = b ? s + b[row] : s;
                 }
             }
 
@@ -514,6 +534,7 @@ namespace dlib
                     {
                         set.w[p] = nullptr;
                         set.y[p] = nullptr;
+                        set.b[p] = nullptr;
                         set.rows[p] = 0;
                     }
                     set.blocks[p] = PAIR ? 0 : matvec_blocks(set.rows[p]);
@@ -529,19 +550,19 @@ namespace dlib
                 */
                 if (type == gguf_blocks::q4_K && words)
                 {
-                    gguf_matvec_k_kernel<gguf_blocks::q4_K, N, PAIR><<<blocks, threads>>>(set, row_bytes, cols, x, n,
-                        aligned);
+                    gguf_matvec_k_kernel<gguf_blocks::q4_K, N, PAIR><<<blocks, threads, 0, next_launch()>>>(set,
+                        row_bytes, cols, x, n, aligned);
                     return;
                 }
                 if (type == gguf_blocks::q6_K)
                 {
-                    gguf_matvec_k_kernel<gguf_blocks::q6_K, N, PAIR><<<blocks, threads>>>(set, row_bytes, cols, x, n,
-                        aligned);
+                    gguf_matvec_k_kernel<gguf_blocks::q6_K, N, PAIR><<<blocks, threads, 0, next_launch()>>>(set,
+                        row_bytes, cols, x, n, aligned);
                     return;
                 }
                 with_format(type, [&](auto format) {
-                    gguf_matvec_kernel<decltype(format)::value, N, PAIR><<<blocks, threads>>>(set, row_bytes, cols,
-                        x, n, aligned);
+                    gguf_matvec_kernel<decltype(format)::value, N, PAIR><<<blocks, threads, 0, next_launch()>>>(set,
+                        row_bytes, cols, x, n, aligned);
                 });
             }
 
@@ -577,8 +598,8 @@ namespace dlib
                 const int threads = 256;
                 const int blocks = static_cast<int>(std::min<size_t>((groups + threads - 1) / threads, 65535));
                 with_format(type, [&](auto format) {
-                    gguf_dequantize_kernel<decltype(format)::value><<<blocks, threads>>>(w, row_bytes, first, count,
-                        cols, aligned, dst);
+                    gguf_dequantize_kernel<decltype(format)::value><<<blocks, threads, 0, next_launch()>>>(w, row_bytes,
+                        first, count, cols, aligned, dst);
                 });
             }
 
@@ -598,8 +619,8 @@ namespace dlib
                 const int threads = 256;
                 const int blocks = static_cast<int>(std::min<size_t>((groups + threads - 1) / threads, 65535));
                 with_format(type, [&](auto format) {
-                    gguf_dequantize_half_kernel<decltype(format)::value><<<blocks, threads>>>(w, row_bytes, first,
-                        count, cols, aligned, dst, saturated);
+                    gguf_dequantize_half_kernel<decltype(format)::value><<<blocks, threads, 0, next_launch()>>>(w,
+                        row_bytes, first, count, cols, aligned, dst, saturated);
                 });
             }
 
@@ -767,19 +788,19 @@ namespace dlib
                 // The matrices start on 4 bytes when the first one does and each holds a multiple of 4 bytes.
                 if (type == gguf_blocks::q4_K && reinterpret_cast<uintptr_t>(w) % 4 == 0)
                 {
-                    gguf_matvec_picked_k_kernel<gguf_blocks::q4_K><<<blocks, threads>>>(w, row_bytes, rows, cols, x,
-                        picks, first_pick, per_row, blocks_per_pick, aligned, y);
+                    gguf_matvec_picked_k_kernel<gguf_blocks::q4_K><<<blocks, threads, 0, next_launch()>>>(w, row_bytes,
+                        rows, cols, x, picks, first_pick, per_row, blocks_per_pick, aligned, y);
                     return;
                 }
                 if (type == gguf_blocks::q6_K)
                 {
-                    gguf_matvec_picked_k_kernel<gguf_blocks::q6_K><<<blocks, threads>>>(w, row_bytes, rows, cols, x,
-                        picks, first_pick, per_row, blocks_per_pick, aligned, y);
+                    gguf_matvec_picked_k_kernel<gguf_blocks::q6_K><<<blocks, threads, 0, next_launch()>>>(w, row_bytes,
+                        rows, cols, x, picks, first_pick, per_row, blocks_per_pick, aligned, y);
                     return;
                 }
                 with_format(type, [&](auto format) {
-                    gguf_matvec_picked_kernel<decltype(format)::value><<<blocks, threads>>>(w, row_bytes, rows, cols,
-                        x, picks, first_pick, per_row, blocks_per_pick, aligned, y);
+                    gguf_matvec_picked_kernel<decltype(format)::value><<<blocks, threads, 0, next_launch()>>>(w,
+                        row_bytes, rows, cols, x, picks, first_pick, per_row, blocks_per_pick, aligned, y);
                 });
             }
 
@@ -1579,11 +1600,11 @@ namespace dlib
             )
             {
                 if (q8)
-                    paged_attention_kernel<DPL, true><<<blocks, 32 * attention_warps>>>(pages, layout, layer, queries,
-                        q_heads, scale, tokens, tables, parts, out, partial);
+                    paged_attention_kernel<DPL, true><<<blocks, 32 * attention_warps, 0, next_launch()>>>(pages, layout,
+                        layer, queries, q_heads, scale, tokens, tables, parts, out, partial);
                 else
-                    paged_attention_kernel<DPL, false><<<blocks, 32 * attention_warps>>>(pages, layout, layer, queries,
-                        q_heads, scale, tokens, tables, parts, out, partial);
+                    paged_attention_kernel<DPL, false><<<blocks, 32 * attention_warps, 0, next_launch()>>>(pages,
+                        layout, layer, queries, q_heads, scale, tokens, tables, parts, out, partial);
             }
         }
 
@@ -1611,7 +1632,7 @@ namespace dlib
             if (n == 0) return;
             tensor* dests[1] = { &dest };
             const tensor* matrices[1] = { &weights };
-            gguf_matvec_group(dests, src, matrices, 1, type, &rows, cols, row_bytes);
+            gguf_matvec_group(dests, src, matrices, 1, type, &rows, cols, row_bytes, nullptr);
         }
 
         void gguf_matvec_group (
@@ -1622,7 +1643,8 @@ namespace dlib
             int type,
             const long* rows,
             long cols,
-            size_t row_bytes
+            size_t row_bytes,
+            const tensor* const* biases
         )
         {
             DLIB_CASSERT(count >= 1 && count <= matvec_parts && dests && weights && rows);
@@ -1639,6 +1661,7 @@ namespace dlib
                 DLIB_CASSERT(dests[p]->size() == static_cast<size_t>(n) * static_cast<size_t>(rows[p]));
                 DLIB_CASSERT(weights[p]->size() * sizeof(float) >= static_cast<size_t>(rows[p]) * row_bytes);
                 for (int q = 0; q < p; ++q) DLIB_CASSERT(!is_same_object(*dests[p], *dests[q]));
+                DLIB_CASSERT(!biases || !biases[p] || biases[p]->size() == static_cast<size_t>(rows[p]));
             }
             if (n == 0) return;
             const float* x = src.device();
@@ -1647,6 +1670,7 @@ namespace dlib
             for (int p = 0; p < count; ++p)
             {
                 set.w[p] = reinterpret_cast<const uint8_t*>(weights[p]->device());
+                set.b[p] = biases && biases[p] ? biases[p]->device() : nullptr;
                 set.rows[p] = static_cast<int>(rows[p]);
                 y[p] = dests[p]->device_write_only();
             }
@@ -1702,6 +1726,221 @@ namespace dlib
             set.y[0] = dest.device_write_only();
             launch_matvec<1, true>(type, set, 2, row_bytes, static_cast<int>(cols), x, 1);
             CHECK_CUDA(cudaGetLastError());
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        struct gguf_launch_graphs::state
+        {
+            struct slot
+            {
+                cudaGraph_t graph = nullptr;
+                cudaGraphExec_t exec = nullptr;
+                unsigned long long signature = 0;
+            };
+
+            std::vector<slot> slots;
+            cudaStream_t stream = nullptr;
+            // The stream the thread launched on before a recording or a routing.
+            cudaStream_t outer = nullptr;
+            bool on = false;
+            bool recording = false;
+            size_t current = 0;
+            unsigned long long current_signature = 0;
+            unsigned long long launches_before = 0;
+            unsigned long long recorded = 0;
+            unsigned long long replayed = 0;
+            std::string failure;
+
+            void forget(slot& sl)
+            {
+                if (sl.exec) cudaGraphExecDestroy(sl.exec);
+                if (sl.graph) cudaGraphDestroy(sl.graph);
+                sl = slot();
+            }
+
+            void forget_all()
+            {
+                for (slot& sl : slots) forget(sl);
+            }
+
+            // Turns the object off with the reason of the device, and takes its error so that the launches go on.
+            bool refuse(const std::string& what, cudaError_t e)
+            {
+                failure = e == cudaSuccess ? what : what + ": " + cudaGetErrorString(e);
+                cudaGetLastError();
+                on = false;
+                forget_all();
+                return false;
+            }
+        };
+
+        gguf_launch_graphs::gguf_launch_graphs() : s(new state())
+        {
+        }
+
+        gguf_launch_graphs::~gguf_launch_graphs()
+        {
+            abort();
+            s->forget_all();
+            if (s->stream) cudaStreamDestroy(s->stream);
+        }
+
+        void gguf_launch_graphs::set_slots(size_t slots)
+        {
+            abort();
+            s->forget_all();
+            s->slots.assign(slots, state::slot());
+        }
+
+        void gguf_launch_graphs::enable(bool on)
+        {
+            if (on == s->on) return;
+            if (!on)
+            {
+                abort();
+                s->on = false;
+                s->forget_all();
+                return;
+            }
+            if (!s->stream)
+            {
+                // A blocking stream: the legacy default stream orders its work with the other work of the thread.
+                const cudaError_t e = cudaStreamCreate(&s->stream);
+                if (e != cudaSuccess)
+                {
+                    s->stream = nullptr;
+                    s->refuse("no stream for the graphs of launches", e);
+                    return;
+                }
+            }
+            s->failure.clear();
+            s->on = true;
+        }
+
+        bool gguf_launch_graphs::enabled() const
+        {
+            return s->on;
+        }
+
+        const std::string& gguf_launch_graphs::failure() const
+        {
+            return s->failure;
+        }
+
+        unsigned long long gguf_launch_graphs::recorded() const
+        {
+            return s->recorded;
+        }
+
+        unsigned long long gguf_launch_graphs::replayed() const
+        {
+            return s->replayed;
+        }
+
+        void gguf_launch_graphs::wait()
+        {
+            if (s->stream) CHECK_CUDA(cudaStreamSynchronize(s->stream));
+        }
+
+        bool gguf_launch_graphs::replay(size_t slot, unsigned long long signature)
+        {
+            if (!s->on || s->recording || slot >= s->slots.size()) return false;
+            const state::slot& sl = s->slots[slot];
+            if (!sl.exec || sl.signature != signature) return false;
+            const cudaError_t e = cudaGraphLaunch(sl.exec, s->stream);
+            if (e != cudaSuccess) return s->refuse("launch of a graph of launches", e);
+            ++s->replayed;
+            return true;
+        }
+
+        bool gguf_launch_graphs::begin(size_t slot, unsigned long long signature)
+        {
+            if (!s->on || s->recording || slot >= s->slots.size()) return false;
+            s->forget(s->slots[slot]);
+            /*
+                The relaxed mode: the calls of the thread that do not launch on the stream, as a
+                tensor that brings its device copy up to date, run at once without ending the
+                recording.
+            */
+            const cudaError_t e = cudaStreamBeginCapture(s->stream, cudaStreamCaptureModeRelaxed);
+            if (e != cudaSuccess) return s->refuse("recording of a sequence of launches", e);
+            s->recording = true;
+            s->current = slot;
+            s->current_signature = signature;
+            s->outer = launch_stream;
+            launch_stream = s->stream;
+            s->launches_before = launches_made;
+            return true;
+        }
+
+        bool gguf_launch_graphs::end()
+        {
+            if (!s->recording) return false;
+            launch_stream = s->outer;
+            s->recording = false;
+            const unsigned long long expected = launches_made - s->launches_before;
+            cudaGraph_t graph = nullptr;
+            cudaError_t e = cudaStreamEndCapture(s->stream, &graph);
+            if (e != cudaSuccess || !graph) return s->refuse("end of the recording of a sequence of launches", e);
+            // A launch that went to another stream ran at once, out of its place: the graph must hold them all.
+            size_t nodes = 0;
+            e = cudaGraphGetNodes(graph, nullptr, &nodes);
+            if (e != cudaSuccess || nodes == 0 || nodes != expected)
+            {
+                cudaGraphDestroy(graph);
+                if (e != cudaSuccess) return s->refuse("count of the launches of a recording", e);
+                return s->refuse("a recording holds " + std::to_string(nodes) + " of the "
+                    + std::to_string(expected) + " launches of its sequence", cudaSuccess);
+            }
+            cudaGraphExec_t exec = nullptr;
+#if CUDART_VERSION >= 12000
+            e = cudaGraphInstantiate(&exec, graph, 0);
+#else
+            e = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+#endif
+            if (e != cudaSuccess)
+            {
+                cudaGraphDestroy(graph);
+                return s->refuse("preparation of a graph of launches", e);
+            }
+            // The recording launched nothing: the graph runs the sequence for the call that recorded it.
+            e = cudaGraphLaunch(exec, s->stream);
+            if (e != cudaSuccess)
+            {
+                cudaGraphExecDestroy(exec);
+                cudaGraphDestroy(graph);
+                return s->refuse("first launch of a graph of launches", e);
+            }
+            state::slot& sl = s->slots[s->current];
+            sl.graph = graph;
+            sl.exec = exec;
+            sl.signature = s->current_signature;
+            ++s->recorded;
+            return true;
+        }
+
+        void gguf_launch_graphs::abort()
+        {
+            if (!s->recording) return;
+            launch_stream = s->outer;
+            s->recording = false;
+            cudaGraph_t graph = nullptr;
+            if (cudaStreamEndCapture(s->stream, &graph) == cudaSuccess && graph) cudaGraphDestroy(graph);
+            cudaGetLastError();
+        }
+
+        bool gguf_launch_graphs::route(bool on)
+        {
+            if (!on)
+            {
+                launch_stream = s->outer;
+                return true;
+            }
+            if (!s->on || s->recording) return false;
+            s->outer = launch_stream;
+            launch_stream = s->stream;
+            return true;
         }
 
         void gguf_dequantize (
@@ -1772,7 +2011,7 @@ namespace dlib
             DLIB_CASSERT(src && dst && saturated);
             if (n == 0) return;
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 4096));
-            floats_to_halves_kernel<<<blocks, 256>>>(src, dst, n, saturated);
+            floats_to_halves_kernel<<<blocks, 256, 0, next_launch()>>>(src, dst, n, saturated);
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -1790,8 +2029,8 @@ namespace dlib
             const size_t total = 2 * static_cast<size_t>(layout.heads) * static_cast<size_t>(span)
                 * static_cast<size_t>(layout.head_dim);
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((total + 255) / 256, 16384));
-            paged_kv_expand_kernel<<<blocks, 256>>>(reinterpret_cast<const uint8_t*>(pages.device()), layout,
-                static_cast<int>(layer), table, static_cast<int>(span), dst, total);
+            paged_kv_expand_kernel<<<blocks, 256, 0, next_launch()>>>(reinterpret_cast<const uint8_t*>(pages.device()),
+                layout, static_cast<int>(layer), table, static_cast<int>(span), dst, total);
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -1807,7 +2046,7 @@ namespace dlib
             DLIB_CASSERT(queries && dst && q_heads > 0 && tokens > 0 && hd > 0 && hd <= 4096);
             DLIB_CASSERT(static_cast<long long>(q_heads) * tokens <= std::numeric_limits<int>::max());
             attention_queries_kernel<<<static_cast<unsigned>(q_heads * tokens), 128,
-                sizeof(float) * static_cast<size_t>(hd)>>>(queries, static_cast<int>(q_heads),
+                sizeof(float) * static_cast<size_t>(hd), next_launch()>>>(queries, static_cast<int>(q_heads),
                 static_cast<int>(tokens), static_cast<int>(hd), rotate, dst);
             CHECK_CUDA(cudaGetLastError());
         }
@@ -1823,7 +2062,7 @@ namespace dlib
             DLIB_CASSERT(scores && span > 0 && rows > 0 && tokens > 0 && first_limit > 0);
             DLIB_CASSERT(first_limit + tokens - 1 <= span && span <= std::numeric_limits<int>::max()
                 && rows <= std::numeric_limits<int>::max());
-            attention_softmax_kernel<<<static_cast<unsigned>(rows), softmax_threads>>>(scores,
+            attention_softmax_kernel<<<static_cast<unsigned>(rows), softmax_threads, 0, next_launch()>>>(scores,
                 static_cast<int>(span), static_cast<int>(tokens), static_cast<int>(first_limit));
             CHECK_CUDA(cudaGetLastError());
         }
@@ -1841,8 +2080,8 @@ namespace dlib
                 && hd <= std::numeric_limits<int>::max());
             const size_t total = static_cast<size_t>(heads) * static_cast<size_t>(tokens) * static_cast<size_t>(hd);
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((total + 255) / 256, 4096));
-            rows_from_heads_kernel<<<blocks, 256>>>(src, static_cast<int>(heads), static_cast<int>(tokens),
-                static_cast<int>(hd), dst, total);
+            rows_from_heads_kernel<<<blocks, 256, 0, next_launch()>>>(src, static_cast<int>(heads),
+                static_cast<int>(tokens), static_cast<int>(hd), dst, total);
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -1861,8 +2100,8 @@ namespace dlib
             DLIB_CASSERT(!is_same_object(dest, x) && !is_same_object(dest, addend) && !is_same_object(x, addend));
             const size_t rows = x.size() / width;
             if (rows == 0) return;
-            add_rms_norm_rows_kernel<<<static_cast<unsigned int>(rows), 256>>>(x.device(), addend.device(), factor,
-                gamma.device(), dest.device_write_only(), static_cast<int>(width), eps);
+            add_rms_norm_rows_kernel<<<static_cast<unsigned int>(rows), 256, 0, next_launch()>>>(x.device(),
+                addend.device(), factor, gamma.device(), dest.device_write_only(), static_cast<int>(width), eps);
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -1880,7 +2119,7 @@ namespace dlib
             // dest may be src: its memory is then read before it is written, by the same thread.
             float* y = is_same_object(dest, src) ? dest.device() : dest.device_write_only();
             const float* x = src.device();
-            rms_norm_rows_kernel<<<static_cast<unsigned int>(rows), 256>>>(x, gamma.device(), y,
+            rms_norm_rows_kernel<<<static_cast<unsigned int>(rows), 256, 0, next_launch()>>>(x, gamma.device(), y,
                 static_cast<int>(width), eps);
             CHECK_CUDA(cudaGetLastError());
         }
@@ -1894,7 +2133,7 @@ namespace dlib
             if (gate.size() == 0) return;
             // Every layer of a step calls it: no occupancy query of launch_kernel().
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((gate.size() + 255) / 256, 4096));
-            silu_multiply_kernel<<<blocks, 256>>>(gate.device(), up.device(), gate.size());
+            silu_multiply_kernel<<<blocks, 256, 0, next_launch()>>>(gate.device(), up.device(), gate.size());
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -1916,7 +2155,7 @@ namespace dlib
             if (pairs == 0) return;
             // Every layer of a step calls it twice: no occupancy query of launch_kernel().
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((pairs + 255) / 256, 4096));
-            rope_rows_kernel<<<blocks, 256>>>(rows.device(), angles.device(), static_cast<int>(heads),
+            rope_rows_kernel<<<blocks, 256, 0, next_launch()>>>(rows.device(), angles.device(), static_cast<int>(heads),
                 static_cast<int>(head_dim), static_cast<int>(rope_dims), neox, pairs);
             CHECK_CUDA(cudaGetLastError());
         }
@@ -1946,9 +2185,9 @@ namespace dlib
             if (pairs == 0) return;
             // Every layer of a step calls it: no occupancy query of launch_kernel().
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((pairs + 255) / 256, 4096));
-            rope_rows_pair_kernel<<<blocks, 256>>>(first_rows.device(), static_cast<int>(first_heads), first_pairs,
-                second_rows.device(), static_cast<int>(second_heads), angles.device(), static_cast<int>(head_dim),
-                static_cast<int>(rope_dims), neox, pairs);
+            rope_rows_pair_kernel<<<blocks, 256, 0, next_launch()>>>(first_rows.device(), static_cast<int>(first_heads),
+                first_pairs, second_rows.device(), static_cast<int>(second_heads), angles.device(),
+                static_cast<int>(head_dim), static_cast<int>(rope_dims), neox, pairs);
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -1971,7 +2210,7 @@ namespace dlib
             DLIB_CASSERT(n <= 65535);
             if (n == 0) return;
             const dim3 blocks(static_cast<unsigned>(n), static_cast<unsigned>(layout.heads), 2);
-            paged_kv_store_kernel<<<blocks, 128, sizeof(float) * static_cast<size_t>(layout.head_dim)>>>(
+            paged_kv_store_kernel<<<blocks, 128, sizeof(float) * static_cast<size_t>(layout.head_dim), next_launch()>>>(
                 reinterpret_cast<uint8_t*>(pages.device()), layout, static_cast<int>(layer), keys.device(),
                 values.device(), reinterpret_cast<const int32_t*>(slots.device()));
             CHECK_CUDA(cudaGetLastError());
@@ -1992,7 +2231,7 @@ namespace dlib
             DLIB_CASSERT(!is_same_object(dest, pages) && !is_same_object(dest, slots));
             if (total == 0) return;
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((total + 255) / 256, 4096));
-            paged_kv_gather_kernel<<<blocks, 256>>>(reinterpret_cast<uint8_t*>(dest.device()),
+            paged_kv_gather_kernel<<<blocks, 256, 0, next_launch()>>>(reinterpret_cast<uint8_t*>(dest.device()),
                 reinterpret_cast<const uint8_t*>(pages.device()), layout,
                 reinterpret_cast<const int32_t*>(slots.device()), total);
             CHECK_CUDA(cudaGetLastError());
@@ -2067,8 +2306,8 @@ namespace dlib
             CHECK_CUDA(cudaGetLastError());
             if (parts > 1)
             {
-                paged_attention_merge_kernel<<<static_cast<unsigned>(n * static_cast<size_t>(q_heads)), 128>>>(partial,
-                    np, static_cast<int>(hd), o);
+                paged_attention_merge_kernel<<<static_cast<unsigned>(n * static_cast<size_t>(q_heads)), 128, 0,
+                    next_launch()>>>(partial, np, static_cast<int>(hd), o);
                 CHECK_CUDA(cudaGetLastError());
             }
         }
@@ -2097,7 +2336,7 @@ namespace dlib
             if (n == 0) return;
             DLIB_CASSERT(n <= static_cast<size_t>(std::numeric_limits<int>::max()));
             // A block per token, of 256 threads: the first top_k of them write its experts.
-            expert_routes_kernel<<<static_cast<unsigned>(n), 256>>>(logits.device(), bias.device(),
+            expert_routes_kernel<<<static_cast<unsigned>(n), 256, 0, next_launch()>>>(logits.device(), bias.device(),
                 static_cast<int>(experts), static_cast<int>(top_k), normalize, scale,
                 reinterpret_cast<int32_t*>(picks.device_write_only()), weights.device_write_only());
             CHECK_CUDA(cudaGetLastError());
@@ -2154,7 +2393,7 @@ namespace dlib
             if (x.size() == 0) return;
             // Every layer of a step calls it: no occupancy query of launch_kernel().
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((x.size() + 255) / 256, 4096));
-            squared_relu_kernel<<<blocks, 256>>>(x.device(), x.size());
+            squared_relu_kernel<<<blocks, 256, 0, next_launch()>>>(x.device(), x.size());
             CHECK_CUDA(cudaGetLastError());
         }
 
@@ -2179,8 +2418,8 @@ namespace dlib
             DLIB_CASSERT(src.size() == weights.size() * width);
             if (width == 0) return;
             const unsigned blocks = static_cast<unsigned>(std::min<size_t>((dest.size() + 255) / 256, 4096));
-            mix_rows_kernel<<<blocks, 256>>>(src.device(), weights.device(), static_cast<int>(per_row), width,
-                dest.device_write_only(), dest.size());
+            mix_rows_kernel<<<blocks, 256, 0, next_launch()>>>(src.device(), weights.device(),
+                static_cast<int>(per_row), width, dest.device_write_only(), dest.size());
             CHECK_CUDA(cudaGetLastError());
         }
 

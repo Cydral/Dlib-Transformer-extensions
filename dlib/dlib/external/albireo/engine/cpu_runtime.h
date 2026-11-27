@@ -319,6 +319,8 @@ namespace albireo
         bool plan_attention(const forward_batch& batch, bool given);
         int probe_layer_pass(long n, kv_format format, bool attention, double tolerance, bool& attended,
             std::string& detail);
+        // probe_layer_pass() for a pass the device attends, made again without its graphs of launches when it differs.
+        int probe_attended_pass(long n, kv_format format, double tolerance, bool& attended, std::string& detail);
         void check_layer_pass();
         // Probes again the attention of the device, which found no room at its probe.
         void check_attention();

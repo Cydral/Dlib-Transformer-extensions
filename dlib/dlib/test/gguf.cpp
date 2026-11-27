@@ -1117,9 +1117,11 @@ namespace
 
     /*
         tt::gguf_matvec_group() against tt::gguf_matvec() for each of its matrices, whose values
-        it must give, with one, two and three matrices and with rows of src beyond one launch;
-        tt::gguf_matvec_swiglu() against the two products and tt::silu_multiply(), with one row,
-        which a device computes in one launch, and with several.
+        it must give, with one, two and three matrices and with rows of src beyond one launch,
+        then with biases against a sum after each product; tt::gguf_matvec_swiglu() against the
+        two products and tt::silu_multiply(), with one row, which a device computes in one
+        launch, and with several; tt::gguf_launch_graphs, whose replays of a sequence must give
+        what the calls of the sequence give with the values its tensors then hold.
     */
     void test_grouped_products()
     {
@@ -1160,6 +1162,27 @@ namespace
                         DLIB_TEST_MSG(max(abs(mat(grouped[p]) - mat(alone[p]))) == 0, "type " << type << ", "
                             << count << " matrices, " << n << " rows, matrix " << p);
                 }
+                // The biases of the first and of the last matrix, the second one taking none.
+                resizable_tensor bias[3];
+                for (int p = 0; p < 3; ++p)
+                {
+                    bias[p].set_size(1, rows[p]);
+                    for (float& v : bias[p]) v = rnd.get_random_gaussian();
+                }
+                {
+                    tensor* dests[3] = { &grouped[0], &grouped[1], &grouped[2] };
+                    const tensor* weights[3] = { &w[0], &w[1], &w[2] };
+                    const tensor* biases[3] = { &bias[0], nullptr, &bias[2] };
+                    tt::gguf_matvec_group(dests, x, weights, 3, type, rows, cols, row_bytes, biases);
+                    for (int p = 0; p < 3; ++p)
+                    {
+                        resizable_tensor expected(alone[p]);
+                        if (biases[p]) tt::add(1, expected, 1, bias[p]);
+                        const float size = 1 + max(abs(mat(expected)));
+                        DLIB_TEST_MSG(max(abs(mat(grouped[p]) - mat(expected))) <= 1e-6 * size, "type " << type
+                            << ", " << n << " rows, biased matrix " << p);
+                    }
+                }
                 resizable_tensor gate(n, rows[0]), up(n, rows[0]), gated(n, rows[0]), work(n, rows[0]);
                 tt::gguf_matvec(gate, x, w[0], type, rows[0], cols, row_bytes);
                 tt::gguf_matvec(up, x, w_up, type, rows[0], cols, row_bytes);
@@ -1171,6 +1194,42 @@ namespace
                 DLIB_TEST_MSG(max(abs(mat(gated) - mat(gate))) < 1e-5 * size, "type " << type << ", " << n
                     << " rows: " << max(abs(mat(gated) - mat(gate))));
             }
+
+            /*
+                A sequence of two launches through tt::gguf_launch_graphs: recorded at its first
+                call, replayed at the next ones with other values in x, each time against the
+                calls of the sequence themselves.
+            */
+            resizable_tensor x(1, cols), q(1, rows[0]), k(1, rows[1]), gated(1, rows[0]), work(1, rows[0]);
+            tensor* dests[2] = { &q, &k };
+            const tensor* weights[2] = { &w[0], &w[1] };
+            auto sequence = [&]() {
+                tt::gguf_matvec_group(dests, x, weights, 2, type, rows, cols, row_bytes);
+                tt::gguf_matvec_swiglu(gated, work, x, w[0], w_up, type, rows[0], cols, row_bytes);
+            };
+            tt::gguf_launch_graphs graphs;
+            graphs.set_slots(1);
+            graphs.enable(true);
+            for (int round = 0; round < 3; ++round)
+            {
+                for (float& v : x) v = rnd.get_random_gaussian();
+                q = 1e30f;
+                gated = 1e30f;
+#ifdef DLIB_USE_CUDA
+                // A replay calls no function that would bring the device copy of x up to date.
+                (void)x.device();
+#endif
+                graphs.run(0, 17, sequence, { &q, &k, &gated });
+                const matrix<float> q_graph = mat(q), k_graph = mat(k), gated_graph = mat(gated);
+                sequence();
+                DLIB_TEST_MSG(max(abs(mat(q) - q_graph)) == 0 && max(abs(mat(k) - k_graph)) == 0
+                    && max(abs(mat(gated) - gated_graph)) == 0, "type " << type << ", round " << round);
+            }
+            DLIB_TEST_MSG(graphs.failure().empty(), graphs.failure());
+#ifdef DLIB_USE_CUDA
+            DLIB_TEST_MSG(graphs.recorded() == 1 && graphs.replayed() == 2, graphs.recorded() << " recorded, "
+                << graphs.replayed() << " replayed");
+#endif
         }
     }
 

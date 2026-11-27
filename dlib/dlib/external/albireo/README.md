@@ -559,12 +559,29 @@ tokens, the matrices of one format and one width that multiply the same rows go 
 together, up to three in a launch whose blocks each compute a matrix (`tt::gguf_matvec_group()`):
 the queries, keys and values of a layer, and the nine inputs of the attention of a hybrid layer in
 three launches. The two products of the feed-forward block of a token and their gate take one
-launch, a warp reading the row of both matrices (`tt::gguf_matvec_swiglu()`). A layer of a
-generated token is 9 launches, where it was 13, or 10 when its values keep another format than its
-queries and keys, as in half the layers of a Q4_K_M file. On a GeForce RTX 5070 Ti Laptop GPU a
-launch chained to the others took 6.5 microseconds, and 13 launches at that cost are 85 of the 282
-microseconds of a block of the size of Qwen3 4B. `test_device_ops` prints the time of a block both
-ways.
+launch, a warp reading the row of both matrices (`tt::gguf_matvec_swiglu()`). The launch of a
+group adds the biases of its matrices, which took a launch each for the queries, keys and values of
+a model that has them. A layer of a generated token is 9 launches, where it was 13, or 10 when its
+values keep another format than its queries and keys, as in half the layers of a Q4_K_M file. On a
+GeForce RTX 5070 Ti Laptop GPU under Windows, a launch chained to the others took 6.8
+microseconds, and a block of the size of Qwen3 4B 274 microseconds in 9 launches against 302 in
+13.
+
+Under Windows the driver of the card queues the launches of a program and hands them to the
+system in batches, so that the time of a launch adds to the time of its kernel instead of hiding
+behind it. A graph of the device is one submission whatever the kernels it holds. For a single
+token, the layer pass therefore records the launches of a layer before its attention and those
+after it as two graphs (`tt::gguf_launch_graphs`) and replays them at the next tokens; the
+attention, which reads one more position at every token, is launched between them on the same
+stream. A graph is recorded again when a tensor it uses changes its address on the card. The
+graphs serve the first tokens of a model, through the passes that compare the card with the
+processor, then the launches go one by one for as many tokens, and the model keeps the graphs
+when its shortest token through them took under 97 % of the other; the log gives both times. A
+pass that differs from the processor through the graphs is compared again without them, and a
+step the card refuses turns them off with its reason in the log. `ALBIREO_LAUNCH_GRAPHS=off`
+keeps the launches one by one and `on` keeps the graphs without timing them. `test_device_ops`
+prints the time of a block launched one by one, replayed as two graphs around its attention, and
+replayed as one graph.
 For a pass of up to 8 tokens, as a step of the generation, a
 block of the card attends each token and key/value head, the positions of a token
 split among the blocks of the card when its heads alone would leave most of it idle, the partial

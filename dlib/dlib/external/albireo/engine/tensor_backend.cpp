@@ -289,6 +289,16 @@ namespace albireo
         */
         const long precision_probe_tokens = 256;
         const int precision_timed_runs = 3;
+
+        /*
+            The tokens a dense pass lets go by before it times a way of launching the layers of a
+            token (tensor_layer_pass::token_done()), the first of them recording the graphs, and
+            the tokens it then times in that way; the share of the time of the launches one by
+            one that the graphs must stay under to be kept.
+        */
+        const int launch_settle_tokens = 3;
+        const int launch_timed_tokens = 8;
+        const double launch_graph_gain = 0.97;
         const size_t attention_work_bytes = size_t(384) << 20;
 
         // The pages of keys and values a first growth of the copies of a layer pass makes at least.
@@ -1354,10 +1364,11 @@ namespace albireo
             and of one width go to the device together, up to grouped_products of them in a
             launch (dlib::tt::gguf_matvec_group()): the time of a token on the device counts its
             launches as well as the bytes it reads.  The other products go one by one
-            (product_on_device()).
+            (product_on_device()).  biases, when given, holds for each matrix the bias its product
+            takes or null: the launch of a group adds it, a sum follows the other products.
         */
         void products_on_device(const weight_matrix* const* W, const copy* const* c, dlib::tensor* const* y, int count,
-            const dlib::tensor& x, bool halves = false)
+            const dlib::tensor& x, bool halves = false, const dlib::tensor* const* biases = nullptr)
         {
             const long n = x.num_samples();
             std::vector<bool>& done = grouped_done_;
@@ -1369,10 +1380,12 @@ namespace albireo
                 if (n >= expanded_product_tokens || !c[i]->quantized)
                 {
                     product_on_device(*W[i], *c[i]->t, c[i]->quantized, x, *y[i], halves);
+                    if (biases && biases[i]) dlib::tt::add(1, *y[i], 1, *biases[i]);
                     continue;
                 }
                 dlib::tensor* dests[grouped_products] = { y[i] };
                 const dlib::tensor* weights[grouped_products] = { c[i]->t.get() };
+                const dlib::tensor* added[grouped_products] = { biases ? biases[i] : nullptr };
                 long rows[grouped_products] = { W[i]->rows };
                 int members = 1;
                 for (int j = i + 1; j < count && members < grouped_products; ++j)
@@ -1383,11 +1396,12 @@ namespace albireo
                     done[static_cast<size_t>(j)] = true;
                     dests[members] = y[j];
                     weights[members] = c[j]->t.get();
+                    added[members] = biases ? biases[j] : nullptr;
                     rows[members] = W[j]->rows;
                     ++members;
                 }
                 dlib::tt::gguf_matvec_group(dests, x, weights, members, static_cast<int>(W[i]->type), rows, W[i]->cols,
-                    W[i]->row_bytes);
+                    W[i]->row_bytes, biases ? added : nullptr);
             }
         }
 
@@ -2137,6 +2151,8 @@ namespace albireo
                 n_ = n;
                 pending_ = false;
                 rows_ = false;
+                token_timed_ = false;
+                token_start_ = std::chrono::steady_clock::now();
                 dlib::device_scope pin({ &x_ });
                 dlib::alias_tensor_instance states = view(x_, n_, d_model);
                 upload(states, x, rows * d_model);
@@ -2158,7 +2174,9 @@ namespace albireo
             guarded([&]() {
                 const long qd = m_.q_dim, kvd = m_.kv_dim;
                 dlib::device_scope pin({ &x_, &xn_, &tmp_, &qkv_, &o_.tile_, &o_.saturated_ });
-                project(layer);
+                // The processor attends: it adds the biases of the model itself.
+                project(layer, pending_, false);
+                pending_ = false;
                 const size_t qn = static_cast<size_t>(n_ * qd), kn = static_cast<size_t>(n_ * kvd);
                 const float* all = download(view(qkv_, n_, qd + 2 * kvd), qn + 2 * kn);
                 std::memcpy(q, all, sizeof(float) * qn);
@@ -2174,6 +2192,7 @@ namespace albireo
                 dlib::alias_tensor_instance attended = view(ctx_, n_, m_.q_dim);
                 upload(attended, ctx, static_cast<size_t>(n_ * m_.q_dim));
                 finish(layer);
+                pending_ = true;
             });
         }
 
@@ -2209,6 +2228,13 @@ namespace albireo
         bool retreat() override
         {
             return o_.retreat_precision("a pass of '" + o_.model() + "' differed from the processor", true);
+        }
+
+        bool leave_launch_graphs() override
+        {
+            if (!use_graphs_) return false;
+            leave_graphs("a pass differed from the processor", ALBIREO_LOG_WARNING);
+            return true;
         }
 
         bool begin_attention(const attention_plan& plan) override
@@ -2255,42 +2281,61 @@ namespace albireo
                 const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
                 dlib::device_scope pin({ &x_, &xn_, &qkv_, &ctx_, &tmp_, &gate_, &up_, &o_.tile_, &o_.saturated_ });
                 dlib::device_scope pin_pages({ &pages_, &plan_, &attention_work_ });
-                project(layer);
                 dlib::alias_tensor_instance q = view(qkv_, n_, qd);
                 dlib::alias_tensor_instance k = view(qkv_, n_, kvd, n_ * qd);
                 dlib::alias_tensor_instance v = view(qkv_, n_, kvd, n_ * (qd + kvd));
                 const size_t at = 5 * static_cast<size_t>(layer);
-                if (L.bq)
-                {
-                    dlib::tt::add(1, q, 1, extras_[at]);
-                    dlib::tt::add(1, k, 1, extras_[at + 1]);
-                    dlib::tt::add(1, v, 1, extras_[at + 2]);
-                }
-                if (L.q_norm)
-                {
-                    dlib::tt::rms_norm_rows(q, q, extras_[at + 3], m_.rms_eps);
-                    dlib::tt::rms_norm_rows(k, k, extras_[at + 4], m_.rms_eps);
-                }
                 const long T = n_;
                 dlib::alias_tensor_instance slots = view(plan_, T, 1);
                 dlib::alias_tensor_instance tokens = view(plan_, 2 * T, 1, T);
-                dlib::alias_tensor_instance tables = view(plan_, table_entries_, 1, 3 * T);
-                dlib::alias_tensor_instance angles = view(plan_, T, m_.rope_dims, 3 * T + table_entries_);
-                dlib::tt::rope_rows(q, H, k, KVH, angles, hd, m_.rope_dims, m_.neox);
-                dlib::tt::paged_kv_store(pages_, layout_, layer, k, v, slots);
+                dlib::alias_tensor_instance angles = view(plan_, T, m_.rope_dims, 3 * T);
+                dlib::alias_tensor_instance tables = view(plan_, table_entries_, 1, 3 * T + T * m_.rope_dims);
                 dlib::alias_tensor_instance attended = view(ctx_, n_, qd);
-                if (rows_)
+                /*
+                    The layer in three sequences of launches.  The first and the last pass the same
+                    arguments from a token to the next, and a graph of the device replays each of
+                    them for a single token (launch_graphs()); the attention reads more positions at
+                    every token and is launched between them.  The sequences change nothing but
+                    tensors: the state of the pass changes around them.
+                */
+                const bool sum = pending_;
+                auto first = [&]() {
+                    project(layer, sum, true);
+                    if (L.q_norm)
+                    {
+                        dlib::tt::rms_norm_rows(q, q, extras_[at + 3], m_.rms_eps);
+                        dlib::tt::rms_norm_rows(k, k, extras_[at + 4], m_.rms_eps);
+                    }
+                    dlib::tt::rope_rows(q, H, k, KVH, angles, hd, m_.rope_dims, m_.neox);
+                    dlib::tt::paged_kv_store(pages_, layout_, layer, k, v, slots);
+                };
+                auto attention = [&]() {
+                    if (rows_)
+                    {
+                        dlib::alias_tensor_instance work = view(attention_work_, static_cast<long>(work_values_), 1);
+                        dlib::tt::paged_attention_rows(attended, q, H, m_.attention_scale, pages_, layout_, layer,
+                            tables, first_entry_, first_position_, work);
+                    }
+                    else
+                    {
+                        dlib::tt::paged_attention(attended, q, H, m_.attention_scale, pages_, layout_, layer, tokens,
+                            tables, span_);
+                    }
+                };
+                auto last = [&]() { finish(layer); };
+                if (launch_graphs(layer))
                 {
-                    dlib::alias_tensor_instance work = view(attention_work_, static_cast<long>(work_values_), 1);
-                    dlib::tt::paged_attention_rows(attended, q, H, m_.attention_scale, pages_, layout_, layer, tables,
-                        first_entry_, first_position_, work);
+                    graphs_.run(2 * static_cast<size_t>(layer), first_signature(layer, sum), first);
+                    graphs_.direct(attention);
+                    graphs_.run(2 * static_cast<size_t>(layer) + 1, last_signature(layer), last);
                 }
                 else
                 {
-                    dlib::tt::paged_attention(attended, q, H, m_.attention_scale, pages_, layout_, layer, tokens,
-                        tables, span_);
+                    first();
+                    attention();
+                    last();
                 }
-                finish(layer);
+                pending_ = true;
             });
         }
 
@@ -2332,6 +2377,7 @@ namespace albireo
                 {
                     // A pass without logits, a part of a prompt, ends once the device has computed it,
                     // so that a failure of the device belongs to the pass that met it.
+                    if (use_graphs_) graphs_.wait();
                     cuda_check(cudaStreamSynchronize(0), "computation of a layer on the device");
                 }
 #endif
@@ -2348,6 +2394,8 @@ namespace albireo
                 // The copies of the rows crossed with the hidden states, which the device waited for.
                 if (written) scatter_written(written);
             });
+            if (token_timed_)
+                token_done(std::chrono::duration<double>(std::chrono::steady_clock::now() - token_start_).count());
             attending_ = false;
             n_ = 0;
         }
@@ -2466,8 +2514,12 @@ namespace albireo
             extras_.swap(extras);
         }
 
-        // The queries, keys and values of the tokens of the pass for layer, into qkv_.
-        void project(long layer)
+        /*
+            The queries, keys and values of the tokens of the pass for layer, into qkv_.  sum tells
+            that the output of the previous layer still joins the hidden states (pending_, which
+            the caller clears), biased that the products take the biases of the model.
+        */
+        void project(long layer, bool sum, bool biased)
         {
             const long d = m_.d_model, qd = m_.q_dim, kvd = m_.kv_dim;
             const dense_layer& L = m_.layers[static_cast<size_t>(layer)];
@@ -2475,12 +2527,11 @@ namespace albireo
             dlib::alias_tensor_instance x = view(x_, n_, d);
             dlib::alias_tensor_instance xn = view(xn_, n_, d);
             const dlib::tensor& norm = norms_[2 * static_cast<size_t>(layer)];
-            if (pending_)
+            if (sum)
             {
                 // The sum that ends the previous layer, with the normalization that starts this one.
                 dlib::alias_tensor_instance last = view(tmp_, n_, d);
                 dlib::tt::add_rms_norm_rows(xn, x, last, m_.residual_scale, norm, m_.rms_eps);
-                pending_ = false;
             }
             else
             {
@@ -2491,13 +2542,172 @@ namespace albireo
             dlib::alias_tensor_instance vv = view(qkv_, n_, kvd, n_ * (qd + kvd));
             const weight_matrix* matrices[3] = { &L.wq, &L.wk, &L.wv };
             dlib::tensor* products[3] = { &qv, &kv, &vv };
-            o_.products_on_device(matrices, c, products, 3, xn, true);
+            const size_t at = 5 * static_cast<size_t>(layer);
+            const dlib::tensor* biases[3] = { &extras_[at], &extras_[at + 1], &extras_[at + 2] };
+            o_.products_on_device(matrices, c, products, 3, xn, true, biased && L.bq ? biases : nullptr);
+        }
+
+        /*
+            True when the layer of the single token of the pass goes to the device as graphs of
+            launches: the pass uses them, the device attends the token, and every matrix of the
+            layer keeps its GGUF format, so that each launch of the layer is one a graph records
+            (dlib::tt::gguf_launch_graphs).  The first such token of the model turns the graphs
+            on, which the passes that compare the device with the processor then run through.
+        */
+        bool launch_graphs(long layer)
+        {
+            if (n_ != 1 || rows_ || !attending_) return false;
+            token_timed_ = true;
+            if (stage_ == graph_stage::untried) try_graphs();
+            if (!use_graphs_ || !graphs_.enabled()) return false;
+            const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+            for (int i = 0; i < 7; ++i)
+                if (!c[i]->quantized) return false;
+            return true;
+        }
+
+        /*
+            Turns the graphs of the launches on for the first token the device attends, unless
+            ALBIREO_LAUNCH_GRAPHS is "off"; "on" keeps them without timing them.
+        */
+        void try_graphs()
+        {
+            const char* asked = std::getenv("ALBIREO_LAUNCH_GRAPHS");
+            const std::string mode = asked ? asked : "";
+            stage_ = graph_stage::left;
+            if (mode == "off") return;
+            graphs_.set_slots(2 * m_.layers.size());
+            graphs_.enable(true);
+            if (!graphs_.enabled())
+            {
+                const std::string why = graphs_.failure();
+                if (!why.empty())
+                    o_.d_.message(ALBIREO_LOG_INFO, "device: the launches of a token of '" + o_.model()
+                        + "' go one by one (" + why + ")");
+                return;
+            }
+            use_graphs_ = true;
+            stage_ = mode == "on" ? graph_stage::kept : graph_stage::graphs;
+            stage_tokens_ = 0;
+        }
+
+        void leave_graphs(const std::string& why, int level)
+        {
+            use_graphs_ = false;
+            graphs_.enable(false);
+            stage_ = graph_stage::left;
+            o_.d_.message(level, "device: the launches of a token of '" + o_.model() + "' go one by one again ("
+                + why + ")");
+        }
+
+        /*
+            Takes the time of a token the device attended, from the copy of its hidden state to
+            the device to the copy of its result, and chooses between the two ways of launching
+            its layers: launch_timed_tokens tokens through the graphs, as many launched one by
+            one, each after launch_settle_tokens tokens, the shortest token of each way counting.
+        */
+        void token_done(double seconds)
+        {
+            if (stage_ != graph_stage::graphs && stage_ != graph_stage::direct && stage_ != graph_stage::kept) return;
+            const std::string failure = graphs_.failure();
+            if (!failure.empty())
+            {
+                leave_graphs(failure, ALBIREO_LOG_WARNING);
+                return;
+            }
+            if (stage_ == graph_stage::kept) return;
+            double& best = stage_ == graph_stage::graphs ? graph_seconds_ : direct_seconds_;
+            if (++stage_tokens_ > launch_settle_tokens && (best <= 0 || seconds < best)) best = seconds;
+            if (stage_tokens_ < launch_settle_tokens + launch_timed_tokens) return;
+            stage_tokens_ = 0;
+            if (stage_ == graph_stage::graphs)
+            {
+                // The graphs stay recorded while the launches one by one are timed.
+                stage_ = graph_stage::direct;
+                use_graphs_ = false;
+                return;
+            }
+            char times[96];
+            std::snprintf(times, sizeof(times), "%.2f ms against %.2f ms", graph_seconds_ * 1e3, direct_seconds_ * 1e3);
+            if (graph_seconds_ < launch_graph_gain * direct_seconds_)
+            {
+                stage_ = graph_stage::kept;
+                use_graphs_ = true;
+                o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of a token of '" + o_.model() + "' are launched "
+                    "as graphs of the device, a token in " + times + " with its launches one by one");
+            }
+            else
+            {
+                graphs_.enable(false);
+                stage_ = graph_stage::left;
+                o_.d_.message(ALBIREO_LOG_INFO, "device: the layers of a token of '" + o_.model() + "' are launched "
+                    "one by one, the graphs of the device giving a token in " + times + " that way");
+            }
+        }
+
+        static void mix(unsigned long long& h, unsigned long long v)
+        {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+
+        /*
+            The signatures of the two sequences of a layer that graphs replay: the addresses on
+            the device of the tensors they use and the numbers they pass.  A buffer that grew, a
+            copy of a matrix that left the card and returned, or other pages give other
+            signatures, and the sequences are recorded again.
+        */
+        unsigned long long first_signature(long layer, bool sum)
+        {
+#if defined(DLIB_USE_CUDA)
+            unsigned long long h = sum ? 1 : 2;
+            mix(h, static_cast<unsigned long long>(n_));
+            mix(h, static_cast<unsigned long long>(layer));
+            for (dlib::resizable_tensor* t : { &x_, &xn_, &tmp_, &qkv_, &plan_, &pages_ })
+                mix(h, reinterpret_cast<uintptr_t>(t->device()));
+            const dlib::tensor& norm = norms_[2 * static_cast<size_t>(layer)];
+            mix(h, reinterpret_cast<uintptr_t>(norm.device()));
+            for (size_t i = 0; i < 5; ++i)
+            {
+                const dlib::tensor& e = extras_[5 * static_cast<size_t>(layer) + i];
+                mix(h, e.size() ? reinterpret_cast<uintptr_t>(e.device()) : 0);
+            }
+            const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+            for (int i = 0; i < 3; ++i)
+                mix(h, reinterpret_cast<uintptr_t>(static_cast<const dlib::tensor&>(*c[i]->t).device()));
+            mix(h, mirrored_pool_);
+            mix(h, layout_.q8 ? 1 : 0);
+            mix(h, static_cast<unsigned long long>(layout_.block_positions));
+            return h;
+#else
+            (void)layer;
+            return sum ? 1 : 2;
+#endif
+        }
+
+        unsigned long long last_signature(long layer)
+        {
+#if defined(DLIB_USE_CUDA)
+            unsigned long long h = 3;
+            mix(h, static_cast<unsigned long long>(n_));
+            mix(h, static_cast<unsigned long long>(layer));
+            for (dlib::resizable_tensor* t : { &x_, &xn_, &tmp_, &ctx_, &gate_, &up_ })
+                mix(h, reinterpret_cast<uintptr_t>(t->device()));
+            const dlib::tensor& norm = norms_[2 * static_cast<size_t>(layer) + 1];
+            mix(h, reinterpret_cast<uintptr_t>(norm.device()));
+            const tensor_offload::copy* const* c = &copies_[static_cast<size_t>(layer) * 7];
+            for (int i = 3; i < 7; ++i)
+                mix(h, reinterpret_cast<uintptr_t>(static_cast<const dlib::tensor&>(*c[i]->t).device()));
+            return h;
+#else
+            (void)layer;
+            return 3;
+#endif
         }
 
         /*
             The projection of the outputs of the attention in ctx_ with its residual sum, then the
             feed-forward block, whose output stays in tmp_ for the sum that the next normalization
-            or the end of the pass makes (pending_).
+            or the end of the pass makes (pending_, which the caller sets).
         */
         void finish(long layer)
         {
@@ -2515,8 +2725,6 @@ namespace albireo
             dlib::alias_tensor_instance up = view(up_, n_, df);
             o_.gated_product_on_device(L.w_gate, *c[4], L.w_up, *c[5], xn, gate, up, true);
             o_.product_on_device(L.w_down, *c[6]->t, c[6]->quantized, gate, tmp, true);
-            // The output of the feed-forward block joins the hidden states with the next normalization, or at the end.
-            pending_ = true;
         }
 
         /*
@@ -2687,7 +2895,7 @@ namespace albireo
                 }
             }
 
-            // The tokens: their slots, their positions and first entries, the pages of the blocks, their angles.
+            // The tokens: their slots, their positions and first entries, their angles, the pages of the blocks.
             plan_host_.resize(words);
             written_.resize(static_cast<size_t>(T));
             long span = 0;
@@ -2705,11 +2913,10 @@ namespace albireo
                 written_[static_cast<size_t>(t)] = std::make_pair(block, p % B);
                 span = std::max(span, p + 1);
             }
+            std::memcpy(plan_host_.data() + 3 * T, plan.angles.data(), sizeof(float) * static_cast<size_t>(T * R));
             for (long i = 0; i < table_entries_; ++i)
-                put_integer(static_cast<size_t>(3 * T + i),
+                put_integer(static_cast<size_t>(3 * T + T * R + i),
                     static_cast<int32_t>(entries_.at(plan.blocks[static_cast<size_t>(i)]).page));
-            std::memcpy(plan_host_.data() + 3 * T + table_entries_, plan.angles.data(),
-                sizeof(float) * static_cast<size_t>(T * R));
             span_ = span;
             pool_ = plan.pool;
             upload_plan(words);
@@ -2995,8 +3202,9 @@ namespace albireo
         std::vector<std::pair<int, long>> needed_;
         /*
             The tokens of the pass on the device, as dlib::tt::paged_attention() reads them: their
-            slots, their positions with their first entries, the pages of the blocks of the plan
-            (table_entries_ of them), as integers, then their angles.
+            slots, their positions with their first entries, as integers, their angles, then the
+            pages of the blocks of the plan (table_entries_ of them), as integers.  The angles keep
+            their address when the plan gains a block, which the graphs of the launches rely on.
         */
         dlib::resizable_tensor plan_;
         std::vector<float> plan_host_;
@@ -3006,6 +3214,21 @@ namespace albireo
         std::vector<std::pair<int, long>> written_;
         kv_pool* pool_ = nullptr;
         dlib::resizable_tensor gathered_;
+        /*
+            The launches of the layers of a token as graphs of the device, two sequences per layer
+            (attend()), and their trial: the tokens of the model first run through the graphs,
+            with the passes that compare the device with the processor, then launched one by one,
+            and the faster way is kept (token_done()).
+        */
+        enum class graph_stage { untried, graphs, direct, kept, left };
+        dlib::tt::gguf_launch_graphs graphs_;
+        graph_stage stage_ = graph_stage::untried;
+        bool use_graphs_ = false;
+        bool token_timed_ = false;
+        int stage_tokens_ = 0;
+        double graph_seconds_ = 0;
+        double direct_seconds_ = 0;
+        std::chrono::steady_clock::time_point token_start_;
 #if defined(DLIB_USE_CUDA)
         // The rows that cross the bus, each way, the tokens of a pass, and the keys and values they wrote.
         pinned_floats to_device_, from_device_, plan_staging_, kv_from_device_;

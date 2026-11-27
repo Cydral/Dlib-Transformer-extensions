@@ -17,7 +17,9 @@
 #include "kv_pages.h"
 #include "npu_dlib.h"
 #include "../rand.h"
+#include <initializer_list>
 #include <memory>
+#include <string>
 #include "../geometry/rectangle.h"
 #include "../test_for_odr_violations.h"
 
@@ -3251,7 +3253,8 @@ namespace dlib { namespace tt
         int type,
         const long* rows,
         long cols,
-        size_t row_bytes
+        size_t row_bytes,
+        const tensor* const* biases = nullptr
     );
     /*!
         requires
@@ -3260,11 +3263,15 @@ namespace dlib { namespace tt
             - for all p < count: *dests[p], src, *weights[p], type, rows[p], cols and row_bytes
               meet the requirements of gguf_matvec()
             - the tensors of dests are distinct objects
+            - biases is null or points to count elements, each null or a tensor of rows[p]
+              values
         ensures
             - performs gguf_matvec(*dests[p], src, *weights[p], type, rows[p], cols, row_bytes)
               for all p < count, with the same values: the products of several matrices of one
               format and one width with the same rows, such as the queries, keys and values
               of an attention block.
+            - for all p with a bias, adds *biases[p] to every row of *dests[p], as
+              add(1, *dests[p], 1, *biases[p]) does after the product.
             - With CUDA, the device computes the count products in one launch for every 8 rows
               of src, where gguf_matvec() takes a launch for each matrix.  The time of the
               generation of a token counts its launches as well as its readings.
@@ -3296,6 +3303,182 @@ namespace dlib { namespace tt
               work as it is.  Otherwise the function computes the two products and their gate,
               and work holds the product with up_weights.
     !*/
+
+    class gguf_launch_graphs
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Sequences of calls of the gguf functions and row operations above (gguf_matvec(),
+                gguf_matvec_group(), gguf_matvec_swiglu(), gguf_matvec_picked(), rms_norm_rows(),
+                add_rms_norm_rows(), silu_multiply(), rope_rows(), paged_kv_store(),
+                paged_kv_gather(), paged_attention(), squared_relu(), mix_rows(), expert_routes()),
+                which a device launches again as one graph each.
+
+                A device launches a kernel for each of these calls.  Under Windows its driver
+                queues the launches of a program and hands them to the system in batches, so
+                that a sequence of short kernels, as the layer of a decoder for one token, costs
+                the time of its launches as well as the time of its kernels.  A graph of the
+                device is one submission whatever the kernels it holds.
+
+                run() records a sequence the first time it meets its slot with a signature, and
+                launches the recorded graph the next times.  The signature is the value by which
+                the caller tells that the sequence launches the same kernels with the same
+                arguments: it must change with the address on the device of any tensor the
+                sequence uses and with any number it passes.  The values the tensors hold are
+                read when the graph runs, as for the calls themselves.
+
+            REQUIREMENTS ON A SEQUENCE
+                - It calls no function that computes on the device other than those above.
+                - The tensors it uses hold their device copies before the call: a recording
+                  holds no transfer between the host and the device.
+                - It changes nothing but tensors: when a graph replays it, the function that
+                  holds it is not called.
+
+            Without CUDA, or while the object is off, run() and direct() call the functions they
+            are given and nothing else.  A recording or a launch that the device refuses turns
+            the object off, failure() telling why.
+
+            THREAD SAFETY
+                An object belongs to one thread at a time.
+        !*/
+    public:
+
+        void set_slots(size_t slots)
+        {
+#ifdef DLIB_USE_CUDA
+            impl.set_slots(slots);
+#else
+            (void)slots;
+#endif
+        }
+        /*!
+            ensures
+                - The object holds room for slots sequences, numbered from 0, and no graph.
+        !*/
+
+        void enable(bool on_)
+        {
+#ifdef DLIB_USE_CUDA
+            impl.enable(on_);
+#else
+            on = on_;
+#endif
+        }
+        /*!
+            ensures
+                - Turns the recording and the replay of the sequences on or off; off, the
+                  object forgets its graphs.
+                - #enabled() == on_, unless the device gave no stream to the object.
+        !*/
+
+        bool enabled() const
+        {
+#ifdef DLIB_USE_CUDA
+            return impl.enabled();
+#else
+            return on;
+#endif
+        }
+
+        template <typename F>
+        void run(size_t slot, unsigned long long signature, F&& launches, std::initializer_list<tensor*> written = {})
+        {
+#ifdef DLIB_USE_CUDA
+            impl.run(slot, signature, launches);
+            // A graph wrote the device copies without the tensors knowing: their host copies are out of date.
+            for (tensor* t : written) (void)t->device();
+#else
+            (void)slot;
+            (void)signature;
+            (void)written;
+            launches();
+#endif
+        }
+        /*!
+            requires
+                - launches() meets the requirements on a sequence
+                - written lists the tensors of the sequence that the caller reads on the host
+                  afterwards, if any
+            ensures
+                - The device copies of the tensors hold what launches() computes: from the
+                  graph recorded for slot with this signature when there is one, otherwise
+                  from launches() itself, which the object records for the next calls while
+                  it is on and slot is below the count of set_slots().
+                - A graph writes the device copies without calling the functions that tell a
+                  tensor so.  The tensors of written are told; another tensor that the
+                  sequence writes must not be read through host() before a function of this
+                  file or its device() has taken it.
+        !*/
+
+        template <typename F>
+        void direct(F&& launches)
+        {
+#ifdef DLIB_USE_CUDA
+            impl.direct(launches);
+#else
+            launches();
+#endif
+        }
+        /*!
+            ensures
+                - Calls launches(), whose launches keep their order with the sequences of
+                  run(): a sequence whose kernels or arguments change at each call.
+        !*/
+
+        void wait()
+        {
+#ifdef DLIB_USE_CUDA
+            impl.wait();
+#endif
+        }
+        /*!
+            ensures
+                - Blocks until the device has run what run() and direct() launched.
+        !*/
+
+        std::string failure() const
+        {
+#ifdef DLIB_USE_CUDA
+            return impl.failure();
+#else
+            return std::string();
+#endif
+        }
+        /*!
+            ensures
+                - Returns why the device turned the object off, or an empty string.
+        !*/
+
+        unsigned long long recorded() const
+        {
+#ifdef DLIB_USE_CUDA
+            return impl.recorded();
+#else
+            return 0;
+#endif
+        }
+
+        unsigned long long replayed() const
+        {
+#ifdef DLIB_USE_CUDA
+            return impl.replayed();
+#else
+            return 0;
+#endif
+        }
+        /*!
+            ensures
+                - recorded() and replayed() count the sequences the object recorded and the
+                  launches of their graphs.
+        !*/
+
+    private:
+#ifdef DLIB_USE_CUDA
+        cuda::gguf_launch_graphs impl;
+#else
+        bool on = false;
+#endif
+    };
 
     void gguf_dequantize (
         tensor& dest,

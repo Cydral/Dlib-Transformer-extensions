@@ -1423,6 +1423,25 @@ namespace albireo
         return first;
     }
 
+    /*
+        probe_layer_pass() for a pass that the device attends.  When the pass differs and the
+        device launched its layers as graphs (layer_pass::leave_launch_graphs()), the graphs may
+        be alone to differ: the device gives them up and the same pass is compared again, so that
+        the device keeps its attention with its launches one by one.
+    */
+    int cpu_runtime::probe_attended_pass(long n, kv_format format, double tolerance, bool& attended,
+        std::string& detail)
+    {
+        int outcome = probe_layer_pass(n, format, true, tolerance, attended, detail);
+        if (outcome == 0 && attended && layer_pass_->leave_launch_graphs())
+        {
+            const std::string differed = detail;
+            outcome = probe_layer_pass(n, format, true, tolerance, attended, detail);
+            detail = differed + ", the launches of the device going one by one again; " + detail;
+        }
+        return outcome;
+    }
+
     void cpu_runtime::check_layer_pass()
     {
         const long first = probe_size();
@@ -1436,7 +1455,8 @@ namespace albireo
         bool attention = layer_pass_->attends() && first <= attention_tokens;
         // Without passes of a few tokens on the device, its attention would serve none.
         if (!attention) layer_pass_->allow_attention(false);
-        int outcome = probe_layer_pass(first, kv_format::f16, attention, probe_tolerance, attended, detail);
+        int outcome = attention ? probe_attended_pass(first, kv_format::f16, probe_tolerance, attended, detail)
+            : probe_layer_pass(first, kv_format::f16, false, probe_tolerance, attended, detail);
         if (outcome < 0) return;
         if (attention && !attended)
         {
@@ -1529,7 +1549,7 @@ namespace albireo
 
         if (attention && kv_.format() == kv_format::q8)
         {
-            outcome = probe_layer_pass(first, kv_format::q8, true, q8_probe_tolerance, attended, detail);
+            outcome = probe_attended_pass(first, kv_format::q8, q8_probe_tolerance, attended, detail);
             if (outcome < 0) return;
             if (outcome == 0 || !attended)
             {
@@ -1600,11 +1620,11 @@ namespace albireo
         layer_pass_->allow_attention(true);
         std::string details, detail;
         bool attended = false;
-        int outcome = probe_layer_pass(first, kv_format::f16, true, probe_tolerance, attended, detail);
+        int outcome = probe_attended_pass(first, kv_format::f16, probe_tolerance, attended, detail);
         if (outcome > 0 && attended && kv_.format() == kv_format::q8)
         {
             details = detail;
-            outcome = probe_layer_pass(first, kv_format::q8, true, q8_probe_tolerance, attended, detail);
+            outcome = probe_attended_pass(first, kv_format::q8, q8_probe_tolerance, attended, detail);
         }
         if (outcome > 0 && attended)
         {

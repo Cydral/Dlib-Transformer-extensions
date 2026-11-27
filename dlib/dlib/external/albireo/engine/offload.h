@@ -243,6 +243,16 @@ namespace albireo
         virtual bool retreat() { return false; }
 
         /*!
+            ensures
+                - Called after a pass of a few tokens that the device attended differed from
+                  the processor.  Returns true when the device launched the layers of these
+                  tokens as graphs (dlib::tt::gguf_launch_graphs), which it gives up for the
+                  model: the runtime then compares the same pass again; false when its
+                  launches already went one by one.
+        !*/
+        virtual bool leave_launch_graphs() { return false; }
+
+        /*!
             requires
                 - begin() returned true, and no layer of the pass was computed yet.
                 - plan describes the n tokens of the pass (attention_plan), their keys and values

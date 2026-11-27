@@ -1403,6 +1403,8 @@ namespace
         dlib::resizable_tensor x(1, d), xn(1, d), tmp(1, d), gamma(1, d), q(1, qd), k(1, kvd), v(1, kvd), ctx(1, qd);
         dlib::resizable_tensor gate(1, df), up(1, df), angles(1, hd);
         random_floats(x.host_write_only(), x.size(), 1.0f, rng);
+        // The hidden state before any block, which the checks of the values start again from.
+        const std::vector<float> x0(x.host(), x.host() + x.size());
         gamma = 1;
         // The output of the block before, which the first operation adds to the hidden state.
         tmp = 0;
@@ -1493,12 +1495,38 @@ namespace
             products and their gate.
         */
         auto values = [](const dlib::tensor& t) { return std::vector<float>(t.host(), t.host() + t.size()); };
+        // The values as bytes: a comparison of floats would take equal values that are no numbers for different ones.
+        auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        auto finite = [](const std::vector<float>& a) {
+            for (float v : a)
+                if (!std::isfinite(v)) return false;
+            return true;
+        };
+        /*
+            The measures above repeat each step alone, the gate in place and the residual sum
+            among them: the values they leave grow beyond the floats.  The checks start again
+            from the hidden state the block was given, as the first block of a token does.
+        */
+        auto restart = [&]() {
+            std::memcpy(x.host_write_only(), x0.data(), sizeof(float) * x0.size());
+            tmp = 0;
+#ifdef DLIB_USE_CUDA
+            // A graph that replays the launches calls no function that would bring these copies up to date.
+            (void)x.device();
+            (void)tmp.device();
+#endif
+            steps[0].run();
+        };
+        restart();
         steps[1].run();
         steps[2].run();
         steps[3].run();
         const std::vector<float> q_ref = values(q), k_ref = values(k), v_ref = values(v);
         launches[1].run();
-        expect(values(q) == q_ref && values(k) == k_ref && values(v) == v_ref,
+        expect(finite(q_ref) && finite(k_ref) && finite(v_ref), "the products of the block are numbers");
+        expect(same(values(q), q_ref) && same(values(k), k_ref) && same(values(v), v_ref),
             "the queries, keys and values of one launch equal the three products launched one by one");
         steps[9].run();
         steps[10].run();
@@ -1512,7 +1540,46 @@ namespace
             apart = std::max(apart, std::abs(gate_ref[i] - gated[i]));
             size = std::max(size, std::abs(gate_ref[i]));
         }
-        expect(apart <= 1e-5f * size, "the gated values of one launch follow the two products and their gate");
+        expect(finite(gate_ref) && finite(gated) && apart <= 1e-5f * size,
+            "the gated values of one launch follow the two products and their gate");
+
+        /*
+            The block as the layer pass launches it for a token: its launches one by one, then the
+            launches before the attention and those after it as two graphs of the device
+            (tt::gguf_launch_graphs), recorded at a first call and replayed at the next, and the
+            whole block as one graph.  The three ways must leave the same values.
+        */
+        auto block = [&](const std::function<void()>& run) {
+            restart();
+            run();
+            return values(tmp);
+        };
+        const std::vector<float> one_by_one = block([&]() {
+            for (const step& s : launches) s.run();
+        });
+        dlib::tt::gguf_launch_graphs graphs;
+        graphs.set_slots(3);
+        graphs.enable(true);
+        auto around = [&]() {
+            graphs.run(0, 1, [&]() {
+                for (size_t i = 0; i < 4; ++i) launches[i].run();
+            });
+            graphs.direct(launches[4].run);
+            graphs.run(1, 1, [&]() {
+                for (size_t i = 5; i < launches.size(); ++i) launches[i].run();
+            });
+        };
+        auto whole = [&]() {
+            graphs.run(2, 1, [&]() {
+                for (const step& s : launches) s.run();
+            });
+        };
+        expect(finite(one_by_one), "the output of the block is made of numbers");
+        // A first call records, a second one replays.
+        expect(same(block(around), one_by_one) && same(block(around), one_by_one),
+            "the block replayed as two graphs around its attention equals its launches one by one");
+        expect(same(block(whole), one_by_one) && same(block(whole), one_by_one),
+            "the block replayed as one graph equals its launches one by one");
         wait_device();
         for (size_t i : { size_t(1), size_t(7) })
         {
@@ -1533,6 +1600,33 @@ namespace
         std::printf("  dense block, one token as the layer pass launches it: %8.1f us in %d launches, against %.1f us "
             "in %d; 36 such blocks, %.1f ms\n", fewer * 1e6, static_cast<int>(launches.size()), chained * 1e6,
             static_cast<int>(steps.size()), fewer * 36e3);
+#ifdef DLIB_USE_CUDA
+        if (graphs.recorded() == 0 || !graphs.failure().empty())
+        {
+            std::printf("  dense block: the device replays no graph of launches (%s)\n", graphs.failure().c_str());
+            return;
+        }
+        double graph_seconds[2];
+        for (int way = 0; way < 2; ++way)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < repeats; ++i)
+            {
+                if (way == 0) around();
+                else whole();
+            }
+            graphs.wait();
+            wait_device();
+            graph_seconds[way] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
+                / repeats;
+        }
+        std::printf("  dense block, one token replayed as two graphs around its attention: %8.1f us; as one graph, "
+            "%.1f us; against %.1f us in %d launches (%llu graphs recorded, %llu launches of them)\n",
+            graph_seconds[0] * 1e6, graph_seconds[1] * 1e6, fewer * 1e6, static_cast<int>(launches.size()),
+            graphs.recorded(), graphs.replayed());
+        if (!graphs.failure().empty())
+            std::printf("  dense block: the device left the graphs of launches (%s)\n", graphs.failure().c_str());
+#endif
     }
 
     /*

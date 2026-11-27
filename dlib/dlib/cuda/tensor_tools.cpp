@@ -2058,15 +2058,19 @@ namespace dlib { namespace tt
         int type,
         const long* rows,
         long cols,
-        size_t row_bytes
+        size_t row_bytes,
+        const tensor* const* biases
     )
     {
         DLIB_CASSERT(count >= 1 && count <= 3 && dests && weights && rows);
 #ifdef DLIB_USE_CUDA
-        cuda::gguf_matvec_group(dests, src, weights, count, type, rows, cols, row_bytes);
+        cuda::gguf_matvec_group(dests, src, weights, count, type, rows, cols, row_bytes, biases);
 #else
         for (int p = 0; p < count; ++p)
+        {
             gguf_matvec(*dests[p], src, *weights[p], type, rows[p], cols, row_bytes);
+            if (biases && biases[p]) add(1, *dests[p], 1, *biases[p]);
+        }
 #endif
     }
 
