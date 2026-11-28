@@ -1854,6 +1854,57 @@ namespace pseudalis
         p_->columns.swap(converted);
     }
 
+    std::vector<corpus_result> engine::fictive(const std::vector<corpus_text>& texts, const std::string& key,
+                                               const corpus_settings& settings) const
+    {
+        if (key.size() != 32) throw std::runtime_error("the key of a corpus must have 32 bytes");
+        fictive_options o;
+        o.languages = settings.languages;
+        o.date_shift_days = settings.date_shift_days;
+        o.keep_city = settings.keep_city;
+        o.date_order = p_->dopt.date_order;
+        const fictive_substituter s(pseudonymization_key::from_bytes(key), o);
+        fictive_batch batch(s);
+        const std::vector<pii_imposed_column> columns = p_->imposed_columns();
+        std::vector<std::string> written, documents;
+        std::vector<corpus_result> out;
+        written.reserve(texts.size());
+        for (const corpus_text& t : texts)
+        {
+            pii_detector d(p_->options());
+            p_->attach(d);
+            document_anonymizer a(*p_->p, d);
+            a.set_imposed_columns(columns);
+            a.set_value_writer([&batch](pii_type type, const std::string& value) { return batch.record(type, value); });
+            document_report r;
+            // A CSV text keeps its cells, by its name or by a header that names an imposed column; any other is plain.
+            const bool csv = !t.name.empty() && detect_document_format(t.text, t.name) == document_format::delimited;
+            const document_format f = csv ? document_format::delimited : document_format::text;
+            try
+            {
+                written.push_back(a.anonymize(t.text, f, r, t.name));
+            }
+            catch (const std::exception& e)
+            {
+                throw std::runtime_error("the text " + t.ref.substr(0, 64) + " cannot be read: " + e.what());
+            }
+            documents.push_back(t.document);
+            corpus_result c;
+            c.ref = t.ref;
+            for (const auto& e : r.entities)
+                c.counts[privacy_impl::lowercase(e.first)] = static_cast<unsigned long long>(e.second);
+            out.push_back(c);
+        }
+        const std::vector<std::string> done = batch.finish(written, documents);
+        for (std::size_t k = 0; k < out.size() && k < done.size(); ++k) out[k].text = done[k];
+        return out;
+    }
+
+    std::string engine::lexicon_version()
+    {
+        return fictive_substituter::lexicon_version();
+    }
+
     json engine::detect(const std::string& text) const
     {
         pii_detector d(p_->options());
@@ -1885,6 +1936,8 @@ namespace pseudalis
         j["tagger"] = anonymizer_models::tagger_source();
         j["span_model"] = anonymizer_models::span_model_source();
         j["size"] = anonymizer_models::span_model_size();
+        // The lexicons of the fictive values, which the reports of the corpora give with the models.
+        j["lexicons"] = lexicon_version();
         return j;
     }
 

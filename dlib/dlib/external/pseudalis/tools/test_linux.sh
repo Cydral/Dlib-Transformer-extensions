@@ -8,17 +8,17 @@
 #   bash dlib/dlib/external/pseudalis/tools/test_linux.sh [build folder]
 #
 # Default build folder: build-pseudalis-linux at the root of the repository.  The tests of the
-# engine, of the host and of the publication run first; the service then runs in a data folder of its own, on port
-# 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a secret, a CSV file,
-# a name and the archive of a folder as the web application sends it, refuses a body sent in
-# chunks, then anonymizes and restores files and a folder through its drive, whose originals
-# come back through the interface, an archive extracted on the
-# drive, an archive whose original was forgotten coming back and the copies of a file, saves the
+# engine, of its two libraries, of the host and of the publication run first; the service then runs
+# in a data folder of its own, on port 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through
+# its interface a text, a secret, a CSV file, a name and the archive of a folder as the web
+# application sends it, refuses a body sent in chunks, then anonymizes and restores files and a
+# folder through its drive, whose originals come back through the interface, an archive extracted
+# on the drive, an archive whose original was forgotten coming back and the copies of a file, saves the
 # settings as the web application does, imposes terms, makes room for newer originals, restores from
 # their tags an archive whose picture was forgotten and a text written elsewhere from anonymized
 # values, protects files, a text and the drive without tags, restores files protected twice,
 # imposes columns on a CSV file, an IP column of both forms among them, keeps the encoding of a
-# Windows-1252 file, and stops.
+# Windows-1252 file, writes a training corpus with fictive values, and stops.
 # The exit code is the number of failed steps.
 
 set -u
@@ -54,6 +54,24 @@ step() { # name pattern command...
 step "configuration" "Generating done|Build files" cmake -S "$SOURCE" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release
 step "build" "." cmake --build "$BUILD" --parallel "$(nproc)"
 step "engine tests" "all tests passed" "$BUILD/bin/test_engine"
+# The engine libraries, loaded as the service of Windows loads them: each variant protects the same documents,
+# and the two must write the same. A processor without AVX2 runs the first one alone.
+engine_library() { # variant
+  "$BUILD/bin/test_engines" "$1" 2>&1 | tee "$WORK/engines_$1.txt"
+  return "${PIPESTATUS[0]}"
+}
+same_engines() {
+  if grep -q "avx2 not run" "$WORK/engines_avx2.txt"; then echo "one variant on this processor"; return 0; fi
+  local a b
+  a=$(grep -E '^(models|sample) ' "$WORK/engines_baseline.txt")
+  b=$(grep -E '^(models|sample) ' "$WORK/engines_avx2.txt")
+  if [ -n "$a" ] && [ "$a" = "$b" ]; then echo "both engines write the same"; return 0; fi
+  printf 'baseline:\n%s\navx2:\n%s\n' "$a" "$b"
+  return 1
+}
+step "engine library" "all tests passed \(baseline\)" engine_library baseline
+step "engine library, AVX2" "all tests passed \(avx2\)|avx2 not run" engine_library avx2
+step "engines compared" "write the same|one variant" same_engines
 step "host tests" "all tests passed" "$BUILD/bin/test_host"
 # The publication of a version, with a chain of the website and a hosting played on this computer.
 step "publication" "all tests passed" python3 "$SOURCE/tests/test_publish_release.py" "$BUILD/bin/pseudalis-sign"
@@ -652,6 +670,47 @@ print(json.dumps({"text": j["text"], "substitutions": j.get("substitutions", [])
     record "IP column" PASS "IPv4 and IPv6 in one column, the original back, edited on the drive: both"
   else record "IP column" FAIL "$(head -c 160 "$WORK/hosts.anon.csv") / $BAD_IP / $IP_COLS / \
     $(tail -c 80 "$WORK/hosts.back2.csv")"
+  fi
+  # A training corpus with fictive values: made, written by batch and by stream, refused without its token or
+  # for a restoration, listed for the settings, deleted, then refused; nothing of its texts in the log.
+  LOG_AT=$(wc -c < "$WORK/service.log")
+  CORPUS=$(api -X POST -H "X-Pseudalis-Admin: $TOKEN" -H "X-Pseudalis-Caller: test-linux" \
+    -H "Content-Type: application/json" --data '{"languages": ["fr", "en"], "date_shift_days": 90}' \
+    "$URL/v1/corpus" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("corpus_id", ""))')
+  corpus_json() { # method route body
+    api -X "$1" -H "X-Pseudalis-Admin: $TOKEN" -H "Content-Type: application/json" --data "$3" \
+      "$URL/v1/corpus/$CORPUS$2"
+  }
+  BATCH='{"texts": [{"ref": "s1", "text": "Bonjour, je suis Jean Dupont, au 06 12 34 56 78 ou jean.dupont@exemple.fr."},
+    {"ref": "s2", "text": "M. Dupont passe le 12/03/2024."}]}'
+  FICTIVE=$(corpus_json POST /texts "$BATCH")
+  AGAIN=$(corpus_json POST /texts "$BATCH")
+  printf '{"ref": "l1", "text": "Jean Dupont, 06 12 34 56 78"}\n{"ref": "l2", "text": "M. Dupont"}\n' \
+    > "$WORK/corpus.jsonl"
+  STREAM=$(api -X POST -H "X-Pseudalis-Admin: $TOKEN" --data-binary @"$WORK/corpus.jsonl" \
+    "$URL/v1/corpus/$CORPUS/stream")
+  NO_TOKEN=$(api -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" --data "$BATCH" \
+    "$URL/v1/corpus/$CORPUS/texts")
+  RESTORE=$(api -X POST -H "Content-Type: application/json" --data '{"text": "x", "substitutes": "fictive"}' \
+    "$URL/v1/text/restore")
+  STATE=$(api -H "X-Pseudalis-Admin: $TOKEN" "$URL/v1/corpus/$CORPUS")
+  LISTED=$(api -H "X-Pseudalis-Admin: $TOKEN" "$URL/v1/corpora")
+  DELETED=$(api -X DELETE -H "X-Pseudalis-Admin: $TOKEN" "$URL/v1/corpus/$CORPUS")
+  AFTER=$(api -o /dev/null -w '%{http_code}' -X POST -H "X-Pseudalis-Admin: $TOKEN" \
+    -H "Content-Type: application/json" --data "$BATCH" "$URL/v1/corpus/$CORPUS/texts")
+  CORPUS_LOG=$(tail -c +$((LOG_AT + 1)) "$WORK/service.log")
+  if [ -n "$CORPUS" ] && printf '%s' "$FICTIVE" | grep -q '"ref":"s1"' &&
+     printf '%s' "$FICTIVE" | grep -q '06 39 98 ' &&
+     ! printf '%s' "$FICTIVE" | grep -q -e Dupont -e '12 34 56 78' -e '\[\[' && [ "$FICTIVE" = "$AGAIN" ] &&
+     printf '%s' "$FICTIVE" | grep -q '.example.com' && [ "$(printf '%s\n' "$STREAM" | grep -c '"ref":"l')" = 2 ] &&
+     ! printf '%s' "$STREAM" | grep -q Dupont && [ "$NO_TOKEN" = 401 ] &&
+     printf '%s' "$RESTORE" | grep -q '"code":"fictive_not_restorable"' &&
+     printf '%s' "$STATE" | grep -q '"texts":6' && printf '%s' "$STATE" | grep -q '"lexicons":"1.1.0-' &&
+     printf '%s' "$LISTED" | grep -q '"caller":"test-linux"' && printf '%s' "$DELETED" | grep -q '"deleted":true' &&
+     [ "$AFTER" = 410 ] && ! printf '%s' "$CORPUS_LOG" | grep -q -e Dupont -e 'exemple.fr' -e '06 39 98'
+  then
+    record "fictive corpus" PASS "batch, stream, same values twice, refusals, listed, deleted"
+  else record "fictive corpus" FAIL "$CORPUS / $(printf '%s' "$FICTIVE" | head -c 160) / $NO_TOKEN / $AFTER"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

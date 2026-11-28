@@ -168,14 +168,24 @@ def main():
             return f.read().splitlines()
 
     common = [installer, "--any-folder", "--key", key, "--sign", signer, "--notes", notes, "--wait", "1",
-              "--site", site]
+              "--site", site, "--version", version]
     check_alone = ["--check", "--site", site, "--wait", "1"]
     try:
         # The program made here is read as the installer of its version.
         check(make_feed.installer_version(installer) == version, "the version resource of the test installer is read")
+        # The version meant must be that of the sources, and notes named for another version are refused.
+        code, out = run(common[:-2])
+        check(code == 1 and "--version names the version" in out, "a publication names its version: %s" % out)
+        code, out = run(common[:-1] + ["0.0.1"])
+        check(code == 1 and "not 0.0.1" in out, "another version than that of the sources is refused: %s" % out)
+        other_notes = os.path.join(work, "pseudalis-notes-0.0.2.json")
+        write(other_notes, read(notes))
+        code, out = run([other_notes if x == notes else x for x in common])
+        check(code == 1 and "those of version 0.0.2" in out, "the notes of another version are refused: %s" % out)
+        check(not os.path.exists(dist), "a refused version writes nothing")
 
         # The chain of the website must be there, with the folder where it takes the files it publishes.
-        code, out = run(common[:-1] + [os.path.join(work, "nowhere")])
+        code, out = run([os.path.join(work, "nowhere") if x == site else x for x in common])
         check(code == 1 and "no chain of the website" in out, "a folder without the chain stops the publication")
         # A chain that takes the files of a product elsewhere, or that tells no version, stops it too.
         code, out = run(common)

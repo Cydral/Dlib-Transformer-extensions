@@ -21,7 +21,8 @@
     engine or the installer imports another library than those of Windows (tools\check_imports.cpp),
     so that the installer carries every file the programs need and no library of a third party.
 
-    -Tests also builds and runs the tests of the engine and of the service.  -Install then
+    -Tests also builds and runs the tests of the engine and of the service, then runs the two
+    engines built on the same documents and stops when they write different files.  -Install then
     runs the installer built and waits for it, which updates the installation in place; a
     failure of a step stops the script before it.  -Jobs bounds the number of compilations
     run at once, for a machine with little memory.  The build tree is build-pseudalis at the
@@ -32,6 +33,10 @@
     %USERPROFILE%\work\Dlib-Transformer-extensions, whose installer the publication reads: the
     script stops when it runs from another copy, unless -AnyFolder is given for a build that is
     not to be published.
+
+    The script prints the commit it builds, first and again beside the installer, and says when
+    files of the copy differ from that commit: a published version is built once, and the trace
+    of its build tells which state of the repository its installer holds.
 #>
 param(
     [switch]$Tests,
@@ -50,6 +55,21 @@ if (-not $AnyFolder -and
     throw "the production chain builds in $chain, not in $root`: run the script of that copy, or give -AnyFolder"
 }
 $tree = Join-Path $root "build-pseudalis"
+
+# The commit of the copy, and the number of its files that differ from it.
+function Get-SourceCommit([string]$folder) {
+    $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+    if (-not $git) { return "unknown, git was not found" }
+    # What git writes on its error stream must not stop the script.
+    $ErrorActionPreference = "Continue"
+    $head = & $git -C $folder rev-parse --short=12 HEAD
+    if ($LASTEXITCODE -ne 0 -or -not $head) { return "unknown" }
+    $changed = @(& $git -C $folder status --porcelain --untracked-files=no)
+    if ($changed.Count -gt 0) { return "$head, with $($changed.Count) file(s) changed since" }
+    return "$head"
+}
+$commit = Get-SourceCommit $root
+Write-Host "== sources: commit $commit"
 $testing = if ($Tests) { "ON" } else { "OFF" }
 $parallel = if ($Jobs -gt 0) { @("--parallel", "$Jobs") } else { @("--parallel") }
 
@@ -113,12 +133,28 @@ if ($Tests) {
         & $program
         if ($LASTEXITCODE -ne 0) { throw "$test failed" }
     }
+    # The two engines of the installer, loaded as the service loads them: each protects the same
+    # documents, and both must write the same. A processor without AVX2 runs the first one alone.
+    $engines = Join-Path $tree "bin\test_engines.exe"
+    $written = @{}
+    foreach ($variant in @("baseline", "avx2")) {
+        Write-Host "== test_engines.exe $variant"
+        $lines = @(& $engines $variant)
+        if ($LASTEXITCODE -ne 0) { throw "test_engines.exe $variant failed" }
+        $lines | ForEach-Object { Write-Host $_ }
+        $written[$variant] = @($lines | Where-Object { $_ -match '^(models|sample) ' }) -join "`n"
+    }
+    if ($written["avx2"] -and $written["avx2"] -ne $written["baseline"]) {
+        throw "the two engines wrote different files: compare the lines of the two runs above"
+    }
+    if ($written["avx2"]) { Write-Host "== both engines write the same" }
 }
 
 $setup = Join-Path $tree "bin\pseudalis-setup.exe"
 if (-not (Test-Path -LiteralPath $setup)) { throw "the build made no $setup" }
 $size = (Get-Item -LiteralPath $setup).Length
 Write-Host ("== {0}: {1:N1} MB, SHA-256 {2}" -f $setup, ($size / 1MB), (Get-Sha256 $setup))
+Write-Host "== built from commit $commit"
 # The installer as WSL reads it, for the publication.
 if ($setup -match '^([A-Za-z]):\\(.*)$') {
     Write-Host ("== under WSL: /mnt/{0}/{1}" -f $Matches[1].ToLowerInvariant(), ($Matches[2] -replace '\\', '/'))

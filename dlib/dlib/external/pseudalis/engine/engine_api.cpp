@@ -7,6 +7,7 @@
 #define PSEUDALIS_ENGINE_BUILD
 #endif
 #include "../common/engine_api.h"
+#include <dlib/crypto/crypto_utils.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -283,6 +284,67 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
         else if (op == "detect")
         {
             res["spans"] = engine->e->detect(bytes);
+        }
+        else if (op == "fictive")
+        {
+            // The texts of a corpus with fictive values: the texts come and go as JSON, the key in hexadecimal.
+            const std::string hex = req["key"].str();
+            std::string key;
+            for (std::size_t k = 0; k + 1 < hex.size() && hex.size() == 64; k += 2)
+            {
+                const auto digit = [](char c) {
+                    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+                };
+                const int hi = digit(hex[k]), lo = digit(hex[k + 1]);
+                if (hi < 0 || lo < 0) break;
+                key.push_back(static_cast<char>(hi * 16 + lo));
+            }
+            pseudalis::json in;
+            if (key.size() != 32 || !pseudalis::json::parse(bytes, in) || !in["texts"].is_array())
+            {
+                put(error, "the key or the texts of the corpus are not valid");
+                return 0;
+            }
+            pseudalis::corpus_settings settings;
+            for (std::size_t k = 0; k < req["languages"].size(); ++k)
+                settings.languages.push_back(req["languages"][k].str());
+            settings.date_shift_days = static_cast<long>(req["date_shift_days"].as_int(180));
+            settings.keep_city = req["keep_city"].as_bool(true);
+            std::vector<pseudalis::corpus_text> texts;
+            for (std::size_t k = 0; k < in["texts"].size(); ++k)
+            {
+                const pseudalis::json& t = in["texts"][k];
+                texts.push_back(pseudalis::corpus_text{ t["ref"].str(), t["text"].str(), t["name"].str(),
+                                                        t["document"].str() });
+            }
+            std::vector<pseudalis::corpus_result> done;
+            try
+            {
+                done = engine->e->fictive(texts, key, settings);
+            }
+            catch (...)
+            {
+                dlib::secure_wipe(&key[0], key.size());
+                throw;
+            }
+            dlib::secure_wipe(&key[0], key.size());
+            pseudalis::json results = pseudalis::json::array();
+            for (const pseudalis::corpus_result& r : done)
+            {
+                pseudalis::json j = pseudalis::json::object();
+                j["ref"] = r.ref;
+                j["text"] = r.text;
+                j["counts"] = r.counts;
+                j["dropped"] = r.dropped;
+                results.push_back(j);
+            }
+            pseudalis::json o = pseudalis::json::object();
+            o["results"] = results;
+            out = o.dump();
+            res["kind"] = "corpus";
+            res["report"] = pseudalis::json::object();
+            res["report"]["lexicons"] = pseudalis::engine::lexicon_version();
+            res["report"]["texts"] = static_cast<unsigned long long>(texts.size());
         }
         else if (op == "extract")
         {

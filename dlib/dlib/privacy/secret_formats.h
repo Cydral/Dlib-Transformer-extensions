@@ -58,6 +58,30 @@ namespace dlib
         inline bool secret_alnum(unsigned char c) { return secret_lower(c) || secret_upper(c) || secret_digit(c); }
         inline bool secret_space(unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
         inline bool secret_line_break(unsigned char c) { return c == '\n' || c == '\r'; }
+
+        /* The number of bytes of the space written at i in the UTF-8 text s, 0 when the character there
+           is none: a space of ASCII, the no-break space that word processors write before a sign or at the
+           end of a cell, the spaces of fixed widths, the narrow no-break space or the ideographic space. */
+        inline std::size_t secret_space_at(const std::string& s, std::size_t i)
+        {
+            if (i >= s.size()) return 0;
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            if (secret_space(c)) return 1;
+            if (c == 0xC2) return i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) == 0xA0 ? 2 : 0;
+            if (i + 2 >= s.size()) return 0;
+            const unsigned char d = static_cast<unsigned char>(s[i + 1]), e = static_cast<unsigned char>(s[i + 2]);
+            if (c == 0xE2 && d == 0x80) return (e >= 0x80 && e <= 0x8A) || e == 0xAF ? 3 : 0;
+            if (c == 0xE2 && d == 0x81) return e == 0x9F ? 3 : 0;
+            return c == 0xE3 && d == 0x80 && e == 0x80 ? 3 : 0;
+        }
+
+        // The number of bytes of the space that ends just before i, 0 when the character there is none.
+        inline std::size_t secret_space_before(const std::string& s, std::size_t i)
+        {
+            for (std::size_t n = 1; n <= 3 && n <= i; ++n)
+                if (secret_space_at(s, i - n) == n) return n;
+            return 0;
+        }
         inline bool secret_quote(unsigned char c) { return c == '"' || c == '\'' || c == '`'; }
 
         inline std::string secret_lowercase(const std::string& s, std::size_t b, std::size_t e)
@@ -1124,10 +1148,19 @@ namespace dlib
         };
         end = std::min(end, text.size());
         if (begin >= end) return;
+        // A reader may give a space with the value, the no-break space that ends a cell for one: the
+        // value starts and ends on a character that is none.
+        for (std::size_t n = 0; begin < end && (n = secret_space_at(text, begin)) != 0 && begin + n <= end;)
+            begin += n;
+        for (std::size_t n = 0; begin < end && (n = secret_space_before(text, end)) != 0 && begin + n <= end;)
+            end -= n;
+        if (begin >= end) return;
         const std::size_t first = begin > secret_max_token ? begin - secret_max_token : 0;
         const std::size_t last = std::min(text.size(), end + secret_max_token);
-        while (begin > first && !opens(static_cast<unsigned char>(text[begin - 1]))) --begin;
-        while (end < last && !closes(static_cast<unsigned char>(text[end]))) ++end;
+        while (begin > first && !opens(static_cast<unsigned char>(text[begin - 1])) &&
+               secret_space_before(text, begin) == 0)
+            --begin;
+        while (end < last && !closes(static_cast<unsigned char>(text[end])) && secret_space_at(text, end) == 0) ++end;
         while (end > begin + 1 && (text[end - 1] == '.' || text[end - 1] == ':')) --end;
         // Never inside a character of several bytes.
         while (begin > 0 && (static_cast<unsigned char>(text[begin]) & 0xC0) == 0x80) --begin;

@@ -681,6 +681,99 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_field_instructions()
+    {
+        /* The fields of a Word document: the instruction of a field that refers to another place of the
+           document keeps its arguments, a bookmark, a style or a sequence, whatever the detector reads in
+           them, and the instructions of the other fields are read. */
+        auto run = [](const string& content) { return "<w:r>" + content + "</w:r>"; };
+        auto field_char = [&run](const char* kind) {
+            return run(string("<w:fldChar w:fldCharType=\"") + kind + "\"/>");
+        };
+        auto instruction = [&run](const string& text) {
+            return run("<w:instrText xml:space=\"preserve\">" + text + "</w:instrText>");
+        };
+        auto text = [&run](const string& value) { return run("<w:t xml:space=\"preserve\">" + value + "</w:t>"); };
+        const string reference = " REF _Ref52346771 \\h ";
+        const string sequence = " SEQ Figure \\* ARABIC ";
+        zip_archive_writer w;
+        w.add("[Content_Types].xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+              "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+              "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+              "<Override PartName=\"/word/document.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+              "</Types>");
+        w.add("_rels/.rels",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+              "<Relationship Id=\"rId1\" "
+              "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+              "Target=\"word/document.xml\"/></Relationships>");
+        w.add("word/document.xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>"
+              // A table of contents: its field runs over the paragraphs of its entries, each with its page.
+              "<w:p>" + field_char("begin") + instruction(" TOC \\o \"1-3\" \\h \\z \\u ") + field_char("separate") +
+              text("Contexte") + field_char("begin") + instruction(" PAGE") + instruction("REF _Toc52346772 \\h ") +
+              field_char("separate") + text("4") + field_char("end") + "</w:p>"
+              "<w:p>" + text("Annexes") + field_char("begin") + instruction(" PAGEREF _Toc52346773 \\h ") +
+              field_char("separate") + text("9") + field_char("end") + field_char("end") + "</w:p>"
+              // A reference to a figure, the number of a figure, and a link to an address of electronic mail.
+              "<w:p>" + text("Voir la ") + field_char("begin") + instruction(reference) + field_char("separate") +
+              text("figure 3") + field_char("end") + text(", transmise par Jean Dupont.") + "</w:p>"
+              "<w:p>" + text("Figure ") + "<w:fldSimple w:instr=\"" + sequence + "\">" + text("3") +
+              "</w:fldSimple></w:p>"
+              "<w:p>" + field_char("begin") + instruction(" HYPERLINK \"mailto:claire.martin@example.fr\" ") +
+              field_char("separate") + text("Nous écrire") + field_char("end") + "</w:p>"
+              "<w:sectPr/></w:body></w:document>");
+        const string docx = w.finish();
+
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x29')));
+        pii_detector detector;
+        // A recognizer that reads the name of a field as a person, as trained models do.
+        detector.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            for (size_t k = t.find("PAGEREF"); k != string::npos; k = t.find("PAGEREF", k + 7))
+            {
+                pii_span s;
+                s.begin = k;
+                s.end = k + 7;
+                s.label = "FAMILY_NAME";
+                s.confidence = 0.95;
+                spans.push_back(s);
+            }
+            return spans;
+        });
+        // Outside a document, the rules and this recognizer read these instructions.
+        DLIB_TEST(!detector.detect(" REF _Ref52346771 \\h ").empty());
+        DLIB_TEST(!detector.detect(" PAGEREF _Toc52346773 \\h ").empty());
+
+        document_anonymizer a(p, detector);
+        document_report report;
+        const string out = a.anonymize(docx, document_format::docx, report);
+        const string body = zip_archive_reader(out).read("word/document.xml");
+        // The instructions that refer stay as written, whole or cut into runs, in a run or in an attribute.
+        DLIB_TEST_MSG(body.find(instruction(reference)) != string::npos, body);
+        DLIB_TEST_MSG(body.find(instruction(" PAGE") + instruction("REF _Toc52346772 \\h ")) != string::npos, body);
+        DLIB_TEST_MSG(body.find(instruction(" PAGEREF _Toc52346773 \\h ")) != string::npos, body);
+        DLIB_TEST_MSG(body.find(instruction(" TOC \\o &quot;1-3&quot; \\h \\z \\u ")) != string::npos ||
+                      body.find(instruction(" TOC \\o \"1-3\" \\h \\z \\u ")) != string::npos, body);
+        DLIB_TEST_MSG(body.find("w:instr=\"" + sequence + "\"") != string::npos, body);
+        // The text around them and the instruction of the link are protected.
+        DLIB_TEST_MSG(body.find("Dupont") == string::npos && body.find("[[PERSON:") != string::npos, body);
+        DLIB_TEST_MSG(body.find("claire.martin") == string::npos && body.find("HYPERLINK") != string::npos, body);
+        DLIB_TEST_MSG(report.total_entities() == 2, report.total_entities());
+
+        document_report back;
+        const string again = zip_archive_reader(a.restore(out, document_format::docx, back)).read("word/document.xml");
+        DLIB_TEST_MSG(again.find("mailto:claire.martin@example.fr") != string::npos &&
+                      again.find(", transmise par Jean Dupont.") != string::npos, again);
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_pdf_document()
     {
         pdf_text_document source;
@@ -4567,6 +4660,102 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_learned_span_edges()
+    {
+        /* What a recognizer reads with a space at an end, the no-break space that ends a cell for one, is
+           judged without it; what a protection before left of a value beside its tag is no account name. */
+        auto reading = [](const string& value, const char* label, double confidence) {
+            return [value, label, confidence](const string& t) {
+                std::vector<pii_span> spans;
+                const size_t k = t.find(value);
+                if (k != string::npos)
+                {
+                    pii_span s;
+                    s.begin = k;
+                    s.end = k + value.size();
+                    s.label = label;
+                    s.confidence = confidence;
+                    spans.push_back(s);
+                }
+                return spans;
+            };
+        };
+        const string nbsp = "\xC2\xA0";
+        const string table = "Exigence\tREQ_SEC_B2" + nbsp + "\nSuite du tableau";
+        // A code of capitals joined by underscores, read as a secret then as an account name.
+        {
+            pii_detector d;
+            d.add_recognizer(reading("REQ_SEC_B2" + nbsp, "SECRET", 0.6));
+            DLIB_TEST_MSG(d.detect(table).empty(), d.detect(table).size());
+            pii_detector plain;
+            plain.add_recognizer(reading("REQ_SEC_B2", "SECRET", 0.6));
+            DLIB_TEST(plain.detect(table).empty());
+        }
+        {
+            pii_detector d;
+            d.add_recognizer(reading("REQ_SEC_B2" + nbsp, "USERNAME", 0.95));
+            DLIB_TEST_MSG(d.detect(table).empty(), d.detect(table).size());
+        }
+        // A value keeps its characters and leaves the spaces read with it.
+        {
+            const string sent = "Transmis hier" + nbsp + "Tournesol2024!" + nbsp + "\nMerci.";
+            pii_detector d;
+            d.add_recognizer(reading(nbsp + "Tournesol2024!" + nbsp, "SECRET", 0.95));
+            const std::vector<pii_entity> found = d.detect(sent);
+            DLIB_TEST_MSG(found.size() == 1 && found[0].type == pii_type::secret &&
+                          sent.substr(found[0].begin, found[0].end - found[0].begin) == "Tournesol2024!", found.size());
+            const string line = "Compte : kfournier84" + nbsp + "\n";
+            pii_detector accounts;
+            accounts.add_recognizer(reading("kfournier84" + nbsp, "USERNAME", 0.95));
+            const std::vector<pii_entity> read = accounts.detect(line);
+            DLIB_TEST_MSG(read.size() == 1 && read[0].type == pii_type::identifier &&
+                          line.substr(read[0].begin, read[0].end - read[0].begin) == "kfournier84", read.size());
+        }
+        // The limits of a secret: the spaces of Unicode as those of ASCII.
+        {
+            const string t = "code" + nbsp + "Xk9mP2vL7q" + nbsp + "fin";
+            size_t b = t.find("9mP2"), e = b + 4;
+            secret_chunk(t, b, e);
+            DLIB_TEST(t.substr(b, e - b) == "Xk9mP2vL7q");
+            b = t.find(nbsp);
+            e = t.find("fin");
+            secret_chunk(t, b, e);
+            DLIB_TEST(t.substr(b, e - b) == "Xk9mP2vL7q");
+            const string narrow = "a\xE2\x80\xAFXk9mP2vL7q\xE3\x80\x80z";
+            b = narrow.find("mP2");
+            e = b + 3;
+            secret_chunk(narrow, b, e);
+            DLIB_TEST(narrow.substr(b, e - b) == "Xk9mP2vL7q");
+            b = e = 3;
+            secret_chunk(narrow, b, e);
+            DLIB_TEST(b == 3 && e == 3);
+            b = 1;
+            e = 4;
+            secret_chunk(narrow, b, e);
+            DLIB_TEST(b >= e);
+        }
+        // What a protection before left of a code, beside the tag it wrote in the place of the rest.
+        {
+            const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x29')));
+            const string tag = p.tag(pii_type::identifier, "REQ_SEC");
+            const string after = "Exigence " + tag + "_B2 couverte";
+            pii_detector d;
+            d.add_recognizer(reading("_B2", "USERNAME", 0.95));
+            DLIB_TEST_MSG(d.detect(after).empty(), d.detect(after).size());
+            const string before = "Serveur srv-" + tag + " en service";
+            pii_detector e;
+            e.add_recognizer(reading("srv", "USERNAME", 0.95));
+            DLIB_TEST_MSG(e.detect(before).empty(), e.detect(before).size());
+            // Away from a tag, the same recognizer names an account.
+            const string apart = "Exigence " + tag + " suivie par kfournier84";
+            pii_detector f;
+            f.add_recognizer(reading("kfournier84", "USERNAME", 0.95));
+            DLIB_TEST_MSG(f.detect(apart).size() == 1, f.detect(apart).size());
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_recognizer_combination()
     {
         /* Two recognizers over the same text: a span of the leading one counts a tenth more than
@@ -4626,6 +4815,35 @@ namespace
         DLIB_TEST(combine_pii_recognizers(text, { span(11, 17, "CITY", 0.1) }, a_town, by_tagger).empty());
         DLIB_TEST(read(text, combine_pii_recognizers(text, none, { span(11, 17, "CITY", 0.92) }, by_tagger)) ==
                   "Rennes=CITY;");
+
+        /* An account name in lower-case letters alone, which has the look of any word, needs the span
+           model to read an account name there too when the leading tagger reads it below
+           second_min_confidence in running text. */
+        const string note = "Le compte reseau de jdupont et de m.leroy42";
+        const spans a_word = { span(10, 16, "USERNAME", 0.75) };
+        DLIB_TEST(combine_pii_recognizers(note, none, a_word, by_tagger).empty());
+        DLIB_TEST(combine_pii_recognizers(note, { span(10, 16, "ORGANIZATION", 0.4) }, a_word, by_tagger).empty());
+        DLIB_TEST(combine_pii_recognizers(note, { span(10, 16, "USERNAME", 0.1) }, a_word, by_tagger).empty());
+        DLIB_TEST(read(note, combine_pii_recognizers(note, { span(10, 16, "USERNAME", 0.25) }, a_word, by_tagger)) ==
+                  "reseau=USERNAME;");
+        DLIB_TEST(read(note, combine_pii_recognizers(note, none, { span(10, 16, "USERNAME", 0.93) }, by_tagger)) ==
+                  "reseau=USERNAME;");
+        DLIB_TEST(read(note, combine_pii_recognizers(note, { span(20, 27, "USERNAME", 0.6) },
+                                                     { span(20, 27, "USERNAME", 0.7) }, by_tagger)) ==
+                  "jdupont=USERNAME;");
+        // With a digit, a sign or a capital, the general rule.
+        DLIB_TEST(read(note, combine_pii_recognizers(note, none, { span(34, 43, "USERNAME", 0.75) }, by_tagger)) ==
+                  "m.leroy42=USERNAME;");
+        // Where a layout writes a value, the general rule too.
+        const string fields = "Compte : jdupont\nadmin;mleroy;actif\n\"pdurand\"";
+        DLIB_TEST(read(fields, combine_pii_recognizers(fields, none, { span(9, 16, "USERNAME", 0.75) }, by_tagger)) ==
+                  "jdupont=USERNAME;");
+        DLIB_TEST(read(fields, combine_pii_recognizers(fields, none, { span(23, 29, "USERNAME", 0.75) }, by_tagger)) ==
+                  "mleroy=USERNAME;");
+        DLIB_TEST(read(fields, combine_pii_recognizers(fields, none, { span(37, 44, "USERNAME", 0.75) }, by_tagger)) ==
+                  "pdurand=USERNAME;");
+        DLIB_TEST(read(fields, combine_pii_recognizers(fields, none, { span(17, 22, "USERNAME", 0.75) }, by_tagger)) ==
+                  "admin=USERNAME;");
 
         // A less confident name part of the second recognizer completes a name kept, and only a name.
         const spans family = { span(6, 9, "FAMILY_NAME", 0.6) };
@@ -5149,6 +5367,256 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_fictive_values()
+    {
+        using namespace dlib::privacy_impl;
+        fictive_options o;
+        o.languages = { "fr", "en" };
+        const fictive_substituter s(pseudonymization_key::from_bytes(string(32, '\x21')), o);
+        const fictive_substituter other(pseudonymization_key::from_bytes(string(32, '\x22')), o);
+        DLIB_TEST(s.get_options().languages.size() == 2 && s.get_options().date_shift_days == 180);
+        const string version = fictive_substituter::lexicon_version();
+        DLIB_TEST_MSG(version.size() == 18 && version.compare(0, 6, "1.1.0-") == 0, version);
+
+        // Every initial of the fictive names has names in each language and each sex.
+        for (std::size_t k = 0; k < fictive_languages().size(); ++k)
+            for (int sex = 1; sex <= 2; ++sex)
+                for (char i : fictive_initials())
+                    DLIB_TEST_MSG(fictive_given_pool(k, sex, static_cast<char>(i | 0x20)).size() >= 2,
+                                  fictive_languages()[k].code << sex << i);
+
+        // The same value takes the same fictive value; the variants of a name stay linked.
+        const string full = s.fictive(pii_type::person, "Jean Dupont");
+        DLIB_TEST(full == s.fictive(pii_type::person, "Jean Dupont") && full != "Jean Dupont");
+        const string given = full.substr(0, full.find(' ')), family = full.substr(full.find(' ') + 1);
+        const char initial = static_cast<char>(std::toupper(fold_key(given)[0]));
+        DLIB_TEST_MSG(s.fictive(pii_type::person, "M. Dupont") == "M. " + family, full);
+        DLIB_TEST_MSG(s.fictive(pii_type::person, "J. Dupont") == string(1, initial) + ". " + family, full);
+        DLIB_TEST_MSG(s.fictive(pii_type::person, "DUPONT Jean") == uppercase(family) + " " + given, full);
+        DLIB_TEST_MSG(s.fictive(pii_type::person, "Dupont") == family, full);
+        DLIB_TEST_MSG(s.fictive(pii_type::person, "jean dupont") == lowercase(full), full);
+        // Jean is a male name: its fictive name is one of the male names of its language.
+        bool male = false;
+        for (const string& n : fictive_language_of("fr")->male) male = male || n == given;
+        DLIB_TEST_MSG(male, given);
+        const string mail = s.fictive(pii_type::email, "jean.dupont@acme.fr");
+        DLIB_TEST_MSG(mail.compare(0, mail.find('@'), fictive_ascii(given) + "." + fictive_ascii(family)) == 0, mail);
+        DLIB_TEST_MSG(mail.size() > 12 && mail.compare(mail.size() - 12, 12, ".example.com") == 0, mail);
+        DLIB_TEST(s.fictive(pii_type::email, "contact@acme.org").compare(0, 8, "contact@") == 0);
+        const string org_mail = s.fictive(pii_type::email, "contact@acme.org");
+        DLIB_TEST_MSG(org_mail.compare(org_mail.size() - 12, 12, ".example.org") == 0, org_mail);
+        DLIB_TEST(s.fictive(pii_type::identifier, "jdupont") == string(1, initial | 0x20) + fictive_ascii(family));
+
+        // An organisation keeps its legal form and its kind; an acronym keeps its length.
+        const string org = s.fictive(pii_type::organization, "Banque Dupont et Fils SA");
+        DLIB_TEST_MSG(org == "Banque " + family + " et Fils SA", org);
+        const string acronym = s.fictive(pii_type::organization, "ACME Industries");
+        DLIB_TEST_MSG(acronym.size() == 15 && acronym.substr(4) == " Industries" && acronym.substr(0, 4) != "ACME",
+                      acronym);
+
+        // Addresses: the number and the street drawn, the type kept; a large city kept with its code.
+        const string a1 = s.fictive(pii_type::address, "12 rue des Lilas, 35000 Rennes");
+        DLIB_TEST_MSG(a1.find(" rue des ") != string::npos && a1.find("Lilas") == string::npos &&
+                      a1.compare(a1.size() - 12, 12, "35000 Rennes") == 0 && a1.compare(0, 2, "12") != 0, a1);
+        const string a2 = s.fictive(pii_type::address, "3 avenue du Moulin, 35400 Saint-Malo");
+        DLIB_TEST_MSG(a2.find("Saint-Malo") == string::npos && a2.find("35400") == string::npos, a2);
+        // In a corpus of French and English, a German address keeps its type of street and the letter of its
+        // number, and its town, which the lexicon does not know, takes a German town; a French one, a French
+        // town.
+        const string a3 = s.fictive(pii_type::address, "Bremer Straße 94 a, 35510 Kleinwiesbach");
+        DLIB_TEST_MSG(a3.find(" Straße ") != string::npos && a3.find(" a, ") != string::npos, a3);
+        const fictive_city* c3 = fictive_city_named(a3.substr(a3.rfind(", ") + 8));
+        DLIB_TEST_MSG(c3 && c3->country == "de" && a3.compare(a3.rfind(", ") + 2, 5, c3->postal) == 0, a3);
+        const string a4 = s.fictive(pii_type::address, "3 rue de la Tour, 54200 Villerupt-sur-Orne");
+        const fictive_city* c4 = fictive_city_named(a4.substr(a4.rfind(", ") + 8));
+        DLIB_TEST_MSG(c4 && c4->country == "fr", a4);
+        fictive_options all_cities = o;
+        all_cities.keep_city = false;
+        const fictive_substituter replaced(pseudonymization_key::from_bytes(string(32, '\x21')), all_cities);
+        DLIB_TEST(replaced.fictive(pii_type::location, "Rennes") != "Rennes");
+        DLIB_TEST(s.fictive(pii_type::location, "Rennes") == "Rennes");
+        const string uk = s.fictive(pii_type::address, "221B Baker Street, London NW1 6XE");
+        DLIB_TEST_MSG(uk.find(" Street, London NW1 ") != string::npos && uk.find("6XE") == string::npos &&
+                      uk.find("Baker") == string::npos, uk);
+
+        // Identifiers with a key receive a valid key, in ranges that designate no real account.
+        const string iban = s.fictive(pii_type::iban, "FR76 3000 6000 0112 3456 7890 189");
+        string compact;
+        for (char ch : iban)
+            if (ch != ' ') compact.push_back(ch);
+        DLIB_TEST_MSG(compact.size() == 27 && iban_checksum_valid(compact) && compact.compare(4, 3, "990") == 0 &&
+                      fr_rib_ok(compact.substr(4)), iban);
+        const string de_iban = s.fictive(pii_type::iban, "DE89370400440532013000");
+        DLIB_TEST_MSG(de_iban.size() == 22 && iban_checksum_valid(de_iban) && de_iban != "DE89370400440532013000",
+                      de_iban);
+        const string card = s.fictive(pii_type::payment_card, "4970 1012 3456 7890");
+        string digits;
+        for (char ch : card)
+            if (ch != ' ') digits.push_back(ch);
+        DLIB_TEST_MSG(digits.size() == 16 && luhn_ok(digits) && digits.compare(0, 6, "411111") == 0, card);
+        const string nir = s.fictive(pii_type::nir, "1 85 03 75 112 345 67");
+        digits.clear();
+        for (char ch : nir)
+            if (ch != ' ') digits.push_back(ch);
+        DLIB_TEST_MSG(digits.size() == 15 && digits[0] == '1' && digits[3] == '1' && digits[4] >= '3' &&
+                      digits[4] <= '9', nir);
+        long long rest = 0;
+        for (std::size_t k = 0; k < 13; ++k) rest = (rest * 10 + (digits[k] - '0')) % 97;
+        DLIB_TEST_MSG(97 - rest == std::atoi(digits.substr(13).c_str()), nir);
+        const string siret = s.fictive(pii_type::siret, "732 829 320 00074");
+        const string siren = s.fictive(pii_type::siret, "732 829 320");
+        DLIB_TEST_MSG(siret.compare(0, 11, siren) == 0 && siren[0] >= '3', siret + " " + siren);
+        const string body = s.fictive(pii_type::siret, "214 365 870");
+        DLIB_TEST_MSG((body[0] == '1' || body[0] == '2') && body != "214 365 870", body);
+        digits.clear();
+        for (char ch : body)
+            if (ch != ' ') digits.push_back(ch);
+        DLIB_TEST_MSG(digits.size() == 9 && luhn_ok(digits), body);
+        digits.clear();
+        for (char ch : siret)
+            if (ch != ' ') digits.push_back(ch);
+        DLIB_TEST(digits.size() == 14 && luhn_ok(digits) && luhn_ok(digits.substr(0, 9)));
+
+        // Telephone numbers in the ranges reserved for fiction.
+        DLIB_TEST(s.fictive(pii_type::phone, "06 12 34 56 78").compare(0, 9, "06 39 98 ") == 0);
+        DLIB_TEST(s.fictive(pii_type::phone, "+33 6 12 34 56 78").compare(0, 12, "+33 6 39 98 ") == 0);
+        DLIB_TEST(s.fictive(pii_type::phone, "02 99 12 34 56").compare(0, 9, "02 61 91 ") == 0);
+        DLIB_TEST(s.fictive(pii_type::phone, "(212) 555-1234").compare(0, 12, "(212) 555-01") == 0);
+        DLIB_TEST(s.fictive(pii_type::phone, "+44 20 7123 4567").compare(0, 13, "+44 20 7946 0") == 0);
+        DLIB_TEST(s.fictive(pii_type::phone, "+44 7911 123456").compare(0, 12, "+44 7700 900") == 0);
+        // A Spanish number written without its country code keeps its shape and its first two digits, the
+        // languages of the corpus being French and English.
+        const string es_phone = s.fictive(pii_type::phone, "921 648 881");
+        DLIB_TEST_MSG(es_phone.size() == 11 && es_phone.compare(0, 2, "92") == 0 && es_phone[3] == ' ' &&
+                      es_phone[7] == ' ' && es_phone != "921 648 881", es_phone);
+
+        // Read again by the detector, the structured fictive values keep their type: a text written with
+        // them is protected again as any other.
+        {
+            pii_detector detector;
+            const std::pair<pii_type, const char*> again[] = {
+                { pii_type::nir, "1 85 03 75 112 345 67" }, { pii_type::iban, "FR76 3000 6000 0112 3456 7890 189" },
+                { pii_type::payment_card, "4970 1012 3456 7890" }, { pii_type::siret, "732 829 320 00074" },
+                { pii_type::phone, "06 12 34 56 78" }, { pii_type::email, "jean.dupont@acme.fr" },
+                { pii_type::ipv4, "10.1.2.3" } };
+            for (const auto& a : again)
+            {
+                const string value = s.fictive(a.first, a.second);
+                const string text = "Le dossier indique " + value + " pour ce client.";
+                detector.begin_document();
+                DLIB_TEST_MSG(found(detector.detect(text), text, a.first, value), value);
+            }
+        }
+
+        // Internet addresses in the ranges of documentation, one /24 in one range.
+        const string ip1 = s.fictive(pii_type::ipv4, "10.1.2.3"), ip2 = s.fictive(pii_type::ipv4, "10.1.2.4");
+        DLIB_TEST_MSG(ip1.substr(0, ip1.rfind('.')) == ip2.substr(0, ip2.rfind('.')), ip1 + " " + ip2);
+        for (const string& ip : { ip1, ip2, s.fictive(pii_type::ipv4, "172.16.40.9") })
+            DLIB_TEST_MSG(ip.compare(0, 8, "192.0.2.") == 0 || ip.compare(0, 11, "198.51.100.") == 0 ||
+                          ip.compare(0, 10, "203.0.113.") == 0, ip);
+        DLIB_TEST(s.fictive(pii_type::ipv6, "fe80::1:2:3:4").compare(0, 9, "2001:db8:") == 0);
+        DLIB_TEST(s.fictive(pii_type::mac_address, "00:1A:2B:3C:4D:5E").compare(0, 3, "02:") == 0);
+
+        // Dates: one shift of whole weeks per document, within its bound.
+        for (const string doc : { "", "a", "b" })
+        {
+            const long shift = s.date_shift_days(doc);
+            DLIB_TEST_MSG(shift != 0 && shift % 7 == 0 && shift <= 180 && shift >= -180, shift);
+            civil_date d;
+            date_format f;
+            DLIB_TEST(parse_date(s.fictive(pii_type::date, "12/03/2024", doc), numeric_date_order::day_month_year,
+                                 d, f));
+            DLIB_TEST(days_from_civil(d.year, d.month, d.day) - days_from_civil(2024, 3, 12) == shift);
+        }
+
+        // A secret shares no character with its original when its classes allow it, and no run of four.
+        const string sec = s.fictive(pii_type::secret, "Tournesol2024!");
+        DLIB_TEST(sec.size() == 14);
+        for (char ch : sec) DLIB_TEST_MSG(string("Tournesol2024!").find(ch) == string::npos, sec);
+        string long_secret;
+        dlib::rand rnd(7);
+        static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int k = 0; k < 600; ++k) long_secret.push_back(b64[rnd.get_random_32bit_number() % 64]);
+        const string long_fictive = s.fictive(pii_type::secret, long_secret);
+        DLIB_TEST(long_fictive.size() == long_secret.size());
+        for (std::size_t k = 0; k + 4 <= long_secret.size(); ++k)
+            DLIB_TEST(long_fictive.find(long_secret.substr(k, 4)) == string::npos);
+
+        // Two corpora give independent values.
+        const char* const values[] = { "Jean Dupont", "Marie Martin", "Paul Bernard", "Claire Petit", "Luc Moreau",
+                                       "Anne Robert", "Hugo Simon", "Emma Laurent", "Louis Michel", "Alice Garcia" };
+        int same = 0, total = 0;
+        for (const char* v : values)
+        {
+            same += s.fictive(pii_type::person, v) == other.fictive(pii_type::person, v);
+            same += s.fictive(pii_type::email, string(v).substr(0, 4) + "@exemple.fr") ==
+                    other.fictive(pii_type::email, string(v).substr(0, 4) + "@exemple.fr");
+            total += 2;
+        }
+        DLIB_TEST_MSG(same * 100 <= total, same);
+
+        // A batch: no fictive value equals an original of the batch, and a civility gives its sex.
+        {
+            fictive_batch b(s);
+            std::vector<string> written;
+            written.push_back("Bonjour Mme " + b.record(pii_type::person, "Camille Durand") + ", voir " +
+                              b.record(pii_type::person, "Jean Dupont") + ".");
+            written.push_back(b.record(pii_type::person, "Camille Durand") + " et " +
+                              b.record(pii_type::person, full) + " et " + b.record(pii_type::title, "M."));
+            const std::vector<string> out = b.finish(written, { "doc", "doc" });
+            DLIB_TEST(out.size() == 2 && out[1].compare(out[1].size() - 3, 3, " M.") == 0);
+            const string camille = s.fictive(pii_type::person, "Camille Durand");
+            const string first = out[0].substr(12, out[0].find(',') - 12);
+            DLIB_TEST_MSG(out[1].compare(0, first.size(), first) == 0, out[0] + " | " + out[1]);
+            bool female = false;
+            const string first_given = first.substr(0, first.find(' '));
+            for (const string& n : fictive_language_of("fr")->female) female = female || n == first_given;
+            DLIB_TEST_MSG(female, first);
+            // "Jean Dupont" would draw full, an original of the batch: it draws again.
+            DLIB_TEST_MSG(out[0].find(full) == string::npos, out[0] + " " + full);
+            DLIB_TEST(out[0].find("Durand") == string::npos && out[1].find("Durand") == string::npos);
+        }
+
+        // The anonymizer writes the values of a text and of a CSV file with the writer of a batch.
+        {
+            const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x41')));
+            pii_detector detector;
+            document_anonymizer a(p, detector);
+            a.set_imposed_columns({ { "Nom", pii_type::person }, { "Courriel", pii_type::email } });
+            fictive_batch b(s);
+            a.set_value_writer([&b](pii_type t, const string& v) { return b.record(t, v); });
+            document_report r1, r2;
+            const string text = "Rendez-vous avec Jean Dupont le 12/03/2024 au 06 12 34 56 78.";
+            const string csv = "Nom;Courriel;Commentaire\nDupont;jean.dupont@acme.fr;Rappeler M. Dupont\n";
+            const string w1 = a.anonymize_text(text, r1);
+            const string w2 = a.anonymize(csv, document_format::delimited, r2, "clients.csv");
+            DLIB_TEST(r1.substitutions.empty() && r2.substitutions.empty() && r2.entities["PERSON"] >= 2);
+            const std::vector<string> out = b.finish({ w1, w2 }, { "x", "x" });
+            DLIB_TEST_MSG(out[0].find("Dupont") == string::npos && out[0].find("06 39 98 ") != string::npos &&
+                          out[0].find("[[") == string::npos, out[0]);
+            DLIB_TEST_MSG(out[1].compare(0, 25, "Nom;Courriel;Commentaire\n") == 0 &&
+                          out[1].find("Dupont") == string::npos && out[1].find(".example.com;") != string::npos,
+                          out[1]);
+            // The family name of the column and the one of the comment take the same fictive name.
+            const std::vector<string> rows = lines_of(out[1]);
+            const string column_name = rows.size() == 2 ? rows[1].substr(0, rows[1].find(';')) : string();
+            DLIB_TEST_MSG(rows.size() == 2 && rows[1].find("M. " + column_name) != string::npos, out[1]);
+            document_report r3;
+            bool refused = false;
+            try
+            {
+                a.anonymize(string("PK\x03\x04", 4), document_format::docx, r3);
+            }
+            catch (dlib::error&)
+            {
+                refused = true;
+            }
+            DLIB_TEST(refused);
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
+
     class privacy_tester : public tester
     {
     public:
@@ -5173,6 +5641,7 @@ namespace
             test_text_documents();
             print_spinner();
             test_office_document();
+            test_field_instructions();
             print_spinner();
             test_untagged_values();
             test_untagged_text();
@@ -5221,10 +5690,12 @@ namespace
             test_imposed_terms();
             test_imposed_columns();
             test_ip_columns();
+            test_fictive_values();
             test_ascii_windows_1252();
             test_health_and_exports();
             print_spinner();
             test_secrets();
+            test_learned_span_edges();
             print_spinner();
             test_recognizer_combination();
             print_spinner();

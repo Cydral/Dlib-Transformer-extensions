@@ -427,6 +427,9 @@ namespace dlib
             bool main_stream = true;
             int shared_index = -1;
             std::vector<std::size_t> cuts;      // container boundaries no value may cross
+            // In a unit of field instructions, each piece of text with its field (part_state::field_starts).
+            struct instruction { std::size_t begin, end; int field; };
+            std::vector<instruction> instructions;
         };
 
         struct cell_info
@@ -458,6 +461,7 @@ namespace dlib
             int header_row = -1;
             std::set<std::string> removed_ids;  // shape identifiers of removed slide elements
             std::map<std::string, std::size_t> counted;  // values replaced in the part, by type keyword
+            std::vector<std::string> field_starts;       // first characters of the instruction of each field
         };
 
     // ------------------------------------------------------------------------------------
@@ -510,7 +514,11 @@ namespace dlib
                 detector_->begin_document();
                 for (const part_state& st : parts)
                     for (const unit& u : st.units)
-                        if (!u.text.empty()) detector_->learn(u.text, u.ctx);
+                    {
+                        if (u.text.empty()) continue;
+                        if (u.instructions.empty()) detector_->learn(u.text, u.ctx);
+                        else detector_->learn(read_text(st, u), u.ctx);
+                    }
                 rename_sheets(parts);
             }
 
@@ -946,8 +954,20 @@ namespace dlib
                     attribute_unit(st, a, identity_type(xml_unescape(v)));
                 else if ((an == "descr" || an == "title") && (local == "docPr" || local == "cNvPr"))
                     attribute_unit(st, a, pii_type::none);
-                else if ((an == "instr" && local == "fldSimple") ||
-                         (an == "val" && (local == "docVar" || local == "tag")) ||
+                else if (an == "instr" && local == "fldSimple")
+                {
+                    // The instruction of a field written whole in an attribute.
+                    const std::size_t units = st.units.size();
+                    attribute_unit(st, a, pii_type::none);
+                    if (st.units.size() > units)
+                    {
+                        unit& u = st.units.back();
+                        u.instructions.push_back(
+                            unit::instruction{ 0, u.text.size(), static_cast<int>(st.field_starts.size()) });
+                        st.field_starts.push_back(u.text.substr(0, field_start_length));
+                    }
+                }
+                else if ((an == "val" && (local == "docVar" || local == "tag")) ||
                          (an == "tooltip" && local == "hyperlink") || (an == "display" && local == "hyperlink"))
                     attribute_unit(st, a, pii_type::none);
                 else if (an == "connection" && local == "dbPr")
@@ -1005,6 +1025,12 @@ namespace dlib
             std::vector<frame> stack;
             struct para { int current = -1, deleted = -1, field = -1; int table = -1, row = -1, col = -1; };
             std::vector<para> paras;
+            /* The fields open at this point of the part, the innermost last, each with its number in
+               field_starts and whether its instruction is still being read: a field runs from a
+               character "begin" to a character "end", over several paragraphs for a table of contents,
+               its instruction before the character "separate" and its result after it. */
+            struct open_field { int id; bool instruction; };
+            std::vector<open_field> fields;
             struct table_state { int id, row, col; };
             std::vector<table_state> tables;
             int next_table = 0;
@@ -1193,14 +1219,41 @@ namespace dlib
                               t.kind == xml_token::start_tag) ||
                              local == "fldChar"))
                             cut_here(paras.back());
+                        if (ns::w(e_ns) && local == "fldChar")
+                        {
+                            std::string kind;
+                            for (const xml_attribute& a : t.attributes)
+                                if (xml_local_name(a.name) == "fldCharType")
+                                    kind = st.xml.substr(a.value_begin, a.value_end - a.value_begin);
+                            if (kind == "begin")
+                            {
+                                fields.push_back(open_field{ static_cast<int>(st.field_starts.size()), true });
+                                st.field_starts.push_back(std::string());
+                            }
+                            else if (kind == "separate" && !fields.empty()) fields.back().instruction = false;
+                            else if (kind == "end" && !fields.empty()) fields.pop_back();
+                        }
                         if (ns::w(e_ns) &&
                             (local == "t" || local == "delText" || local == "instrText" || local == "delInstrText") &&
                             t.kind == xml_token::start_tag && !paras.empty())
                         {
                             const int stream = local == "t" ? 0 : (local == "delText" ? 1 : 2);
                             const int node = add_text_node(st, t, i, match[i], local == "t");
-                            add_piece(unit_for(paras.back(), stream), node,
-                                      st.nodes[static_cast<std::size_t>(node)].text);
+                            unit& u = unit_for(paras.back(), stream);
+                            const std::size_t begin = u.text.size();
+                            add_piece(u, node, st.nodes[static_cast<std::size_t>(node)].text);
+                            if (stream == 2)
+                            {
+                                // The field of this piece of instruction: the innermost one before its separator.
+                                const int field = !fields.empty() && fields.back().instruction ? fields.back().id : -1;
+                                u.instructions.push_back(unit::instruction{ begin, u.text.size(), field });
+                                if (field >= 0)
+                                {
+                                    std::string& start = st.field_starts[static_cast<std::size_t>(field)];
+                                    if (start.size() < field_start_length)
+                                        start += u.text.substr(begin, field_start_length - start.size());
+                                }
+                            }
                         }
                         else if (in_run && ns::w(e_ns) && !paras.empty())
                         {
@@ -1783,6 +1836,40 @@ namespace dlib
     // ------------------------------------------------------------------------------------
     // Text transformation and write-back.
 
+        // The characters of an instruction that field_starts keeps: enough for the name of its field.
+        static const std::size_t field_start_length = 24;
+
+        /* Whether an instruction that starts with these characters is the one of a field that refers to
+           another place of the document or numbers it: "REF _Ref52346771 \h", "PAGEREF _Toc52346771 \h",
+           "NOTEREF _Ref52346772", "STYLEREF 1 \s", "SEQ Figure \* ARABIC", "TOC \o "1-3" \h \z \u". */
+        static bool reference_instruction(const std::string& start)
+        {
+            std::size_t b = 0;
+            while (b < start.size() && (start[b] == ' ' || start[b] == '\t')) ++b;
+            std::string name;
+            for (std::size_t e = b; e < start.size(); ++e)
+            {
+                const char c = start[e];
+                if (c >= 'a' && c <= 'z') name.push_back(static_cast<char>(c - 'a' + 'A'));
+                else if (c >= 'A' && c <= 'Z') name.push_back(c);
+                else break;
+            }
+            return name == "REF" || name == "PAGEREF" || name == "NOTEREF" || name == "STYLEREF" || name == "SEQ" ||
+                   name == "TOC";
+        }
+
+        /* The text of a unit of field instructions as the detector reads it: the instructions of the
+           fields that refer to another place of the document are spaces, byte for byte, so that the
+           offsets of what is found stay those of the unit. */
+        static std::string read_text(const part_state& st, const unit& u)
+        {
+            std::string text = u.text;
+            for (const unit::instruction& f : u.instructions)
+                if (f.field >= 0 && reference_instruction(st.field_starts[static_cast<std::size_t>(f.field)]))
+                    std::fill(text.begin() + static_cast<long>(f.begin), text.begin() + static_cast<long>(f.end), ' ');
+            return text;
+        }
+
         void transform_unit(part_state& st, unit& u)
         {
             if (u.text.empty()) return;
@@ -1879,7 +1966,11 @@ namespace dlib
             }
             else
             {
-                for (const pii_entity& e : to_write(u.text, detector_->detect(u.text, u.ctx)))
+                /* The instruction of a field that refers to another place of the document is read as
+                   spaces: its arguments name a bookmark, a style or a sequence, which a tag would break. */
+                const std::vector<pii_entity> found = u.instructions.empty() ?
+                    detector_->detect(u.text, u.ctx) : detector_->detect(read_text(st, u), u.ctx);
+                for (const pii_entity& e : to_write(u.text, found))
                 {
                     if (p_.keeps_in_clear(e.type)) continue;
                     report_.count(e.type);

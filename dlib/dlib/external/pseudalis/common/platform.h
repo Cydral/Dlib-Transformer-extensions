@@ -158,6 +158,17 @@ namespace pseudalis
     bool free_disk_space(const std::string& p, uint64_t& available);
 
     // Seconds since 1970, and the ISO 8601 form of a time in UTC.
+    /*!
+        ensures
+            - Returns the security identifier ("S-1-5-18") of the account of the process that holds,
+              on this computer, the TCP connection from 127.0.0.1:remote_port to 127.0.0.1:local_port:
+              the caller of a request of the local server, on Windows.  Returns an empty string
+              elsewhere, and when the connection or its process cannot be found or opened.
+    !*/
+    std::string peer_account(int remote_port, int local_port);
+    // The name of an account ("NT AUTHORITY\SYSTEM") from its security identifier, else the identifier.
+    std::string account_name(const std::string& sid);
+
     int64_t now_unix();
     std::string iso_time(int64_t t);
 

@@ -1097,6 +1097,110 @@ namespace pseudalis
         return true;
     }
 
+    bool service::create_corpus(const json& settings, const std::string& caller, const std::string& account,
+                                std::string& id, user_error& error)
+    {
+        id = random_hex(32);
+        std::string key, why;
+        if (id.size() != 32 || !create_corpus_key(join_path(data_dir_, "keys"), id, key, why))
+        {
+            log_error("corpus: " + why);
+            error.set("the key of the corpus cannot be made", "corpus_key");
+            return false;
+        }
+        wipe(key);
+        corpus_record c;
+        c.id = id;
+        c.created = now_unix();
+        c.caller = caller;
+        c.account = account;
+        c.settings = settings.dump();
+        try
+        {
+            db_->add_corpus(c);
+        }
+        catch (const std::exception& x)
+        {
+            destroy_corpus_key(join_path(data_dir_, "keys"), id);
+            log_error("corpus: " + std::string(x.what()));
+            error.set("the database cannot record the corpus", "database");
+            return false;
+        }
+        log_info("corpus: a corpus made for the caller " + caller);
+        return true;
+    }
+
+    bool service::corpus_texts(const corpus_record& c, const json& texts, json& results, user_error& error)
+    {
+        if (!engine_)
+        {
+            error.set("the engine is not ready", "engine");
+            return false;
+        }
+        std::string key, why;
+        if (!load_corpus_key(join_path(data_dir_, "keys"), c.id, key, why))
+        {
+            error.set("the key of this corpus is gone: the corpus was deleted", "corpus_deleted");
+            return false;
+        }
+        static const char* const hex = "0123456789abcdef";
+        std::string key_hex;
+        for (unsigned char b : key)
+        {
+            key_hex.push_back(hex[b >> 4]);
+            key_hex.push_back(hex[b & 15]);
+        }
+        wipe(key);
+        json settings;
+        json::parse(c.settings, settings);
+        json request = json::object();
+        request["operation"] = "fictive";
+        request["key"] = key_hex;
+        wipe(key_hex);
+        request["languages"] = settings["languages"];
+        request["date_shift_days"] = settings["date_shift_days"];
+        request["keep_city"] = settings["keep_city"];
+        json data = json::object();
+        data["texts"] = texts;
+        json result;
+        std::string output, e;
+        const bool ok = engine_->process(request, data.dump(), result, output, nullptr, e);
+        // The key in the request is written over before the request goes.
+        request["key"] = std::string(64, '0');
+        json out;
+        if (!ok || !json::parse(output, out) || !out["results"].is_array())
+        {
+            error.set(ok ? std::string("the engine gave no results") : e, "corpus_failed");
+            return false;
+        }
+        results = out["results"];
+        try
+        {
+            db_->add_corpus_texts(c.id, static_cast<long long>(results.size()));
+        }
+        catch (const std::exception& x)
+        {
+            log_warning("corpus: " + std::string(x.what()));
+        }
+        return true;
+    }
+
+    bool service::delete_corpus(const std::string& id)
+    {
+        const bool gone = destroy_corpus_key(join_path(data_dir_, "keys"), id);
+        try
+        {
+            db_->set_corpus_deleted(id, now_unix());
+        }
+        catch (const std::exception& x)
+        {
+            log_error("corpus: " + std::string(x.what()));
+            return false;
+        }
+        log_info("corpus: a corpus deleted");
+        return gone;
+    }
+
     bool service::forget(long long record, const std::string& reason)
     {
         std::vector<std::string> blobs;

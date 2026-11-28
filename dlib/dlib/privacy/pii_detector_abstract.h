@@ -566,13 +566,17 @@ namespace dlib
             ensures
                 - recognizer is called on every text analysed afterwards, and its spans
                   whose confidence is at least min_confidence are added to the candidates.
-                  A span whose offsets fall inside a UTF-8 character covers that character.
+                  A span whose offsets fall inside a UTF-8 character covers that character,
+                  and the spaces a span holds at its ends, the no-break space that ends a
+                  cell for one, are left out of it.
                 - The pieces of one word, one name or one login that recognizer reports side
                   by side are merged first ("E" and "sch-sur-Alzette"; "Inès", "de" and
                   "Brunet"; "v" and "wojcikski"; "u" and "l. Długa 5"), and the at sign
                   before a login joins it ("@hpetit38"). A span that names nothing is then
                   ignored: a piece of a word that no other piece completes ("Rem" in
-                  "Remplacez"), a login inside a longer token, a file name
+                  "Remplacez"), a login inside a longer token, what a protection before left
+                  of a value beside the tag it wrote ("_B2" glued to the tag that took
+                  "REQ_SEC"), a file name
                   ("rapport_final.docx", "journal.log2"), a single character or one repeated,
                   a common word in lower case ("month"; a place too, but for the towns among
                   the common words: "copies"), for addresses, a field label or a common word alone

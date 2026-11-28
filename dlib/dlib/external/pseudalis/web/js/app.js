@@ -1089,6 +1089,33 @@
     message('columns-message', t('columns_saved', { n: columns.length }));
   }
 
+  // The callers that had texts written with fictive values, and the number of those texts.
+  async function loadCorpora() {
+    let r;
+    try {
+      r = await adminFetch('v1/corpora');
+    } catch (e) {
+      return;
+    }
+    if (!r.ok) return;
+    const b = await r.json().catch(function () { return null; });
+    if (!b) return;
+    const callers = b.callers || [];
+    const body = document.getElementById('corpora');
+    body.textContent = '';
+    callers.forEach(function (c) {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'name', c.caller || ''));
+      tr.appendChild(el('td', '', c.account || ''));
+      tr.appendChild(el('td', 'number', String(c.corpora || 0)));
+      tr.appendChild(el('td', 'number', String(c.texts || 0)));
+      tr.appendChild(el('td', 'number', (c.last || '').replace('T', ' ').replace('Z', '')));
+      body.appendChild(tr);
+    });
+    document.getElementById('corpora-table').hidden = callers.length === 0;
+    document.getElementById('corpora-none').hidden = callers.length !== 0;
+  }
+
   async function startAdmin() {
     if (!admin || !(await loadRecords(false))) return;
     ['records-card', 'key-card', 'settings-card', 'terms-card', 'columns-card'].forEach(function (id) {
@@ -1099,6 +1126,7 @@
     fingerprint = info.key_fingerprint || '';
     document.getElementById('fingerprint').textContent = fingerprint;
     loadSettings();
+    loadCorpora();
     loadTerms();
     loadColumns();
   }

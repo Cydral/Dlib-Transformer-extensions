@@ -13,7 +13,9 @@
     back so, their name and their report in headers, or as JSON with format=json.  The
     operations that change the installation or reveal its records (settings, restart,
     updates, records, key, logs) require the administration token of the data folder in the
-    X-Pseudalis-Admin header; the tray and the shell read it there.  Every request must name
+    X-Pseudalis-Admin header; the tray and the shell read it there.  The training corpora written
+    with fictive values (/v1/corpus) require it too, from a caller of this computer whose Windows
+    account stays the one that made the corpus.  Every request must name
     the local server in its Host header, and a request that comes from a page must come from
     the local server too, so that no web site can drive the service through the browser.
 */
@@ -26,6 +28,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
+#include <memory>
 
 #include "../common/log.h"
 #include "../common/platform.h"
@@ -33,6 +37,7 @@
 #include "crypto.h"
 #include "drive.h"
 #include "http_fetch.h"
+#include "keys.h"
 #include "service.h"
 
 namespace pseudalis
@@ -230,6 +235,68 @@ namespace pseudalis
             return false;
         }
 
+        // The name a caller gives itself (X-Pseudalis-Caller): printable ASCII, 64 characters at most, else "api".
+        std::string caller_of(const httplib::Request& req)
+        {
+            const std::string v = req.get_header_value("X-Pseudalis-Caller");
+            if (v.empty() || v.size() > 64) return "api";
+            for (char c : v)
+                if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) return "api";
+            return v;
+        }
+
+        // The values of a report by type, keyword in lower case: the counts of a text of a corpus.
+        json counts_of(const json& report)
+        {
+            json counts = json::object();
+            for (const auto& kv : report["values"].items()) counts[lower(kv.first)] = kv.second;
+            return counts;
+        }
+
+        /*
+            The texts of a request of a corpus, checked: a list of 1 to 256 objects whose "text" is a
+            string, "ref", "name" and "document" strings of 256 bytes at most, and 4 MiB of text in
+            all.  Returns the texts to give the engine, or sends the refusal and returns false.
+        */
+        bool corpus_texts_of(const json& list, httplib::Response& res, json& texts, std::size_t first = 0)
+        {
+            if (!list.is_array() || list.empty() || list.size() > 256)
+            {
+                send_error(res, 400, "texts must be a list of 1 to 256 texts", "corpus_texts");
+                return false;
+            }
+            texts = json::array();
+            std::size_t bytes = 0;
+            for (std::size_t k = 0; k < list.size(); ++k)
+            {
+                const json& t = list[k];
+                bool ok = t.is_object() && t["text"].is_string();
+                for (const char* field : { "ref", "name", "document" })
+                    ok = ok && (!t.contains(field) || (t[field].is_string() && t[field].str().size() <= 256));
+                if (!ok)
+                {
+                    user_error e;
+                    e.set("each text is an object whose text is a string, and whose ref, name and document are strings "
+                          "of 256 bytes at most", "corpus_texts").arg("index", std::to_string(first + k));
+                    send_error(res, 400, e);
+                    return false;
+                }
+                bytes += t["text"].str().size();
+                json one = json::object();
+                one["ref"] = t.contains("ref") ? t["ref"].str() : std::to_string(first + k);
+                one["text"] = t["text"].str();
+                one["name"] = t["name"].str();
+                one["document"] = t["document"].str();
+                texts.push_back(one);
+            }
+            if (bytes > (4u << 20))
+            {
+                send_error(res, 413, "the texts of a request hold 4 MiB at most", "corpus_too_large");
+                return false;
+            }
+            return true;
+        }
+
         bool parse_body(const httplib::Request& req, httplib::Response& res, json& body)
         {
             if (!json::parse(req.body, body) || !body.is_object())
@@ -268,7 +335,9 @@ namespace pseudalis
             */
             const unsigned long long length =
                 std::strtoull(req.get_header_value("Content-Length").c_str(), nullptr, 10);
-            const bool file_route = req.path == "/v1/anonymize" || req.path == "/v1/restore";
+            const bool file_route = req.path == "/v1/anonymize" || req.path == "/v1/restore" ||
+                                    (req.path.compare(0, 11, "/v1/corpus/") == 0 && req.path.size() > 18 &&
+                                     req.path.compare(req.path.size() - 7, 7, "/stream") == 0);
             const unsigned long long limit = file_route
                 ? (static_cast<unsigned long long>(s->settings().get().max_file_mb) + 1) << 20 : 16ull << 20;
             if (length > limit)
@@ -447,6 +516,14 @@ namespace pseudalis
                 if (!busy_refused(slot, res)) return;
                 json body, out;
                 if (!parse_body(req, res, body)) return;
+                // A text written with fictive values gives back nothing: no record, no substitute kept.
+                if (std::string(operation) == "restore_text" &&
+                    (body["substitutes"].str() == "fictive" || body.contains("corpus_id")))
+                {
+                    send_error(res, 409, "a text written with fictive values cannot be restored",
+                               "fictive_not_restorable");
+                    return;
+                }
                 // Tags unless the body or, without "tags", the settings say otherwise.
                 const bool tags = body["tags"].as_bool(s->settings().get().tags);
                 if (body.contains("substitutions") && !body["substitutions"].is_array())
@@ -506,6 +583,324 @@ namespace pseudalis
         };
         srv.Post("/v1/names/anonymize", name_route(true));
         srv.Post("/v1/names/restore", name_route(false));
+
+        /*
+            Training corpora written with fictive values: the administration token, a caller of this
+            computer, and for a corpus, the Windows account that made it.  Nothing of a text is kept.
+        */
+        auto local = [](const httplib::Request& req, httplib::Response& res) {
+            if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") return true;
+            send_error(res, 403, "the corpora are written for the programs of this computer alone", "corpus_local");
+            return false;
+        };
+        auto corpus_of = [s, port](const httplib::Request& req, httplib::Response& res, corpus_record& c) {
+            if (!s->db().get_corpus(lower(req.matches[1].str()), c))
+            {
+                send_error(res, 404, "no such corpus", "corpus_unknown");
+                return false;
+            }
+            if (!c.account.empty() && peer_account(req.remote_port, port) != c.account)
+            {
+                send_error(res, 403, "this corpus belongs to another account of Windows", "corpus_caller");
+                return false;
+            }
+            return true;
+        };
+        // Writes texts in the mode asked: fictive values under the key of the corpus, tags or substitutes.
+        auto write_texts = [s](const corpus_record& c, const std::string& mode, const json& texts, json& results,
+                               user_error& e) {
+            if (mode == "fictive") return s->corpus_texts(c, texts, results, e);
+            results = json::array();
+            for (std::size_t k = 0; k < texts.size(); ++k)
+            {
+                json out;
+                if (!s->text("anonymize_text", texts[k]["text"].str(), out, e, mode == "tags")) return false;
+                json r = json::object();
+                r["ref"] = texts[k]["ref"];
+                r["text"] = out["text"];
+                r["counts"] = counts_of(out["report"]);
+                r["dropped"] = false;
+                if (out.contains("substitutions")) r["substitutions"] = out["substitutions"];
+                results.push_back(r);
+            }
+            return true;
+        };
+        srv.Post("/v1/corpus", [s, admin, local, port](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res) || !local(req, res)) return;
+            json parsed;
+            if (!parse_body(req, res, parsed)) return;
+            const json& body = parsed;
+            auto refuse = [&res](const char* field, const std::string& message) {
+                user_error e;
+                e.set(message, "corpus_settings").arg("field", field);
+                send_error(res, 400, e);
+            };
+            json languages = json::array();
+            if (body.contains("languages"))
+            {
+                const json& list = body["languages"];
+                bool ok = list.is_array() && !list.empty() && list.size() <= 5;
+                for (std::size_t k = 0; ok && k < list.size(); ++k)
+                {
+                    const std::string l = list[k].str();
+                    ok = list[k].is_string() &&
+                         std::string(" fr en de es it ").find(" " + l + " ") != std::string::npos;
+                    for (std::size_t j = 0; ok && j < languages.size(); ++j) ok = languages[j].str() != l;
+                    if (ok) languages.push_back(l);
+                }
+                if (!ok) return refuse("languages", "languages is a list of fr, en, de, es and it, each once");
+            }
+            else languages.push_back("fr");
+            const json& shift = body["date_shift_days"];
+            const long long days = body.contains("date_shift_days") ? shift.as_int(0) : 180;
+            if (body.contains("date_shift_days") &&
+                (!shift.is_number() || static_cast<double>(days) != shift.as_double() || days < 7 || days > 3650))
+                return refuse("date_shift_days", "date_shift_days is a whole number from 7 to 3650");
+            if (body.contains("keep_city") && !body["keep_city"].is_bool())
+                return refuse("keep_city", "keep_city is true or false");
+            const std::string sensitive = body["sensitive_sentences"].str("generalize");
+            if (body.contains("sensitive_sentences") &&
+                (!body["sensitive_sentences"].is_string() || (sensitive != "generalize" && sensitive != "drop")))
+                return refuse("sensitive_sentences", "sensitive_sentences is generalize or drop");
+            json settings = json::object();
+            settings["languages"] = languages;
+            settings["date_shift_days"] = days;
+            settings["keep_city"] = body["keep_city"].as_bool(true);
+            settings["sensitive_sentences"] = sensitive;
+            std::string id;
+            user_error e;
+            if (!s->create_corpus(settings, caller_of(req), peer_account(req.remote_port, port), id, e))
+            {
+                send_error(res, 500, e);
+                return;
+            }
+            json j = json::object();
+            j["corpus_id"] = id;
+            j["key_created"] = true;
+            send_json(res, 201, j);
+        });
+        srv.Get(R"(/v1/corpus/([0-9a-fA-F]{32}))", [s, admin, local, corpus_of](const httplib::Request& req,
+                                                                              httplib::Response& res) {
+            corpus_record c;
+            if (!admin(req, res) || !local(req, res) || !corpus_of(req, res, c)) return;
+            json j;
+            if (!json::parse(c.settings, j) || !j.is_object()) j = json::object();
+            j["corpus_id"] = c.id;
+            j["caller"] = c.caller;
+            j["created"] = iso_time(c.created);
+            j["texts"] = c.texts;
+            j["deleted"] = c.deleted ? iso_time(c.deleted) : std::string();
+            // No sentence of the categories of articles 9 and 10 of the GDPR is told apart by this version.
+            j["sensitive_detection"] = "none";
+            const json models = s->status()["engine"]["models"];
+            j["models"] = models;
+            j["lexicons"] = models["lexicons"];
+            send_json(res, 200, j);
+        });
+        srv.Post(R"(/v1/corpus/([0-9a-fA-F]{32})/texts)", [s, admin, local, corpus_of, write_texts](
+                                                              const httplib::Request& req, httplib::Response& res) {
+            work_slot slot(s->work());
+            if (!busy_refused(slot, res)) return;
+            corpus_record c;
+            if (!admin(req, res) || !local(req, res) || !corpus_of(req, res, c)) return;
+            if (c.deleted)
+            {
+                send_error(res, 410, "this corpus was deleted: its key is gone", "corpus_deleted");
+                return;
+            }
+            json parsed, texts, results;
+            if (!parse_body(req, res, parsed)) return;
+            const std::string mode = parsed["substitutes"].str("fictive");
+            if (mode != "fictive" && mode != "tags" && mode != "tagless")
+            {
+                send_error(res, 400, "substitutes is fictive, tags or tagless", "corpus_mode");
+                return;
+            }
+            if (!corpus_texts_of(parsed["texts"], res, texts)) return;
+            user_error e;
+            if (!write_texts(c, mode, texts, results, e))
+            {
+                send_error(res, e.code == "corpus_deleted" ? 410 : 422, e);
+                return;
+            }
+            json j = json::object();
+            j["results"] = results;
+            send_json(res, 200, j);
+        });
+        /*
+            The stream of a corpus: lines of JSON in, one text each, and lines of JSON out, one result
+            each, in the order of the texts.  The texts are written by batches of 256 texts or 4 MiB;
+            the results wait in a file of the data folder, which only SYSTEM and the administrators
+            open, until the request is read, then leave with the answer and the file is removed.
+        */
+        srv.Post(R"(/v1/corpus/([0-9a-fA-F]{32})/stream)", [s, admin, local, corpus_of, write_texts](
+                                                               const httplib::Request& req, httplib::Response& res,
+                                                               const httplib::ContentReader& reader) {
+            work_slot slot(s->work());
+            if (!busy_refused(slot, res)) return;
+            corpus_record c;
+            if (!admin(req, res) || !local(req, res) || !corpus_of(req, res, c)) return;
+            if (c.deleted)
+            {
+                send_error(res, 410, "this corpus was deleted: its key is gone", "corpus_deleted");
+                return;
+            }
+            const std::string mode = req.has_param("substitutes") ? req.get_param_value("substitutes") : "fictive";
+            if (mode != "fictive" && mode != "tags" && mode != "tagless")
+            {
+                send_error(res, 400, "substitutes is fictive, tags or tagless", "corpus_mode");
+                return;
+            }
+            const std::string folder = join_path(s->data_dir(), "temp");
+            std::string why;
+            if (!private_folder(folder, why))
+            {
+                send_error(res, 500, "the service cannot keep the results of the stream", "corpus_stream");
+                return;
+            }
+            const std::string path = join_path(folder, "corpus-" + random_hex(16) + ".jsonl");
+            std::ofstream out(path.c_str(), std::ios::binary | std::ios::trunc);
+            json batch = json::array();
+            std::size_t batch_bytes = 0, line = 0, done = 0;
+            std::string pending, failure_code, failure;
+            httplib::Response refused;
+            auto flush = [&]() {
+                if (batch.empty() || !failure_code.empty()) return failure_code.empty();
+                json texts, results;
+                user_error e;
+                if (!corpus_texts_of(batch, refused, texts, done) || !write_texts(c, mode, texts, results, e))
+                {
+                    failure_code = e.code.empty() ? "corpus_texts" : e.code;
+                    failure = e.code.empty() ? refused.body : e.text;
+                    return false;
+                }
+                for (std::size_t k = 0; k < results.size(); ++k) out << results[k].dump() << "\n";
+                done += batch.size();
+                batch = json::array();
+                batch_bytes = 0;
+                return static_cast<bool>(out);
+            };
+            auto take = [&](const std::string& text) {
+                ++line;
+                if (text.find_first_not_of(" \t\r") == std::string::npos) return true;
+                json t;
+                if (!json::parse(text, t) || !t.is_object())
+                {
+                    failure_code = "corpus_line";
+                    failure = "line " + std::to_string(line) + " is not a JSON object";
+                    return false;
+                }
+                batch_bytes += t["text"].str().size();
+                batch.push_back(t);
+                if (batch.size() < 256 && batch_bytes < (4u << 20)) return true;
+                return flush();
+            };
+            const bool read = reader([&](const char* data, size_t size) {
+                pending.append(data, size);
+                std::size_t start = 0, end;
+                while ((end = pending.find('\n', start)) != std::string::npos)
+                {
+                    if (!take(pending.substr(start, end - start))) return false;
+                    start = end + 1;
+                }
+                pending.erase(0, start);
+                if (pending.size() > (4u << 20))
+                {
+                    failure_code = "corpus_line";
+                    failure = "a line of the stream holds more than 4 MiB";
+                    return false;
+                }
+                return true;
+            });
+            if (read && failure_code.empty() && !pending.empty()) take(pending);
+            if (read && failure_code.empty()) flush();
+            out.close();
+            if (!read || !failure_code.empty() || !out)
+            {
+                remove_file(path);
+                if (failure_code == "corpus_deleted")
+                    send_error(res, 410, "this corpus was deleted: its key is gone", "corpus_deleted");
+                else if (failure_code == "corpus_line" || failure_code == "corpus_texts")
+                    send_error(res, 400, failure.empty() ? "the stream cannot be read" : failure, failure_code);
+                else
+                    send_error(res, read ? 422 : 400, failure.empty() ? "the stream cannot be read" : failure,
+                               failure_code.empty() ? "bad_request" : failure_code);
+                return;
+            }
+            const uint64_t size = file_size(path);
+            auto file = std::make_shared<std::ifstream>(path.c_str(), std::ios::binary);
+            res.set_header("X-Pseudalis-Texts", std::to_string(done));
+            res.set_content_provider(
+                static_cast<size_t>(size), "application/x-ndjson",
+                [file](size_t offset, size_t length, httplib::DataSink& sink) {
+                    std::vector<char> buffer(std::min<size_t>(length, 1u << 16));
+                    file->seekg(static_cast<std::streamoff>(offset));
+                    file->read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                    const std::streamsize n = file->gcount();
+                    if (n <= 0) return false;
+                    return sink.write(buffer.data(), static_cast<size_t>(n));
+                },
+                [file, path](bool) {
+                    file->close();
+                    remove_file(path);
+                });
+        });
+        srv.Delete(R"(/v1/corpus/([0-9a-fA-F]{32}))", [s, admin, local, corpus_of](const httplib::Request& req,
+                                                                                 httplib::Response& res) {
+            corpus_record c;
+            if (!admin(req, res) || !local(req, res) || !corpus_of(req, res, c)) return;
+            if (!s->delete_corpus(c.id))
+            {
+                send_error(res, 500, "the key of the corpus cannot be removed", "corpus_key");
+                return;
+            }
+            json j = json::object();
+            j["corpus_id"] = c.id;
+            j["deleted"] = true;
+            send_json(res, 200, j);
+        });
+        // A text written with fictive values cannot be restored: nothing was kept to give its values back.
+        srv.Post(R"(/v1/corpus/([0-9a-fA-F]{32})/restore)", [](const httplib::Request&, httplib::Response& res) {
+            send_error(res, 409, "a text written with fictive values cannot be restored", "fictive_not_restorable");
+        });
+        // The callers that used the corpora and the number of their texts, for the settings of the web application.
+        srv.Get("/v1/corpora", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
+            json list = json::array(), callers = json::array();
+            std::vector<std::pair<std::string, std::string>> keys;
+            for (const corpus_record& c : s->db().corpora())
+            {
+                const std::string account = account_name(c.account);
+                json j = json::object();
+                j["corpus_id"] = c.id;
+                j["caller"] = c.caller;
+                j["account"] = account;
+                j["created"] = iso_time(c.created);
+                j["texts"] = c.texts;
+                j["deleted"] = c.deleted ? iso_time(c.deleted) : std::string();
+                list.push_back(j);
+                const std::pair<std::string, std::string> key(c.caller, account);
+                std::size_t k = std::find(keys.begin(), keys.end(), key) - keys.begin();
+                if (k == keys.size())
+                {
+                    keys.push_back(key);
+                    json one = json::object();
+                    one["caller"] = c.caller;
+                    one["account"] = account;
+                    one["corpora"] = 0;
+                    one["texts"] = 0;
+                    one["last"] = iso_time(c.created);
+                    callers.push_back(one);
+                }
+                json& one = callers.at(k);
+                one["corpora"] = one["corpora"].as_int(0) + 1;
+                one["texts"] = one["texts"].as_int(0) + c.texts;
+            }
+            json j = json::object();
+            j["corpora"] = list;
+            j["callers"] = callers;
+            send_json(res, 200, j);
+        });
 
         // The drive, its events, Albireo.
         srv.Get("/v1/drive", [s](const httplib::Request&, httplib::Response& res) {

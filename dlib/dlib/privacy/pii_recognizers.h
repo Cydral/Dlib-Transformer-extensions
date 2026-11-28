@@ -157,11 +157,48 @@ namespace dlib
                     return true;
             return false;
         };
+        /* An account name written in lower-case letters alone has the look of any word of a sentence
+           ("jdupont", "reseau"): below second_min_confidence, a leading tagger keeps one in running text
+           where the span model reads an account name too, even weakly, and keeps one as any span where a
+           layout writes a value. */
+        auto plain_word = [&text](const pii_span& s) {
+            if (s.begin >= s.end || s.end > text.size()) return false;
+            for (std::size_t i = s.begin; i < s.end; ++i)
+            {
+                const unsigned char c = static_cast<unsigned char>(text[i]);
+                if (!((c >= 'a' && c <= 'z') || c >= 0x80)) return false;
+            }
+            return true;
+        };
+        auto account_confirmed = [&model_spans](const pii_span& s) {
+            for (const pii_span& m : model_spans)
+                if (m.label == "USERNAME" && m.confidence >= 0.2 && spans_overlap(s, m)) return true;
+            return false;
+        };
+        /* Where a layout writes a value: at the start of the text or of a line, after a tab, a colon,
+           an equals sign, a semicolon or a vertical bar, spaces and an opening quote between, or right
+           after a comma or a '>' ("Compte : jdupont", "id;jdupont;actif", "<td>jdupont"). */
+        auto value_place = [&text](const pii_span& s) {
+            std::size_t q = std::min(s.begin, text.size());
+            if (q > 0 && (text[q - 1] == ',' || text[q - 1] == '>')) return true;
+            if (q > 0 && (text[q - 1] == '"' || text[q - 1] == '\'')) --q;
+            while (q > 0)
+            {
+                if (text[q - 1] == ' ') --q;
+                else if (q >= 2 && text[q - 2] == '\xC2' && text[q - 1] == '\xA0') q -= 2;
+                else break;
+            }
+            if (q == 0) return true;
+            const char c = text[q - 1];
+            return c == '\n' || c == '\r' || c == '\t' || c == ':' || c == '=' || c == ';' || c == '|';
+        };
         for (const pii_span& s : tagger_spans)
         {
             const bool leads = tagger_leads && s.label != "SECRET";
             const bool sure =
-                leads && (s.label != "CITY" || s.confidence >= second_min_confidence || town_confirmed(s));
+                leads && (s.label != "CITY" || s.confidence >= second_min_confidence || town_confirmed(s)) &&
+                (s.label != "USERNAME" || !plain_word(s) || s.confidence >= second_min_confidence ||
+                 value_place(s) || account_confirmed(s));
             if (s.confidence >= (sure ? min_confidence : second_min_confidence))
                 candidates.emplace_back(s.confidence + (leads ? lead : 0), &s);
         }

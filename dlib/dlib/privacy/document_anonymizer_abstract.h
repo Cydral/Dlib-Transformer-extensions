@@ -3,6 +3,7 @@
 #undef DLIB_DOCUMENT_ANONYMIZER_ABSTRACT_H_
 #ifdef DLIB_DOCUMENT_ANONYMIZER_ABSTRACT_H_
 
+#include <functional>
 #include <string>
 #include <vector>
 #include "../documents/document_image_abstract.h"
@@ -96,6 +97,15 @@ namespace dlib
         std::string name;
         pii_type type = pii_type::none;
     };
+
+// ----------------------------------------------------------------------------------------
+
+    typedef std::function<std::string(pii_type type, const std::string& value)> document_value_writer;
+    /*!
+        Returns what a document writes in the place of a value of the given type, read from the
+        text: a fictive value, or a placeholder that the caller replaces afterwards
+        (fictive_batch::record()).
+    !*/
 
 // ----------------------------------------------------------------------------------------
 
@@ -309,6 +319,33 @@ namespace dlib
                   (set_text_substitute_resolver()). The names of the sheets of a workbook
                   and the tags that a document keeps for them in its custom properties are
                   written as without untagged text.
+        !*/
+
+        void set_value_writer(
+            const document_value_writer& write
+        );
+        /*!
+            ensures
+                - #value_writer() == write
+        !*/
+
+        const document_value_writer& value_writer(
+        ) const;
+        /*!
+            ensures
+                - Returns an empty function, the default, when the values take their tags or their
+                  substitutes (untagged_text()).
+                - Otherwise anonymize() and anonymize_text() write each value of the text formats
+                  (plain text, delimited values, markup) as write returns it, given the type and the
+                  value, without tag, substitute or report.substitutions: in the paragraphs of a text,
+                  the cells of a delimited file, the imposed columns among them, and the character
+                  data and attributes of markup, percent-encoded in a URI. A verified tag of a text
+                  protected before is given as its value. The entities are chosen as
+                  pseudonymizer::apply() chooses them, and the dates kept in clear (date_policy::keep)
+                  are not given. Each value is counted in report.entities as before.
+            throws
+                - anonymize() throws error for a document of another format (Word, Excel,
+                  PowerPoint, PDF) while a writer is set.
         !*/
 
         void set_text_substitute_resolver(

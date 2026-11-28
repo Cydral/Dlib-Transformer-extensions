@@ -26,6 +26,8 @@
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <winsock2.h>
+#include <iphlpapi.h>
 #else
 #include <dirent.h>
 #include <errno.h>
@@ -946,6 +948,79 @@ namespace pseudalis
             if (x != y) return x < y ? -1 : 1;
         }
         return 0;
+    }
+
+    std::string peer_account(int remote_port, int local_port)
+    {
+#if defined(_WIN32)
+        if (remote_port <= 0 || remote_port > 65535 || local_port <= 0 || local_port > 65535) return std::string();
+        // The connections of the computer with their processes; the ports are in the order of the network.
+        DWORD size = 0;
+        if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0) !=
+            ERROR_INSUFFICIENT_BUFFER)
+            return std::string();
+        std::vector<unsigned char> table(size + 16384);
+        size = static_cast<DWORD>(table.size());
+        if (GetExtendedTcpTable(table.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0) != NO_ERROR)
+            return std::string();
+        const MIB_TCPTABLE_OWNER_PID* t = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(table.data());
+        auto port = [](DWORD p) { return static_cast<int>(((p & 0xFF) << 8) | ((p >> 8) & 0xFF)); };
+        const DWORD loopback = 0x0100007Fu;
+        DWORD pid = 0;
+        for (DWORD k = 0; k < t->dwNumEntries; ++k)
+        {
+            const MIB_TCPROW_OWNER_PID& r = t->table[k];
+            if (port(r.dwLocalPort) == remote_port && port(r.dwRemotePort) == local_port && r.dwLocalAddr == loopback &&
+                r.dwRemoteAddr == loopback)
+            {
+                pid = r.dwOwningPid;
+                break;
+            }
+        }
+        if (pid == 0) return std::string();
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) return std::string();
+        std::string sid;
+        HANDLE token = nullptr;
+        if (OpenProcessToken(process, TOKEN_QUERY, &token))
+        {
+            DWORD need = 0;
+            GetTokenInformation(token, TokenUser, nullptr, 0, &need);
+            std::vector<unsigned char> user(need > 0 ? need : 1);
+            LPWSTR text = nullptr;
+            if (need > 0 && GetTokenInformation(token, TokenUser, user.data(), need, &need) &&
+                ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &text))
+            {
+                sid = narrow(text);
+                LocalFree(text);
+            }
+            CloseHandle(token);
+        }
+        CloseHandle(process);
+        return sid;
+#else
+        (void)remote_port;
+        (void)local_port;
+        return std::string();
+#endif
+    }
+
+    std::string account_name(const std::string& sid)
+    {
+#if defined(_WIN32)
+        PSID p = nullptr;
+        if (sid.empty() || !ConvertStringSidToSidW(widen(sid).c_str(), &p)) return sid;
+        wchar_t name[256], domain[256];
+        DWORD n = 256, d = 256;
+        SID_NAME_USE use;
+        std::string out = sid;
+        if (LookupAccountSidW(nullptr, p, name, &n, domain, &d, &use))
+            out = d > 0 ? narrow(domain) + "\\" + narrow(name) : narrow(name);
+        LocalFree(p);
+        return out;
+#else
+        return sid;
+#endif
     }
 
     std::string random_hex(size_t n)

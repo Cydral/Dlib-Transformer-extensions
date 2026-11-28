@@ -87,6 +87,24 @@ namespace pseudalis
         std::string state;              // "protected", "kept" or "folder"
     };
 
+    struct corpus_record
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A training corpus written with fictive values: its settings, its caller and the
+                number of its texts, never a text nor a value.  Its key lies in the folder of the
+                keys (keys.h) until the corpus is deleted, the record staying so that the web
+                application lists who used the mode and for how many texts.
+        !*/
+        std::string id;                 // 32 hexadecimal digits
+        int64_t created = 0;
+        std::string caller;             // the name the caller gave itself (X-Pseudalis-Caller), or "api"
+        std::string account;            // the security identifier of its Windows account, or empty
+        std::string settings;           // JSON: languages, date_shift_days, keep_city, sensitive_sentences
+        long long texts = 0;
+        int64_t deleted = 0;            // when its key was destroyed, else 0
+    };
+
     class store
     {
         /*!
@@ -191,6 +209,13 @@ namespace pseudalis
 
         void add_event(const std::string& kind, const std::string& path, const std::string& message);
         json events(long long since, int limit = 100);
+
+        // The training corpora (corpus_record), the newest first.
+        void add_corpus(const corpus_record& c);
+        bool get_corpus(const std::string& id, corpus_record& c);
+        void add_corpus_texts(const std::string& id, long long count);
+        void set_corpus_deleted(const std::string& id, int64_t when);
+        std::vector<corpus_record> corpora();
 
         std::string value(const std::string& key);
         void set_value(const std::string& key, const std::string& value);

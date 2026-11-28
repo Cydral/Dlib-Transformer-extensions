@@ -4055,9 +4055,12 @@ namespace dlib
                     }
                     if (a.size() == 15 && boundary_after(t, end))
                     {
+                        // The months of the register (01 to 12, 20 to 42 and 50 to 99 for a month not
+                        // known), and 13 to 19, which the register does not give and the fictive numbers
+                        // of fictive_values.h carry, so that a text written with them is protected again.
                         const int month = (a[3] - '0') * 10 + (a[4] - '0');
                         bool month_ok =
-                            (month >= 1 && month <= 12) || (month >= 20 && month <= 42) || (month >= 50 && month <= 99);
+                            (month >= 1 && month <= 42) || (month >= 50 && month <= 99);
                         if (month_ok && nir_key_valid(a))
                         {
                             add(out, i, end, pii_type::nir, 0.97);
@@ -6991,6 +6994,17 @@ namespace dlib
             if (type == pii_type::identifier)
             {
                 if (b > 0 && (is_word_char(t.cps[b - 1]) || t.cps[b - 1] == '_')) return true;
+                /* What a protection before left of a value beside the tag it wrote, glued to it or joined
+                   by a sign: "_B2" after the tag that took "REQ_SEC", "srv-" before the one that took "0042". */
+                {
+                    auto joiner = [](char32_t c) { return c == '_' || c == '-' || c == '.' || c == '/'; };
+                    std::size_t q = b;
+                    while (q > 0 && b - q < 2 && joiner(t.cps[q - 1])) --q;
+                    if (q >= 2 && t.cps[q - 1] == ']' && t.cps[q - 2] == ']') return true;
+                    std::size_t r = e;
+                    while (r < n && r - e < 2 && joiner(t.cps[r])) ++r;
+                    if (r + 1 < n && t.cps[r] == '[' && t.cps[r + 1] == '[') return true;
+                }
                 // A piece of a longer word or code: "REQ_SEC" in "REQ_SEC_B2".
                 if (e < n && (is_word_char(t.cps[e]) || (t.cps[e] == '_' && e + 1 < n && is_word_char(t.cps[e + 1]))))
                     return true;
@@ -8248,8 +8262,13 @@ namespace dlib
                 const std::size_t e = static_cast<std::size_t>(
                     std::lower_bound(t.offsets.begin(), t.offsets.end(), s.end) - t.offsets.begin());
                 if (e <= b || e > t.size()) continue;
-                // "au sens du RGPD", "Gemäß DSGVO": a law, a regulation or a standard names nobody.
+                // A reader may take a space with a value, the no-break space that ends a cell for one: the
+                // value starts and ends on a character that is none.
                 std::size_t pb = b, pe = e;
+                while (pb < pe && is_space(t.cps[pb])) ++pb;
+                while (pe > pb && is_space(t.cps[pe - 1])) --pe;
+                if (pe <= pb) continue;
+                // "au sens du RGPD", "Gemäß DSGVO": a law, a regulation or a standard names nobody.
                 if (type == pii_type::person || type == pii_type::organization || type == pii_type::location)
                 {
                     trim_regulations(text, t, pb, pe);

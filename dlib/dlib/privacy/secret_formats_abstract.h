@@ -231,8 +231,10 @@ namespace dlib
               a secret is written whole: to the space, the quote, the bracket, the comma,
               the semicolon, the equals sign or the colon before it, and to the space, the
               quote, the closing bracket, the comma or the semicolon after it, by 1024 bytes
-              at most on each side; a period or a colon that ends it is left out. An empty
-              range stays as it is.
+              at most on each side; a period or a colon that ends it is left out. A space is
+              one of ASCII or of Unicode, the no-break space among them, and the spaces that
+              the range holds at its ends are left out first. An empty range stays as it is,
+              and a range of spaces becomes empty.
     !*/
 
 // ----------------------------------------------------------------------------------------

@@ -44,6 +44,19 @@ namespace pseudalis
     bool load_master_key(const std::string& keys_dir, std::string& master, bool& created, std::string& error);
     bool save_master_key(const std::string& keys_dir, const std::string& master, std::string& error);
 
+    /*!
+        ensures
+            - Creates the key of a training corpus, 32 random bytes, in keys_dir/corpora/<id>.key,
+              protected as the master key is (DPAPI for the account of the service on Windows), and
+              gives it in key.  id is 32 hexadecimal digits.  Returns false with error when the key
+              cannot be written or already exists.
+    !*/
+    bool create_corpus_key(const std::string& keys_dir, const std::string& id, std::string& key, std::string& error);
+    // The key of a corpus, false when it is gone or cannot be read.
+    bool load_corpus_key(const std::string& keys_dir, const std::string& id, std::string& key, std::string& error);
+    // Overwrites and removes the key of a corpus; true when no key of it remains.
+    bool destroy_corpus_key(const std::string& keys_dir, const std::string& id);
+
     // The export of the master key: a JSON document protected by passphrase (12 characters at least).
     std::string export_master_key(const std::string& master, const std::string& passphrase);
     bool import_master_key(const std::string& exported, const std::string& passphrase, std::string& master,

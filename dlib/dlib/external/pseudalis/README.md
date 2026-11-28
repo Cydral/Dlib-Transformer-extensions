@@ -54,6 +54,12 @@ character that Windows refuses in a name. The database records each substitute w
 its value in clear; a restoration gives back the original name and the original properties, those of a
 copy edited since included, as long as the substitutes stay in place.
 
+In a Word document, the fields that refer to another place of the document or number it (a
+cross-reference, the page of an entry of a table of contents, the number of a figure) keep their
+instructions as written: their arguments name a bookmark, a style or a sequence, and Word updates these
+fields in the protected copy as in the original. The text that a field shows is read as the rest of the
+document, and so are the instructions of the other fields, the address of a link for one.
+
 ### Without tags
 
 The values can also be written without their tags, their substitutes alone, as the names already are:
@@ -345,6 +351,60 @@ the record gives the originals back.
   and the engine applies a new list at once, to the files processed afterwards. The sheets of the
   workbooks, and the other kinds of files, are read as before.
 
+### Training corpora with fictive values
+
+A program of this computer that trains models on local documents, Albireo-Training for instance, needs
+texts whose values read as real ones: a model trained on tags learns to write tags, and one trained on
+substitutes learns names and addresses of no language. It asks the service, through its interface alone,
+to write texts with plausible fictive values: each value found takes a value of the same type, of the same
+language and of the same form, drawn under the key of a corpus, the same in every text of the corpus,
+and nothing gives the original back. The web application offers no way to use this writing; its settings
+list the programs that used it and the number of their texts.
+
+| Original | Fictive value (one key, languages fr and en) |
+| --- | --- |
+| Jean Dupont, M. Dupont, J. Dupont | Patrice Gilel, M. Gilel, P. Gilel |
+| jean.dupont@acme.fr | patrice.gilel@labon.example.com |
+| 06 12 34 56 78 | 06 39 98 84 61 |
+| ACME Industries SA | TMEN Industries SA |
+| 12 rue des Lilas, 35000 Rennes | 97 rue des Érables, 35000 Rennes |
+| 12/03/2024 | 04/06/2024 (the shift of its document, 12 weeks, weekday kept) |
+
+- A corpus is made by `POST /v1/corpus` with its languages, the bound of the shift of its dates (180 days
+  by default), `keep_city` and `sensitive_sentences`; the service makes its key, 32 random bytes kept in
+  `keys\corpora` and protected by DPAPI for its account, as its master key is, and gives its identifier.
+  `POST /v1/corpus/<id>/texts` writes batches of 256 texts or 4 MiB, `POST /v1/corpus/<id>/stream` lines
+  of JSON of any number, `GET` tells its state and `DELETE` destroys its key: the texts written stay
+  coherent with one another, and no text can be added to them any more (410, code `corpus_deleted`). The
+  same routes take `"substitutes": "tags"` or `"tagless"`, the two other writings.
+- The routes take the administration token, from a program of this computer, and the routes of a corpus
+  the Windows account that made it (403, code `corpus_caller`); a restoration of such a text is refused
+  (409, code `fictive_not_restorable`). The service records the settings of a corpus, its caller and the
+  number of its texts, never a text nor a value, and writes none in its log.
+- A given name takes a given name of its language and of its sex, read from its lexicon, else from the
+  civility before it in the texts of the batch, whose initial is the fictive initial of its own; a family
+  name takes a family name of its language made of a stem and an ending. Particles, civilities, legal
+  forms, words of trade, types of streets and small words stay. A city of 50,000 inhabitants or more stays
+  with its postal code when `keep_city` is true, the default, in an address as in the name of an
+  organization (`Université de Rennes` stays); the other places take a city of the same country and of
+  the same size class, a small town for a place the lexicon does not know.
+- The numbers take the ranges that designate no subscriber, account, person or host where one is
+  published: the ranges reserved for fiction by ARCEP, by the NANP (555-0100 to 555-0199), by Ofcom and
+  by the Bundesnetzagentur, the fictive bank codes 990xx of the test base of the Banque de France, a month
+  from 13 to 19 in a NIR, the domains `example.com`, `example.org` and `example.net`, the addresses of
+  documentation 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and 2001:db8::/32. A card keeps the prefix
+  of a test number that the processors publish, and a SIREN the class of its first digit, 1 or 2 for a
+  public body; the keys of the IBAN, of the RIB, of the cards, of the NIR and of the SIRET are valid, and
+  the detector finds these numbers again in a text written with them, which can then be protected as any
+  other. A secret takes characters of the same classes that it does not hold.
+- A value of the batch is never given as the fictive value of another: a draw that equals an original of
+  the batch is drawn again, for every occurrence of the batch. The imposed terms are read first, and a
+  text named `.csv`, or whose header names an imposed column, is read as a CSV file whose imposed columns
+  take fictive values whole.
+- The version of the lexicons of the fictive values (`lexicons`, "1.1.0-" and 12 hexadecimal digits of
+  their digest) is given with the models by `GET /v1/corpus/<id>` and `/v1/info`; the lexicons are
+  compiled into the engine, whose installer and update feed are signed.
+
 ### Pictures and Albireo
 
 When Albireo, the local inference service, is installed on the same computer and one of its models reads
@@ -536,7 +596,11 @@ The script builds every program into `build-pseudalis\bin`; the installer,
 `build-pseudalis\bin\pseudalis-setup.exe`, carries them all, with the runtime linked statically. The
 engines compile the models of the header
 [`examples/slm_document_anonymizer_ex.h`](../../../examples/slm_document_anonymizer_ex.h)
-(`PSEUDALIS_MODELS_HEADER`). `-Tests` also builds and runs the tests.
+(`PSEUDALIS_MODELS_HEADER`). `-Tests` also builds and runs the tests of the engine and of the service, then
+runs the two engines built, as the service loads them, on the same documents
+([`tests/test_engines.cpp`](tests/test_engines.cpp)), and stops when they write different files: the
+engine of the processors with AVX2 runs there before its installation. The script prints the commit it
+builds, first and again beside the installer, and says when files of the copy differ from that commit.
 
 The build checks, before it packs the installer and once it is linked, that each program and each engine
 imports the libraries of Windows alone, found in System32, or its API sets
@@ -550,7 +614,7 @@ of the programs, and refuses an engine of another version or of another build.
 ### Linux
 
 The service builds on Linux with its engine inside and its drive as a folder without letter, for the
-tests of the engine, of the host, of the interface and of the drive:
+tests of the engine, of its two libraries, of the host, of the interface and of the drive:
 
 ```
 bash dlib/dlib/external/pseudalis/tools/test_linux.sh
@@ -601,7 +665,9 @@ first failure:
    the interface disagree.
 2. Windows, in the copy of the production chain, `%USERPROFILE%\work\Dlib-Transformer-extensions`:
    the installer is built from the sources pushed, tested and installed in place
-   (`tools/build_windows.ps1 -Tests -Install`), which prints its size, its SHA-256 and its path under WSL.
+   (`tools/build_windows.ps1 -Tests -Install`), which prints the commit it builds, the size of the
+   installer, its SHA-256 and its path under WSL. A version is built once: the trace of that build tells
+   which state of the repository its installer holds, other subjects moving the main branch meanwhile.
 3. Linux, where the private key and the chain of the website lie: the installer of that copy, which Linux
    reads under `/mnt/c/Users/<user>/work`, goes into the folder of the publication with the feed written
    and signed for it, the chain of the website publishes the three files, and the publication ends once
@@ -619,7 +685,8 @@ Set-Location $env:USERPROFILE\work\Dlib-Transformer-extensions; git pull --ff-on
 
 ```
 git pull --ff-only &&
-python3 dlib/dlib/external/pseudalis/tools/publish_release.py --key ~/keys/pseudalis-feed-signing.key --notes notes.json
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py --version 1.1.0 --key ~/keys/pseudalis-feed-signing.key \
+  --notes pseudalis-notes-1.1.0.json
 ```
 
 Without an installer named, `publish_release.py` takes the one of the copy of the production chain,
@@ -627,7 +694,9 @@ Without an installer named, `publish_release.py` takes the one of the copy of th
 refuses an installer of another folder unless `--any-folder` is given.
 
 `publish_release.py` checks that the installer carries the version of
-[`common/version.h`](common/version.h), that the feed announces no later one, that the key is the one of
+[`common/version.h`](common/version.h), that `--version` names that version and that the name of the
+notes holds no other (`pseudalis-notes-<version>.json`), so that a publication run after a commit that
+stopped publishes nothing, that the feed announces no later one, that the key is the one of
 the public key of the sources, and that the chain of the website is there (`--site`,
 `~/work/cydral-website` by default), in version 1.0.5 at least, the first that takes the files of a
 product in `dist` (its file `VERSION`; `tools/site.sh update` installs a later package), with its folder
@@ -705,3 +774,17 @@ folder above, from 1.0.13 to 1.0.15: they are updated once by hand, with the ins
   personal data: a text file of tens of megabytes takes minutes.
 - The protection is a pseudonymization in the sense of the GDPR: the key restores the data, which stay
   personal data for its holder.
+- The fictive values replace the values that the detector finds, with its limits: a value it misses stays
+  in clear in a text of a corpus. No sentence of the categories of articles 9 and 10 of the GDPR is told
+  apart in this version: `sensitive_sentences` is recorded with the corpus, and no text is dropped.
+- The collision of a draw with an original is checked within the batch, the corpus keeping no value: a
+  value whose first draw is an original of one batch takes another fictive value in that batch than in
+  the others, which the stems and endings of the family names make rare and the small lists of given
+  names less so.
+- Italy, Spain and the countries other than France, the United Kingdom, Germany and those of the NANP
+  publish no telephone ranges for fiction known to this version: their numbers keep their country code and
+  their first two national digits, the others drawn, which may name an assigned number. The bank code of
+  an IBAN of another country than France is drawn, its account too. Neither the card networks nor the
+  register of companies reserve numbers for tests: a fictive card number or SIREN may be one in use.
+- A text of a corpus is read as plain text or as a CSV file: the markup, Office and PDF documents are
+  extracted by the caller before they are sent.

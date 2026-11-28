@@ -42,6 +42,12 @@ namespace dlib
                 lengths, drawn with the given weights, teach the model short units such
                 as table cells and long ones such as paragraphs. A window that starts
                 inside a span starts it with its B class.
+
+                The examples are laid in an order drawn from seed and drawn again at each
+                pass over the training set. steps * batch_size windows read a part of that
+                order, a pass or several: two trainings on the same training set with the
+                same seed read the same windows in the same order, and those that stop
+                before the end of a pass never read the examples that end it.
         !*/
         unsigned long steps = 20000;            // optimizer steps
         unsigned long batch_size = 32;          // windows per step
@@ -157,7 +163,10 @@ namespace dlib
                 - When options.continue_training is true and is_trained() == true, starts
                   from the current weights: a complementary training, on new data mixed
                   with the data the model was trained on so that it keeps what it knows,
-                  usually with a lower learning rate. The solver state starts afresh.
+                  usually with a lower learning rate. The solver state starts afresh. On
+                  the training set and with the seed of the training before it, it reads
+                  the windows that training read first: another seed, or the examples in
+                  another order, gives it other windows.
                 - Otherwise seeds std::rand() with options.seed, since the layers draw their
                   initial weights from it; with the same data, options and device, two
                   trainings give the same model.

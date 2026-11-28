@@ -14,6 +14,7 @@
 #include "privacy/ooxml_anonymizer.h"
 #include "privacy/pdf_anonymizer.h"
 #include "privacy/document_anonymizer.h"
+#include "privacy/fictive_values.h"
 #include "privacy/pii_dataset.h"
 
 /*

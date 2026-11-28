@@ -52,6 +52,20 @@ int main()
     CHECK(aes256_ctr(keys.vault_encryption, std::string(16, '\1'),
                      aes256_ctr(keys.vault_encryption, std::string(16, '\1'), "round trip")) == "round trip");
 
+    // The keys of the training corpora: made once, read back, overwritten and removed; no other name taken.
+    {
+        const std::string id = "0123456789abcdef0123456789abcdef";
+        std::string corpus_key, read_back;
+        CHECK(create_corpus_key(join_path(dir, "keys"), id, corpus_key, error) && corpus_key.size() == 32);
+        CHECK(!create_corpus_key(join_path(dir, "keys"), id, read_back, error));
+        CHECK(load_corpus_key(join_path(dir, "keys"), id, read_back, error) && read_back == corpus_key);
+        CHECK(!create_corpus_key(join_path(dir, "keys"), "../master", read_back, error));
+        CHECK(!load_corpus_key(join_path(dir, "keys"), "../../keys/master", read_back, error));
+        CHECK(destroy_corpus_key(join_path(dir, "keys"), id) && !load_corpus_key(join_path(dir, "keys"), id, read_back,
+                                                                                   error));
+        CHECK(file_exists(join_path(join_path(dir, "keys"), "master.key")));
+    }
+
     // The vault: blobs read back, altered ones refused.
     vault v(join_path(dir, "vault"), keys.vault_encryption, keys.vault_authentication);
     const std::string data(100000, 'x');
@@ -244,6 +258,29 @@ int main()
     // The database: records, pictures and the tree of the drive.
     {
         store db(join_path(dir, "pseudalis.db"));
+        // The corpora: settings, caller and number of texts, the newest first, deleted ones kept.
+        {
+            corpus_record c;
+            c.id = "00112233445566778899aabbccddeeff";
+            c.created = 100;
+            c.caller = "Albireo-Training";
+            c.account = "S-1-5-18";
+            c.settings = "{\"languages\": [\"fr\"]}";
+            db.add_corpus(c);
+            corpus_record c2 = c;
+            c2.id = "ffeeddccbbaa99887766554433221100";
+            c2.created = 200;
+            db.add_corpus(c2);
+            db.add_corpus_texts(c.id, 3);
+            db.add_corpus_texts(c.id, 2);
+            db.set_corpus_deleted(c2.id, 300);
+            corpus_record back;
+            CHECK(db.get_corpus(c.id, back) && back.texts == 5 && back.caller == "Albireo-Training" &&
+                  back.account == "S-1-5-18" && back.deleted == 0 && back.settings == c.settings);
+            const std::vector<corpus_record> all = db.corpora();
+            CHECK(all.size() == 2 && all[0].id == c2.id && all[0].deleted == 300 && all[1].texts == 5);
+            CHECK(!db.get_corpus("0000", back));
+        }
         file_record r;
         r.source = "shell";
         r.original_name = "CV Jean Dupont.docx";

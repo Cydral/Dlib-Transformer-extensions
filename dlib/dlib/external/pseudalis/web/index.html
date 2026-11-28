@@ -149,6 +149,17 @@
         <span data-t="set_updates"></span></label>
       <div class="buttons"><button id="settings-save" data-t="btn_save"></button></div>
       <p class="message" id="settings-message" hidden></p>
+      <!-- The programs that had texts written with fictive values: the mode is asked by the interface alone. -->
+      <h3 class="corpora-title" data-t="corpora_title"></h3>
+      <p class="hint" data-t="corpora_hint"></p>
+      <table class="records" id="corpora-table" hidden>
+        <thead>
+          <tr><th data-t="col_caller"></th><th data-t="col_account"></th><th data-t="col_corpora"></th>
+            <th data-t="col_texts"></th><th data-t="col_last"></th></tr>
+        </thead>
+        <tbody id="corpora"></tbody>
+      </table>
+      <p class="hint" id="corpora-none" data-t="corpora_none" hidden></p>
     </section>
 
     <section class="card" id="terms-card" hidden>

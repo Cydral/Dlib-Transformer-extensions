@@ -197,6 +197,20 @@ namespace pseudalis
         bool text(const std::string& operation, const std::string& text, json& out, user_error& error,
             bool tags = true, const json& substitutions = json());
         /*!
+            The training corpora written with fictive values (the routes /v1/corpus).
+            create_corpus() makes the key of a corpus in keys/corpora, protected as the master key
+            is, and records its settings and its caller; corpus_texts() writes texts with fictive
+            values under that key (engine::fictive()), recording their number alone; delete_corpus()
+            destroys the key, the record staying for the web application, which lists the callers and
+            their numbers of texts.  Nothing of a text reaches the log or the database, and nothing
+            gives an original back.
+        !*/
+        bool create_corpus(const json& settings, const std::string& caller, const std::string& account,
+            std::string& id, user_error& error);
+        bool corpus_texts(const corpus_record& c, const json& texts, json& results, user_error& error);
+        bool delete_corpus(const std::string& id);
+
+        /*!
             Deletes a record, its original and the pictures no other record shows.  With a
             reason, "forgotten" when a user asked for it, "expired" when its time is over or
             "space" when the oldest originals make room (make_room()), the protected file of

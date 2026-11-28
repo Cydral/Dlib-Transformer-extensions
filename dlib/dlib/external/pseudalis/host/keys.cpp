@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
 
 #include <dlib/crypto/aes.h>
 #include <dlib/crypto/crypto_utils.h>
@@ -38,8 +39,15 @@ namespace pseudalis
             return join_path(dir, "master.key");
         }
 
+        // The file of the key of a corpus, for an identifier of 32 hexadecimal digits alone.
+        std::string corpus_key_path(const std::string& dir, const std::string& id)
+        {
+            if (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos) return std::string();
+            return join_path(join_path(dir, "corpora"), id + ".key");
+        }
+
 #if defined(_WIN32)
-        bool dpapi(const std::string& in, std::string& out, bool protect)
+        bool dpapi(const std::string& in, std::string& out, bool protect, const wchar_t* what = L"Pseudalis master key")
         {
             DATA_BLOB a, b;
             a.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(in.data()));
@@ -47,8 +55,7 @@ namespace pseudalis
             b.pbData = nullptr;
             b.cbData = 0;
             const BOOL ok = protect
-                ? CryptProtectData(&a, L"Pseudalis master key", nullptr, nullptr, nullptr,
-                                   CRYPTPROTECT_UI_FORBIDDEN, &b)
+                ? CryptProtectData(&a, what, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &b)
                 : CryptUnprotectData(&a, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &b);
             if (!ok) return false;
             out.assign(reinterpret_cast<const char*>(b.pbData), b.cbData);
@@ -225,6 +232,99 @@ namespace pseudalis
             return false;
         }
         return true;
+    }
+
+    bool create_corpus_key(const std::string& keys_dir, const std::string& id, std::string& key, std::string& error)
+    {
+        const std::string path = corpus_key_path(keys_dir, id);
+        if (path.empty() || !private_folder(keys_dir, error) || !private_folder(parent_path(path), error))
+        {
+            if (error.empty()) error = "the identifier of the corpus is not valid";
+            return false;
+        }
+        if (file_exists(path))
+        {
+            error = "the key of this corpus exists already";
+            return false;
+        }
+        key = dlib::generate_secure_random_bytes(32);
+        std::string stored;
+#if defined(_WIN32)
+        if (!dpapi(key, stored, true, L"Pseudalis corpus key"))
+        {
+            wipe(key);
+            error = "DPAPI cannot protect the key of the corpus";
+            return false;
+        }
+#else
+        stored = key;
+#endif
+        const bool ok = write_file_restricted(path, "PSDC1" + stored);
+        wipe(stored);
+        if (!ok)
+        {
+            wipe(key);
+            error = "cannot write the key of the corpus";
+        }
+        return ok;
+    }
+
+    bool load_corpus_key(const std::string& keys_dir, const std::string& id, std::string& key, std::string& error)
+    {
+        const std::string path = corpus_key_path(keys_dir, id);
+        std::string data;
+        if (path.empty() || !file_exists(path) || !read_file(path, data, 64 * 1024) || data.compare(0, 5, "PSDC1") != 0)
+        {
+            wipe(data);
+            error = "the key of the corpus is gone";
+            return false;
+        }
+        std::string stored = data.substr(5);
+        wipe(data);
+#if defined(_WIN32)
+        const bool ok = dpapi(stored, key, false);
+        wipe(stored);
+        if (!ok)
+        {
+            error = "DPAPI cannot open the key of the corpus";
+            return false;
+        }
+#else
+        key = stored;
+        wipe(stored);
+#endif
+        if (key.size() != 32)
+        {
+            wipe(key);
+            error = "the key of the corpus is damaged";
+            return false;
+        }
+        return true;
+    }
+
+    bool destroy_corpus_key(const std::string& keys_dir, const std::string& id)
+    {
+        const std::string path = corpus_key_path(keys_dir, id);
+        if (path.empty()) return false;
+        if (!file_exists(path)) return true;
+        // Its bytes overwritten in place first, then the file removed.
+        const uint64_t size = file_size(path);
+        {
+            std::fstream f;
+#if defined(_WIN32)
+            f.open(widen(path).c_str(), std::ios::in | std::ios::out | std::ios::binary);
+#else
+            f.open(path.c_str(), std::ios::in | std::ios::out | std::ios::binary);
+#endif
+            if (f && size > 0 && size <= 65536)
+            {
+                std::string noise = dlib::generate_secure_random_bytes(static_cast<size_t>(size));
+                f.write(noise.data(), static_cast<std::streamsize>(noise.size()));
+                f.flush();
+                wipe(noise);
+            }
+        }
+        return remove_file(path) || !file_exists(path);
     }
 
     std::string export_master_key(const std::string& master, const std::string& passphrase)

@@ -191,7 +191,7 @@ target_include_directories(pseudalis_common PUBLIC ${PSEUDALIS_INCLUDE_DIR})
 target_compile_options(pseudalis_common PRIVATE ${PSEUDALIS_WARNINGS})
 target_link_libraries(pseudalis_common PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 if (WIN32)
-   target_link_libraries(pseudalis_common PUBLIC shell32 ole32 bcrypt advapi32)
+   target_link_libraries(pseudalis_common PUBLIC shell32 ole32 bcrypt advapi32 iphlpapi)
 endif()
 
 # The public key of the update feed, which pseudalis-sign keygen writes once, beside the private
@@ -276,4 +276,11 @@ if (PSEUDALIS_TESTS)
       target_link_libraries(test_host PRIVATE crypt32)
    endif()
    target_compile_options(test_host PRIVATE ${PSEUDALIS_WARNINGS})
+   # The engine libraries as the service loads them: the scripts of the build run this program once for
+   # each variant, the only test of the code of the AVX2 engine, and compare what the two wrote.
+   add_executable(test_engines tests/test_engines.cpp common/engine_loader.cpp)
+   target_include_directories(test_engines PRIVATE ${CMAKE_BINARY_DIR}/generated)
+   target_link_libraries(test_engines PRIVATE pseudalis_common)
+   target_compile_options(test_engines PRIVATE ${PSEUDALIS_WARNINGS})
+   add_dependencies(test_engines pseudalis-engine pseudalis-engine-avx2)
 endif()

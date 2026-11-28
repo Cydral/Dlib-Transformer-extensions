@@ -5,7 +5,7 @@ Publishes a version of Pseudalis on the website: puts its installer in the folde
 the website that holds the files of Pseudalis, beside the update feed that announces it, written
 and signed, has the chain publish the three files, then checks what the website serves.
 
-    python3 publish_release.py [<pseudalis-setup.exe>] --key <private key>
+    python3 publish_release.py [<pseudalis-setup.exe>] --version <x.y.z> --key <private key>
                                [--notes <notes.json>] [--sign <pseudalis-sign>]
                                [--site <folder>] [--deposit] [--dry-run] [--wait <seconds>]
     python3 publish_release.py --check [--site <folder>] [--wait <seconds>]
@@ -24,7 +24,10 @@ product the same layout, files/<product>/dist/: the folder of the publication is
 the sources alone, and nothing of a publication is written in it.
 
 The version is that of common/version.h, which must also be the version the installer carries
-in its resources.  The installer is copied into the folder of the publication as
+in its resources and the one --version names: a publication of other sources than those of the
+version meant, the commit of a version that stopped before it was made for instance, is refused
+before anything is written, as are notes whose file name holds another version
+(pseudalis-notes-<version>.json).  The installer is copied into the folder of the publication as
 pseudalis-setup-<version>.exe, and the installers of the other versions leave it.  The feed
 names the installer by its file beside it, with its size and its SHA-256; the program writes it
 with LF ends of line, signs it with pseudalis-sign, checks the signature with the public key of
@@ -389,6 +392,8 @@ def main():
     p.add_argument("--check-key", action="store_true")
     p.add_argument("--create-key", action="store_true")
     p.add_argument("--wait", type=int, default=300)
+    p.add_argument("--version", help="the version meant, which the sources, the installer and the name of the "
+                   "notes must carry")
     p.add_argument("--any-folder", action="store_true", help="take an installer of another copy than the one of "
                    "the production chain")
     a = p.parse_args()
@@ -426,6 +431,15 @@ def main():
         if not os.path.isfile(a.installer):
             raise RuntimeError("no installer at %s: build it on Windows first (tools/build_windows.ps1)" % a.installer)
         version = source_version()
+        # The version meant, against the sources, then against the name of the notes.
+        if not a.version:
+            raise RuntimeError("--version names the version to publish, %s for these sources" % version)
+        if a.version != version:
+            raise RuntimeError("the sources are of version %s, not %s: build and commit version %s first, then publish "
+                               "its installer" % (version, a.version, a.version))
+        named = re.search(r"\d+\.\d+\.\d+", os.path.basename(a.notes or ""))
+        if named and named.group(0) != version:
+            raise RuntimeError("the notes %s are those of version %s, not %s" % (a.notes, named.group(0), version))
         # The folder of the website, then the key, are checked before anything is written.
         site, dist = check_site(a.site)
         feed_path = os.path.join(dist, "feed.json")

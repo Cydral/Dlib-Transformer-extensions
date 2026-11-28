@@ -55,6 +55,11 @@ namespace pseudalis
             "CREATE TABLE IF NOT EXISTS text_substitutes(record INTEGER NOT NULL REFERENCES files(id)"
             " ON DELETE CASCADE, substitute TEXT NOT NULL, tag TEXT NOT NULL, places INTEGER NOT NULL,"
             " inherited INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(record, substitute, tag)) WITHOUT ROWID;"
+            /* The training corpora written with fictive values: settings, caller and number of texts,
+               never a text nor a value. */
+            "CREATE TABLE IF NOT EXISTS corpora(id TEXT PRIMARY KEY, created INTEGER NOT NULL, caller TEXT NOT NULL,"
+            " account TEXT NOT NULL, settings TEXT NOT NULL, texts INTEGER NOT NULL DEFAULT 0,"
+            " deleted INTEGER NOT NULL DEFAULT 0);"
             // The files of the folder of the drive as the service left them.
             "CREATE TABLE IF NOT EXISTS folder_files(folder TEXT NOT NULL, path TEXT NOT NULL COLLATE NOCASE,"
             " size INTEGER NOT NULL, written INTEGER NOT NULL, sha256 TEXT NOT NULL, record INTEGER NOT NULL,"
@@ -745,6 +750,68 @@ namespace pseudalis
         std::vector<std::string> tags;
         while (s.step()) tags.push_back(s.text(0));
         return tags;
+    }
+
+    namespace
+    {
+        corpus_record read_corpus_row(statement& s)
+        {
+            corpus_record c;
+            c.id = s.text(0);
+            c.created = s.integer(1);
+            c.caller = s.text(2);
+            c.account = s.text(3);
+            c.settings = s.text(4);
+            c.texts = s.integer(5);
+            c.deleted = s.integer(6);
+            return c;
+        }
+    }
+
+    void store::add_corpus(const corpus_record& c)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT INTO corpora(id, created, caller, account, settings, texts, deleted)"
+                         " VALUES(?1, ?2, ?3, ?4, ?5, 0, 0)");
+        s.bind(1, c.id).bind(2, static_cast<long long>(c.created)).bind(3, c.caller).bind(4, c.account)
+            .bind(5, c.settings);
+        s.step();
+    }
+
+    bool store::get_corpus(const std::string& id, corpus_record& c)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT id, created, caller, account, settings, texts, deleted FROM corpora WHERE id = ?1");
+        s.bind(1, id);
+        if (!s.step()) return false;
+        c = read_corpus_row(s);
+        return true;
+    }
+
+    void store::add_corpus_texts(const std::string& id, long long count)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "UPDATE corpora SET texts = texts + ?2 WHERE id = ?1");
+        s.bind(1, id).bind(2, count);
+        s.step();
+    }
+
+    void store::set_corpus_deleted(const std::string& id, int64_t when)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "UPDATE corpora SET deleted = ?2 WHERE id = ?1 AND deleted = 0");
+        s.bind(1, id).bind(2, static_cast<long long>(when));
+        s.step();
+    }
+
+    std::vector<corpus_record> store::corpora()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT id, created, caller, account, settings, texts, deleted FROM corpora"
+                         " ORDER BY created DESC, id");
+        std::vector<corpus_record> out;
+        while (s.step()) out.push_back(read_corpus_row(s));
+        return out;
     }
 
     std::string store::value(const std::string& key)

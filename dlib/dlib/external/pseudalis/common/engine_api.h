@@ -17,7 +17,7 @@
 
     request is a JSON object:
         "operation"     "anonymize", "restore", "anonymize_text", "restore_text", "detect",
-                        "anonymize_name", "restore_name" or "extract"
+                        "anonymize_name", "restore_name", "extract" or "fictive"
         "name"          the name of the file, whose extension tells its kind when its
                         content does not
         "entry"         "extract": the path of an entry in the archive given as data
@@ -29,6 +29,9 @@
         "ascii_encoding" "restore": "windows-1252" writes in that encoding a text file whose
                         bytes are plain ASCII, its original having been written so (the
                         "encoding" of the report of its protection); UTF-8 otherwise
+        "key", "languages", "date_shift_days", "keep_city"
+                        "fictive": the key of a training corpus in 64 hexadecimal digits and the
+                        settings of the corpus (dlib::fictive_options)
     result receives a JSON object: "name" (the name of the output, protected or restored:
     "photo.png.txt" for a picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx",
     "pdf", "image", "zip", "tar", "tar.gz" or "text"), "report" ({"values": {type: count},
@@ -49,7 +52,11 @@
     path in the archive read), "name" (its path in the archive written), "sha256" (of the
     bytes written), "kind"}], the entries of an archive inside the archive after it, their
     paths after its own and '!' ("dossier/notes.tar.gz!a.txt").  The caller knows by them a
-    file extracted from a protected archive.  "extract" gives as output the bytes of the
+    file extracted from a protected archive.
+    "fictive" takes as data {"texts": [{"ref", "text", "name", "document"}]} and gives as output
+    {"results": [{"ref", "text", "counts", "dropped"}]}: each value found takes a fictive value
+    drawn under the key of the corpus, nothing being recorded, and the result holds "kind":
+    "corpus" and "report": {"lexicons", "texts"} (engine::fictive()).  "extract" gives as output the bytes of the
     entry "entry" of the archive given as data, read as "anonymize" read it: an "original"
     of "entries", whose original archive the caller kept.
 
@@ -86,7 +93,7 @@
 #define PSD_CALL
 #endif
 
-#define PSEUDALIS_ENGINE_API_VERSION 5
+#define PSEUDALIS_ENGINE_API_VERSION 6
 
 #ifdef __cplusplus
 extern "C" {

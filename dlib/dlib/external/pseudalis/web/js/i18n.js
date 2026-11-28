@@ -115,6 +115,17 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Letter of the drive (empty: no drive)',
     set_albireo: 'Describe the pictures with Albireo when it is installed',
     set_updates: 'Check for updates every day',
+    corpora_title: 'Training corpora with fictive values',
+    corpora_hint: 'Programs of this computer, such as Albireo-Training, may ask the service through its interface ' +
+      'to write texts with plausible fictive values for the corpora they train models on. Nothing of these texts ' +
+      'is kept, and they cannot be restored. The callers that used this writing and the number of their texts are ' +
+      'listed here.',
+    col_caller: 'Caller',
+    col_account: 'Windows account',
+    col_corpora: 'Corpora',
+    col_texts: 'Texts',
+    col_last: 'Latest corpus',
+    corpora_none: 'No program has used this writing.',
     set_max: 'Largest file (MB)',
     set_removed: 'Kept after leaving the drive (days)',
     btn_save: 'Save',
@@ -332,6 +343,17 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Lettre du lecteur (vide : pas de lecteur)',
     set_albireo: "Décrire les images avec Albireo lorsqu'il est installé",
     set_updates: 'Rechercher les mises à jour chaque jour',
+    corpora_title: 'Corpus d\'apprentissage à valeurs fictives',
+    corpora_hint: 'Des programmes de cet ordinateur, comme Albireo-Training, peuvent demander au service, par son ' +
+      'interface, d\'écrire des textes avec des valeurs fictives vraisemblables pour les corpus sur lesquels ils ' +
+      'entraînent des modèles. Rien de ces textes n\'est conservé et ils ne peuvent pas être restaurés. Les ' +
+      'appelants qui ont employé cette écriture et le nombre de leurs textes figurent ici.',
+    col_caller: 'Appelant',
+    col_account: 'Compte Windows',
+    col_corpora: 'Corpus',
+    col_texts: 'Textes',
+    col_last: 'Dernier corpus',
+    corpora_none: 'Aucun programme n\'a employé cette écriture.',
     set_max: 'Fichier le plus grand (Mo)',
     set_removed: 'Conservation après retrait du lecteur (jours)',
     btn_save: 'Enregistrer',
@@ -552,6 +574,17 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Laufwerksbuchstabe (leer: kein Laufwerk)',
     set_albireo: 'Bilder mit Albireo beschreiben, wenn es installiert ist',
     set_updates: 'Täglich nach Updates suchen',
+    corpora_title: 'Trainingskorpora mit fiktiven Werten',
+    corpora_hint: 'Programme dieses Computers wie Albireo-Training können den Dienst über seine Schnittstelle ' +
+      'bitten, Texte mit plausiblen fiktiven Werten für die Korpora zu schreiben, mit denen sie Modelle ' +
+      'trainieren. Von diesen Texten wird nichts aufbewahrt, und sie lassen sich nicht wiederherstellen. Hier ' +
+      'stehen die Aufrufer, die diese Schreibweise verwendet haben, und die Zahl ihrer Texte.',
+    col_caller: 'Aufrufer',
+    col_account: 'Windows-Konto',
+    col_corpora: 'Korpora',
+    col_texts: 'Texte',
+    col_last: 'Letztes Korpus',
+    corpora_none: 'Kein Programm hat diese Schreibweise verwendet.',
     set_max: 'Größte Datei (MB)',
     set_removed: 'Aufbewahrung nach Entfernen vom Laufwerk (Tage)',
     btn_save: 'Speichern',
@@ -776,6 +809,17 @@ window.PSEUDALIS_TEXTS = {
     set_drive: "Lettera dell'unità (vuota: nessuna unità)",
     set_albireo: 'Descrivere le immagini con Albireo quando è installato',
     set_updates: 'Cercare gli aggiornamenti ogni giorno',
+    corpora_title: 'Corpora di addestramento con valori fittizi',
+    corpora_hint: 'I programmi di questo computer, come Albireo-Training, possono chiedere al servizio, tramite la ' +
+      'sua interfaccia, di scrivere testi con valori fittizi verosimili per i corpora su cui addestrano modelli. ' +
+      'Nulla di questi testi viene conservato e non possono essere ripristinati. Qui figurano i chiamanti che ' +
+      'hanno usato questa scrittura e il numero dei loro testi.',
+    col_caller: 'Chiamante',
+    col_account: 'Account di Windows',
+    col_corpora: 'Corpora',
+    col_texts: 'Testi',
+    col_last: 'Ultimo corpus',
+    corpora_none: 'Nessun programma ha usato questa scrittura.',
     set_max: 'File più grande (MB)',
     set_removed: 'Conservazione dopo la rimozione dall’unità (giorni)',
     btn_save: 'Salva',
@@ -995,6 +1039,17 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Letra de la unidad (vacía: sin unidad)',
     set_albireo: 'Describir las imágenes con Albireo cuando está instalado',
     set_updates: 'Buscar actualizaciones cada día',
+    corpora_title: 'Corpus de entrenamiento con valores ficticios',
+    corpora_hint: 'Los programas de este ordenador, como Albireo-Training, pueden pedir al servicio, por su ' +
+      'interfaz, que escriba textos con valores ficticios verosímiles para los corpus con los que entrenan ' +
+      'modelos. No se conserva nada de estos textos y no pueden restaurarse. Aquí figuran los llamantes que usaron ' +
+      'esta escritura y el número de sus textos.',
+    col_caller: 'Llamante',
+    col_account: 'Cuenta de Windows',
+    col_corpora: 'Corpus',
+    col_texts: 'Textos',
+    col_last: 'Último corpus',
+    corpora_none: 'Ningún programa ha usado esta escritura.',
     set_max: 'Archivo más grande (MB)',
     set_removed: 'Conservación tras salir de la unidad (días)',
     btn_save: 'Guardar',

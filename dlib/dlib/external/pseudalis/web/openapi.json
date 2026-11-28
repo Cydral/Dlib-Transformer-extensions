@@ -2,7 +2,7 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Pseudalis interface",
-  "version": "1.0.17",
+  "version": "1.1.0",
   "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise. A request gives the length of its body (Content-Length): a body sent in chunks is refused (411).",
   "contact": {
    "name": "Cydral Technology",
@@ -40,6 +40,10 @@
   },
   {
    "name": "Administration"
+  },
+  {
+   "name": "Corpora",
+   "description": "Training corpora written with plausible fictive values: each value found takes a value of the same type, of the same language and of the same form, drawn under the key of the corpus, the same in every text of the corpus. Nothing is recorded, no original is kept and no text can be restored. The routes take the administration token, from a program of this computer, and the routes of a corpus the Windows account that made it (403, code corpus_caller). The web application lists the callers and the number of their texts in its settings, and offers no way to use the mode."
   }
  ],
  "paths": {
@@ -554,6 +558,14 @@
            }
           },
           "description": "The substitutes of a text protected without tags, as /v1/text/anonymize listed them: their values come back with those of the tags. A list that is not an array is refused (400, code bad_request)."
+         },
+         "substitutes": {
+          "type": "string",
+          "description": "fictive: the text was written with fictive values, which nothing gives back (409, code fictive_not_restorable)."
+         },
+         "corpus_id": {
+          "type": "string",
+          "description": "The corpus of a text written with fictive values: refused (409, code fictive_not_restorable)."
          }
         },
         "required": [
@@ -615,6 +627,9 @@
       "$ref": "#/components/responses/Error"
      },
      "503": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
       "$ref": "#/components/responses/Error"
      }
     },
@@ -1525,6 +1540,542 @@
        "application/json": {
         "schema": {
          "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/corpus": {
+   "post": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "Make a corpus",
+    "description": "Makes the key of a corpus, 32 random bytes kept in the folder of the keys of the service and protected by DPAPI for its account, as its master key is, and records the settings of the corpus, its caller and its Windows account. Settings out of their ranges are refused (400, code corpus_settings, the setting in args.field); a request from another computer is refused (403, code corpus_local).",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "X-Pseudalis-Caller",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "maxLength": 64
+      },
+      "description": "The name of the calling program, printable ASCII, which the settings of the web application show: Albireo-Training for instance. Without it, the caller is named api."
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "languages": {
+          "type": "array",
+          "items": {
+           "type": "string",
+           "enum": [
+            "fr",
+            "en",
+            "de",
+            "es",
+            "it"
+           ]
+          },
+          "minItems": 1,
+          "maxItems": 5,
+          "description": "The languages of the corpus, each once: the first is that of the names found in no lexicon, and its country that of the places, numbers and addresses whose country the value does not tell. fr by default."
+         },
+         "date_shift_days": {
+          "type": "integer",
+          "minimum": 7,
+          "maximum": 3650,
+          "default": 180,
+          "description": "The bound of the shift of the dates: each document moves by a whole number of weeks, one at least, into the past or the future."
+         },
+         "keep_city": {
+          "type": "boolean",
+          "default": true,
+          "description": "true: a postal code and its city stay when the city has 50,000 inhabitants or more in the lexicon of the cities, the inward code of a British postcode and the four digits of a ZIP+4 being drawn; any other place, and every place when false, takes a city of the same country and of the same size class."
+         },
+         "sensitive_sentences": {
+          "type": "string",
+          "enum": [
+           "generalize",
+           "drop"
+          ],
+          "default": "generalize",
+          "description": "The writing of the sentences of the categories of articles 9 and 10 of the GDPR, recorded with the corpus; this version tells none apart (sensitive_detection none)."
+         }
+        }
+       },
+       "example": {
+        "languages": [
+         "fr",
+         "en"
+        ],
+        "date_shift_days": 180,
+        "keep_city": true,
+        "sensitive_sentences": "generalize"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "The corpus made",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "corpus_id": {
+           "type": "string"
+          },
+          "key_created": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/corpus/{id}": {
+   "get": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "The state of a corpus",
+    "description": "Its settings, its caller, the number of its texts, the day its key was destroyed when it was deleted, the models of the engine and the version of the lexicons of the fictive values; sensitive_detection is none, this version telling apart no sentence of the categories of articles 9 and 10 of the GDPR.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[0-9a-fA-F]{32}$"
+      },
+      "description": "The identifier of the corpus, as POST /v1/corpus gave it."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The state of the corpus",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "Delete a corpus",
+    "description": "Overwrites and removes the key of the corpus: the texts written before stay coherent with one another, and no text can be added to them any more (410, code corpus_deleted). The record of the corpus, its caller and the number of its texts, stays for the settings of the web application.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[0-9a-fA-F]{32}$"
+      },
+      "description": "The identifier of the corpus, as POST /v1/corpus gave it."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The corpus deleted",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "corpus_id": {
+           "type": "string"
+          },
+          "deleted": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/corpus/{id}/texts": {
+   "post": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "Write texts of a corpus",
+    "description": "Writes a batch of 1 to 256 texts, 4 MiB of text at most (413, code corpus_too_large): with substitutes fictive, the default, each value found by the detector, with the imposed terms and, in a CSV text, the imposed columns, takes a fictive value drawn under the key of the corpus, no fictive value equalling an original value of the batch; with tags or tagless, the texts are protected as /v1/text/anonymize protects them. Nothing of the texts is kept: the corpus counts them alone. A deleted corpus refuses them (410, code corpus_deleted); a text that cannot be read fails the batch (422, its reference in the message).",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[0-9a-fA-F]{32}$"
+      },
+      "description": "The identifier of the corpus, as POST /v1/corpus gave it."
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "texts"
+        ],
+        "properties": {
+         "texts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+           "type": "object",
+           "required": [
+            "text"
+           ],
+           "properties": {
+            "ref": {
+             "type": "string",
+             "maxLength": 256,
+             "description": "The reference of the text, sent back with its result; its position in the list when it is left out."
+            },
+            "text": {
+             "type": "string",
+             "description": "The text, in UTF-8."
+            },
+            "name": {
+             "type": "string",
+             "maxLength": 256,
+             "description": "A file name whose extension .csv, .tsv or .tab makes the text a CSV file read cell by cell, whose imposed columns take fictive values whole; empty for a plain text."
+            },
+            "document": {
+             "type": "string",
+             "maxLength": 256,
+             "description": "The document the text comes from: the dates of the texts of one document move by one shift, those of different documents by different shifts; without it, the dates of the corpus move together."
+            }
+           }
+          }
+         },
+         "substitutes": {
+          "type": "string",
+          "enum": [
+           "fictive",
+           "tags",
+           "tagless"
+          ],
+          "default": "fictive"
+         }
+        }
+       },
+       "example": {
+        "texts": [
+         {
+          "ref": "seg-001",
+          "text": "Jean Dupont, 06 12 34 56 78, jean.dupont@acme.fr"
+         }
+        ],
+        "substitutes": "fictive"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The results, in the order of the texts",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "results": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "ref": {
+              "type": "string"
+             },
+             "text": {
+              "type": "string",
+              "description": "The text with its values replaced."
+             },
+             "counts": {
+              "type": "object",
+              "additionalProperties": {
+               "type": "integer"
+              },
+              "description": "The values found by type, in lower case: person, org, location, address, email, phone, date, id, iban, card, nir, siret, ipv4, ipv6, mac, url, plate, geo, secret, title, gender, nationality. The civilities, the sexes and the nationalities stay as they are."
+             },
+             "dropped": {
+              "type": "boolean",
+              "description": "Whether the text was left out of the corpus: never in this version, which tells apart no sentence of the categories of articles 9 and 10 of the GDPR."
+             },
+             "substitutions": {
+              "type": "array",
+              "items": {
+               "type": "object"
+              },
+              "description": "With substitutes tagless alone: the substitutes written and their tags, as /v1/text/anonymize lists them."
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "410": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/corpus/{id}/stream": {
+   "post": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "Write a stream of texts of a corpus",
+    "description": "The same writing for large volumes: one JSON object per line in the body (application/x-ndjson), as the items of /v1/corpus/{id}/texts, and one result per line in the answer, in the order of the texts. The texts are written by batches of 256 texts or 4 MiB; the results wait in a file of the data folder, which only SYSTEM and the administrators open, and leave with the answer, the file removed then. The body gives its length, up to the largest file of the settings; a line that is not a JSON object stops the stream (400, code corpus_line). X-Pseudalis-Texts gives the number of texts written.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[0-9a-fA-F]{32}$"
+      },
+      "description": "The identifier of the corpus, as POST /v1/corpus gave it."
+     },
+     {
+      "name": "substitutes",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "enum": [
+        "fictive",
+        "tags",
+        "tagless"
+       ],
+       "default": "fictive"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/x-ndjson": {
+       "schema": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "One result per line",
+      "content": {
+       "application/x-ndjson": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "410": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/corpus/{id}/restore": {
+   "post": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "Restore a text of a corpus: refused",
+    "description": "A text written with fictive values cannot be restored: nothing was kept to give its values back (409, code fictive_not_restorable). /v1/text/restore refuses it so too when its body names the corpus (corpus_id) or the writing (substitutes fictive).",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[0-9a-fA-F]{32}$"
+      },
+      "description": "The identifier of the corpus, as POST /v1/corpus gave it."
+     }
+    ],
+    "responses": {
+     "409": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/corpora": {
+   "get": {
+    "tags": [
+     "Corpora"
+    ],
+    "summary": "The callers of the corpora",
+    "description": "The corpora, newest first, and their callers with their Windows accounts, their numbers of corpora and of texts and their latest corpus: what the settings of the web application show. Never a text nor a value.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The corpora and their callers",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "corpora": {
+           "type": "array",
+           "items": {
+            "type": "object"
+           }
+          },
+          "callers": {
+           "type": "array",
+           "items": {
+            "type": "object"
+           }
+          }
+         }
         }
        }
       }

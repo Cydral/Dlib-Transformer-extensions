@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -588,6 +589,10 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    typedef std::function<std::string(pii_type type, const std::string& value)> document_value_writer;
+
+// ----------------------------------------------------------------------------------------
+
     class document_anonymizer
     {
     public:
@@ -633,6 +638,9 @@ namespace dlib
 
         void set_untagged_text(bool untagged) { untagged_text_ = untagged; }
         bool untagged_text() const { return untagged_text_; }
+
+        void set_value_writer(const document_value_writer& write) { writer_ = write; }
+        const document_value_writer& value_writer() const { return writer_; }
 
         void set_text_substitute_resolver(const pseudonymizer::substitute_resolver& resolve)
         {
@@ -715,6 +723,7 @@ namespace dlib
            untagged, which report lists with the tag it stands for. */
         std::string text_value(pii_type type, const std::string& value, document_report& report) const
         {
+            if (writer_) return written_value(type, value);
             if (!untagged_text_) return p_.tag(type, value);
             document_substitution s;
             s.substitute = p_.substitute(type, value, &s.tag);
@@ -723,10 +732,42 @@ namespace dlib
             return s.substitute;
         }
 
+        // A value given to the writer: a verified tag written by a protection before stands for its value.
+        std::string written_value(pii_type type, const std::string& value) const
+        {
+            pii_type tagged = pii_type::none;
+            std::string original;
+            if (p_.decode(value, tagged, original) && tagged != pii_type::none) return writer_(tagged, original);
+            return writer_(type, value);
+        }
+
         // A text with its entities replaced as text_value() replaces each one.
         std::string text_values(const std::string& text, const std::vector<pii_entity>& entities,
                                 document_report& report) const
         {
+            if (writer_)
+            {
+                // The entities chosen as pseudonymizer::apply() chooses them, each given to the writer.
+                std::vector<pii_entity> chosen;
+                for (const pii_entity& e : entities)
+                    if (e.type != pii_type::none && e.end <= text.size() && e.begin < e.end &&
+                        !p_.keeps_in_clear(e.type))
+                        chosen.push_back(e);
+                std::stable_sort(chosen.begin(), chosen.end(), [](const pii_entity& a, const pii_entity& b) {
+                    return a.begin < b.begin || (a.begin == b.begin && a.end - a.begin > b.end - b.begin);
+                });
+                std::string out;
+                std::size_t pos = 0;
+                for (const pii_entity& e : chosen)
+                {
+                    if (e.begin < pos) continue;
+                    out.append(text, pos, e.begin - pos);
+                    out += written_value(e.type, text.substr(e.begin, e.end - e.begin));
+                    pos = e.end;
+                }
+                out.append(text, pos, std::string::npos);
+                return out;
+            }
             if (!untagged_text_) return p_.apply(text, entities);
             std::vector<pseudonymizer::substitution> made;
             const std::string out = p_.apply_substitutes(text, entities, &made);
@@ -758,7 +799,7 @@ namespace dlib
         std::vector<pii_entity> to_write(const std::string& text, std::vector<pii_entity> entities) const
         {
             entities = without_known(text, std::move(entities));
-            return untagged_text_ ? p_.with_tag_entities(text, std::move(entities)) : entities;
+            return untagged_text_ || writer_ ? p_.with_tag_entities(text, std::move(entities)) : entities;
         }
 
         // A restored text with the substitutes that the text resolver knows given back too.
@@ -797,6 +838,9 @@ namespace dlib
             report.operation = restoring ? "restore" : "anonymize";
             report.key_fingerprint = p_.key_fingerprint();
             report.format = document_format_name(format);
+            if (writer_ && !restoring && format != document_format::text && format != document_format::delimited &&
+                format != document_format::markup)
+                throw error("a value writer writes the text formats only: plain text, delimited values and markup");
             switch (format)
             {
                 case document_format::docx:
@@ -1200,7 +1244,7 @@ namespace dlib
                     const std::string part = core.substr(b, e - b);
                     if (known_substitute(part, type, nullptr)) return value;
                     form = found;
-                    if (address_of_form(p_.substitute(found, part), found))
+                    if (writer_ || address_of_form(p_.substitute(found, part), found))
                     {
                         ab = b;
                         ae = e;
@@ -1211,6 +1255,7 @@ namespace dlib
             const std::string before = value.substr(0, r.first) + core.substr(0, ab);
             const std::string after = core.substr(ae) + value.substr(r.second);
             report.count(form);
+            if (writer_) return before + written_value(form, address) + after;
             // A civility, a sex or a nationality takes another substitute at each place, as its tags do.
             const bool varying = form == pii_type::title || form == pii_type::gender || form == pii_type::nationality;
             const std::string key = std::string(pii_type_keyword(form)) + '\x1f' + address;
@@ -1854,7 +1899,8 @@ namespace dlib
                         const std::string written =
                             text_value(e.type, a.value.substr(e.begin, e.end - e.begin), report);
                         if (a.uri)
-                            value += untagged_text_ ? percent_encode_substitute(written) : percent_encode_tag(written);
+                            value += untagged_text_ || writer_ ? percent_encode_substitute(written)
+                                                               : percent_encode_tag(written);
                         else
                             value += written;
                         pos = e.end;
@@ -1972,6 +2018,7 @@ namespace dlib
         bool untagged_properties_ = false;
         pseudonymizer::substitute_resolver resolve_;
         bool untagged_text_ = false;
+        document_value_writer writer_;
         pseudonymizer::substitute_resolver text_resolve_;
         document_picture_text_finder pictures_;
         std::vector<pii_imposed_column> columns_;

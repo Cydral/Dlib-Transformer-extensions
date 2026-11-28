@@ -12,9 +12,9 @@
     for the same reason (CMakeLists.txt).
 */
 #define PSEUDALIS_VERSION_MAJOR 1
-#define PSEUDALIS_VERSION_MINOR 0
-#define PSEUDALIS_VERSION_PATCH 17
-#define PSEUDALIS_VERSION "1.0.17"
+#define PSEUDALIS_VERSION_MINOR 1
+#define PSEUDALIS_VERSION_PATCH 0
+#define PSEUDALIS_VERSION "1.1.0"
 
 #define PSEUDALIS_PRODUCT_NAME "Pseudalis"
 /*

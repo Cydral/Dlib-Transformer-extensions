@@ -922,6 +922,64 @@ int main()
         psd_free(&err);
     }
 
+    // A training corpus: fictive values under the key of the corpus, nothing kept, CSV texts by their names.
+    {
+        json req = json::object();
+        req["key"] = std::string(64, 'c');
+        json languages = json::array();
+        languages.push_back("fr");
+        req["languages"] = languages;
+        req["date_shift_days"] = 70;
+        json texts = json::object(), list = json::array();
+        auto text = [&list](const char* ref, const char* t, const char* name) {
+            json one = json::object();
+            one["ref"] = ref;
+            one["text"] = t;
+            one["name"] = name;
+            one["document"] = "d1";
+            list.push_back(one);
+        };
+        text("a", "Bonjour, je suis Jean Dupont, joignable au 06 12 34 56 78 ou jean.dupont@example.fr.", "");
+        text("b", "M. Dupont viendra le 12/03/2024 depuis l'adresse 10.1.2.3.", "");
+        text("c", "Nom;Courriel\nDupont;jean.dupont@example.fr\n", "clients.csv");
+        texts["texts"] = list;
+        const std::string columns = "[{\"column\": \"Nom\", \"type\": \"PERSON\"}]";
+        CHECK(psd_set_columns(e, columns.data(), columns.size(), &err) == 1);
+        psd_free(&err);
+        CHECK(process(e, "fictive", "corpus", texts.dump(), res, out, false, false, req));
+        const json results = json::parse_or_null(out)["results"];
+        CHECK(res["kind"].str() == "corpus" && res["report"]["lexicons"].str().compare(0, 6, "1.1.0-") == 0 &&
+              results.size() == 3);
+        std::string all;
+        for (const json& r : results.elements()) all += r["text"].str() + "\n";
+        CHECK(all.find("Dupont") == std::string::npos && all.find("12 34 56 78") == std::string::npos &&
+              all.find("10.1.2.3") == std::string::npos && all.find("[[") == std::string::npos);
+        CHECK(all.find("06 39 98 ") != std::string::npos && all.find(".example.com") != std::string::npos);
+        CHECK(results.size() == 3 && results.elements()[0]["counts"]["person"].as_int() >= 1 &&
+              results.elements()[0]["ref"].str() == "a" && !results.elements()[0]["dropped"].as_bool(true));
+        // The family name of the first text is that of the second and of the column of the CSV text.
+        if (results.size() == 3)
+        {
+            const std::string b = results.elements()[1]["text"].str(), c = results.elements()[2]["text"].str();
+            const std::string family = b.substr(3, b.find(' ', 3) - 3);
+            CHECK(b.compare(0, 3, "M. ") == 0 && results.elements()[0]["text"].str().find(" " + family) !=
+                  std::string::npos && c.find("\n" + family + ";") != std::string::npos);
+        }
+        // Another key gives other values; a key of another size is refused.
+        json other = req;
+        other["key"] = std::string(64, 'd');
+        std::string out2;
+        CHECK(process(e, "fictive", "corpus", texts.dump(), res, out2, false, false, other) && out2 != out);
+        other["key"] = "abcd";
+        CHECK(!process(e, "fictive", "corpus", texts.dump(), res, out2, false, true, other));
+        CHECK(psd_set_columns(e, "[]", 2, &err) == 1);
+        psd_free(&err);
+        // The models name the lexicons of the fictive values.
+        psd_buffer m = { nullptr, 0 };
+        CHECK(psd_models(&m) == 1 && m.data && std::string(m.data, m.size).find("\"lexicons\"") != std::string::npos);
+        psd_free(&m);
+    }
+
     psd_buffer fp = { nullptr, 0 };
     CHECK(psd_key_fingerprint(e, &fp) == 1 && fp.size > 0);
     psd_free(&fp);

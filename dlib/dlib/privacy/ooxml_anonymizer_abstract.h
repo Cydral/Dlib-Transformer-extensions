@@ -43,7 +43,13 @@ namespace dlib
                                 comments, threaded comments, charts and drawings that are
                                 kept as text, tables, pivot caches and pivot tables,
                                 external link caches and revision logs are treated the same
-                                way.
+                                way. In the field codes of Word, the instruction of a field
+                                that refers to another place of the document or numbers
+                                it (REF, PAGEREF, NOTEREF, STYLEREF, SEQ, TOC) stays as
+                                written: its arguments name a bookmark, a style or a
+                                sequence, and a tag in their place would break the field
+                                at its next update. The instructions of the other fields
+                                are read, the address of a HYPERLINK for one.
                     Formulas  - the string literals of cell formulas, validation lists,
                                 conditional formats, filters and defined names are
                                 anonymized; cell references stay as written.

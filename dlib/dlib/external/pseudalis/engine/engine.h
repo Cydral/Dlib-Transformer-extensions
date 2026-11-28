@@ -67,6 +67,31 @@ namespace pseudalis
         std::string kind;
     };
 
+    // A text of a training corpus, written with fictive values (engine::fictive()).
+    struct corpus_text
+    {
+        std::string ref;                    // the reference the caller gives it, sent back with its result
+        std::string text;                   // UTF-8
+        std::string name;                   // a file name whose extension tells a CSV text, or empty
+        std::string document;               // the document whose dates move together, or empty
+    };
+
+    struct corpus_result
+    {
+        std::string ref;
+        std::string text;                   // the text with its fictive values
+        json counts = json::object();       // the values found by type, keyword in lower case ("person": 2)
+        bool dropped = false;               // the text left out of the corpus (none in this version)
+    };
+
+    // The settings of a corpus (dlib::fictive_options): languages, bound of the shift of the dates, cities.
+    struct corpus_settings
+    {
+        std::vector<std::string> languages;
+        long date_shift_days = 180;
+        bool keep_city = true;
+    };
+
     struct engine_result
     {
         std::string bytes;                  // the file written
@@ -207,6 +232,21 @@ namespace pseudalis
             const std::vector<substitution>& substitutes = std::vector<substitution>()) const;
         // [{"begin", "end", "type", "confidence", "text"}] of the values of a text.
         json detect(const std::string& text) const;
+
+        /*
+            The texts of a training corpus, each value found taking a fictive value of the same type,
+            language and form drawn under key, the 32 bytes of the key of the corpus
+            (dlib/privacy/fictive_values.h): the detector reads each text with the imposed terms, a
+            text named .csv, or whose header names an imposed column, as a CSV file whose imposed
+            columns take fictive values whole, and the texts of one call form one batch, in which no
+            fictive value equals an original of the batch.  Nothing is recorded and nothing gives the
+            originals back.  Throws std::runtime_error for a key of another size or a text that
+            cannot be read, whose reference the message gives.
+        */
+        std::vector<corpus_result> fictive(const std::vector<corpus_text>& texts, const std::string& key,
+            const corpus_settings& settings) const;
+        // The version of the lexicons of the fictive values ("1.1.0-" and 12 hexadecimal digits).
+        static std::string lexicon_version();
 
         /*
             Replaces the imposed terms (common/imposed_terms.h), which every file, text and name

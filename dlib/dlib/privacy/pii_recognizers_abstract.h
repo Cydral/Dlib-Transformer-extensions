@@ -113,6 +113,13 @@ namespace dlib
               kept only where the span model reads a town or a postal code too, with a
               confidence of 0.2 at least: its context alone tells a town from any other
               capitalized word.
+            - An account name written in lower-case letters alone ("jdupont") that a
+              leading tagger reads with less than second_min_confidence in running text is
+              kept only where the span model reads an account name too, with a confidence
+              of 0.2 at least: it has the look of any word of a sentence. Where a layout
+              writes a value (at the start of the text or of a line, after a tab, a colon,
+              an equals sign, a semicolon or a vertical bar, or right after a comma or a
+              '>'), and with a digit, a sign or a capital, it follows the general rule.
             - The less confident name parts of the other recognizer (at least
               min_confidence) that complete a name kept, separated from it by spaces or a
               hyphen only, are kept too, so that the parts of a name are replaced
